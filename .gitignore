@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Lean / Lake
+/.lake
+/lean/.lake
+/lake-packages
+/build
+
+# cargo-fuzz
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# mdbook
+/docs/book
+
+# Editor / OS
+*.swp
+.DS_Store

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-arch"
+description = "Per-architecture support: arch identity and the per-CPU fast-path mode (RSEQ asm lands in plan 05). no_std."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[dependencies]
+
+[lints]
+workspace = true

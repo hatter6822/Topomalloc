@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+#
+# Pinned Rust toolchain (W0-3). A fresh clone + `cargo xtask setup` installs
+# exactly this toolchain, these components, and these cross targets, so every
+# contributor and every CI job builds with an identical compiler.
+#
+# The channel is an exact release (not `stable`) for reproducibility. We use a
+# stable channel deliberately: no allocator-core code requires a nightly
+# feature (W0-3). The one nightly-only tool, `cargo-fuzz`, is installed on
+# demand by `xtask test --kind fuzz` and is never part of the default build.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+profile = "minimal"

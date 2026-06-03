@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "trace-replay"
+description = "Executable-model trace replay / differential runner stub (§33.7, plan 08 W21-2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "trace-replay"
+path = "src/main.rs"
+
+[dependencies]
+topo-core = { path = "../../crates/topo-core" }
+topo-test-support = { path = "../../crates/topo-test-support" }
+
+[lints]
+workspace = true

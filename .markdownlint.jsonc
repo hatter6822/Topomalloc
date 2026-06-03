@@ -1,0 +1,32 @@
+{
+  // Markdown lint policy (W0-6) for /planning, /docs, and repo Markdown.
+  "default": true,
+  // Long lines: our SPEC/plan prose and tables are intentionally wide.
+  "MD013": false,
+  // Inline HTML: we lead files with an <!-- SPDX --> comment and use a few spans.
+  "MD033": false,
+  // First line need not be a top-level heading (files start with the SPDX comment).
+  "MD041": false,
+  // Duplicate headings are fine across different sections.
+  "MD024": { "siblings_only": true },
+  // Ordered-list numbering style is a matter of taste in long design docs.
+  "MD029": false,
+  // Trailing punctuation in headings (we don't use it, but don't gate on it).
+  "MD026": false,
+  // Bare URLs appear in references; allow them.
+  "MD034": false,
+  // Emphasis-as-heading is used stylistically in the plan.
+  "MD036": false,
+  // The SPEC is a single long document that uses section-level `#` headings.
+  "MD025": false,
+  // Table pipe padding/alignment style is too opinionated for wide design tables.
+  "MD060": false,
+  // The following are cosmetic layout rules that the prose-heavy SPEC and plan
+  // documents (authored before this gate) use deliberately. Disabling them
+  // keeps markdownlint focused on genuine defects (trailing whitespace, hard
+  // tabs, multiple blank lines, missing final newline, bad links, ...).
+  "MD004": false, // unordered-list marker style (-, *, + used interchangeably)
+  "MD028": false, // blank line inside blockquote (the plan's "> note" blocks)
+  "MD031": false, // blanks around fenced code (fences embedded in lists/quotes)
+  "MD032": false  // blanks around lists
+}

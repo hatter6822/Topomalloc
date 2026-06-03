@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/hatter6822/topomalloc/bench/results-schema.json",
+  "title": "TopoMalloc benchmark result",
+  "description": "Schema for one benchmark run, so results are comparable across commits and machines (W0-8, §34.6). Additive within a release series.",
+  "type": "object",
+  "required": ["schema_version", "topomalloc_version", "commit", "arch", "profile", "benchmarks"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "topomalloc_version": { "type": "string" },
+    "commit": { "type": "string", "description": "git commit SHA the run was built from" },
+    "arch": { "type": "string", "enum": ["x86_64", "aarch64"] },
+    "profile": {
+      "type": "string",
+      "enum": ["performance", "hardened", "debug", "deterministic_test", "low_rss", "hugepage_optimized"]
+    },
+    "backend": { "type": "string", "enum": ["posix", "sele4n-sim"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "benchmarks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "unit", "value"],
+        "properties": {
+          "name": { "type": "string" },
+          "unit": { "type": "string", "enum": ["ns", "ns/op", "bytes", "ops/s", "ratio"] },
+          "value": { "type": "number" },
+          "p50": { "type": "number" },
+          "p99": { "type": "number" },
+          "stddev": { "type": "number" }
+        }
+      }
+    }
+  }
+}

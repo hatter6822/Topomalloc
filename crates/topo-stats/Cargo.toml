@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-stats"
+description = "Statistics snapshot + additive stats JSON (Appendix D); wires topomalloc_version (W0-13). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[dependencies]
+topo-core = { path = "../topo-core", version = "0.1.0" }
+
+[dev-dependencies]
+# Used only to assert the emitted stats JSON is well-formed and additive.
+serde_json = "1"
+
+[lints]
+workspace = true

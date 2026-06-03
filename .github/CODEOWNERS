@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+#
+# Code ownership / review routing (W0-11). The sensitive domains below require
+# review from their owners. Replace @hatter6822 with the appropriate team
+# handles (e.g. @org/formal, @org/sele4n, @org/arch) as the project grows.
+
+# Default owner for everything.
+*                                   @hatter6822
+
+# Formal model & proofs — changes here gate the formal conformance class.
+/lean/                              @hatter6822
+
+# seLe4n integration (GPL-3.0-or-later; capability authority is load-bearing).
+/sele4n/                            @hatter6822
+/crates/topo-backend-sele4n/        @hatter6822
+/lean/TopoMalloc/SeLe4n/            @hatter6822
+
+# Per-architecture assembly (RSEQ / restartable sequences).
+/crates/topo-arch/                  @hatter6822
+
+# The single source of truth for generated tables and the build/CI contract.
+/tools/size-class-gen/              @hatter6822
+/xtask/                             @hatter6822
+/.github/                           @hatter6822
+
+# Specification and plan changes.
+/planning/                          @hatter6822

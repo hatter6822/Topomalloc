@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: MIT
+#
+# TopoMalloc Cargo workspace (W0-4, D3). `cargo xtask` is the single entry
+# point driving Rust, Lean (`lake`), codegen, and cross builds so contributors
+# and CI run identical commands.
+#
+# Licensing (D5, W0-12): the workspace default is MIT. The seLe4n integration
+# crates (`topo-backend-sele4n`) are GPL-3.0-or-later because they link the
+# GPLv3 seLe4n ABI. They are never linked by the default MIT artifact; see
+# NOTICE and docs/DECISIONS.md.
+[workspace]
+resolver = "2"
+members = [
+    "crates/topo-core",
+    "crates/topo-abi",
+    "crates/topo-backend-posix",
+    "crates/topo-backend-sele4n",
+    "crates/topo-arch",
+    "crates/topo-stats",
+    "crates/topo-control",
+    "crates/topo-test-support",
+    "tools/size-class-gen",
+    "tools/trace-replay",
+    "tests",
+    "xtask",
+]
+# `fuzz/` is intentionally excluded: cargo-fuzz requires a nightly toolchain and
+# its own workspace (W0-7). It is built on demand by `xtask test --kind fuzz`.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+repository = "https://github.com/hatter6822/topomalloc"
+authors = ["The TopoMalloc Authors"]
+
+# Shared lint policy (W0-6). `clippy -D warnings` is applied in CI on top of
+# these; here we raise the floor for every crate so a fresh crate inherits the
+# house rules. Crates opt in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2021_compatibility = "warn"
+
+[workspace.lints.clippy]
+# Correctness-leaning groups; policy/heavy groups stay opt-in per crate.
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+checked_conversions = "warn"
+
+[profile.release]
+# Performance profile is the optimized build; debug assertions are gated by
+# feature, not by profile (principle 8: profiles are features, not forks).
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

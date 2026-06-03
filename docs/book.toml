@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+[book]
+title = "TopoMalloc"
+authors = ["The TopoMalloc Authors"]
+description = "A safety-first, formally-grounded, capability-aware memory allocator."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/hatter6822/topomalloc"

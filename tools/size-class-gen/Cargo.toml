@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "size-class-gen"
+description = "THE size-class generator: the single source of truth for the size-class table (DD-1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "size-class-gen"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

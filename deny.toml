@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+#
+# cargo-deny configuration (W0-6 / W0-12 supply-chain gate). Enforces:
+#  * licenses — every dependency is permissively licensed, EXCEPT the seLe4n
+#    integration crate which is allowed to be GPL-3.0-or-later (D5);
+#  * advisories — no known-vulnerable or yanked dependencies;
+#  * sources — crates come from crates.io or the pinned seLe4n git repo (D8).
+# Run via `cargo xtask deny` (and the CI `deny` job).
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses allowed for all dependencies. Kept to the set the current
+# dependency tree actually uses plus the most common permissive licenses, so a
+# routine dependency update does not trip the gate.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+# The D5 license boundary: GPL-3.0-or-later is permitted ONLY for the seLe4n
+# integration crates — never for an arbitrary dependency. This is the automated
+# counterpart to the per-file SPDX policy and the `xtask` license-boundary check.
+exceptions = [
+    { crate = "topo-backend-sele4n", allow = ["GPL-3.0-or-later"] },
+]
+
+[bans]
+# Dev-dependency trees (criterion) legitimately pull duplicate versions.
+multiple-versions = "allow"
+# No wildcard ("*") version requirements on registry crates...
+wildcards = "deny"
+# ...but intra-workspace `path` dependencies are version-less by design.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The pinned seLe4n ABI repo (D8); wired behind the `real-abi` feature at M1.
+allow-git = ["https://github.com/hatter6822/seLe4n"]

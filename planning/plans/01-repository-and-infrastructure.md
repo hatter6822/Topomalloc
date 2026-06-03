@@ -10,6 +10,20 @@
 > clone and get a green build, tests, lints, and a Lean check on x86-64 **and** AArch64, with the dual-backend
 > layout already in place. Nothing else can start until the seams and toolchain here exist.
 
+> **Implementation status — W0 landed; M0 closed.** All of W0-1 … W0-14 are
+> implemented and **verified end to end on both arches**: the Cargo workspace +
+> `cargo xtask` (D3), pinned toolchains, CI (`.github/workflows/ci.yml`, every job
+> calling `xtask`), the lint/SPDX/Lean-style/license-boundary/`cargo-deny` gates,
+> the unit/property/differential/fuzz/bench harnesses, the C-ABI compile-link-run
+> test, the SessionStart hook + `scripts/setup_lean.sh`, governance and docs, the
+> MIT/GPL license split (D5/D8), versioning + ABI policy, and the M0 walking
+> skeleton. `cargo xtask ci` is green on a fresh clone. The decisions are ratified
+> in [`../../docs/DECISIONS.md`](../../docs/DECISIONS.md). The Lean toolchain is
+> pinned to `leanprover/lean4:v4.28.0` (matching seLe4n) and `lake build` +
+> `lake exe check` pass; AArch64 builds and runs the full suite under QEMU. The
+> five M0 walking-skeleton sub-units (W0-14a..e) all pass — see
+> `tests/tests/walking_skeleton.rs` and `tests/tests/dual_backend.rs`.
+
 ---
 
 ## W0 — Repository, build & developer infrastructure
