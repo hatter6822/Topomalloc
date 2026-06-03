@@ -1,16 +1,16 @@
 # TopoMalloc Specification
 
-**Document status:** Design specification, revision 0.2  
-**Date:** 2026-06-01  
+**Document status:** Design specification, revision 0.3  
+**Date:** 2026-06-03  
 **Audience:** allocator implementers, systems engineers, runtime maintainers, database engineers, performance engineers, and formal verification engineers  
-**Scope:** A proposed general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean-first formal model, and an optional seLe4n/seL4-style microkernel integration profile.
+**Scope:** A proposed general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean-first formal model, and a required seLe4n/seL4-style microkernel integration profile.
 
 ## Document control
 
 | Field | Value |
 |---|---|
 | Name | TopoMalloc Specification |
-| Revision | 0.2 |
+| Revision | 0.3 |
 | Status | Draft technical specification |
 | Primary design goal | High-throughput, low-fragmentation, topology-aware allocation with machine-checkable safety invariants |
 | Reference allocators | jemalloc and modern Google TCMalloc |
@@ -19,6 +19,14 @@
 | Supported first platform | Linux x86-64 and AArch64 with mmap, madvise, TLS, atomics, and optional RSEQ |
 | First microkernel integration profile | seLe4n user-level allocator and memory-service profile |
 | Portability target | Degraded-but-correct mode on POSIX-like systems without RSEQ |
+
+## Document history
+
+| Revision | Date | Summary |
+|---|---|---|
+| 0.1 | 2026-05 | Initial draft. |
+| 0.2 | 2026-06-01 | Expanded the seLe4n integration profile (Section 36) and the appendices. |
+| 0.3 | 2026-06-03 | Audit and refinement pass. Made the seLe4n/seL4 integration profile a **required** (non-optional) profile with its own conformance class and a normative preamble to Section 36. Corrected the size-class rounding-waste model to separate the spacing-dominated and alignment-dominated regimes — the previous flat `<= 33%` target was unattainable below ~48 B under a 16-byte ABI quantum. Required `class.size` to be an integer multiple of `class.alignment` and removed per-object slab-offset adjustment. Unified the span object-count conservation law across the descriptor, the bitmap invariants, and empty-span detection. Reordered the lock hierarchy to follow data flow (transfer before central) and added release-before-acquire guidance. Added OOM and retry handling to the small-allocation slow path. Strengthened the RSEQ Lean contract with a frame condition and a distinct empty/underflow case. Added the allocator-TLS recursion rule, `errno`/C23 allocation-API requirements, the calloc rounding-overflow cross-reference, the unmapped-memory accounting caveat, and a new Section 11.7 resolving per-CPU-cache/arena routing. Synchronized the table of contents with the appendix sections. |
 
 ## Source basis and limits
 
@@ -32,8 +40,8 @@ This document intentionally separates established allocator mechanisms from prop
 * seLe4n is treated as a candidate microkernel integration target because its public repository describes a Lean 4, capability-based microkernel with machine-checked invariants, a seL4-inspired architecture, a Raspberry Pi 5 target, and an active SMP trajectory [R10, R11].
 * seL4-style physical memory management is treated as the authority model for the seLe4n profile: almost all physical memory is delegated to user level as untyped capabilities; objects are created by retyping; and greedy watermark behavior makes largest-first untyped partitioning an allocator best practice [R12].
 * Upstream seL4 user-level C libraries include allocman, VKA, and VSpace abstractions for virtual memory, malloc memory, CSpaces, object allocation, and virtual memory management; the same documentation states those C libraries are useful for prototyping and are not verified [R13].
-* The seL4 Microkit is a static-system framework on top of seL4; TopoMalloc's seLe4n profile must therefore be optional and must support fixed-arena operation for statically structured systems [R14].
-* The seLe4n integration described in this revision is a proposed profile. It is not a claim that seLe4n currently ships TopoMalloc or that seLe4n kernel-internal allocation should be replaced by a general-purpose heap.
+* The seL4 Microkit is a static-system framework on top of seL4; the TopoMalloc seLe4n profile must therefore support fixed-arena operation for statically structured systems [R14]. Within the profile, dynamic retype and runtime arena growth are the features that degrade to fixed-arena mode; the integration profile itself is a required part of this specification, not an optional add-on.
+* The seLe4n integration described in this revision is a required profile of this specification. It is not a claim that seLe4n currently ships TopoMalloc or that seLe4n kernel-internal allocation should be replaced by a general-purpose heap; it is a normative requirement on a conforming TopoMalloc to *provide* the integration, subject to the user-level/service boundary defined in Section 36.
 
 The specification does not promise that TopoMalloc will dominate all allocators on all workloads. It defines a design intended to make high performance plausible while making correctness, accounting, safety boundaries, and operational behavior explicit.
 
@@ -45,6 +53,7 @@ The keywords **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, *
 * **Performance conformance** means the implementation includes per-CPU fast paths, batching, hugepage-aware backing, adaptive cache budgets, and background memory return.
 * **Formal conformance** means the implementation exposes a Lean model, machine-checkable size-class tables, and contracts linking implementation paths to model transitions.
 * **Operational conformance** means the implementation exports structured statistics, profiles, controls, and runtime diagnostics sufficient to explain memory residency and fragmentation.
+* **Microkernel-integration conformance** means the implementation provides the seLe4n/seL4-style integration profile of Section 36: capability-backed arenas, the backing-provider contract, label-partitioned caches and statistics, the arena revocation protocol, and the Lean bridge theorem checklist. This profile is normative, not optional. On hosts that are not capability-based microkernels it is satisfied by building and proving the Lean bridge model and providing the fixed-arena deployment profile; the POSIX backend remains the default runtime backend there.
 
 ## Table of contents
 
@@ -85,17 +94,24 @@ The keywords **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, *
 35. Deployment and ABI compatibility  
 36. seLe4n integration profile  
 37. Implementation roadmap  
-38. Appendices and references
+38. Appendix A: Key algorithms  
+39. Appendix B: Required invariant checklist  
+40. Appendix C: Suggested default constants  
+41. Appendix D: Example stats JSON  
+42. Appendix E: Example control namespace  
+43. Appendix F: Anti-patterns  
+44. Appendix G: Open design questions  
+45. References
 
 # 1. Executive summary
 
-TopoMalloc is a proposed general-purpose allocator for modern multicore systems. Its design combines four ideas that are usually found in separate allocators or research systems:
+TopoMalloc is a proposed general-purpose allocator for modern multicore systems. Its design combines five ideas that are usually found in separate allocators or research systems:
 
 1. A TCMalloc-like per-CPU fast path for small objects, using RSEQ where available and a safe fallback where it is not.
 2. A jemalloc-like policy model built around explicit arenas, extent hooks, decay controls, and rich introspection.
 3. A Temeraire-like hugepage-aware back-end that treats physical memory, hugepage coverage, and TLB behavior as first-class allocation goals.
 4. A Lean-first formal specification that defines allocator state, ownership, object disjointness, cache conservation, arena isolation, and safe release-to-OS properties as machine-checkable theorems.
-5. An optional seLe4n integration profile that treats TopoMalloc as a capability-backed user-level allocator/resource server rather than as a hidden in-kernel heap.
+5. A required seLe4n integration profile that treats TopoMalloc as a capability-backed user-level allocator/resource server rather than as a hidden in-kernel heap.
 
 The allocator is layered:
 
@@ -187,7 +203,7 @@ TopoMalloc has the following goals, in priority order:
 8. **Operational transparency:** all major internal states should be exported through structured statistics and profiles.
 9. **Formal model:** safety-critical transformations should be specified in Lean.
 10. **Portable degradation:** the allocator should remain correct on platforms without RSEQ or THP.
-11. **Microkernel compatibility:** the allocator should integrate cleanly with capability-based microkernels as a user-space/resource-server component without weakening kernel minimality.
+11. **Microkernel integration (required):** the allocator MUST provide a clean, capability-backed integration with seLe4n/seL4-style microkernels as a user-space/resource-server component, without weakening kernel minimality (Section 36). This is a required profile, not an optional one; what is configurable is the deployment style within the profile.
 
 ## 3.2 Non-goals
 
@@ -429,6 +445,11 @@ free(ptr):
         large_free(ptr, meta)
 ```
 
+In the per-CPU pseudocode above, the non-empty/has-capacity test and the `pop_rseq` /
+`push_rseq` update are a single restartable transaction, not a check-then-act. The test and the
+pointer update commit together or abort together (11.3, 11.4, 33.5); the separate lines are
+expository. The emptiness test is therefore not a TOCTOU window.
+
 ## 6.3 Slow path summary
 
 The slow path handles all cases that cannot be resolved locally:
@@ -604,7 +625,7 @@ Debug validation SHOULD periodically sample free structures and check:
 * no duplicate pointer across lists,
 * pointer belongs to the advertised size class,
 * pointer belongs to the advertised arena,
-* pointer is not live according to span bitmap,
+* pointer is not live -- determined from the span's owner model (the five-term partition of 16.4), not from the central `free_bitmap` alone, since a cached free object has `bit(i) = 0` exactly like a live object; the check MUST therefore also consult cache residency (for example `cache_bitmap`),
 * pointer's span exists and agrees with pagemap.
 
 ## 8.5 Metadata duplication rule
@@ -613,14 +634,14 @@ Duplicated metadata is allowed only when one copy is declared authoritative for 
 
 Example:
 
-* The span free count MAY duplicate the free bitmap.
-* The free bitmap is authoritative for object state within the span.
-* The free count is a cached aggregate.
+* The span central-free count MAY duplicate the free bitmap.
+* The free bitmap is authoritative for *central-list residency* within the span (16.4), not for liveness: an object cached in a per-CPU, thread, or transfer cache is free yet has `bit(i) = 0`. Liveness is determined from the owner model, optionally accelerated by `cache_bitmap`.
+* The central-free count is a cached aggregate (`central_free_count = popcount(free_bitmap)`).
 * Every transition that changes the bitmap MUST update the free count in the same critical section or atomic/RSEQ transaction.
 
 ## 8.6 Statistics consistency
 
-Statistics are derived from ownership states. The sum of all exported allocator-owned byte classes SHOULD equal total allocator-managed virtual memory, modulo documented sampling delay and stats epoch behavior.
+Statistics are derived from ownership states. The sum of all exported allocator-owned byte classes SHOULD equal total allocator-managed virtual memory, modulo documented sampling delay, stats epoch behavior, and memory that has been fully unmapped from the managed address space. A `Released` range that was decommitted but retained in virtual memory still counts as managed virtual memory; a `Released` range that was unmapped does not (see 20.1). The accounting identity MUST state which convention the implementation uses so the exported numbers reconcile.
 
 The stats API MUST include an epoch or sequence number. Multi-field reads SHOULD support a consistent snapshot mode for operational debugging.
 
@@ -666,33 +687,81 @@ class.max_local_capacity
 For every request `req` mapped to class `c`:
 
 ```text
-c.size >= req.size
-c.alignment >= req.alignment, or the object start is adjusted to satisfy req.alignment
-c.size is a multiple of the minimum ABI alignment required for that class
+c.size      >= req.size
+c.alignment >= req.alignment
+c.size      is an integer multiple of c.alignment
 ```
+
+The third constraint is required, not merely desirable. A slab places object `i` at
+`base0 + i * c.size`, where `base0` is aligned to `c.alignment` (§16.3). Every object in
+the slab is therefore aligned to `c.alignment` **if and only if** `c.size` is an integer
+multiple of `c.alignment`. This is the proof obligation behind "alignment is sufficient"
+in §9.5.
+
+Requests whose required alignment exceeds the natural alignment of every front-end-cacheable
+class MUST be served by a dedicated over-aligned size class or routed to the medium/large
+path (§25.5). The allocator MUST NOT adjust the offset of an individual object inside a
+shared uniform slab to satisfy a larger alignment, because variable per-object offsets break
+the `base0 + i * c.size` layout, the `objects_per_slab` count, and the pairwise-disjointness
+proof of §9.5.
 
 If the implementation supports C++ operator new alignment optimization similar to TCMalloc's documented 8-byte alignment behavior for certain build modes [R1], that behavior MUST be explicitly selected by ABI mode and compiler compatibility checks.
 
 ## 9.4 Rounding waste policy
 
-For each size class:
+For each request:
 
 ```text
-waste(req) = class_size(req) - req.size
+waste(req)       = class_size(req) - req.size
 waste_ratio(req) = waste(req) / max(req.size, 1)
 ```
 
-TopoMalloc SHOULD enforce maximum waste ratios by range:
+Internal fragmentation has two regimes that MUST be analyzed separately, because a single
+flat per-request ratio target is not achievable across all sizes.
 
-| Range | Target max waste ratio |
-|---|---:|
-| 1 to 16 bytes | implementation-defined, but documented |
-| 17 to 128 bytes | <= 33% |
-| 129 bytes to 1 KiB | <= 20% |
-| 1 KiB to 32 KiB | <= 12.5% |
-| Above 32 KiB | page and hugepage policy dominates |
+**Spacing-dominated regime.** Let `r(c) = size(c) / size(prev(c))` be the ratio of a class
+size to the next-smaller class size. The worst case for a request mapped to class `c` is
+`req = size(prev(c)) + 1`, which gives
 
-The exact table MUST be generated from a script or Lean model, not hand-edited in multiple places.
+```text
+waste_ratio_worstcase(c) ~= size(c) / size(prev(c)) - 1 = r(c) - 1
+```
+
+Bounding the per-class spacing ratio `r(c) <= 1 + W` therefore bounds the worst-case
+per-request waste to approximately `W`. The spacing ratio is the achievable, measurable
+invariant the size-class generator MUST target.
+
+**Alignment-dominated regime.** Let `q` be the alignment quantum for a class range: the
+minimum spacing the ABI permits, `q = alignof(max_align_t)` (typically 16 bytes on LP64),
+or a smaller `tiny` quantum such as 8 bytes for classes whose required alignment is `<= 8`.
+The smallest nonzero spacing is `q`, so for small requests the spacing ratio cannot be made
+arbitrarily close to 1, and a per-request waste target `W` is unachievable while
+`req < q / W`. In that regime waste is bounded by the quantum, not by `r`:
+
+```text
+waste_ratio(req) <= (q - 1) / req     for req in the alignment-dominated regime
+```
+
+TopoMalloc SHOULD target the following per-class spacing ratios (equivalently, the
+worst-case per-request waste), subject to the alignment-dominated caveat:
+
+| Size range | Max spacing ratio `r` | Worst-case per-request waste | Notes |
+|---|---:|---:|---|
+| `req < q/W` (tiny; `q=16 B` => roughly `<= 48 B`) | quantum-limited | `<= (q-1)/req` | alignment-dominated; bounded by `q`, not by `r` |
+| `q/W` to 128 B (`q=16 B` => ~49 B to 128 B) | `<= 1.33` | `<= ~33%` | 16-byte spacing suffices here |
+| 129 B to 1 KiB | `<= 1.20` | `<= ~20%` | |
+| 1 KiB to 32 KiB | `<= 1.125` | `<= ~12.5%` | 8 classes per power-of-two group |
+| above 32 KiB | page/hugepage granularity | n/a | rounded to page/hugepage units |
+
+Earlier revisions stated a flat `<= 33%` target for "17 to 128 bytes." That target is
+mathematically unattainable below `q/W`: a 17-byte request under a 16-byte ABI quantum must
+round up to 32 bytes (~88% waste), and no 16-aligned class lies in `(16, 32)`. The bound is
+therefore split into the spacing and alignment regimes above so that every published target
+is provably achievable.
+
+The exact table MUST be generated from a script or Lean model, not hand-edited in multiple
+places. The generator MUST assert, per class, both the spacing-ratio bound for the class's
+range and that `size(c)` is an integer multiple of `c.alignment` (§9.3).
 
 ## 9.5 Size-class verification
 
@@ -750,7 +819,17 @@ void* memalign(size_t alignment, size_t size);
 void* valloc(size_t size);       // optional compatibility
 void* pvalloc(size_t size);      // optional compatibility
 size_t malloc_usable_size(void* ptr);
+void  free_sized(void* ptr, size_t size);                            // C23
+void  free_aligned_sized(void* ptr, size_t alignment, size_t size);  // C23
+void* reallocarray(void* ptr, size_t n, size_t size);                // BSD/glibc; overflow-checked
 ```
+
+On allocation failure the C functions MUST set `errno` to `ENOMEM` and return null where the
+platform C ABI specifies it, so POSIX callers and `perror`-style diagnostics behave correctly.
+`realloc` failure MUST leave the original allocation valid and set `errno` to `ENOMEM`. Per
+POSIX, `free` MUST NOT modify `errno`. The C23 `free_sized` / `free_aligned_sized` functions
+carry a size the allocator MAY use like a sized delete (10.2); a mismatched size is undefined
+behavior in performance mode and SHOULD be sample-checked in hardened/debug mode.
 
 ## 10.2 C++ APIs
 
@@ -963,6 +1042,37 @@ When a CPU becomes unavailable to the process due to affinity changes, cgroup co
 
 The control plane MUST provide a way to release memory stranded in specific CPU caches, analogous in spirit to public controls that allow releasing memory held by inactive CPU caches in TCMalloc [R1, R2].
 
+## 11.7 Arena interaction with per-CPU and thread caches
+
+A per-CPU (and thread) cache slot is keyed by size class, but on free the object's owning arena
+is recovered from the pagemap (6.2, 17.5), so a single `(cpu, sc)` slot could receive frees that
+route to different arenas. Because a batch carries exactly one arena (14.2) and an empty span can
+only be reclaimed by its owning arena's central list (16.5), the allocator MUST NOT let an object
+reach a central or transfer structure under the wrong arena. Two conforming designs satisfy this:
+
+1. **Bound-arena fast path (recommended default).** Per-CPU and thread caches serve a single
+   bound arena -- normally the default arena. Allocations and frees for other explicit arenas use
+   arena-scoped caches and central lists and MAY bypass the per-CPU fast path. This keeps each
+   `(cpu, sc)` slot single-arena and makes the refill (14.3) and flush (14.4) pseudocode exact as
+   written for the bound arena.
+2. **Arena-qualified per-CPU slots.** To serve more than one arena from the per-CPU path while
+   preserving arena isolation, the cache MUST be keyed by `(cpu, arena, sc)` -- a separate slot per
+   arena -- so that pop, refill, and flush are all arena-qualified. An allocation for arena A pops
+   only from `cpu_cache[cpu][A][sc]`; a free pushes to the slot for the arena recovered from the
+   pagemap. A single mixed-arena slot partitioned only at flush time is NOT permitted: allocation
+   pops *before* any flush, so a mixed slot could hand arena A's caller an object owned by arena B,
+   violating arena isolation (22.7) and the reset/destroy guarantees (22.5, 22.6). Per-arena slots
+   cost cache footprint proportional to the number of hot arenas, so this design suits a small
+   number of explicit arenas.
+
+In both designs the fully-qualified indexing is `cpu_cache[cpu][arena][sc]`,
+`transfer_cache[domain][arena][sc]`, and `central_free_list[node][arena][sc]`; the refill/flush
+snippets in 14.3-14.4 and A.4 elide the arena subscript only because they describe the
+bound-arena case. The choice MUST be documented per build. Two safety properties hold under both
+designs: the free-routing rule (an object always returns to its owning arena's structures) and
+its allocation dual (an allocation from arena A returns only an object owned by A). Both follow
+from ownership uniqueness and arena isolation (8.2, 22.7); they are safety properties, not policy.
+
 # 12. RSEQ contract and fallback modes
 
 ## 12.1 RSEQ role
@@ -995,7 +1105,7 @@ rseq_push(cache, ptr):
         all invariants are preserved
 ```
 
-`LivePending` is an implementation-proof state used during an allocation return. It is not visible in runtime metadata.
+`LivePending` is an implementation-proof state used during an allocation return. It is not visible in runtime metadata, and it collapses to `Owner.live` at the operation's linearization point (27.1). The abstract RSEQ contract (33.5) therefore models a successful pop as transitioning ownership directly from `CpuCache(cpu, sc)` to `Owner.live`; `LivePending` appears only in the finer-grained refinement between the successful RSEQ commit and the return to the caller.
 
 ## 12.3 RSEQ implementation requirements
 
@@ -1242,15 +1352,25 @@ struct Span {
     uint32_t page_count;
     HugePageId hugepage;
     SpanState state;
-    uint32_t object_count;
-    uint32_t live_count;
-    uint32_t local_free_count;
-    uint32_t central_free_count;
-    Bitmap free_bitmap;
-    Bitmap cache_bitmap;       // debug/hardened optional
+    uint32_t object_count;        // total objects carved from this span
+    uint32_t live_count;          // objects currently owned by the application
+    uint32_t central_free_count;  // == popcount(free_bitmap): objects resident in the central list
+    Bitmap free_bitmap;           // authoritative "resident in central list" state (16.4)
+    Bitmap cache_bitmap;          // debug/hardened optional: reconstructs cached residency
     uint32_t generation;
     uint32_t flags;
 };
+
+// Canonical conservation law for a span (see 16.4):
+//   object_count = live_count
+//                + local_cached_count      // per-CPU and thread caches
+//                + transfer_cached_count   // transfer caches
+//                + central_free_count      // == popcount(free_bitmap)
+//                + quarantined_count
+// local_cached_count and transfer_cached_count are logical quantities. They are not
+// cheaply maintained per span in performance builds and are reconstructed (e.g. from
+// cache_bitmap) only in debug/hardened validation. This is why empty-span detection
+// (16.5) is one of the hardest accounting problems in the allocator.
 ```
 
 The production descriptor can be compact. The logical fields MUST be derivable.
@@ -1280,22 +1400,34 @@ The authoritative slab state SHOULD be a bitmap or equivalent compact representa
 Bitmap invariants:
 
 ```text
-bit(i) = 1  <=> object i is free in the span's authoritative central state
-live_count + central_free_count + cached_count + quarantined_count = object_count
+bit(i) = 1  <=>  object i is currently resident in this span's central free list
+central_free_count = popcount(free_bitmap)
+
+object_count = live_count
+             + local_cached_count        // per-CPU and thread caches
+             + transfer_cached_count      // transfer caches
+             + central_free_count         // == popcount(free_bitmap)
+             + quarantined_count
 ```
 
-`cached_count` may not be cheaply exact in performance builds. It MUST be exactly reconstructable in debug validation.
+The free bitmap is authoritative only for *central* residency. An object held in a per-CPU,
+thread, or transfer cache is not live, yet its bit is 0 because it is not in the central list.
+`local_cached_count` and `transfer_cached_count` are therefore logical quantities that need
+not be cheaply exact in performance builds; they MUST be exactly reconstructable in debug
+validation (for example from `cache_bitmap`), and the conservation law above MUST then hold
+exactly. No object may be counted in two terms simultaneously: the five terms partition
+`object_count`.
 
 ## 16.5 Empty span detection
 
-A span may be returned to the backend only when:
+A span may be returned to the backend only when, using the canonical terms of 16.4:
 
 ```text
-live_count == 0
-local_free_count == 0
-transfer_free_count == 0
-quarantined_count == 0, unless quarantine is being drained
-central_free_count == object_count
+live_count            == 0
+local_cached_count    == 0
+transfer_cached_count == 0
+quarantined_count     == 0      (unless quarantine is being drained)
+central_free_count    == object_count
 ```
 
 Because local and transfer caches may hold objects from a span, empty-span detection MUST account for all caches. This is one of the hardest accounting problems in a high-performance allocator.
@@ -1960,6 +2092,12 @@ if n != 0 and size > SIZE_MAX / n:
     fail
 ```
 
+This guard is correct -- it rejects exactly the pairs whose product exceeds `SIZE_MAX`, and the
+`n != 0` test avoids a divide-by-zero -- but it is not sufficient on its own. After the product
+is known not to overflow, it is still subject to size-class, page, and hugepage rounding, each
+of which can overflow per 9.7. calloc MUST also fail (return null, set `errno = ENOMEM`) if any
+subsequent rounding would overflow.
+
 ## 26.2 Zeroing sources
 
 Memory returned by calloc must be zero. Zeroing may be achieved by:
@@ -2004,20 +2142,27 @@ TopoMalloc operations are linearizable with respect to valid calls. Each public 
 
 ## 27.2 Lock hierarchy
 
-To avoid deadlocks, locks MUST be ordered. Recommended order:
+To avoid deadlocks, locks MUST be acquired in a single global order. The order follows the
+data-flow layering front-end -> transfer -> central -> span -> backend, so that the common
+refill and flush paths never acquire two middle-end locks in conflicting directions:
 
 ```text
 Global config lock
   -> Arena registry lock
     -> Arena lock
-      -> NUMA central list lock
-        -> Transfer cache lock
+      -> Transfer cache lock        (per-LLC domain; closer to the CPU)
+        -> NUMA central list lock   (per-NUMA node)
           -> Span lock
             -> Backend extent lock
               -> Stats shard lock
 ```
 
-This order may be refined, but cycles MUST be forbidden and tested.
+When two middle-end locks would otherwise be held at once, the transfer-cache lock is
+acquired before the central-list lock. Implementations SHOULD prefer release-before-acquire
+(hand-over-hand) so that at most one middle-end lock is held at a time; the refill (14.3) and
+flush (14.4) paths are written this way and hold no two of these locks simultaneously. This
+order may be refined, but it MUST remain a total order, cycles MUST be forbidden, and a
+lock-order checker SHOULD enforce it in debug builds.
 
 ## 27.3 Atomics
 
@@ -2052,6 +2197,15 @@ On thread exit:
 * unregister or let libc handle RSEQ according to platform ABI,
 * publish final stats,
 * avoid calling APIs that may require destroyed thread state.
+
+The allocator's own thread-local storage MUST use a TLS model that cannot re-enter `malloc`
+while it is being established -- in practice the initial-exec model, or a static `__thread`
+slot reached without a dynamic TLS allocation. General-dynamic TLS can trigger a lazy
+allocation on first access, which would re-enter the allocator before its per-thread state
+exists and risk unbounded recursion or deadlock. When the allocator is loaded as a shared
+library with `dlopen`, where initial-exec TLS may be unavailable, it MUST fall back to an
+allocation-free per-thread bootstrap path until TLS is safe, consistent with the phased
+initialization of 35.4. This is the threading analogue of the bootstrap-metadata rule S-007.
 
 # 28. fork, signal, and async constraints
 
@@ -2441,20 +2595,38 @@ size_class_table_covers_all_small_requests
 
 ## 33.5 RSEQ abstraction
 
-RSEQ should initially be modeled as an axiom or trusted primitive with a precise contract:
+RSEQ should initially be modeled as an axiom or trusted primitive with a precise contract.
+The contract MUST distinguish three outcomes -- abort, empty, and success -- and MUST include
+a frame condition stating that at most the popped object changes owner. The frame condition is
+load-bearing: the cache refill/flush conservation theorems (33.4) cannot be proved if a pop is
+permitted to silently disturb any other object.
 
 ```lean
+inductive RseqPop (s : State) (cpu : CpuId) (sc : SizeClassId) where
+  | abort                              -- preempted or migrated; state unchanged, caller retries
+  | empty                              -- no object of class sc on this CPU; caller takes the slow path
+  | success (p : Addr) (s' : State)
+
 axiom rseq_pop_contract :
-  forall s cpu sc,
-    WellFormed s ->
-    RseqPopResult s cpu sc = AbortUnchanged \/
-    exists p s', RseqPopResult s cpu sc = Success p s' /\
-      OwnerOf s p = Owner.cpuCache cpu sc /\
-      OwnerOf s' p = Owner.live /\
-      WellFormed s'
+  ∀ (s : State) (cpu : CpuId) (sc : SizeClassId),
+    WellFormed s →
+    match rseqPop s cpu sc with
+    | .abort        => True
+    | .empty        => cpuCacheCount s cpu sc = 0
+    | .success p s' =>
+        OwnerOf s  p = Owner.cpuCache cpu sc ∧
+        OwnerOf s' p = Owner.live ∧
+        WellFormed s' ∧
+        (∀ q, q ≠ p → OwnerOf s' q = OwnerOf s q)   -- frame: only p changes owner
 ```
 
-Later work MAY refine this axiom to verified assembly for selected architectures.
+`rseq_push` has the symmetric contract: `abort` (retry), `full` (cache at capacity, caller
+flushes), or `success` moving `Owner.live` to `Owner.cpuCache cpu sc` under the same frame
+condition. The `abort` and `empty`/`full` cases are deliberately distinct: `abort` means the
+hardware sequence was interrupted and the operation must be retried, whereas `empty`/`full`
+are genuine logical underflow/overflow that route to the slow path. Conflating them would let
+the model "prove" progress that the implementation does not make. Later work MAY refine these
+axioms to verified per-architecture assembly (open question 7).
 
 ## 33.6 Generated tables
 
@@ -2670,6 +2842,18 @@ At process exit, TopoMalloc SHOULD avoid complex teardown unless explicitly requ
 
 # 36. seLe4n integration profile
 
+The seLe4n/seL4-style integration profile defined in this section is a **required** part of
+TopoMalloc, not an optional add-on (see the conformance model under "Normative language"). A
+conforming implementation MUST provide the capability-backed arena model, the backing-provider
+contract, label-partitioned caches and statistics, and the arena revocation protocol specified
+here, and MUST ship the Lean bridge model of 36.3.3. What remains configurable *within* the
+profile is the deployment style (36.18) and the use of dynamic retype versus fixed-arena
+operation -- not whether the profile exists. On hosts that are not capability-based microkernels
+the POSIX backend (Section 18) remains the default runtime backend, but the seLe4n bridge model
+and the fixed-arena profile MUST still be built and proved. The profile MUST remain a user-level
+or service-level component: requiring it does not permit placing TopoMalloc inside the kernel
+core (3.2, 36.2).
+
 ## 36.1 Fit assessment
 
 TopoMalloc and seLe4n are a good architectural fit when TopoMalloc is treated as a user-space allocator and memory-resource service for seLe4n-hosted components. They are a poor fit if TopoMalloc is inserted as an unrestricted dynamic allocator inside the microkernel core.
@@ -2764,7 +2948,7 @@ The client library MUST be correct even if the resource server denies a slow-pat
 
 ### 36.3.3 Lean bridge modules
 
-The integration SHOULD add a bridge package with a shape similar to:
+A conforming microkernel integration MUST provide a bridge package with a shape similar to:
 
 ```text
 TopoMalloc/SeLe4n/
@@ -3165,7 +3349,7 @@ Required tests:
 
 ## 36.17 Formal theorem checklist for the bridge
 
-The following theorem families SHOULD be part of the seLe4n bridge acceptance criteria.
+The following theorem families MUST be part of the seLe4n bridge acceptance criteria.
 
 Theorem families:
 
@@ -3181,7 +3365,7 @@ Theorem families:
 * `per_core_cache_abort_no_change`: aborted per-core fast paths leave allocator-visible state unchanged.
 * `stats_observation_noninterference`: authorized stats observations do not reveal forbidden higher-domain state.
 
-The first integration milestone MAY prove these for a simplified single-core model. The SMP/per-core theorem set SHOULD be staged after seLe4n's multicore resource invariants stabilize.
+For microkernel-integration conformance the bridge package MUST exist and compile, and the single-core forms of these theorem families MUST be proved; the first integration milestone MAY establish them in a simplified single-core model. The SMP/per-core extensions of the set MAY be staged after seLe4n's multicore resource invariants stabilize, consistent with V-004, which allows implementation paths to be documented as refinements even where a machine-level proof is still incomplete. Staging applies only to the SMP/per-core extensions; it does not make the bridge package or the single-core checklist optional.
 
 ## 36.18 Deployment profiles
 
@@ -3259,7 +3443,7 @@ Risk register:
 
 ## 36.21 Conclusion
 
-TopoMalloc should complement seLe4n as a verified, capability-aware, user-level memory allocator and resource service. The projects fit because both prefer explicit authority, machine-checked invariants, and small trusted boundaries. The integration should not be an in-kernel heap. It should be an optional, proof-carrying service layer that gives seLe4n-based systems a modern dynamic allocator without weakening the microkernel's capability and verification discipline.
+TopoMalloc should complement seLe4n as a verified, capability-aware, user-level memory allocator and resource service. The projects fit because both prefer explicit authority, machine-checked invariants, and small trusted boundaries. The integration should not be an in-kernel heap. It should be a first-class, required, proof-carrying service layer that gives seLe4n-based systems a modern dynamic allocator without weakening the microkernel's capability and verification discipline.
 
 # 37. Implementation roadmap
 
@@ -3421,15 +3605,18 @@ classify(size, align, flags):
 ```text
 small_alloc_slow(cpu, req):
     maybe_grow_cache_capacity(cpu, req.sc)
-    batch = transfer_try_pop(llc_domain(cpu), req.sc, req.arena)
-    if batch.empty:
-        batch = central_remove_batch(numa_node(cpu), req.arena, req.sc)
-    if batch.empty:
-        span = backend_new_span(req.arena, req.sc, placement_policy(req))
-        central_attach_span(span)
-        batch = central_remove_batch(numa_node(cpu), req.arena, req.sc)
-    cpu_cache_insert_batch(cpu, req.sc, batch.tail)
-    return batch.head
+    loop:
+        batch = transfer_try_pop(llc_domain(cpu), req.sc, req.arena)
+        if batch.empty:
+            batch = central_remove_batch(numa_node(cpu), req.arena, req.sc)
+        if batch.empty:
+            span = backend_new_span(req.arena, req.sc, placement_policy(req))
+            if span == null:
+                return null            // OOM: malloc sets errno=ENOMEM; operator new throws std::bad_alloc
+            central_attach_span(span)
+            continue                   // re-derive a batch; another CPU may have drained the new span
+        cpu_cache_insert_batch(cpu, req.sc, batch.tail)
+        return batch.head
 ```
 
 ## A.3 Small free slow path
