@@ -5,10 +5,11 @@
 name = "TopoMalloc"
 version = "0.1.0"
 defaultTargets = ["TopoMalloc", "check"]
+# All Lean sources live under `lean/` (package-level source directory).
+srcDir = "lean"
 
 [[lean_lib]]
 name = "TopoMalloc"
-srcDir = "lean"
 
 # `lake exe check` (CI job `lean`, W0-5c): replays the generated size-class table
 # through the Lean well-formedness predicate — the single-source-of-truth loop
@@ -16,4 +17,3 @@ srcDir = "lean"
 [[lean_exe]]
 name = "check"
 root = "Check"
-srcDir = "lean"

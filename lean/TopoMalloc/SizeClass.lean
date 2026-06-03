@@ -31,19 +31,20 @@ def rowOk (pageSize quantum : Nat) (r : SizeClassRow) : Bool :=
     && isPow2 r.align
     && r.size % r.align == 0          -- §9.3 third constraint (load-bearing)
     && r.size % quantum == 0          -- granule-lookup soundness
-    && r.align ≤ r.size
-    && r.slabPages ≥ 1
-    && r.objectsPerSlab ≥ 1
+    && Nat.ble r.align r.size         -- align ≤ size
+    && r.slabPages != 0               -- ≥ 1
+    && r.objectsPerSlab != 0          -- ≥ 1
     && r.objectsPerSlab == r.slabPages * pageSize / r.size   -- exact packing
-    && r.objectsPerSlab * r.size ≤ r.slabPages * pageSize    -- fits the span
-    && r.batch ≥ 1
-    && r.batch ≤ r.maxLocalCapacity   -- §9.5 batch fits capacity
+    && Nat.ble (r.objectsPerSlab * r.size) (r.slabPages * pageSize)  -- fits the span
+    && r.batch != 0                   -- ≥ 1
+    && Nat.ble r.batch r.maxLocalCapacity   -- §9.5 batch ≤ capacity
 
-/-- Sizes are strictly increasing. -/
+/-- Sizes are strictly increasing. (Bool-valued comparisons so the predicate is
+decidable by evaluation; `Nat.blt`/`Nat.ble` return `Bool`, unlike `<`/`≤`.) -/
 def monotone : List SizeClassRow → Bool
   | [] => true
   | [_] => true
-  | a :: b :: rest => a.size < b.size && monotone (b :: rest)
+  | a :: b :: rest => Nat.blt a.size b.size && monotone (b :: rest)
 
 /-- Whole-table well-formedness: non-empty, every row sound, strictly
 increasing, and the largest class equals `smallMax` (coverage upper bound). -/
