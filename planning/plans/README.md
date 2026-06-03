@@ -1,6 +1,6 @@
 # TopoMalloc Implementation Plan — Overview & Index
 
-**Document status:** Master plan, revision 2.0 (split into domain plans)
+**Document status:** Master plan, revision 2.1 (split into domain plans + per-task deep dives)
 **Implements:** [`../SPEC.md`](../SPEC.md) (TopoMalloc Specification, rev 0.3)
 **Supersedes:** the former single-file `../WORKSTREAM_PLAN.md` (now a redirect)
 
@@ -25,7 +25,9 @@ Three nouns are used precisely throughout every document:
 Each WU carries a **size** (`S`/`M`/`L`, relative) and a **parallelism** flag (`∥` = runnable concurrently
 with siblings once deps are met). A **▸ Decomposition** note after a table gives the design space, pitfalls,
 and sequencing for the hardest units. A bare cluster reference (e.g. "W5-3") denotes the whole sub-unit
-family. Acceptance criteria are written so a reviewer can say *done* or *not done* without judgement.
+family. Acceptance criteria are written so a reviewer can say *done* or *not done* without judgement. Each
+domain plan ends with a **Deep dives** section that expands every complex task into a mini design doc
+(*Problem · Design space · Structures · Work breakdown · Invariants · Verify · Failure modes · Sequencing*).
 
 **Reading order for a newcomer:** §1 (principles) → §3 (the seam) → [01 Repository & Infrastructure](01-repository-and-infrastructure.md)
 (the first work) → §5 (milestones) → the domain plan you own (§ index below).
@@ -53,7 +55,8 @@ family. Acceptance criteria are written so a reviewer can say *done* or *not don
 | 1.0 | Initial single-file plan: 24 workstreams, 10 milestones, requirement traceability. |
 | 1.1 | Integrated the real `hatter6822/seLe4n` Rust ABI; `Sele4nBackingProvider` compiles against it from M1. |
 | 1.2 | Deep-decomposition pass: dependency audit + corrections; every L-unit split into letter-suffixed sub-units; engineering ▸ Decomposition notes. |
-| **2.0** | **Split into this overview + ten domain plans. Each domain plan further decomposes its complex tasks (ordered steps, interface sketches, proof/test obligations), adds domain-local interfaces, sequencing, risks, and a best-practices checklist. End-to-end optimize + refine across the whole set.** |
+| 2.0 | Split into this overview + ten domain plans, each with domain-local interfaces, sequencing, risks, and a best-practices checklist. |
+| **2.1** | **Per-task deep dives.** Every domain plan ends with a **Deep dives** section expanding each complex task into a mini design doc — *Problem · Design space (options → chosen + rationale) · Structures (interface/data-structure sketches) · Work breakdown (finer than the table) · Invariants · Verify (test + proof obligations) · Failure modes (+ guards) · Sequencing*. End-to-end optimize + refine + best-practices sweep across the whole set. |
 
 ---
 

@@ -1,7 +1,7 @@
 # Plan 08 — Security, Debug & Testing
 
 **Workstreams:** W18 (security/hardening), W19 (debug/sanitizers/deterministic), W21 (testing/bench/differential)
-· **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+· **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §29, §30, §34, §17.3, §36.12, §33.7, Appendix B; S-009.
 **Upstream deps:** [03](03-core-allocator.md), [02](02-formal-model.md) (trace oracle). **Downstream:** every
 plan (this is the verification apparatus that makes their "Exit" provable). **Milestones:** testing is
@@ -88,6 +88,100 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > gate; 3c (loom/shuttle) explores bounded interleavings of the lock-free push/pop/flush sequences that TSan's
 > single-schedule runs can miss — the strongest guarantee available short of the Lean RSEQ proof (plan 02
 > W1-7), and complementary to it.
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · Differential testing (W21-2) — the bridge between code and proof
+
+**Problem.** A Lean model that nobody ties to the implementation is theater (R9). The implementation and the
+executable model must be shown to agree on *every* operation's abstract outcome and on `WellFormed` at each
+boundary — on **both** backends.
+
+**Design space.** **Capture a trace from the running allocator (deterministic mode), replay it through the
+Lean executable model, and assert agreement at each step** — chosen (§33.7). Splitting capture/replay/report
+lets capture ride on deterministic mode (W19-3) and the driver evolve with the model.
+
+**The trace grammar (§33.7).**
+```text
+ALLOC req size align arena flags -> ptr usable sc span      FREE ptr hint -> sc span
+REFILL cpu sc count source        FLUSH cpu sc count target
+SPAN_ALLOC arena sc span pages hp  RELEASE range state
+```
+
+**Work breakdown (refines W21-2a..c).** 1. instrument every public op to emit the grammar under deterministic
+mode (W21-2a). 2. the replay driver: feed the trace to the Lean executable model (plan 02 W1-10); after each
+op, check `WellFormed` and that the model's abstract outcome (owner transitions) matches the implementation's
+(W21-2b). 3. divergence reporting: shrink to the minimal failing op + emit a state diff; wire as a CI gate
+(W21-2c).
+
+**Invariants.** model and implementation agree on abstract outcome + `WellFormed` after every op, for both
+POSIX and `Sele4nSim`.
+
+**Verify.** a recorded corpus replays clean in CI; a seeded fault (e.g. a deliberately wrong empty-detection)
+is caught with the offending op named.
+
+**Failure modes.** *F1* nondeterminism makes traces unreplayable → deterministic mode (W19-3) seeds RNG,
+fixes refill order, reproduces sampling. *F2* the model lags the code → the formal-in-lockstep DoD + this gate
+force them together. *F3* a POSIX↔Sim behavioral difference → caught here because both backends replay the
+same corpus.
+
+**Sequencing.** capture **M1**; replay/report **M2**; corpus grows every milestone.
+
+### DD-2 · Debug invariant checks (W19-1) — Appendix B as runtime code
+
+**Problem.** The Appendix B invariants must be *executable* so debug/hardened builds (and CI gates) can assert
+them after transitions — not just live in prose.
+
+**Design space.** **One callable checker per invariant group, run from debug assertions and from CI gates** —
+chosen (principle 7). Each lands with the workstream that creates the state it checks.
+
+**Work breakdown (refines W19-1a..d).** 1. B.1 global (one-owner, live-disjoint, free-structure reachability,
+page↔descriptor, released-no-live). 2. B.2 cache (capacity/budget, batch distinctness, refill/flush count).
+3. B.3 span (ranges fit/disjoint, sc match, free-count==bitmap, **empty-detection across caches**,
+generation). 4. B.4/B.5 hugepage + arena (bins match occupancy, live-bytes sum, reset/destroy drain,
+hook-install order).
+
+**Invariants.** each checker is total and side-effect-free; running all of them is the strongest single
+debug-time correctness statement.
+
+**Verify.** the checkers *are* the verification — they back G-core (B.1/B.3), G-conc (B.2), G-mem (B.4),
+G-arena (B.5); W19-1c is the runtime counterpart to plan 03's conservation law (W5-3) and DD-1.
+
+**Failure modes.** *F1* a checker is too slow to run often → keep them O(state) and run on a sampled cadence
+in long tests, every op in unit tests. *F2* a new state has no checker → the DoD requires one.
+
+**Sequencing.** B.1/B.3 **M1**; B.2 **M2**; B.5 **M4**; B.4 **M5**.
+
+### DD-3 · Hardening: double-free detection & quarantine (W18-2/W18-3)
+
+**Problem.** The hardened profile must detect common heap misuse (double/invalid free, sized-delete mismatch)
+and delay reuse of suspicious frees — without the performance profile paying for any of it.
+
+**Design space.** **Profile-gated, layered detection + an accounted quarantine** — chosen (§29.3/§29.4):
+fast mode detects nothing extra; hardened detects same-cache double free, flush-time double free, quarantine
+hits, free-of-not-live (debug bitmap), and sized-delete mismatch; quarantine holds freed objects out of
+circulation under a byte/object budget.
+
+**Work breakdown.** detection (W18-2): the five checks above, each cheap and local. quarantine (W18-3):
+separate accounting, policy knobs (max_bytes/objects, random_evict, per-arena, sampled_only), a drain
+protocol. Plus encoded freelist pointers (W18-1b) so free-object metadata is not plain in user-writable
+memory (Appendix F).
+
+**Invariants.** a detected misuse never corrupts *unrelated* state; quarantined bytes are accounted
+separately and are not available for allocation (plan 07 stats); reuse is delayed per policy.
+
+**Verify.** a misuse suite (double free into same cache, free of interior pointer, sized-delete mismatch)
+asserts detection + safe failure; quarantine accounting reconciles in stats.
+
+**Failure modes.** *F1* detection corrupts state while reporting → checks are read-only until the abort
+decision. *F2* quarantine unbounded → byte/object budget + eviction.
+
+**Sequencing.** **M7**.
 
 ---
 

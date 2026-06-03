@@ -3,9 +3,10 @@
 > **This single-file plan has been split into focused domain documents.**
 > Start at the overview/index: **[`plans/README.md`](plans/README.md)**.
 
-The former monolith (revisions 1.0–1.2) is preserved in git history. As of revision **2.0** the plan is a set
+The former monolith (revisions 1.0–1.2) is preserved in git history. As of revision **2.1** the plan is a set
 of one overview plus ten domain plans under [`plans/`](plans/), each self-contained, cross-linked, and
-further-decomposed around its complex tasks.
+further-decomposed around its complex tasks — with a per-task **Deep dives** section (Problem · Design space ·
+Structures · Work breakdown · Invariants · Verify · Failure modes · Sequencing) in every domain plan.
 
 | Document | Workstreams | Covers |
 |---|---|---|

@@ -1,7 +1,7 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+(topology) · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §18, §20, §21, §19, §15, §36.6, §36.9, §36.11; M-004/M-005, H-001..H-005, O-007.
 **Upstream deps:** [03](03-core-allocator.md) (pagemap/spans). **Downstream:** [03](03-core-allocator.md)
 (spans come from extents), [09](09-sele4n-integration.md) (the capability provider implements the same seam).
@@ -125,6 +125,120 @@ normal-frame runs (§36.9).
 | W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. |
 | W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. |
 | W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. |
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · Extents: split, merge & coalesce (W4-2)
+
+**Problem.** The backend owns virtual ranges and physical backing and must split a range to satisfy a request
+and merge adjacent free ranges to fight fragmentation — while keeping the pagemap, hugepage accounting, and
+pointer-classification all consistent and never exposing a stale descriptor.
+
+**Design space.** **A boundary-tag + free-extent index (by size and by address)** — chosen: address-ordered
+lookup makes neighbour-coalescing O(log n); size-ordered lookup makes best/first-fit O(log n). Split and merge
+are kept as *separate* operations with separate preconditions because they have different stale-descriptor
+hazards (merge is where most backend use-after-free hides).
+
+**Structures.**
+```rust
+struct Extent { id: ExtentId, arena: ArenaId, base: usize, len: usize,
+                committed_len: usize, state: ExtentState, huge: HugeRange, split_gen: u32 }
+// indices: by_size: BTree<(len, base)>,  by_addr: BTree<base>  (neighbour lookup)
+```
+
+**Work breakdown (refines W4-2a..d).** 1. descriptor + dual index (W4-2a). 2. `alloc`+`split` (W4-2b):
+results page-aligned; install both halves' metadata, then publish; pagemap via **plan 03 W3-6**. 3.
+`merge`/coalesce (W4-2c): adjacency + arena/state compat + hugepage-accounting update; **retire the old
+descriptors only after no classifier can reach them** (epoch/generation). 4. physical-state ops (W4-2d),
+each mirrored to Lean (plan 02 W1-8a/c).
+
+**Invariants.** §18.4 split/merge rules; M-004 (no live in a released range); M-005 (recommit before reuse);
+disjointness preserved across split/merge (mirrors plan 02 W1-8a).
+
+**Verify.** unit on split/merge edge cases (zero-length tail, alignment boundary); property: random
+split/merge sequences keep ranges disjoint + the pagemap sound; failure-injection (W4-5) leaves state
+well-formed.
+
+**Failure modes.** *F1* publish-before-metadata on split → reader sees an uninitialized half → install then
+publish. *F2* coalescing a range a classifier still points into → retire descriptors behind a generation/epoch
+(`split_gen`). *F3* hugepage occupancy not updated on merge → H-002 violation → W11-2c checks it in debug.
+
+**Sequencing.** **M1**.
+
+### DD-2 · Hugepage filler: bins & scoring (W11-2) + partial subrelease (W11-4b)
+
+**Problem.** Pack sub-hugepage spans densely so few hugepages hold the live set and empty hugepages release
+easily (§19), without scanning every hugepage on each placement, and never releasing a subpage that
+intersects a live object (H-005).
+
+**Design space.** **Approximate bins keyed by free space + state, with a score computed only over the
+candidate bin** — chosen (§19.3): exact "best hugepage" would scan all of them; bins give O(1)-ish placement.
+Crucially, **bins are correctness, score is policy**: H-003 requires each hugepage in exactly one bin
+consistent with occupancy; the score may be arbitrarily wrong without ever misplacing a live object (§2.4).
+
+**Structures.** 9 bins (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/
+cold_sparse/hot_dense). `score = packing+locality+lifetime+hotness+release_preservation −
+fragmentation−cross_numa−partial_subrelease`.
+
+**Work breakdown.** 1. bin set + transition-on-occupancy-change (W11-2a). 2. candidate scan over the target
+bin + score (W11-2b). 3. H-002/H-003 consistency checks (W11-2c). 4. **partial subrelease** (W11-4b) as its
+own guarded unit: only if the subrange has *no live object*, is aligned to release granularity, the hugepage
+is cold/sparse or pressure is high, and predicted RSS benefit > predicted fragmentation cost; record the
+metric.
+
+**Invariants.** H-001 a live range is in a committed, non-released subrange; H-002 occupancy bytes == Σ
+contained spans/large; H-003 bin == occupancy/state; H-005 partial subrelease never intersects a live object.
+
+**Verify.** unit: bin transitions on occupancy crossings; property: random span placement keeps Σ-occupancy ==
+bin accounting; a dedicated H-005 test attempts a subrelease overlapping a live object and asserts refusal.
+
+**Failure modes.** *F1* a hugepage in two bins → transition logic centralized + B.4 check. *F2* subrelease
+races a new allocation into the subrange → take the placement lock + re-check liveness at commit. *F3* score
+overfit to x86 hugepages → keep inputs backend-agnostic so W11-6 reuses them on normal-frame runs.
+
+**Sequencing.** **M5**; W11-6 (seLe4n large-mapping over normal frames) lands with plan 09.
+
+### DD-3 · Release controller & demand reserve (W12-2)
+
+**Problem.** Decide *when* to return memory to the provider, balancing RSS, page faults, hugepage coverage,
+latency, and cgroup pressure — and specifically **avoid the release→refault oscillation** where memory is
+freed only to be faulted straight back (§21.1, R2 of the SPEC's tuning guidance).
+
+**Design space.** **A priority ladder driven by a pressure mode, braked by a demand reserve** — chosen
+(§21.3/§21.4). The reserve is the non-obvious, load-bearing piece: it is *not* a knob on the ladder but a
+separate predictor that withholds release proportional to recent demand.
+
+**Structures.**
+```text
+inputs = {live, rss, dirty, muzzy, coverage, alloc_rate, free_rate, refill_latency, cgroup_cur/max, pressure}
+demand_reserve = f(recent_alloc_rate, recent_peak, refill_latency, pressure)
+ladder (gated by mode): drain idle caches → release empty hugepages → purge dirty(not hot)
+                         → dirty→muzzy → subrelease cold-sparse → emergency shrink
+```
+
+**Work breakdown.** 1. sample the input vector cheaply (W12-2a). 2. the ordered ladder, each step gated by the
+pressure mode (W12-2b). 3. the demand reserve + the anti-oscillation brake (W12-2c). Plus W12-3b: **emergency
+mode** bypasses optional caches and the HugeCache reserve, drawing only on a pre-reserved pool that never
+depends on the normal heap (§36.5).
+
+**Invariants.** every ladder step is certified by `release_to_os_preserves_live_objects` (plan 02 W1-8c): a
+live pointer stays live + committed across release; the emergency reserve is independent of the normal heap.
+
+**Verify.** the **oscillation test**: a workload that frees then immediately re-allocates must *not* thrash
+the OS — the reserve holds enough back; pressure-mode transitions tested against simulated cgroup pressure;
+emergency path tested with an injected allocation failure.
+
+**Failure modes.** *F1* release-then-refault loop → the demand reserve (a first-class, tested unit). *F2*
+emergency allocation depends on the heap it is trying to rescue → the reserve is pre-allocated at boot (plan
+09 W22-5c on seLe4n). *F3* releasing a hot hugepage breaks TLP → the ladder purges dirty *not on hot
+hugepages* first.
+
+**Sequencing.** **M5**.
 
 ---
 

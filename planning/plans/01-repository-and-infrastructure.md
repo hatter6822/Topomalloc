@@ -1,6 +1,6 @@
 # Plan 01 — Repository & Infrastructure
 
-**Workstreams:** W0 · **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+**Workstreams:** W0 · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** Appendix F (anti-patterns → CI checks), §34 (test categories to scaffold), §35
 (deployment/ABI to anticipate), §30.1 (profiles).
 **Upstream deps:** none (this is the first work). **Downstream:** *every* other plan depends on M0 here.
@@ -109,6 +109,69 @@ toolchain end to end. **Enables:** all.
 > Closing all five = **M0**.
 
 ---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · The single-source-of-truth codegen pipeline (W0-4c / W0-14d)
+
+**Problem.** The size-class table (and other generated tables) must be **provably identical** in three
+places — the Lean proofs (plan 02), the Rust runtime (plan 03), and the C headers (plan 06) — or the
+Appendix-F "hand-maintained tables" anti-pattern silently returns through drift.
+
+**Design space.** **One generator emits data; everyone consumes it; CI golden-diffs** — chosen. Lean derives
+the table (plan 02 W1-4e) and serializes it; `tools/size-class-gen` reads that serialization and emits Rust +
+C; CI re-runs the generator and fails on any diff from the committed golden.
+
+**Pipeline.**
+```text
+plan 02 Lean buildTable ──serialize──▶ size-classes.json (committed golden)
+                                          │
+                 tools/size-class-gen ◀────┘──▶ crates/topo-core/tables.rs  +  include/topomalloc_tables.h
+xtask gen: regenerate from the golden; `git diff --exit-code` ⇒ G-table fails if anything diverged
+```
+
+**Work breakdown.** 1. define the serialization format + commit the golden (W0-14d). 2. `xtask gen` emits Rust
++ C from the golden (W0-4c). 3. CI runs `xtask gen` and fails on a non-empty diff (W0-5e, G-table).
+
+**Invariants.** the Rust table, the C header, and the Lean golden are byte-for-byte consistent; no table value
+is ever hand-edited.
+
+**Verify.** G-table in CI; plan 03's exhaustive `size_class` differential vs Lean closes the loop at runtime.
+
+**Failure modes.** *F1* someone edits `tables.rs` by hand → the golden-diff fails. *F2* the Lean table changes
+but the golden isn't refreshed → `lake` emits a new serialization, the diff fails until the golden is updated
+in the same PR.
+
+**Sequencing.** **M0** (the trivial table) so the pipeline exists *before* any real table — drift becomes
+impossible by construction.
+
+### DD-2 · Dual-arch CI (W0-5a) — AArch64 is not optional
+
+**Problem.** The RSEQ/restartable assembly (plan 05 W7) and the seLe4n target (plan 09) are **AArch64**.
+CI that runs only x86-64 would not exercise the arch that the microkernel deployment actually ships on, and
+would let AArch64-only asm bugs through to M3/M8.
+
+**Design space.** **A build/test matrix {x86-64 native, aarch64 via cross + `qemu-user`} × {debug,
+performance}** — chosen. Native x86-64 for speed; QEMU AArch64 so the asm and forced-migration tests run on
+the real instruction set before hardware exists.
+
+**Work breakdown.** 1. cross toolchain + `qemu-user` in `xtask setup`/CI (W0-3/W0-5a). 2. the matrix jobs
+(W0-5a). 3. mark asm/RSEQ AArch64 jobs retry-once-on-infra-flake but never auto-skip.
+
+**Invariants.** every gate that can differ by arch (G-build, G-fast) runs on both; AArch64 is co-primary, not
+a nightly afterthought.
+
+**Verify.** the matrix is a required status check; plan 05 W7-3 (AArch64 RSEQ) and W7-6 (battery) run under
+QEMU here.
+
+**Failure modes.** *F1* AArch64 deferred "until later" → asm bugs surface at M8 on hardware → it is required
+from M0. *F2* QEMU flake masks a real failure → retry-once + never auto-skip; a persistent failure blocks
+merge.
+
+**Sequencing.** **M0**.
 
 ## Sequencing & milestone mapping
 

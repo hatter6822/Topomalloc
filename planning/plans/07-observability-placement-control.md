@@ -1,7 +1,7 @@
 # Plan 07 — Observability, Placement & Control
 
 **Workstreams:** W17 (stats/telemetry/profiling), W14 (lifetime/hotness/placement), W20 (config/control plane)
-· **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+· **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §31, §8.6, §19.7, §36.12, §24, §32, §10.5, Appendices D/E; O-001..O-007.
 **Upstream deps:** every state-owner (stats read all of them), [04](04-backend-hugepages-release.md) (coverage),
 [08](08-security-debug-testing.md)/[02](02-formal-model.md) (sampling unwind safety). **Downstream:**
@@ -83,6 +83,73 @@ affects locality/fragmentation only — **never** validity, size, alignment, or 
 | W20-2 | Knob set (§32.2) wired to behavior; safe server defaults (§32.3). | M | ∥ | each knob has effect + default; defaults match §32.3. |
 | W20-3 | Control namespace (§10.5/Appendix E): stats/cache/release/arena/profile/emergency controls; blocking controls documented. | M | | every Appendix E entry resolves; blocking ones flagged. |
 | W20-4 | Runtime-change validation (§32.4): immediate vs future vs quiescence-required. | S | ∥ | each change classified + enforced. |
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · Sampled profiling without recursive malloc (W17-3)
+
+**Problem.** Heap/lifetime profiling must capture a stack trace on a *sampled* allocation, but the obvious
+implementation — an unwinder that allocates a buffer — re-enters the allocator *from inside an allocation*,
+the exact anti-pattern the SPEC forbids (Appendix F, §31.4). It must also be lock-free on the hot path and
+correctly account objects still live at dump time (right-censored lifetimes).
+
+**Design space.** **A lock-free per-thread Poisson sampling counter + an allocation-free unwinder writing into
+a fixed, pre-allocated per-thread buffer** — chosen. Sampling decisions touch only thread-local state; the
+unwind never calls back into `malloc`.
+
+**Structures.**
+```text
+thread-local: bytes_until_sample (Poisson), sample_buffer[FIXED]   // pre-allocated, never grows
+sampled set:  map<ptr, {stack_id, size, alloc_epoch}>              // for live + lifetime accounting
+```
+
+**Work breakdown (refines W17-3a..d).** 1. lock-free sampling decision (W17-3a). 2. alloc-free stack capture
+into the fixed buffer (W17-3b). 3. sampled-object lifecycle: record on sampled alloc, resolve on free, count
+right-censored (still-live) objects at dump (W17-3c). 4. heap + lifetime aggregation + dump format (W17-3d).
+
+**Invariants.** the unwinder never re-enters the allocator; sampling never takes a hot-path lock; freeing a
+sampled object is correct whether or not it was sampled.
+
+**Verify.** a re-entrancy guard counts allocator depth and asserts the sampler never increments it; an
+overhead micro-benchmark bounds the sampled-path cost (a G-ops check); a lifetime test injects known-lifetime
+objects and checks the histogram including right-censoring.
+
+**Failure modes.** *F1* unwinder allocates → recursion → fixed buffer + alloc-free unwind. *F2* a sampled
+object freed on another thread → the sampled set is concurrency-safe (sharded/lock-free). *F3* sampling cost
+creeps → the overhead budget gate.
+
+**Sequencing.** **M6**.
+
+### DD-2 · Epoch-consistent stats (W17-1)
+
+**Problem.** A stats snapshot taken while threads allocate must still *reconcile* — the sum of the parts
+equals managed VM, modulo a documented convention (§8.6) — without locking the allocation fast path to take
+the snapshot.
+
+**Design space.** **Per-shard relaxed counters + an epoch/sequence number for consistent snapshots** —
+chosen: fast paths bump relaxed per-CPU/per-arena counters; a snapshot advances the epoch and reads a coherent
+set, accepting bounded skew that the reconciliation convention accounts for.
+
+**Work breakdown (refines W17-1a/b).** 1. the byte-class counters (app/cache/central/backend/metadata/
+quarantine/hugepage/arena) as sharded relaxed atomics (W17-1a). 2. epoch/sequence + a consistent-snapshot
+mode that reconciles (W17-1b).
+
+**Invariants.** every byte the allocator manages is in exactly one class; a `CONSISTENT_SNAPSHOT` reconciles
+to managed VM modulo the convention; counters are non-negative.
+
+**Verify.** a reconciliation test under concurrent load asserts the snapshot balances; the JSON matches
+Appendix D; fields are additive across the release series (§35.3).
+
+**Failure modes.** *F1* double-counting a byte in two classes → the five-term partition (plan 03 W5-3) is the
+source of truth for cached/central/live; stats derive from it. *F2* a snapshot that never balances →
+the documented convention bounds the skew and the test enforces it.
+
+**Sequencing.** W17-1a **M1** (so M1 reconciles); W17-1b **M6**.
 
 ---
 

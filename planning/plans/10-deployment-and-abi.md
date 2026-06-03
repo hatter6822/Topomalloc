@@ -1,6 +1,6 @@
 # Plan 10 — Deployment & ABI
 
-**Workstreams:** W23 · **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+**Workstreams:** W23 · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §35 (whole), §36.19 S9, §34.6, Appendix F (deployment anti-patterns).
 **Upstream deps:** [06](06-api-realloc-arenas.md) (the ABI), [05](05-caches-concurrency-fastpath.md) (init/TLS),
 [07](07-observability-placement-control.md) (stats), [09](09-sele4n-integration.md) (seLe4n perf baseline).
@@ -38,6 +38,65 @@
 > the seLe4n story (vs static pools and an allocman-like baseline — the comparison that matters for the
 > microkernel target, §36.19 S9). Both record into `/bench` with a committed results schema so runs are
 > comparable over time; "targets met or documented as open" keeps perf honest without blocking GA on a number.
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · Interposition / LD_PRELOAD hazards (W23-1b)
+
+**Problem.** Becoming the process allocator via interposition means TopoMalloc may run *before* its own init
+completes, may be called from inside the dynamic loader, and may see pointers from another allocator that ran
+earlier (§35.1). Each is a documented foot-gun, not a turnkey mode.
+
+**Design space.** **Lean on phased init (plan 05 W16-7) + the TLS bootstrap (plan 05 W16-2) so the allocator
+survives being first; document the caveats as a first-class deliverable** — chosen. The SPEC requires
+LD_PRELOAD be presented *as tricky*.
+
+**Work breakdown (refines W23-1a/b).** 1. low-risk modes (static link, dynamic-as-process-allocator) where
+init order is controllable (W23-1a). 2. interposition (W23-1b): the symbol-export set, early-init survival,
+and the **caveats document** (init order, interposition order, mixed allocators) — the doc is as much the
+deliverable as the code. 3. mixed-allocator safety (W23-2): foreign-pointer detection in hardened (plan 03
+W3-4b) so a pointer from another allocator fails safely, not silently corrupts.
+
+**Invariants.** the allocator answers a `malloc` issued during its own Phase 0–2 (from the bootstrap path,
+plan 03 DD-2); a foreign `free` in hardened mode is detected, not acted on.
+
+**Verify.** an interposition smoke test (LD_PRELOAD a small program); a mixed-allocator test frees a
+foreign pointer under hardened and asserts safe failure.
+
+**Failure modes.** *F1* a `malloc` arrives before init → the phased-init bootstrap path serves it. *F2* a
+loader-internal allocation re-enters → reentrancy guard (plan 05 W16-6). *F3* freeing foreign memory → hardened
+foreign-pointer detection (W23-2).
+
+**Sequencing.** **M9** (low-risk static/dynamic usable from M1 for testing).
+
+### DD-2 · ABI stability test (W23-3)
+
+**Problem.** Within a release series the public C names, struct ABI, opaque-handle layout, and stats-JSON
+fields must not break downstream consumers (§35.3) — and "must not break" needs to be a *mechanical* check,
+not a review habit.
+
+**Design space.** **A committed ABI snapshot + a CI diff** — chosen: capture exported symbols, public struct
+layouts, and the stats-JSON field set into a checked-in baseline; CI fails on a non-additive change.
+
+**Work breakdown (refines W23-3).** 1. snapshot exported symbols + `#[repr(C)]` layouts + opaque-handle sizes.
+2. snapshot the stats-JSON field set. 3. CI diff: removed/renamed symbols or fields, or changed layouts, fail
+(G-abi); *added* stats fields pass (additive rule).
+
+**Invariants.** no public symbol/struct/handle changes incompatibly within a series; stats-JSON fields are
+additive-only.
+
+**Verify.** G-abi at M9 and on every release branch; a deliberate breaking change in a test asserts the gate
+fires.
+
+**Failure modes.** *F1* an accidental struct reorder → layout snapshot diff fails. *F2* a removed stats field
+breaks a dashboard → field-set diff fails (only additions pass).
+
+**Sequencing.** **M9** (release-gating); the snapshot tooling can land earlier to track drift.
 
 ---
 

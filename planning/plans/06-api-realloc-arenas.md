@@ -1,7 +1,7 @@
 # Plan 06 — Public API, Reallocation & Arenas
 
 **Workstreams:** W8 (public API/ABI), W15 (realloc/aligned/calloc), W9 (capability-backed arenas), W10
-(extent hooks) · **Status:** rev 2.0 · **Overview:** [README.md](README.md)
+(extent hooks) · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §10, §25, §26, §9.6/§9.7, §22, §36.4, §36.13, §23, §35.2/§35.3; F-001..F-010, §15.5.
 **Upstream deps:** [03](03-core-allocator.md) (classify, pagemap, central), [04](04-backend-hugepages-release.md)
 (provider, extents), [05](05-caches-concurrency-fastpath.md) (front-end). **Downstream:** every consumer;
@@ -123,6 +123,106 @@ M4, W10, plan 09.
 | W10-1 | Hook interface (§23.2) wired through the provider seam (plan 04). | M | | alloc/dealloc/commit/decommit/purge/split/merge dispatch to user hooks. |
 | W10-2 | Hook contracts (§23.3) enforced/validated (alignment, size, no-overlap, subrange-only, no undocumented reentrancy). | M | | violations detected in debug; assumptions documented in Lean (§23.4). |
 | W10-3 | Failure-injection tests (§34.8): every hook can fail; the allocator stays well-formed. | M | ∥ | fuzzed hook failures never corrupt state. |
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · realloc, as a state machine (W15)
+
+**Problem.** `realloc` has four standard obligations that interact badly if implemented ad hoc: `realloc(NULL,
+n)==malloc(n)`; `realloc(p,0)` follows a configured policy; on success the new object holds
+`min(old,new)` bytes of old content; **on failure the old allocation stays valid** (§25.1). The last is the
+trap — a clever in-place attempt that fails after mutating the original loses data.
+
+**Design space.** **Decide the path from `(classify_ptr(p), old_class, new_class)`, always allocate-before-free
+on the move path, and treat in-place as a fast path layered *under* move** — chosen. Never the reverse.
+
+**State machine.**
+```text
+realloc(p, n):
+  p == NULL            -> malloc(n)
+  n == 0               -> policy(free(p); return zero_unique|NULL)
+  same size class      -> in-place, return p                                   (W15-3a)
+  shrink, large tail   -> split + return tail to backend, return p             (W15-3b)
+  grow, adjacent free  -> try extent-merge grow (plan 04 W4-2c); else MOVE     (W15-3a)
+  otherwise            -> MOVE: q=malloc(n); copy min(old_usable,n); free(p)   (W15-2)  ← q first, free p last
+```
+
+**Work breakdown (refines W15-1..5).** 1. the contract + dispatch (W15-1). 2. the **move** path, q-before-free
+(W15-2) — *ship this first; it is always correct*. 3. in-place grow (W15-3a) + shrink (W15-3b) as fast paths
+*under* move. 4. aligned validation + over-aligned routing (W15-4). 5. calloc zeroing + overflow (W15-5, see
+DD-2).
+
+**Invariants.** failure preserves the original object and its contents; alignment + arena preserved across a
+move; content `min(old_usable, new)` preserved.
+
+**Verify.** a property test that interleaves `realloc` with content checks (write a pattern, realloc, verify
+the prefix survives) and injects allocation failure to assert the original survives.
+
+**Failure modes.** *F1* in-place grow mutates then fails → **never**: in-place only commits when it cannot
+fail; otherwise fall to move. *F2* copying `new` bytes when `new>old_usable` reads OOB → copy `min`.
+
+**Sequencing.** **M1** for move + same-class in-place; extent-merge grow lands with plan 04 **M5**.
+
+### DD-2 · calloc overflow & zeroing (W15-5, with plan 03 W2-4)
+
+**Problem.** `calloc(n,size)` must reject `n*size` overflow *and* any subsequent size-class/page/hugepage
+**rounding** overflow (§26.1/§9.7), then return genuinely-zeroed memory cheaply.
+
+**Design space.** check `n != 0 && size > SIZE_MAX/n` → then route the rounded size through the same
+overflow-checked rounding as malloc (plan 03 W2-4); zero via OS zero-pages when the span is freshly committed,
+else `memset`, tracking a `zeroed` flag invalidated on user write.
+
+**Invariants.** no integer wraps to a small allocation; returned bytes are zero; the `zeroed` flag is
+invalidated when user-visible memory may be non-zero.
+
+**Verify.** overflow tests across the boundary (`n*size` near `SIZE_MAX`, and a product that passes but rounds
+past `SIZE_MAX`); a zeroing test on both the fresh-commit and reused-span paths.
+
+**Failure modes.** *F1* checking only `n*size`, not rounding → a product that fits but rounds over wraps → DD
+routes through W2-4. *F2* trusting a stale `zeroed` flag → invalidate on any user write to the span.
+
+**Sequencing.** **M1**.
+
+### DD-3 · Arena revocation protocol (W9-6) — the seLe4n-critical lifecycle
+
+**Problem.** Destroying an arena in the seLe4n profile is far more serious than a POSIX `free`: backing is
+revocable capabilities + mapped frames, and recycling backing while a client mapping or derived capability
+still exists would hand **live authority to another security domain** (§36.13). Ordering is the whole game.
+
+**Design space.** **A strictly ordered, step-isolated protocol with a non-DESTROYED failure state** — chosen:
+each step is its own unit so a partial failure stops cleanly in `DRAINING`/`ERROR_QUARANTINED`, never
+`DESTROYED`, never with a half-revoked CSpace.
+
+**The protocol (ordered; **unmap before revoke before recycle**).**
+```text
+1 DRAINING: reject new allocations + delegations; notify clients          (W9-6a)
+2 drain local/transfer caches + central lists; quarantine stale frees     (W9-6b)  ← same hard search as DD-3 of plan 03
+3 unmap client VSpace windows                                             (W9-6c)
+4 scrub dirty pages IF cross-label reuse is possible                      (W9-6c → plan 08 W18-6)
+5 revoke derived frame/mapping caps; delete CSlots                        (W9-6d)
+6 recycle untyped to free pools                                           (W9-6d, provider.recycle)
+7 DESTROYED + generation++                                                (W9-6e)
+on partial failure at any step → DRAINING | ERROR_QUARANTINED  (never DESTROYED)
+```
+
+**Invariants.** no live derived cap/mapping after step 6; a stale pointer never becomes valid for a new arena
+(generation guard); emergency allocations never depend on a draining arena.
+
+**Verify.** the revocation test (§36.16): after destroy, assert zero live frame caps, zero client mappings,
+zero cache objects for the arena; mirror to Lean `destroy_revokes_descendants` (plan 02 W1-12c). On POSIX,
+steps 3–6 collapse to unmap + no-op revoke, so the *structure* is identical and seLe4n drops in.
+
+**Failure modes.** *F1* recycle before revoke → live authority leaks across domains → the fixed order. *F2*
+an object hidden in a per-CPU cache survives step 2 → bound-arena routing (D6) + arena-qualified slots (M4)
+make the drain exhaustive (the same technique as empty-span detection). *F3* destroy marked complete after a
+failed revoke → the non-DESTROYED failure state.
+
+**Sequencing.** **M4** (against the Sim); real-kernel revocation at plan 09 **M8**.
 
 ---
 

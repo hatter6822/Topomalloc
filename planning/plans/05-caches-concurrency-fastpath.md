@@ -1,7 +1,7 @@
 # Plan 05 — Caches, Concurrency & Fast Paths
 
 **Workstreams:** W6 (front/middle caches), W7 (RSEQ/restartable + asm), W16 (concurrency/ordering/fork/TLS) ·
-**Status:** rev 2.0 · **Overview:** [README.md](README.md)
+**Status:** rev 2.1 · **Overview:** [README.md](README.md)
 **SPEC anchors:** §11, §12, §13, §14.2–§14.4, §27, §28, §35.4; B.2, P-001..P-003, S-008/S-010.
 **Upstream deps:** [03](03-core-allocator.md) (central list), [02](02-formal-model.md) (RSEQ contract).
 **Downstream:** [06](06-api-realloc-arenas.md) (the public fast path), [04](04-backend-hugepages-release.md)
@@ -124,6 +124,167 @@ most one** of ranks 3–6 at a time. The checker (W16-1b) enforces monotonicity 
 > threads, disable background threads, conservative mode). The child handler is the hard one: locks may be
 > held by threads that no longer exist, so it must *reset* rather than *unlock* and enter a conservative mode
 > until safe.
+
+---
+
+## Deep dives
+
+> Template: **Problem · Design space · Structures · Work breakdown (finer than the table) · Invariants ·
+> Verify · Failure modes · Sequencing.**
+
+### DD-1 · Refill / flush, hand-over-hand (W6-3)
+
+**Problem.** Refill (front-end empty → pull a batch up the hierarchy) and flush (front-end full → push a batch
+down) are the only places two *middle-end* locks could be wanted at once. The lock hierarchy forbids holding
+them together, so both must be written to hold **at most one** of {transfer, central} at a time, while still
+conserving object count exactly.
+
+**Design space.** **Hand-over-hand (release-before-acquire)** — chosen (§27.2): take the transfer-cache lock,
+get/put the batch, *release it*, then take the central lock. The alternative (hold both to avoid a re-lookup)
+reintroduces exactly the deadlock the hierarchy prevents.
+
+**Structures.**
+```text
+refill(core,arena,sc): b = transfer_try_pop(...)            // hold transfer lock only
+                       if b.empty { b = central_remove_batch(...) }  // hold central lock only (transfer released)
+                       if b.empty { span = backend_new_span(...); central_attach(span); retry }  // §A.2
+                       cpu_cache_insert_batch(core, sc, b)
+flush(core,sc):        b = cpu_cache_make_space(core, sc)
+                       if !transfer_try_push(b) { central_insert_batch(b) }   // triggers empty-detection
+```
+
+**Work breakdown (refines W6-3a..c).** 1. refill with the release-before-acquire discipline (W6-3a). 2. flush,
+same discipline (W6-3b). 3. wire empty-span detection (plan 03 W5-3e) into flush-to-central + the debug
+conservation check (W6-3c).
+
+**Invariants.** object count conserved across refill and flush (plan 02 W1-6c); **≤ 1** middle-end lock held
+at any instant; span creation happens *outside* the central lock (§A.2).
+
+**Verify.** the lock-order checker (DD-3) proves the ≤1 property at runtime; plan 02 W1-6c proves
+conservation; plan 08 W21-3 stresses concurrent refill/flush under TSan.
+
+**Failure modes.** *F1* a "fast" refactor grabs both locks → deadlock under the hierarchy → the checker
+(W16-1b) fails it in debug CI (G-conc). *F2* a flush empties a span but doesn't trigger detection → leak →
+W6-3c wires the trigger.
+
+**Sequencing.** **M2**.
+
+### DD-2 · RSEQ restartable sequences (W7-2/W7-3) — the only assembly
+
+**Problem.** Make per-CPU pop/push lock-free using a restartable critical section that the kernel aborts on
+preemption/migration. This is the highest-risk code in the project: a single mis-ordered store or a faulting
+reference inside the CS corrupts the cache.
+
+**Design space.** **Linux RSEQ on POSIX; a pinned-thread per-core contract on seLe4n (§36.10)** behind one
+front-end interface. Both implement the same `FeOutcome` contract and the same Lean axiom (plan 02 W1-7).
+
+**Anatomy of a sequence (the non-negotiable shape, §12.3).**
+```text
+  start_ip:  load cpu id from the rseq area
+             load head/index for (cpu, sc)
+             compute next; bounds-check (→ Empty/Full without committing)
+  commit_ip: SINGLE store that publishes the new head/index   ← the only state change
+  post_commit_ip:
+  abort_ip:  (kernel jumps here on preempt/migrate) → return Abort; caller retries
+```
+Rules: **no calls, no possibly-faulting memory reference** between `start_ip` and `commit_ip`; the abort
+handler restores a logical no-op; the commit is one store, so an abort before it is invisible.
+
+**Work breakdown (refines W7-2a..e / W7-3a..c).** 1. cs descriptors + abort trampolines in a dedicated section
++ rseq registration (W7-2a). 2. `rseq_pop` (W7-2b). 3. `rseq_push` (W7-2c). 4. clobber/barrier docs + a lint
+that no call/fault occurs in a CS (W7-2d). 5. forced-migration equivalence vs the locked baseline (W7-2e).
+6–8. the AArch64 mirror (W7-3a..c) — **co-primary**, since AArch64 is the seLe4n target.
+
+**Invariants.** the only store that changes cache state is the commit; abort ⇒ no change (plan 02 W1-7 frame
+condition); `Abort` is distinct from `Empty`/`Full`.
+
+**Verify.** *two* ways, both required: (a) plan 02 W1-7 axiom + W1-12d `per_core_cache_abort_no_change`; (b)
+a forced-migration differential test (W7-2e/W7-3c) that pins/repins a thread mid-sequence thousands of times
+and asserts object movement identical to the locked baseline (W6-4). Plus the §34.5 battery (W7-6): signal
+near the CS, preemption, registration failure.
+
+**Failure modes.** *F1* a load inside the CS faults (e.g., touches an unmapped page) → kernel does *not*
+restart a fault, it delivers the signal → keep all CS memory references to already-resident cache metadata.
+*F2* compiler reorders across the commit → explicit fences + the no-call rule. *F3* `Abort` treated as
+`Empty` → spurious slow-path or lost progress → the front-end contract keeps them distinct.
+
+**Sequencing.** **M3**; pinned-core (W7-5) lands alongside for seLe4n.
+
+### DD-3 · Lock hierarchy & the checker (W16-1)
+
+**Problem.** A fixed global acquisition order is the only practical defense against deadlock across the
+front→transfer→central→span→backend→stats layering; it must be cheap to follow and *enforced*, not just
+documented.
+
+**Design space.** **A typed/ranked lock wrapper + a debug per-thread held-rank stack** — chosen: ranks are
+compile-time constants on the lock type; acquisition pushes the rank and asserts it exceeds the current top.
+
+**Structures.**
+```text
+rank: config 0 < arena_registry 1 < arena 2 < transfer 3 < central 4 < span 5 < backend 6 < stats 7
+RankedLock<const R: u8>;  acquire(): assert(thread.top_rank < R); thread.push(R)
+```
+
+**Work breakdown (refines W16-1a/b).** 1. the ranked wrapper; route *every* lock through it (W16-1a). 2. the
+debug checker (per-thread rank stack) + wire as the G-conc gate (W16-1b).
+
+**Invariants.** acquisitions are strictly rank-increasing; refill/flush hold ≤1 of ranks 3–6 (DD-1).
+
+**Verify.** the checker fails any out-of-order acquire in debug CI; plan 08 W21-3 runs the full concurrency
+suite under it.
+
+**Failure modes.** *F1* a lock not routed through the wrapper escapes the checker → a lint/grep forbids raw
+`Mutex` in `topo-core`. *F2* two locks of the same rank → ranks are unique per layer; same-rank needs a
+documented tie-break (none currently).
+
+**Sequencing.** **M2** (the global lock of M1 trivially satisfies it; the hierarchy replaces it here).
+
+### DD-4 · TLS bootstrap (W16-2) — a top risk (R3)
+
+**Problem.** The allocator's own thread-local state must be reachable on a thread's first allocation *without*
+that access itself allocating — or the allocator re-enters itself before its per-thread state exists →
+recursion/deadlock.
+
+**Design space.** **Initial-exec TLS (or a static `__thread` slot reached without dynamic TLS allocation)** —
+chosen (§27.6). When loaded via `dlopen`, where initial-exec may be unavailable, fall back to an
+**allocation-free per-thread bootstrap path** until TLS is safe, consistent with the phased init (W16-7).
+
+**Work breakdown (refines W16-2).** 1. declare per-thread state initial-exec. 2. a dlopen-safe bootstrap that
+serves the first allocations from a thread-agnostic path until the TLS slot is established. 3. the recursion
+test.
+
+**Invariants.** first TLS access never calls `malloc`; the bootstrap path is allocation-free.
+
+**Verify.** load the allocator via `dlopen` in a test and assert the first allocation does not re-enter (a
+re-entrancy guard counts depth). This is the **threading analogue of S-007** (plan 03 DD-2).
+
+**Failure modes.** *F1* general-dynamic TLS sneaks in via a dependency → a build assertion on the TLS model;
+*F2* fast paths assume TLS exists → **W16-2 must be proven before W7 lands** (M2 before M3).
+
+**Sequencing.** **M2**, ahead of the W7 fast paths.
+
+### DD-5 · fork (W16-5)
+
+**Problem.** In a multithreaded process, `fork()` yields a child with one thread but locks possibly held by
+threads that no longer exist. The child must not deadlock on the allocator's own locks.
+
+**Design space.** **atfork handlers in three contexts** — chosen (§28.1): pre-fork acquire+quiesce, parent
+release+resume, child **reset** (not unlock) + disable background threads + conservative mode.
+
+**Work breakdown (refines W16-5a/b).** 1. pre-fork (acquire the fork lock, quiesce background threads) +
+parent-post-fork (release, resume) (W16-5a). 2. child-post-fork (reset all lock states, disable background
+threads, flush/mark-conservative inconsistent per-CPU state) (W16-5b).
+
+**Invariants.** after fork: no lock is held by a vanished thread; the child allocates correctly; background
+threads stay off until safe.
+
+**Verify.** a fork-in-multithread stress test (threads mid-allocation at fork) asserts the child allocates
+without deadlock and stats are consistent.
+
+**Failure modes.** *F1* child *unlocks* a lock held by a dead thread (UB) → it must **reset** state, not
+unlock. *F2* a per-CPU cache is mid-RSEQ at fork → the child enters conservative (locked) mode until flushed.
+
+**Sequencing.** **M2**.
 
 ---
 
