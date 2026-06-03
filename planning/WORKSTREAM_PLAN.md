@@ -39,6 +39,7 @@ the first work) → §5 (milestones) → the workstream(s) you own in §6.
 | 0.9 | 2026-06-03 | **Optimization pass.** Reordered to a single `TopoBackingProvider` seam; folded seLe4n into every milestone via a deterministic simulator; pulled the size-class single-source-of-truth, bootstrap metadata, and TLS-model constraints onto the critical path; collapsed redundant WUs; added the interface-contract table to unblock parallel tracks. |
 | 1.0 | 2026-06-03 | **Refinement pass.** End-to-end consistency: every WU traces to a SPEC section and a requirement family; milestone exit criteria reconciled with SPEC conformance classes; risk register and Definition-of-Done finalized; traceability matrix completed; ratified decisions D1/D2 recorded. |
 | 1.1 | 2026-06-03 | **seLe4n real-ABI integration.** Incorporated the existing `hatter6822/seLe4n` Rust ABI (`sele4n-abi`/`sele4n-types`/`sele4n-sys`/`sele4n-hal`; `no_std`; AArch64 `svc #0`). `Sele4nBackingProvider` now compiles against the real ABI from M1; `Sele4nSim` reframed as a host test-double sharing the same `invoke_syscall`/`SyscallId`/`TypeTag`/`KernelError` surface; M8 reframed from "build the real API" to "execute on the real kernel (QEMU/RPi5)"; added decision D8 (dependency pinning) and risk R13 (upstream ABI drift). |
+| 1.2 | 2026-06-03 | **Deep-decomposition pass.** Audited dependencies/sequencing and corrected per-WU dependency scoping (W4 trait vs extent ops; W8's M1 path goes via the central list, not the caches; W15 classify references; W3-1 bootstrap independence). Broke every L-sized (and several pivotal M-sized) work units into smaller, independently-shippable sub-units (letter-suffixed, e.g. `W5-3a`..`W5-3e`), and added engineering **▸ Decomposition** notes — design space, ordered steps, pitfalls, proof/test obligations — for the highest-complexity units (size-class model, pagemap, empty-span conservation, extents, RSEQ assembly, refill/flush locking, arena revocation, hugepage filler, release controller, differential testing, `Sele4nSim`, resource server). End-to-end best-practices sweep. |
 
 ---
 
@@ -325,7 +326,10 @@ W1 (formal), W17 (stats), W20 (config), W21 (testing) are CONTINUOUS: they grow 
 ## 6. Workstream catalog
 
 Legend for WU tables: **Size** = S/M/L relative effort; **∥** = parallelizable with siblings once deps met.
-Every WU's acceptance criteria implicitly include the global **Definition of Done** (§9).
+Every WU's acceptance criteria implicitly include the global **Definition of Done** (§9). Complex units are
+broken into **letter-suffixed sub-units** (e.g. `W5-3a`..`W5-3e`), each independently shippable and testable;
+a **▸ Decomposition** note after a table gives the design space, pitfalls, and sequencing for the hardest
+ones. A bare cluster reference (e.g. "W5-3") denotes the whole family.
 
 ---
 
@@ -400,19 +404,40 @@ testing, and (c) the proofs that make Core/Formal/Microkernel conformance real.
 | W1-1 | Lake package + CI `lake exe check`; core types (§33.2): `Owner`, `Range`, `State`. | S | | `Owner` includes all SPEC owners incl. `released`/`quarantine`; compiles in CI. |
 | W1-2 | **Empty bridge package** scaffolding (§36.3.3) so seLe4n is co-developed from day one. | S | ∥ | `TopoMalloc/SeLe4n/*.lean` files compile (stubs); importable without seLe4n internals. |
 | W1-3 | `WellFormed` predicate (§33.3): single-owner, live-disjointness, cache/central residency, span-fit, bitmap agreement, pagemap agreement, hugepage occupancy, arena uniqueness, released-no-live, capacity. | M | | predicate total; each clause cross-referenced to a SPEC bullet. |
-| W1-4 | **Size-class model + generator contract** (§9.4/§9.5): spacing-ratio regime *and* alignment-quantum regime; `size(c)` multiple of `alignment(c)`. Emits the table `tools/size-class-gen` will mirror. | L | | Lean proves coverage, `size≥req`, alignment sufficiency, in-bounds, batch≤capacity, slab fits, pairwise-disjoint (§9.5); both fragmentation regimes asserted per class. |
+| W1-4a | Abstract `SizeClass` record + the *parameterized* table-construction function in Lean (size, alignment, slab_pages, objects_per_slab, batch_size, max_local_capacity) — a pure function of the build params (D4), no literals. | M | | table derives entirely from params; reproducible. |
+| W1-4b | Prove the **spacing-dominated** bound `r(c)=size(c)/size(prev(c)) ≤ 1+W` for each §9.4 size range. | M | ∥ | per-range spacing lemma discharged. |
+| W1-4c | Prove the **alignment-dominated** caveat (`req<q/W` ⇒ waste ≤ `(q-1)/req`) and classify each class into its regime, so no unattainable flat target is claimed (§9.4). | S | ∥ | regime split machine-checked. |
+| W1-4d | Prove the layout lemmas (§9.5): `size(c)` is an integer multiple of `alignment(c)`; objects fit the span; object ranges pairwise-disjoint. | M | | layout lemmas proved. |
+| W1-4e | Prove the lookup obligations (total, monotonic, in-bounds, `size≥req`, `align≥req.align`, `batch≤max_local_capacity`) and **emit** the concrete table as machine-readable data + define the golden-diff contract consumed by W2-1. | M | | `size_class_table_covers_all_small_requests` proved; emitted table is the single source of truth. |
 | W1-5 | Abstract transitions: `malloc`, `free`, `central_batch_remove/insert`, `cache_refill/flush`. | M | | each transition is a total function on `State`. |
-| W1-6 | Core theorems (§33.4 part 1): `malloc/free_preserves_wellformed`, success-returns-aligned-disjoint, free-removes-liveness-adds-one-owner, refill/flush conservation. | L | | proved; named exactly per SPEC for traceability. |
+| W1-6a | `malloc_preserves_wellformed` + `malloc_success_returns_aligned_sufficient_disjoint_object`. | M | | both proved, named per §33.4. |
+| W1-6b | `free_preserves_wellformed_for_valid_pointer` + `free_removes_liveness_and_adds_exactly_one_free_owner`. | M | ∥ | both proved. |
+| W1-6c | `cache_refill_preserves_ownership_conservation` + `cache_flush_preserves_ownership_conservation` (consumes the W1-7 frame condition). | M | | both proved; depend on W1-7. |
 | W1-7 | RSEQ abstraction (§33.5): `RseqPop`/`RseqPush` with **abort / empty(full) / success** + **frame condition**; axioms stated. | M | ∥ | distinct abort vs empty/full cases; frame condition present; refill/flush proofs depend on it. |
-| W1-8 | Back-end theorems (§33.4 part 2): span split/merge disjointness, `pagemap_lookup_sound`, `release_to_os_preserves_live_objects` (§21.6). | L | | proved. |
+| W1-8a | `span_split_preserves_disjointness` + `span_merge_preserves_disjointness`. | M | | both proved; mirror W4-2b/c. |
+| W1-8b | `pagemap_lookup_sound` (mirrors W3-3d). | M | ∥ | proved. |
+| W1-8c | `release_to_os_preserves_live_objects` — the §21.6 release-safety theorem (every pointer live before stays live and committed). | M | | proved; mirrors W4-2d/W12-2. |
 | W1-9 | Arena theorems: `arena_reset_invalidates_only_target_arena`, `arena_destroy_preserves_other_arenas`. | M | | proved. |
 | W1-10 | Executable model + trace replay (§33.7): consume SPEC trace grammar, check `WellFormed` at boundaries. | M | | replays a recorded trace; flags an injected violation. |
-| W1-11 | Bridge model (§36.3.3, §36.7): relation `TopoState ↔ SeLe4n SystemState`; backing-provider state machine (§36.6); single-label `TopoSeLe4nWellFormed`. | L | | bridge compiles; backing state machine matches §36.6 ordering. |
-| W1-12 | Bridge theorem families (§36.17, single-core): `backing_descends_from_untyped`, `no_live_object_released`, `destroy_revokes_descendants`, `label_partition_preserved`, `scrub_before_downgrade`, `arena_cap_authorizes_alloc`, `arena_quota_preserved`, `client_cache_refines_server_authority`, `per_core_cache_abort_no_change`, `stats_observation_noninterference`, `topo_step_preserves_sele4n_invariants`. | L | | each proved in single-core form by M7/M8 as scheduled in §5. |
+| W1-11a | Bridge relation `TopoState ↔ SeLe4n SystemState` + abstraction function (§36.3.3, §36.7). | M | | relation + abstraction compile; importable without seLe4n internals. |
+| W1-11b | Backing-provider state machine as a Lean transition system (§36.6 ordering: `AuthorizedUntyped → … → RecyclableUntyped`). | M | ∥ | transitions match §36.6 exactly. |
+| W1-11c | Single-label `TopoSeLe4nWellFormed` predicate composing TopoMalloc `WellFormed` with the seLe4n invariant bundle. | M | | predicate total; clauses cross-referenced to §36.7/§36.12. |
+| W1-12a | Authority/quota family: `arena_cap_authorizes_alloc`, `arena_quota_preserved`, `client_cache_refines_server_authority`. | M | | proved single-core. |
+| W1-12b | Provenance/release family: `backing_descends_from_untyped`, `no_live_object_released`. | M | ∥ | proved single-core. |
+| W1-12c | Destroy/label/scrub family: `destroy_revokes_descendants`, `label_partition_preserved`, `scrub_before_downgrade`. | M | | proved single-core; mirror W9-6/W18-6. |
+| W1-12d | Per-core/stats/composite family: `per_core_cache_abort_no_change`, `stats_observation_noninterference`, `topo_step_preserves_sele4n_invariants`. | M | ∥ | proved single-core; gate M7/M8. |
 | W1-13 | Non-interference (§36.12): `topo_step_preserves_low_equivalence` shape proved for the cache/stats steps. | L | ∥ | proved for the modeled steps. |
 | W1-14 | SMP/per-core bridge extensions (§36.17 SMP forms) — staged per V-004. | L | | proved or recorded as explicit refinement debt by M9. |
 
-> **Critical-path note:** W1-4 (size-class model) gates W2 and therefore M1. Start it in M0 alongside W0.
+> **▸ Decomposition — W1-4 (size-class model), the M1 longest pole.** The single-source-of-truth table
+> (Appendix F: never hand-maintained) is split so each sub-proof ships independently. The reason it is split
+> into a spacing regime (W1-4b) and an alignment regime (W1-4c) is that the SPEC (§9.4) proves a flat per-
+> request waste target is *unattainable* below the ABI quantum `q`: a 17 B request under a 16 B quantum must
+> round to 32 B. W1-4b targets the achievable `r(c) ≤ 1+W`; W1-4c bounds the small-request tail by `q`. The
+> emitted table (W1-4e) is data, consumed by W2-1 and golden-diffed in CI (G-table). **Pitfall:** keeping
+> alignment-multiple (W1-4d) and lookup (W1-4e) as separate proofs lets a generator change re-check cheaply
+> rather than re-proving the whole table. **Sequencing:** W1-4a starts in M0 alongside W0; 4b/4c run in
+> parallel; 4d/4e gate W2 and therefore M1.
 
 ---
 
@@ -434,16 +459,29 @@ testing, and (c) the proofs that make Core/Formal/Microkernel conformance real.
 **Goal:** the metadata substrate every other layer reads: bootstrap-safe metadata, the pagemap, span
 descriptors, and pointer classification.
 **SPEC:** §16.2 (span descriptor), §17 (whole), §27.5 (generation/ABA), P-Map-001..006, S-007.
-**Depends on:** W0; W2 for `sc`. **Enables:** W4, W5, W8, W15, W18.
+**Depends on:** W0 — **W3-1 (bootstrap allocator) needs only W0 and starts in M0**, off the W1-4 critical
+path; W2 (`sc`) is needed only from W3-2 (span descriptor) onward. **Enables:** W4, W5, W8, W15, W18.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W3-1 | **Bootstrap metadata allocator** (§17.4, S-007): no dependency on public malloc, monotonic, idempotent init, lock-free before threading. | M | | unit test allocates metadata before any arena exists; never calls global `malloc`. |
 | W3-2 | Span descriptor (§16.2) incl. `object_count/live_count/central_free_count`, `free_bitmap`, optional `cache_bitmap`, `generation`. | M | ∥ | fields derivable to the §16.4 conservation law; sizes asserted. |
-| W3-3 | Pagemap (§17.1/§17.2): address→descriptor; small vs large; released-retained metadata. | L | | P-Map-001..006 unit tests; lookup sound vs Lean (`pagemap_lookup_sound`). |
+| W3-3a | Pagemap data structure: multi-level radix keyed by allocator-page, O(1) lookup, full address-range coverage; level count chosen for the page size (D4). | L | | lookup is O(1); metadata overhead bounded + documented. |
+| W3-3b | Entry encoding: small (arena/span/sc), large (descriptor), released-retained, external sentinel (P-Map-002/004/005). | M | ∥ | every allocator page maps to exactly one descriptor; non-owned → sentinel. |
+| W3-3c | Concurrent install/update synchronized to span lifecycle (P-Map-006): release-store publish / acquire-load read; generation-guarded so a descriptor is never freed while a classifier may read it (with W3-5, §27.5). | L | | no unsynchronized update (Appendix F); ABA-safe. |
+| W3-3d | Lookup-soundness tests (P-Map-001..006) + differential check vs Lean `pagemap_lookup_sound` (W1-8b). | M | | passes; divergence fails CI. |
 | W3-4 | Pointer classification (§17.5): Null/Small/Large/Interior/Metadata/Released/Quarantined/External. | M | | interior & foreign pointers detected in debug/hardened; base-pointer-only frees enforced. |
 | W3-5 | Generation counters + stale-descriptor protection (§27.5, §16.6). | S | ∥ | reused span bumps generation; debug catches stale ref. |
 | W3-6 | Pagemap↔span synchronization protocol (P-Map-006) used by split/merge (W4) and span lifecycle (W5). | M | | no unsynchronized pagemap update (Appendix F); lock-order respected. |
+
+> **▸ Decomposition — W3-3 (pagemap).** The radix shape is the key design call: a 2- or 3-level radix over
+> allocator-page numbers gives O(1) lookup with bounded, lazily-populated overhead, where a flat array would
+> waste virtual space on 64-bit. The subtle correctness pieces are (P-Map-005) released-but-retained pages
+> keeping enough metadata to forbid reuse without recommit, and (P-Map-006 / §27.5) publishing entries with
+> release/acquire ordering plus a generation so a concurrent `free`-classification can never follow a stale
+> pointer to a recycled descriptor. **Pitfall:** updating the pagemap and the span state in *different*
+> critical sections is the classic use-after-free in pointer classification — W3-6 owns that single protocol
+> and W4-2b/W5-5 must both call through it.
 
 ---
 
@@ -452,12 +490,16 @@ descriptors, and pointer classification.
 degenerate single-authority case that the seLe4n provider (W22) generalizes.
 **SPEC:** §18 (whole), §20 (dirty/muzzy/retained/released), §23 (hooks shape), §36.6 (the contract the seam
 must also satisfy), M-004/M-005.
-**Depends on:** W3. **Enables:** W5, W9, W11, W22.
+**Depends on:** W0 for **W4-1 (the trait + stubs is an M0 deliverable and must not depend on the pagemap)**;
+W3 for **W4-2 onward** (extent ops install/update pagemap entries). **Enables:** W5, W9, W11, W22.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W4-1 | **Define `TopoBackingProvider`** (§3 box ≅ §36.6) with POSIX + `Sele4nSim` stub impls; provider-state machine type (§36.6 ordering). The seLe4n impl skeleton compiles against the real `sele4n-abi`/`sele4n-types` (D8). | M | | trait compiles; M0 skeleton runs over either provider; seLe4n side type-checks against the pinned upstream crates. |
-| W4-2 | Extent descriptor + ops (§18.2/§18.3): alloc/split/merge/commit/decommit/purge_lazy/purge_forced/release with pre/postconditions mirrored in Lean (W1-8). | L | | split/merge rules (§18.4) enforced; disjointness preserved; unit tests. |
+| W4-2a | Extent descriptor (§18.2) + free-extent index (by size and by address) to support coalescing. | M | | index supports best/first-fit + neighbor lookup. |
+| W4-2b | `alloc` + `split` (§18.4): both results page-aligned; metadata installed *before* publication; pagemap update atomic wrt readers (via W3-6). | M | | split rules enforced; no torn publish. |
+| W4-2c | `merge`/coalesce (§18.4): adjacency, arena-compatibility, state-compatibility, hugepage-accounting update, no stale descriptors visible to classification. | M | ∥ | merge rules enforced; mirrors W1-8a. |
+| W4-2d | `commit`/`decommit`/`purge_lazy`/`purge_forced`/`release` with pre/postconditions mirrored in Lean (W1-8c); enforces M-004 (no live in released) and M-005 (recommit before use). | M | | preconditions checked; failure leaves state well-formed (W4-5). |
 | W4-3 | POSIX physical-state mapping (§20.4): `madvise`/`mprotect` for dirty/muzzy/released; retain-vs-unmap policy (§20.5). | M | ∥ | platform mapping documented; states reconcile in stats. |
 | W4-4 | Large allocation path (§18.5) + region cache hook point (§18.6, filled by W11). | M | | large allocs bypass small caches; round-overflow safe. |
 | W4-5 | Backend failure semantics: every op fallible, leaves state well-formed (mirrors §36.6 "failure leaves state well-formed"). | S | | failure-injection test keeps invariants green. |
@@ -474,13 +516,30 @@ allocator, empty-span detection across caches.
 |---|---|---|---|---|
 | W5-1 | Slab layout (§16.3): `base0 + i*sc.size`, header/bitmap non-overlap, alignment from `size`-multiple-of-`alignment`. | M | | object ranges fit & disjoint (proved-in-Lean shape mirrored by tests). |
 | W5-2 | Free bitmap + `central_free_count = popcount` (§16.4); update count and bitmap in one critical section (§8.5). | M | | invariant test; no torn updates. |
-| W5-3 | **Conservation law + empty-span detection** (§16.4/§16.5): five-term partition; `cache_bitmap` reconstruction in debug; `span_is_empty` accounts for local+transfer+central+quarantine. | L | | B.3 checks pass; a cached object is never misread as live or as empty-eligible. |
-| W5-4 | Central free list keyed `(node, arena, sc)` (§14.5) + label dimension (D2); `remove_batch`/`insert_batch` (§A.4). | L | | C-001..C-004 tested; batches single-arena, single-label, distinct, correct-size. |
+| W5-3a | Encode the five-term partition `object_count = live + local_cached + transfer_cached + central_free + quarantined` (§16.4) as the span accounting model; mark which terms are exact vs reconstructed. | M | | partition documented; no term double-counts. |
+| W5-3b | `central_free_count == popcount(free_bitmap)` maintained atomically with the bitmap (with W5-2) — the authoritative *central-residency* invariant. | M | | invariant holds under all central transitions. |
+| W5-3c | Debug-exact reconstruction of `local_cached`/`transfer_cached` (via `cache_bitmap` or a cache scan) so the conservation law holds *exactly* in debug builds. | M | ∥ | reconstructed counts match observed cache contents. |
+| W5-3d | `span_is_empty(span)`: all four non-central terms zero AND `central_free == object_count`; never reads a cached free object as live (§8.4/§16.5). | M | | predicate correct; B.3 empty-detection check passes. |
+| W5-3e | Empty-detection trigger protocol: re-evaluate on central insert (flush) and on cache drain so a newly-emptied span is detected and returned, never stranded. | M | | a span emptied only by the *last* cache flush is detected + returned (test). |
+| W5-4a | Central structure keyed `(node, arena, label, sc)` (§14.5, D2): partial-span list + empty-span cache + span occupancy counters. | M | | C-001/C-002 hold by construction. |
+| W5-4b | `remove_batch` (§A.4 / A.2 loop): pull from partial spans, activate an empty/backend span on demand, carve a batch, update counts; return empty so the caller can request a new span and retry. | M | | batch single-arena/label, distinct, correct-size; OOM-retry path exercised. |
+| W5-4c | `insert_batch`: return objects, update bitmap+count atomically (W5-3b), run empty-detection (W5-3e) on affected spans. | M | | C-003/C-004: empty detected, non-empty never returned. |
+| W5-4d | Locking/sharding (§14.5) under the lock hierarchy (W16-1); per-`(node,sc)` shards to cut contention. | M | ∥ | no lock-order violation; contention measured. |
 | W5-5 | Span activation/return-to-backend (§14.6 C-003/C-005) with lock-order discipline (§27.2). | M | | empty spans returned; non-empty never returned; no lock-order violation. |
 
-> **Critical-path note:** W5-3 is flagged by the SPEC as "one of the hardest accounting problems." Budget it
-> generously and pair it with debug reconstruction in the *same* WU; do not let performance builds drift from
-> the debug-exact conservation law.
+> **▸ Decomposition — W5-3 (empty-span detection), the hardest accounting in the allocator (§16.5).** The
+> difficulty: an object cached in a per-CPU/thread/transfer cache is *free* but invisible to its span — its
+> bitmap bit is 0, exactly like a live object's. So liveness cannot be read off the bitmap, and a span is
+> empty only once *every* cache has also released its objects. Chosen strategy: keep
+> `free_bitmap`/`central_free_count` authoritative for *central* residency (cheap, exact, hot-path) and
+> reconstruct `local_cached`/`transfer_cached` only in debug (W5-3c), where the full conservation law is
+> checked exactly; performance builds therefore detect emptiness *eventually*, at the W5-3e trigger points
+> (central insert + cache drain), instead of paying a per-span counter on every cache push/pop.
+> **Two failure modes, both tested:** (1) a *leak* — a truly-empty span is never re-checked and never
+> returned; (2) far worse, a span declared empty while a cache still holds one of its objects, which would let
+> the backend recycle *live* memory. W5-3d/3e + the B.3 debug check + differential tests (W21-2) guard both.
+> **Sequencing:** there are no caches to account for until M2, so land W5-3a/b/d at M1 (central-only) and
+> complete W5-3c/3e in M2 when caches arrive.
 
 ---
 
@@ -494,7 +553,9 @@ allocator, empty-span detection across caches.
 |---|---|---|---|---|
 | W6-1 | Thread cache fallback (§13): per-`(arena,sc,label)` lists; GC on exit/pressure/budget (§13.3); arena-reset drain precondition (§13.4). | M | | thread-exit flush; budget bounded (B.2). |
 | W6-2 | Transfer cache `(domain, arena, sc, label)` with `Batch` (§14.2); distinct/correct/free guarantee. | M | ∥ | batch invariants tested. |
-| W6-3 | Refill/flush (§14.3/§14.4) with **hand-over-hand** locking (§27.2) — never hold two middle-end locks. | L | | refill/flush conservation matches Lean (W1-6); lock-order checker clean. |
+| W6-3a | Refill (§14.3): try transfer-cache batch → central batch (W5-4b) → new span; push the batch to the cpu/thread cache. **Hand-over-hand:** release the transfer lock before taking the central lock. | M | | never holds two middle-end locks; conservation matches W1-6c. |
+| W6-3b | Flush (§14.4): pop a batch from the cache → transfer cache if it has capacity, else central (W5-4c); same hand-over-hand discipline. | M | ∥ | lock-order checker clean; conservation matches W1-6c. |
+| W6-3c | Wire empty-span detection (W5-3e) into flush-to-central; debug conservation check (B.2). | S | | a flush that empties a span triggers detection. |
 | W6-4 | Per-CPU cache structure + **locked** per-CPU mode (§11.2–§11.5) as the RSEQ-free correct baseline. | M | | hard-capacity invariant (§11.5) holds; ready as RSEQ fallback. |
 | W6-5 | Cache budget controller v1 (§11.5, P-005): adapt to miss/overflow counts; global budget + per-CPU soft/hard. | M | ∥ | budget honored; stats expose miss/overflow. |
 | W6-6 | Arena routing per D6 (§11.7): bound-arena fast path now; arena-qualified `(cpu,arena,sc)` slots wired for M4. | M | | free always returns to owning arena's structures (safety, §11.7); alloc from A returns only A's objects. |
@@ -511,11 +572,27 @@ for seLe4n (§36.10), behind one front-end interface with a proven abort case.
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W7-1 | RSEQ registration + availability detection per thread (§12.3); initial-exec TLS interplay (§27.6, see W16-2). | M | | registered on Linux; clean fallback when absent (P-003). |
-| W7-2 | x86-64 restartable push/pop sequences (§11.3/§11.4) with abort handler leaving state unchanged. | L | | forced-migration test: no lost/duplicated object vs locked mode. |
-| W7-3 | AArch64 restartable push/pop sequences + abort handler. | L | ∥ | same as W7-2 on AArch64. |
+| W7-2a | RSEQ critical-section descriptors + abort-handler trampolines in a dedicated section; register the rseq area per thread. | M | | cs table present; abort vector wired. |
+| W7-2b | x86-64 `rseq_pop` (load cpu → load head → single committing store); abort ⇒ logical no-op. | M | | pops one or reports empty; abort unchanged. |
+| W7-2c | x86-64 `rseq_push` (capacity check → store → commit index); abort ⇒ no-op. | M | ∥ | pushes one or reports full; abort unchanged. |
+| W7-2d | Clobber/barrier docs + compiler-fence discipline; audit/lint that no call or faulting ref occurs inside a CS (§12.3). | S | | documented; lint passes. |
+| W7-2e | x86-64 equivalence vs locked mode under forced migration (feeds W7-6). | M | | no lost/duplicated object vs locked (G-fast). |
+| W7-3a | AArch64 `rseq_pop`/`rseq_push` + abort handler (commit-store model); shares the arch with the seLe4n RPi5 target. | L | ∥ | pop/push correct; abort unchanged. |
+| W7-3b | AArch64 clobber/barrier docs + no-call/no-fault-in-CS audit. | S | ∥ | documented; lint passes. |
+| W7-3c | AArch64 equivalence vs locked under forced migration (QEMU). | M | ∥ | matches locked (G-fast). |
 | W7-4 | Non-owner coordination (§27.4): flushing an idle CPU vs owner RSEQ (epoch/stop-the-world/per-CPU lock). | M | | concurrent flush-vs-fastpath stress clean. |
 | W7-5 | seLe4n pinned-thread per-core mode (§36.10 option 1) behind the same front-end contract; abort/no-change case. | M | | migration flush/hand-off correct; `per_core_cache_abort_no_change` mirrored in tests. |
 | W7-6 | RSEQ test battery (§34.5): migration, signal near sequence, preemption, registration failure, compare-vs-locked. | M | | all pass in CI (QEMU where needed). |
+
+> **▸ Decomposition — W7-2/W7-3 (per-arch restartable sequences).** This is the only hand-written assembly in
+> the allocator and its highest-risk performance code, so each sequence is its own reviewable unit with its
+> own equivalence test. Non-negotiable rules (§12.3): the critical section contains no calls and no
+> possibly-faulting memory reference; the abort handler restores a logical no-op; the only state-changing
+> instruction is the single commit store at the end, so an abort before commit is invisible. Each sequence is
+> validated *two* ways — the Lean RSEQ contract (W1-7) with its abort/empty/success + frame condition, and a
+> forced-migration differential test against the locked baseline (W6-4) that must show identical object
+> movement. **Why pop/push/abort are separate units:** they fail differently (pop underflows, push overflows,
+> abort retries) and the SPEC requires these be *distinct* outcomes, never conflated (§33.5).
 
 ---
 
@@ -523,7 +600,9 @@ for seLe4n (§36.10), behind one front-end interface with a proven abort case.
 **Goal:** the standards-correct public surface, including errno/C23 semantics and C++ operators, exported
 from the Rust core.
 **SPEC:** §10 (whole), §5.1 (F-001..F-009), §9.6 (zero-size), §25 (realloc/aligned cross-ref), §35.2/§35.3.
-**Depends on:** W2, W3, W5 (free path), W6 (fast path). **Enables:** every consumer + tests.
+**Depends on:** W2, W3, W5 — **the M1 public path allocates/frees through the central list under the global
+lock; it does *not* depend on W6.** W6 is wired in as the per-CPU fast path at M2 (W16-4 handles the
+global-lock→fast-path transition). **Enables:** every consumer + tests.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
@@ -550,10 +629,27 @@ from the Rust core.
 | W9-1 | Arena descriptor (§22.2) extended with `authority_cap`, `label`, `quota` (§36.4); trivial ambient values on POSIX. | M | | POSIX default arena works; fields present for seLe4n. |
 | W9-2 | Arena states + lifecycle (§22.3): Initializing/Active/Draining/Resetting/Destroyed; allocations only in Active. | M | | illegal-state ops rejected; tested. |
 | W9-3 | Create/configure (§22.4, F-005/F-006): validate policy, metadata from safe arena, hooks installed before first extent, publish id only after init. | M | | creation order enforced; default-arena policy (F-006) covers no-extended-API programs. |
-| W9-4 | Reset (§22.5) + destroy (§22.6): cache-drain/invalidate precondition; isolation preserved. | L | | `arena_reset/destroy` tests; isolation invariant §22.7. |
+| W9-4a | State transitions Active→Resetting/Draining + precondition checks (no active allocators; explicit, not the default arena unless special mode) (§22.5). | M | | illegal reset rejected; tested. |
+| W9-4b | Cache drain/invalidate of *every* per-CPU/thread/transfer cache holding the arena's objects (uses W6 routing) — the hard part. | M | | post-drain: no cache holds an arena object (B.5). |
+| W9-4c | Return arena extents to backend/retain per policy; reset accounting; bump reset generation. | M | ∥ | §22.5 postconditions met. |
+| W9-4d | Destroy = reset + metadata removal + id non-reuse-while-stale (§22.6); isolation preserved (§22.7); mirrors W1-9. | M | | `arena_destroy` tests; isolation invariant. |
 | W9-5 | **Capability monotonicity** (§36.4): authority/quota/label monotonic on delegation; attenuation-only. | M | | delegation cannot widen rights/quota or downgrade label; tested (§36.16 quota/authority/label). |
-| W9-6 | **Revocation protocol** (§36.13): DRAINING→flush→drain→unmap→scrub→revoke→delete CSlots→recycle→DESTROYED(gen++); partial failure ⇒ DRAINING/ERROR_QUARANTINED, never DESTROYED. | L | | revocation test: destroyed arena leaves no live caps/mappings/cache objects. |
+| W9-6a | Enter DRAINING: reject new allocations + new delegations; notify participating clients (§36.13). | M | | no new alloc/delegation accepted while draining. |
+| W9-6b | Drain local/transfer caches + central lists; quarantine or reject stale frees. | M | | post-drain inventory empty (shares W9-4b). |
+| W9-6c | Unmap client VSpace windows; scrub dirty pages if cross-label reuse is possible (uses W18-6). | M | ∥ | unmapped before revoke; scrub recorded. |
+| W9-6d | Revoke derived frame/mapping caps; delete CSlots; recycle untyped to free pools (provider `revoke_descendants`/`recycle_untyped`). | M | | no live derived cap/mapping remains. |
+| W9-6e | Finalize DESTROYED + generation++; **partial failure ⇒ DRAINING/ERROR_QUARANTINED, never DESTROYED**; emergency allocs never depend on a destroying arena. | M | | revocation test (§36.16); mirrors `destroy_revokes_descendants` (W1-12c). |
 | W9-7 | NUMA policy modes (§15.5) + binding-failure visibility in stats. | M | ∥ | local/interleave/bind/arena_policy/OS_default supported; failures surfaced. |
+
+> **▸ Decomposition — W9-6 (arena revocation), the seLe4n-critical lifecycle.** Ordering is the whole game:
+> the protocol must *unmap before revoke before recycle*, because recycling untyped backing while a client
+> mapping or derived capability still exists would hand live authority to another security domain. Each step
+> is its own unit so a partial failure stops cleanly — the arena lands in DRAINING/ERROR_QUARANTINED, never
+> DESTROYED, and never with a half-revoked CSpace. The scrub step (W9-6c → W18-6) is what makes cross-label
+> reuse safe (§36.12) and is skippable only when the reused-at label is ≥ the old label. **Pitfall:** draining
+> *all* caches (W9-6b, shared with W9-4b) is the same hard search as empty-span detection — an object can hide
+> in any per-CPU/thread/transfer cache; bound-arena routing (D6) plus arena-qualified slots (M4) make it
+> tractable. Mirrors Lean `destroy_revokes_descendants` (W1-12c); on the M4 G-arena gate.
 
 ---
 
@@ -579,11 +675,20 @@ behind the provider seam.
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W11-1 | HugeAllocator + HugeCache (§19.2). | M | | hugepage-aligned reservations; empty-backed cache reuse. |
-| W11-2 | HugePageFiller + bins (§19.3/§19.4): each hugepage in exactly one bin; bin matches occupancy. | L | | H-003 tested; scoring approximated via bins. |
+| W11-2a | Bin set (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/cold_sparse/hot_dense) as the filler structure; each hugepage in exactly one bin; bin transitions on occupancy change. | M | | H-003: bin membership consistent with occupancy. |
+| W11-2b | Candidate selection/scoring (§19.3): approximate-bin scan; packing/locality/lifetime/hotness/release-preservation bonuses minus fragmentation/cross-numa/partial-subrelease penalties. | M | | no full scan of all hugepages; deterministic in test mode. |
+| W11-2c | Bin↔occupancy consistency invariant + tests (H-002/H-003): occupancy bytes equal the sum of contained spans/large allocs. | M | ∥ | invariants checked in debug (B.4). |
 | W11-3 | RegionCache for awkward sizes (§18.6). | M | ∥ | slightly-larger-than-hugepage allocs avoid full-hugepage rounding waste. |
 | W11-4 | Packing policy (§19.5) + partial-subrelease guards (§19.6/H-005): never intersect a live object; pressure/coldness gated. | M | | partial subrelease only when allowed; recorded as metric. |
 | W11-5 | Coverage metrics (§19.7) exported to stats (W17). | S | ∥ | all §19.7 fields present; `coverage_ratio` computed. |
 | W11-6 | seLe4n large-mapping policy (§36.9): same placement over contiguous normal-frame runs; prefer whole-mapping release. | M | | correct when every backing range is normal pages; Sim test. |
+
+> **▸ Decomposition — W11-2 (hugepage filler).** Splitting *bins* (W11-2a) from *scoring* (W11-2b) matters
+> because the bins are the correctness object (H-003: exactly one bin, consistent with occupancy) while the
+> score is pure policy (§2.4: a wrong score may hurt fragmentation but must never misplace a live object).
+> Bins also let the filler avoid scanning every hugepage (§19.3 "approximate bins"). The seLe4n large-mapping
+> policy (W11-6) reuses the same placement model over contiguous normal-frame runs, so keep scoring inputs
+> backend-agnostic and never assume a hardware hugepage exists.
 
 ---
 
@@ -595,7 +700,9 @@ behind the provider seam.
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W12-1 | Decay config per arena (§20.2) + background purge worker (§20.3): off hot paths, fair, yields under CPU pressure. | M | | no purging on the allocation fast path; backlog in stats. |
-| W12-2 | Release controller step (§21.3/§A.5) honoring priority order + demand reserve (§21.4). | L | | reserve prevents release/refault oscillation (test). |
+| W12-2a | Inputs collection (§21.2): the observation vector (live/rss/dirty/muzzy/coverage, alloc/free/refill rates, cgroup current/max, pressure notifications, NUMA pressure, hints). | M | | all §21.2 inputs sampled cheaply. |
+| W12-2b | Release priority ladder (§21.3/§A.5): drain idle caches → release empty hugepages → purge dirty (not hot) → dirty→muzzy → subrelease cold-sparse → emergency shrink. | M | | ladder applied in order; each step gated by pressure mode (§21.5). |
+| W12-2c | Demand reserve (§21.4) + anti-oscillation: reserve = f(recent rate, peak, refill latency, pressure); prevents release-then-refault. | M | ∥ | refault-loop oscillation test passes. |
 | W12-3 | Pressure modes (§21.5) + **emergency mode** (O-007) + bounded emergency reserve (§36.5). | M | | emergency bypasses optional caches, releases aggressively; reserve never depends on normal heap. |
 | W12-4 | Latency classes (§36.11) annotated on slow paths; arena `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. |
 
@@ -631,7 +738,8 @@ behind the provider seam.
 ### W15 — Reallocation, aligned allocation & calloc zeroing
 **Goal:** correct realloc/aligned/calloc semantics including in-place grow/shrink and zeroing sources.
 **SPEC:** §25 (whole), §26 (whole), §9.7.
-**Depends on:** W3 (classify), W4 (extent grow), W8. **Enables:** M1 (basic), M5 (in-place via extents).
+**Depends on:** W2 (size classification), W3 (pointer classification), W4 (extent grow/shrink), W8.
+**Enables:** M1 (basic), M5 (in-place via extents).
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
@@ -650,11 +758,13 @@ behind the provider seam.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W16-1 | **Lock hierarchy** (§27.2) front-end→transfer→central→span→backend→stats; total order; **debug lock-order checker**. | M | | checker fails any out-of-order acquire; refill/flush hold ≤1 middle-end lock. |
+| W16-1a | Encode the lock ranks (front-end<transfer<central<span<backend<stats, §27.2) as a typed/ranked lock wrapper; acquisition records its rank. | M | | every lock has a compile-time rank; refill/flush hold ≤1 middle-end lock by construction. |
+| W16-1b | Debug lock-order checker: a per-thread held-rank stack asserts monotonic acquisition; wired as the G-conc gate. | S | ∥ | any out-of-order acquire fails in debug CI. |
 | W16-2 | **TLS initial-exec model** (§27.6): no `malloc` re-entry on first TLS access; `dlopen` allocation-free bootstrap path. | M | | TLS-recursion test (load via dlopen) does not re-enter allocator. |
 | W16-3 | Atomics ordering map (§27.3): publication=release, consumption=acquire, transitions=acq-rel, stats=relaxed; documented per atomic. | M | ∥ | each atomic annotated; TSan clean. |
 | W16-4 | Single global lock (M1) → fine-grained (M2) migration without correctness regression. | M | | M1 passes with global lock; M2 passes with hierarchy. |
-| W16-5 | fork atfork handlers (§28.1): pre/parent/child; child resets locks + conservative mode. | M | | fork-in-multithread test; child allocates safely. |
+| W16-5a | Pre-fork + parent-post-fork handlers (§28.1): acquire the fork lock + quiesce background threads pre-fork; release + resume in the parent. | M | | parent unaffected; no leaked held lock. |
+| W16-5b | Child-post-fork handler: reset lock states, disable background threads, flush/conservative-mode inconsistent per-CPU state (§28.1). | M | | fork-in-multithread test: child allocates safely; no inherited held lock. |
 | W16-6 | Signal/reentrancy/crash (§28.2–§28.4): document non-async-signal-safety; reentrancy guard; lock-free crash summary. | S | ∥ | reentrancy during init/hooks handled; crash summary needs no lock/alloc. |
 | W16-7 | Initialization phases (§35.4) Phase0–6, each reentrancy-safe; shutdown policy (§35.5). | M | | phased init test; teardown available for tests, leak-by-default in prod. |
 
@@ -670,7 +780,10 @@ profiling — including label-scoped views for seLe4n.
 |---|---|---|---|---|
 | W17-1 | Stats core (§31.1, O-002): all byte classes; epoch/sequence + consistent-snapshot mode (§8.6). | M | | classes reconcile to managed VM modulo documented convention (§8.6). |
 | W17-2 | Snapshot/JSON/print API (§31.2) + flags (SUMMARY/BY_ARENA/BY_SIZE_CLASS/BY_CPU/BY_NUMA/BY_HUGEPAGE). | M | ∥ | JSON matches Appendix D shape; additive-field rule (§35.3). |
-| W17-3 | Sampled heap + lifetime profiling (§31.3/§31.4): no hot-path locks; no recursive malloc in unwinding. | L | | sampling overhead bounded; deallocation of sampled objects safe. |
+| W17-3a | Sampling mechanism (§31.4): per-thread/per-CPU bytes-between-samples counter (Poisson), no hot-path lock. | M | | sampling decision lock-free; rate configurable. |
+| W17-3b | Stack capture on a sampled alloc without recursive malloc (bounded, alloc-free unwind into a fixed buffer). | M | | unwinder never re-enters the allocator (§31.4). |
+| W17-3c | Sampled-object bookkeeping: track sampled live objects, free them safely, right-censored lifetime accounting (§31.4). | M | ∥ | freeing a sampled object is correct + accounted. |
+| W17-3d | Heap + lifetime profile aggregation + dump format (§31.3). | M | ∥ | profiles dumpable; low overhead. |
 | W17-4 | Fragmentation metrics (§31.5) + hugepage coverage (§19.7) wired from W11. | M | ∥ | internal/external/cache/hugepage fragmentation reported. |
 | W17-5 | `topo_explain_memory()` (§31.6). | S | ∥ | returns a human-readable RSS attribution string. |
 | W17-6 | **Label-scoped & redacted stats** (§36.12): low domains cannot infer high-domain patterns. | M | | stats-redaction test (§36.16); `stats_observation_noninterference` mirrored. |
@@ -702,7 +815,10 @@ replay.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W19-1 | Debug invariant checks (§30.2 = Appendix B) as runtime validators. | L | | each B.* item is a callable checker run in debug CI. |
+| W19-1a | Global invariants (B.1): one-owner, live-disjoint, free-structure reachability, page↔descriptor, released-no-live. | M | | each a callable checker; runs in debug CI. |
+| W19-1b | Cache invariants (B.2): capacity/budget, batch distinctness, refill/flush count preservation. | M | ∥ | checkers pass on the M2 cache paths. |
+| W19-1c | Span invariants (B.3): ranges fit/disjoint, sc match, free-count==bitmap, empty-detection across caches, generation. | M | ∥ | checkers pass; consumes W5-3. |
+| W19-1d | Hugepage + arena invariants (B.4/B.5): bins match occupancy, live-bytes sum, reset/destroy drain, hook-install order. | M | ∥ | checkers pass on M4/M5 paths. |
 | W19-2 | Sanitizer integration (§30.3): ASan/MSan/TSan builds; disable custom asm under sanitizers. | M | | sanitizer CI jobs green; no false positives from RSEQ asm. |
 | W19-3 | Deterministic test mode (§30.4): seeded randomness, deterministic refill, reproducible sampling, force-slow-path, trace IDs. | M | ∥ | a trace replays identically; differential runner uses it. |
 
@@ -731,11 +847,23 @@ differential testing against the Lean model.
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W21-1 | Property-test generators (§34.3) for the API op set; properties: no dup live ptr, content preserved, alignment, nonneg stats, ownership conservation. | M | | properties run in CI; shrink to minimal counterexamples. |
-| W21-2 | **Differential testing** (§33.7): emit trace → replay against Lean executable model → assert agreement at boundaries. | L | | a divergence fails CI with the offending op. |
-| W21-3 | Concurrency stress (§34.4): same/mixed sc, cross-thread free, producer/consumer, affinity changes, thread-exit-with-full-cache, purge-during-alloc, rejected arena-reset races. | L | ∥ | runs under TSan; no data races; invariants hold. |
+| W21-2a | Trace capture: instrument the allocator (deterministic mode, W19-3) to emit the §33.7 grammar for every op. | M | | every public op emits a trace line; replayable. |
+| W21-2b | Replay driver: feed the trace to the Lean executable model (W1-10); check `WellFormed` + abstract-outcome agreement at each boundary. | M | | model and impl agree on a recorded corpus. |
+| W21-2c | Divergence reporting: minimal failing op + state diff; wired into CI as a gate. | S | ∥ | a seeded divergence fails CI with the offending op. |
+| W21-3a | Throughput stress (§34.4): many threads, same + mixed size classes, cross-thread free, producer/consumer ownership transfer. | M | ∥ | no data race under TSan; invariants hold. |
+| W21-3b | Adversarial lifecycle (§34.4): affinity changes, thread-exit-with-full-cache, purge-during-alloc, rejected arena-reset races. | M | ∥ | each scenario green; rejected races return errors, not corruption. |
+| W21-3c | Model-checking the lock-free sequences (loom/shuttle-style) where feasible. | M | ∥ | bounded interleavings of push/pop/flush explored. |
 | W21-4 | Memory-pressure + failure-injection (§34.7): cgroup approach, mmap/madvise/retype/map/CSlot/VSpace failures deterministic. | M | ∥ | each failure is deterministic + documented. |
 | W21-5 | Fuzzing (§34.8): API sequences, flags, arena lifecycle, control inputs, stats JSON, hook failures, corrupted metadata harness. | M | ∥ | fuzz targets in CI nightly; corpus committed. |
 | W21-6 | ABI + benchmark suites (§34.6): hot-path throughput, producer/consumer, idle-cache footprint, churn, fragmentation-over-trace, RSS phase changes, tail latency. | M | ∥ | benchmarks reproducible; results schema in `/bench`. |
+
+> **▸ Decomposition — W21-2 (differential testing), the bridge between code and proof.** This is what makes
+> the Lean model load-bearing rather than decorative (R9): the implementation and the executable model
+> (W1-10) must agree on every operation's abstract outcome and on `WellFormed` at each boundary. Splitting
+> capture/replay/reporting lets capture ride on deterministic mode (W19-3) and lets the replay driver evolve
+> with the model. **Why high-value:** one divergence localizes a bug to a single operation with a minimal
+> trace — far cheaper than a crash three million allocations later. It runs against *both* backends, so a
+> POSIX↔Sim behavioral difference is caught here too.
 
 ---
 
@@ -751,20 +879,42 @@ kernel in QEMU.
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W22-0 | **Bind to the real ABI:** add `sele4n-abi`/`sele4n-types`/`sele4n-sys` as pinned deps (D8); map `TopoBackingProvider` ops → `SyscallId`/`TypeTag` retype + page map/unmap with `AccessRights`/`PagePerms`; map the §36.14 `TOPO_ERR_*` taxonomy onto `KernelError`/`KernelResult`. | M | | provider + Sim share the real types; the op→syscall and error-mapping tables are reviewed; workspace type-checks against the pinned upstream. |
-| W22-1 | **`Sele4nSim`**: host-side deterministic simulator implementing the *same* `invoke_syscall`/`SyscallId`/`TypeTag`/`AccessRights`/`KernelError` surface as `sele4n-abi`/`sele4n-types` (untyped/retype/map/unmap/revoke/CSpace/VSpace; §36.6 state machine); trace-replayable. | L | | M1 slice runs over Sim identically to POSIX; Sim and the real provider share one type surface; replays against Lean bridge. |
+| W22-1a | Model kernel objects on the host: untyped pool, CNode/CSlots, frames, VSpace — typed with `CPtr`/`Slot`/`ObjId`/`TypeTag`/`AccessRights` from `sele4n-types`. | M | | object model uses the real types; deterministic. |
+| W22-1b | Implement `invoke_syscall` dispatch for the retype/map/unmap/delete/revoke `SyscallId`s deterministically; return `KernelResult`/`KernelError`. | L | | each modeled syscall matches the real ABI signature + error space. |
+| W22-1c | Enforce the provider state machine (§36.6) + provenance: every frame descends from authorized untyped; device/DMA isolation. | M | | illegal transitions rejected as `KernelError`; provenance recorded. |
+| W22-1d | Trace emit + replay hook so the Sim participates in differential testing against the Lean bridge (W21-2, W1-11). | M | ∥ | Sim traces replay against the bridge model. |
 | W22-2 | Capability authority set (§36.4): `TopoHeapServiceCap/ArenaCap/BackingCap/ControlCap/StatsCap/EmergencyCap`; attenuation. | M | ∥ | authority checks enforced; monotonicity tests (W9-5). |
 | W22-3 | CSlot/VSpace accounting (§36.8) + clean exhaustion errors (`TOPO_ERR_CSPACE_EXHAUSTED`/`VSPACE_EXHAUSTED`). | M | | exhaustion tests (§36.16) fail cleanly, never borrow authority. |
 | W22-4 | Backing-state mapping (§36.7): Topo states ↔ seLe4n resource states; `Released`=revoked+recycled. | M | | state-mapping tests; no cross-label reuse without scrub+revoke. |
-| W22-5 | TopoResourceServer (§36.3.1): owns untyped/CSlots/VSpace authority; arena create/quota/purge/stats over IPC; boots in simulation. | L | | server boots on Sim (S2); deterministic trace replay. |
-| W22-6 | libtopomalloc-sele4n client (§36.3.2): local caches, slow-path batching to server, correct even if server denies. | L | ∥ | denial paths (quota/CSlot/VSpace/policy) handled; client never assumes server success. |
+| W22-5a | Server state (§36.3.1): untyped inventory, CSlot/VSpace accounting (W22-3), per-arena quota ledger. | M | | state model + accounting consistent. |
+| W22-5b | IPC request handlers (arena create/quota/purge/stats/backing) over `MessageInfo`/`IpcBuffer`; per-cap authorization (W22-2). | L | | each request authorized by capability; denials explicit. |
+| W22-5c | Boot/init integration (with W22-7) + emergency reserve allocated before clients. | M | | server boots on Sim (S2); reserve independent of normal heap. |
+| W22-5d | Maintenance scheduling: resumable revoke/scrub chunks per latency classes (§36.11, W12-4). | M | ∥ | maintenance never blocks a client critical path unboundedly. |
+| W22-6a | Client-side caches + local metadata for already-mapped objects; the no-IPC fast path (§36.3.2/§36.11). | M | ∥ | common-path malloc/free issue no IPC. |
+| W22-6b | Slow-path batching to the server; correct on denial (quota/CSlot/VSpace/policy/pressure). | M | | every denial class handled; client never assumes success. |
+| W22-6c | Flush/quarantine before arena destroy, capability revocation, thread migration, or domain transfer. | M | ∥ | caches drained before any such event (ties W9-6b). |
 | W22-7 | Boot inventory + largest-first retype (§36.5): classify device/DMA/normal; emergency reserve before clients; provenance recorded. | M | | boot-inventory + largest-first tests (§36.16); device memory never in normal pool. |
-| W22-8 | Information-flow labels end-to-end (§36.12): partition caches/central/backend by label unless authorized declassify. | L | | `label_partition_preserved` mirrored; cross-label mixing blocked. |
+| W22-8a | Label type + arena label assignment; partition local/transfer/central/backend pools by label (§36.12). | M | | pools never mix labels by construction. |
+| W22-8b | Cross-label reuse gate: high→low reuse only after scrub+revoke (W18-6/W9-6c); enforced at the central/backend boundary. | M | | cross-label reuse blocked without scrub (§36.16). |
+| W22-8c | Label-scoped stats/profiling (with W17-6) + non-interference test (mirrors `stats_observation_noninterference`, W1-12d). | M | ∥ | low domain cannot infer high-domain patterns. |
 | W22-9 | seLe4n API surface (§36.14): bootstrap/create/delegate/mallocx_arena/destroy/snapshot + full error taxonomy. | M | ∥ | every error class reachable + tested; C++ maps selected errors to `bad_alloc`. |
 | W22-10 | Adapters (§36.15): VKA-like, VSpace, allocman-like, Rust `GlobalAlloc`, C++ ABI on seLe4n. | M | ∥ | each adapter passes a compatibility test (S7). |
 | W22-11 | Deployment profiles (§36.18): static fixed-arena, dynamic-service, kernel-adjacent bootstrap (bump-only). | M | | fixed-arena needs no runtime retype; bootstrap profile has no general free. |
-| W22-12 | **Run on the real kernel:** switch the execution target from `Sele4nSim` to real `invoke_syscall`; boot `TopoResourceServer` in QEMU/RPi5. The provider API is unchanged since W22-0/M1. | L | | the real-kernel vertical slice passes the same suite Sim passed, in QEMU. |
-| W22-13 | seLe4n test suite (§36.16) + bridge theorem checklist (§36.17) wired to CI as gates. | L | | all §36.16 tests + single-core §36.17 families gate M8. |
+| W22-12a | Feature-flag the backend to select real `invoke_syscall` vs `Sele4nSim`; build `topo-backend-sele4n` against the real kernel ABI. | M | | both targets build; selection is one flag. |
+| W22-12b | Boot `TopoResourceServer` in QEMU; serve a minimal client; vertical-slice malloc/free works on the real kernel. | L | | server boots in QEMU; client allocates/frees. |
+| W22-12c | Run the §36.16 suite in QEMU; fixed-arena profile needs no runtime retype; dynamic exhaustion clean. | L | | §36.16 green on the real kernel (G-sele4n). |
+| W22-13a | §36.16 test list realized as concrete tests on Sim (then reused in QEMU at W22-12c). | M | | every §36.16 bullet has a test. |
+| W22-13b | Wire the single-core §36.17 theorem families (from W1-12) as CI gates for M8. | S | ∥ | G-sele4n requires the families proved. |
 
+> **▸ Decomposition — W22-1 (`Sele4nSim`) and why it is split from W22-0.** W22-0 *binds the types* (compile
+> against `sele4n-abi`/`sele4n-types`, map ops→`SyscallId`/`TypeTag` and errors→`KernelError`); W22-1
+> *implements the behavior* of those syscalls on the host. Keeping them separate means the type/error mapping
+> is reviewed once and frozen, and the Sim's behavior (W22-1b, the largest piece) can evolve without
+> re-touching the seam. The Sim must enforce the same *failures* the real kernel does — provenance
+> (every frame descends from untyped, W22-1c), authority, and the §36.6 transition order — or it gives false
+> confidence; that is why W22-1c is its own unit and why the Sim participates in differential replay (W22-1d).
+> At M8 only the execution target changes (W22-12a, a feature flag); the suite (W22-13a) is reused verbatim.
+>
 > **Risk-front-loading (D2):** W22-0 (bind to the real ABI) + W22-1 (`Sele4nSim`) are the linchpins that make
 > "seLe4n co-equal from the start" real without hardware: the provider type-checks against the actual
 > `sele4n-abi`/`sele4n-types` from M1, and the host Sim shares that exact surface for execution. Both land in
@@ -784,7 +934,8 @@ kernel in QEMU.
 | W23-2 | Mixed-allocator detection (§35.2): TopoMalloc-frees-only-TopoMalloc; foreign-pointer detection in hardened/debug. | M | ∥ | foreign free fails safely in hardened. |
 | W23-3 | ABI stability (§35.3): stable C names/struct ABI, opaque handles, additive stats fields; ABI test in CI. | M | | ABI test pins the surface across a release series. |
 | W23-4 | Packaging + docs site (mdbook): deployment, profiles, tuning, ABI, seLe4n integration guide. | M | ∥ | `cargo xtask docs` builds the site; published artifact. |
-| W23-5 | Perf validation (§36.19 S9): RPi5/QEMU vs static pools + allocman-like baseline; POSIX vs jemalloc/TCMalloc micro + workload. | L | | results recorded in `/bench`; targets met or documented as open. |
+| W23-5a | POSIX perf vs jemalloc/TCMalloc: micro-benchmarks + workload replays (§34.6); record in `/bench`. | M | ∥ | reproducible; targets met or documented as open. |
+| W23-5b | seLe4n perf (§36.19 S9): RPi5/QEMU vs static pools + an allocman-like baseline. | L | ∥ | reproducible; recorded in `/bench`. |
 
 ---
 
@@ -922,8 +1073,8 @@ In strict order, the first concrete moves that begin executing this plan:
    (D8) so the seLe4n provider stub type-checks against the real ABI; Lean skeleton + **empty bridge
    package**; the `TopoBackingProvider` trait with POSIX + `Sele4nSim` stubs; and the bump-allocating
    **walking skeleton** — closing **M0**.
-6. **W1-4 (start) + W2-1** — the size-class model + generator (the single source of truth), because it gates
-   M1 and is the longest pole in the Core floor.
+6. **W1-4a (start) → W1-4e + W2-1** — the size-class model + generator (the single source of truth), because
+   it gates M1 and is the longest pole in the Core floor. Begin W1-4a in M0; W1-4d/4e gate W2 and M1.
 
 Everything else follows the milestone ladder in §5.
 
