@@ -14,8 +14,10 @@
 //! accident.
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::cell::Cell;
 use core::ffi::{c_char, c_void};
 use core::ptr;
+use std::alloc::System;
 use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
@@ -98,12 +100,43 @@ fn selected_backend_name() -> String {
     std::env::var("TOPOMALLOC_BACKEND").unwrap_or_else(|_| "posix".into())
 }
 
+thread_local! {
+    /// Set while this thread is initializing [`GLOBAL`]. When `TopoMallocGlobal`
+    /// is the process `#[global_allocator]`, the allocations the initializer makes
+    /// (reading the backend env var, reserving the backing heap, the provider's
+    /// bookkeeping) would otherwise route back through this same allocator and
+    /// re-enter `global()`, deadlocking the `OnceLock`. While the flag is set the
+    /// adapter serves those allocations straight from the system allocator.
+    static BOOTSTRAPPING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII marker that sets [`BOOTSTRAPPING`] for the duration of `GLOBAL`
+/// initialization and clears it on the way out — even if the initializer panics.
+struct BootstrapGuard;
+
+impl BootstrapGuard {
+    fn enter() -> Self {
+        BOOTSTRAPPING.with(|b| b.set(true));
+        BootstrapGuard
+    }
+}
+
+impl Drop for BootstrapGuard {
+    fn drop(&mut self) {
+        BOOTSTRAPPING.with(|b| b.set(false));
+    }
+}
+
 /// The lazily-initialized global allocator, or `None` if the skeleton heap could
 /// not be reserved. The result is memoized: a process that cannot reserve the
 /// heap once keeps reporting OOM (a null `malloc`) rather than retrying.
 fn global() -> Option<&'static AnyAllocator> {
     GLOBAL
         .get_or_init(|| {
+            // `_guard` is declared first, so it drops *last* — after `name` and any
+            // other init-path temporaries have been allocated and freed through the
+            // system allocator — and only then clears the bootstrap flag.
+            let _guard = BootstrapGuard::enter();
             let name = selected_backend_name();
             new_allocator_named(&name, SKELETON_HEAP_BYTES)
                 .or_else(|| new_allocator_named("posix", SKELETON_HEAP_BYTES))
@@ -153,10 +186,14 @@ pub extern "C" fn topomalloc_calloc(n: usize, size: usize) -> *mut c_void {
 }
 
 /// `void* topomalloc_aligned_alloc(size_t alignment, size_t size)` (§25.5).
-/// `alignment` must be a power of two; otherwise null.
+/// `alignment` must be a power of two and `size` an integer multiple of it;
+/// otherwise null.
 #[no_mangle]
 pub extern "C" fn topomalloc_aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
-    if !alignment.is_power_of_two() {
+    // §25.5: validate the power-of-two alignment *and* the C `aligned_alloc`
+    // size-multiple constraint. `alignment` is a power of two here (hence
+    // nonzero), so `is_multiple_of` is well-defined.
+    if !alignment.is_power_of_two() || !size.is_multiple_of(alignment) {
         return ptr::null_mut();
     }
     global().map_or(ptr::null_mut(), |a| {
@@ -187,21 +224,40 @@ pub extern "C" fn topomalloc_backend() -> *const c_char {
     }
 }
 
-/// The Rust [`GlobalAlloc`] adapter (D1). Provided for opt-in use as
-/// `#[global_allocator]`; it is intentionally **not** registered here so it
-/// never replaces a test or dependent crate's allocator.
+/// The Rust [`GlobalAlloc`] adapter (D1). Suitable for opt-in use as the process
+/// `#[global_allocator]`: the first allocation lazily initializes the skeleton
+/// heap, and a per-thread bootstrap guard serves the initializer's own
+/// allocations from the system allocator so it cannot deadlock (see [`global`]).
+/// It is intentionally **not** registered here, so linking this crate never
+/// replaces a test or dependent crate's allocator.
 pub struct TopoMallocGlobal;
 
 // SAFETY: `alloc` returns either null or a pointer to at least `layout.size()`
-// bytes aligned to `layout.align()` (the skeleton honors both); `dealloc`
-// accepts any pointer `alloc` returned (it leaks in M0, which is sound — leaking
-// is always memory-safe). These satisfy the `GlobalAlloc` contract.
+// bytes aligned to `layout.align()`. During `GLOBAL` initialization it forwards
+// to the system allocator (so a re-entrant init allocation cannot deadlock);
+// otherwise it serves from the skeleton. `dealloc` returns each pointer to the
+// allocator that produced it — `System` within the bootstrap window, the skeleton
+// otherwise (which leaks in M0, and leaking is always memory-safe). These satisfy
+// the `GlobalAlloc` contract.
 unsafe impl GlobalAlloc for TopoMallocGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if BOOTSTRAPPING.with(|b| b.get()) {
+            // Inside `GLOBAL` init: the skeleton heap does not exist yet, so serve
+            // this init-path allocation from the system allocator and never
+            // re-enter `global()`.
+            // SAFETY: `layout` is forwarded unchanged to the system allocator.
+            return unsafe { System.alloc(layout) };
+        }
         global().map_or(ptr::null_mut(), |a| a.malloc(layout.size(), layout.align()))
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if BOOTSTRAPPING.with(|b| b.get()) {
+            // SAFETY: every allocation made during bootstrap came from `System`, so
+            // one freed in that same window is returned to `System` with its
+            // original `layout`.
+            return unsafe { System.dealloc(ptr, layout) };
+        }
         if let Some(a) = global() {
             a.free(ptr);
         }
@@ -241,12 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn aligned_alloc_honors_alignment() {
-        let p = topomalloc_aligned_alloc(4096, 100);
+    fn aligned_alloc_honors_alignment_and_size_multiple() {
+        // Size is an integer multiple of the power-of-two alignment: succeeds.
+        let p = topomalloc_aligned_alloc(4096, 8192);
         assert!(!p.is_null());
         assert_eq!(p as usize % 4096, 0);
         topomalloc_free(p);
-        assert!(topomalloc_aligned_alloc(3, 100).is_null()); // not power of two
+        assert!(topomalloc_aligned_alloc(3, 64).is_null()); // alignment not power of two
+        assert!(topomalloc_aligned_alloc(256, 100).is_null()); // size not a multiple (§25.5)
     }
 
     #[test]

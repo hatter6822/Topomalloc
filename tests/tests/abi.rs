@@ -31,9 +31,13 @@ fn calloc_overflow_returns_null() {
 }
 
 #[test]
-fn aligned_alloc_rejects_non_power_of_two() {
+fn aligned_alloc_validates_alignment_and_size() {
+    // Alignment must be a power of two (§25.5).
     assert!(topomalloc_aligned_alloc(24, 64).is_null());
-    let p = topomalloc_aligned_alloc(256, 64);
+    // Size must be an integer multiple of the alignment (§25.5).
+    assert!(topomalloc_aligned_alloc(256, 64).is_null());
+    // A conforming request: size is a multiple of the power-of-two alignment.
+    let p = topomalloc_aligned_alloc(256, 512);
     assert!(!p.is_null());
     assert_eq!(p as usize % 256, 0);
     topomalloc_free(p);

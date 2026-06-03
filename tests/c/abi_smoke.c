@@ -40,11 +40,13 @@ int main(void) {
     topomalloc_free(z);
     assert(topomalloc_calloc((size_t) -1, 2) == NULL);
 
-    /* aligned_alloc: honors alignment; rejects non-powers-of-two */
-    void *a = topomalloc_aligned_alloc(256, 100);
+    /* aligned_alloc: honors alignment; rejects non-power-of-two alignment and
+       sizes that are not an integer multiple of the alignment (SPEC 25.5). */
+    void *a = topomalloc_aligned_alloc(256, 512);
     assert(a != NULL && ((size_t) a % 256u) == 0u);
     topomalloc_free(a);
-    assert(topomalloc_aligned_alloc(3, 100) == NULL);
+    assert(topomalloc_aligned_alloc(3, 64) == NULL);    /* alignment not power of two */
+    assert(topomalloc_aligned_alloc(256, 100) == NULL); /* size not a multiple */
 
     /* generated table header is consistent and usable from C */
     assert(TOPOMALLOC_QUANTUM == 16u);

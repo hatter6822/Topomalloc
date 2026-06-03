@@ -5,10 +5,10 @@
 //! plan 08 W21-6). These exist so the harness is wired from M0.
 #![allow(missing_docs)] // criterion's generated harness fns have no public API
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 
-use topo_abi::topomalloc_malloc;
-use topo_core::{classify, size_class};
+use topo_abi::new_allocator_named;
+use topo_core::{classify, size_class, MIN_ALIGN};
 
 fn bench_size_class(c: &mut Criterion) {
     c.bench_function("size_class(64,16)", |b| {
@@ -22,19 +22,21 @@ fn bench_classify(c: &mut Criterion) {
     });
 }
 
-fn bench_c_abi_malloc(c: &mut Criterion) {
-    c.bench_function("topomalloc_malloc(64)", |b| {
-        b.iter(|| {
-            let p = topomalloc_malloc(black_box(64));
-            black_box(p);
-        })
+fn bench_malloc(c: &mut Criterion) {
+    // The M0 skeleton leaks on free, so a single shared heap would be exhausted by
+    // a long run and we'd end up timing the OOM/null path. Measure each `malloc`
+    // against a freshly reserved local heap instead: the bump allocator's cost is
+    // independent of how full it is, so one allocation per fresh heap is
+    // representative and never starves. A reclaiming steady-state bench arrives
+    // with plan 08 W21-6.
+    c.bench_function("malloc(64) [fresh skeleton]", |b| {
+        b.iter_batched_ref(
+            || new_allocator_named("posix", 16 * 1024).expect("reserve skeleton heap"),
+            |a| black_box(a.malloc(black_box(64), MIN_ALIGN)),
+            BatchSize::NumIterations(256),
+        )
     });
 }
 
-criterion_group!(
-    benches,
-    bench_size_class,
-    bench_classify,
-    bench_c_abi_malloc
-);
+criterion_group!(benches, bench_size_class, bench_classify, bench_malloc);
 criterion_main!(benches);

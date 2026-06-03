@@ -29,7 +29,8 @@ void topomalloc_free(void *ptr);
 /* Allocate `n * size` zeroed bytes. Returns NULL on overflow (never wraps). */
 void *topomalloc_calloc(size_t n, size_t size);
 
-/* Allocate `size` bytes aligned to `alignment` (a power of two), else NULL. */
+/* Allocate `size` bytes aligned to `alignment`. `alignment` must be a power of
+ * two and `size` an integer multiple of it (SPEC 25.5); otherwise NULL. */
 void *topomalloc_aligned_alloc(size_t alignment, size_t size);
 
 /* The NUL-terminated TopoMalloc version string (matches stats topomalloc_version). */

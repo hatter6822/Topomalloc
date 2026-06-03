@@ -191,6 +191,7 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
                 "cargo",
                 &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
             );
+            global_alloc_smoke_step(&mut r);
         }
     }
     r.finish()
@@ -296,6 +297,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
     );
+    global_alloc_smoke_step(&mut r);
 
     // C ABI compile-link-run (§34.1) + rustdoc intra-doc-link check.
     abi_test_steps(&mut r, root);
@@ -404,6 +406,24 @@ fn fuzz_steps(r: &mut Runner<'_>) {
     } else {
         r.note("cargo-fuzz not found; skipping fuzz build. Install: cargo install cargo-fuzz (nightly).");
     }
+}
+
+/// Run the `#[global_allocator]` bootstrap smoke example (the re-entrancy guard,
+/// D1): registering `TopoMallocGlobal` as the process allocator must not deadlock
+/// when its lazy initializer allocates. Host-only — the bootstrap is arch-neutral.
+fn global_alloc_smoke_step(r: &mut Runner<'_>) {
+    r.run(
+        "global-allocator bootstrap (re-entrancy guard)",
+        "cargo",
+        &[
+            "run",
+            "-q",
+            "-p",
+            "topo-abi",
+            "--example",
+            "global_allocator",
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
