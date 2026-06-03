@@ -71,6 +71,19 @@ impl Profile {
             Profile::HugepageOptimized => "hugepage_optimized",
         }
     }
+
+    /// The profile selected by the compiled-in Cargo features (§30.1), so stats
+    /// and the control plane report the actual build, not a hard-coded default.
+    pub fn active() -> Profile {
+        match topo_core::active_profile() {
+            "hardened" => Profile::Hardened,
+            "debug" => Profile::Debug,
+            "deterministic_test" => Profile::DeterministicTest,
+            "low_rss" => Profile::LowRss,
+            "hugepage_optimized" => Profile::HugepageOptimized,
+            _ => Profile::Performance,
+        }
+    }
 }
 
 impl Stats {

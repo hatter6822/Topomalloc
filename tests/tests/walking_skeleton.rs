@@ -62,6 +62,7 @@ fn classify_allocate_emit_parse_replay() {
         match rec {
             TraceRecord::Alloc { .. } => allocs += 1,
             TraceRecord::Free { .. } => frees += 1,
+            _ => {}
         }
         model.apply(&rec).expect("trace stays well-formed");
     }

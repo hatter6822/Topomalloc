@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Cross-compilation + execution config for the AArch64 co-primary target (DD-2).
-#
+# Cross-compilation + execution config for the AArch64 co-primary target (DD-2),
+# and the `cargo xtask` alias (D3, W0-4) so `cargo xtask <cmd>` resolves to the
+# in-repo build driver for every contributor and every CI job.
+
+# `cargo xtask ...` == `cargo run --package xtask -- ...`. Without this alias,
+# `cargo xtask` fails with "no such command: xtask".
+[alias]
+xtask = "run --package xtask --"
+
 # CI installs `gcc-aarch64-linux-gnu` (the linker) and `qemu-user` (the runner),
 # so `cargo build/test --target aarch64-unknown-linux-gnu` links and runs the
 # asm/RSEQ paths on the real instruction set. On a dev box without those tools,

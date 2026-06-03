@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! Parser for the SPEC §33.7 trace grammar. The counterpart to the emit side in
-//! `topo_core::trace`; round-tripping the two is tested there and here.
+//! `topo_core::trace`; round-tripping the two is tested there and here. The full
+//! grammar is supported (`ALLOC`/`FREE`/`REFILL`/`FLUSH`/`SPAN_ALLOC`/`RELEASE`)
+//! so the replay tool accepts any conforming trace, even though the M0 skeleton
+//! only emits `ALLOC`/`FREE`.
 
-/// A parsed trace record (the M0 subset: `ALLOC` and `FREE`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use alloc::string::{String, ToString};
+
+/// A parsed trace record covering the whole §33.7 grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceRecord {
     /// `ALLOC request_id size align arena flags -> ptr usable_size sc span`.
     Alloc {
@@ -36,6 +41,50 @@ pub enum TraceRecord {
         sc: Option<u64>,
         /// Span id, or `None`.
         span: Option<u64>,
+    },
+    /// `REFILL cpu sc count source`.
+    Refill {
+        /// CPU/cache id.
+        cpu: u64,
+        /// Size class.
+        sc: u64,
+        /// Objects moved.
+        count: u64,
+        /// Source of the refill (e.g. `central`/`transfer`).
+        source: String,
+    },
+    /// `FLUSH cpu sc count target`.
+    Flush {
+        /// CPU/cache id.
+        cpu: u64,
+        /// Size class.
+        sc: u64,
+        /// Objects moved.
+        count: u64,
+        /// Target of the flush (e.g. `central`/`transfer`).
+        target: String,
+    },
+    /// `SPAN_ALLOC arena sc span pages hugepage`.
+    SpanAlloc {
+        /// Arena id.
+        arena: u64,
+        /// Size class.
+        sc: u64,
+        /// Span id.
+        span: u64,
+        /// Pages backing the span.
+        pages: u64,
+        /// Backing hugepage id, or `None` for normal-page spans.
+        hugepage: Option<u64>,
+    },
+    /// `RELEASE base:len state`.
+    Release {
+        /// Range base address.
+        base: u64,
+        /// Range length in bytes.
+        len: u64,
+        /// New memory state (e.g. `dirty`/`muzzy`/`released`).
+        state: String,
     },
 }
 
@@ -82,27 +131,27 @@ pub fn parse_trace_line(line: &str) -> Result<TraceRecord, ParseError> {
     if line.is_empty() {
         return Err(ParseError::Empty);
     }
-    // Collect tokens without allocating a Vec by indexing a small fixed window.
     let mut it = line.split_whitespace();
     let verb = it.next().ok_or(ParseError::Empty)?;
+
+    // Helper: the next token, or BadArity if the line is too short.
+    let mut next = || it.next().ok_or(ParseError::BadArity);
+
     match verb {
         "ALLOC" => {
-            // request_id size align arena flags -> ptr usable_size sc span
-            let request_id = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            let size = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            let align = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            let arena = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            let flags = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            if it.next().ok_or(ParseError::MissingArrow)? != "->" {
+            let request_id = parse_u64(next()?)?;
+            let size = parse_u64(next()?)?;
+            let align = parse_u64(next()?)?;
+            let arena = parse_u64(next()?)?;
+            let flags = parse_u64(next()?)?;
+            if next()? != "->" {
                 return Err(ParseError::MissingArrow);
             }
-            let ptr = parse_addr(it.next().ok_or(ParseError::BadArity)?)?;
-            let usable_size = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            let sc = parse_opt(it.next().ok_or(ParseError::BadArity)?)?;
-            let span = parse_opt(it.next().ok_or(ParseError::BadArity)?)?;
-            if it.next().is_some() {
-                return Err(ParseError::BadArity);
-            }
+            let ptr = parse_addr(next()?)?;
+            let usable_size = parse_u64(next()?)?;
+            let sc = parse_opt(next()?)?;
+            let span = parse_opt(next()?)?;
+            expect_end(&mut it)?;
             Ok(TraceRecord::Alloc {
                 request_id,
                 size,
@@ -116,17 +165,14 @@ pub fn parse_trace_line(line: &str) -> Result<TraceRecord, ParseError> {
             })
         }
         "FREE" => {
-            // ptr size_hint -> sc span
-            let ptr = parse_addr(it.next().ok_or(ParseError::BadArity)?)?;
-            let size_hint = parse_u64(it.next().ok_or(ParseError::BadArity)?)?;
-            if it.next().ok_or(ParseError::MissingArrow)? != "->" {
+            let ptr = parse_addr(next()?)?;
+            let size_hint = parse_u64(next()?)?;
+            if next()? != "->" {
                 return Err(ParseError::MissingArrow);
             }
-            let sc = parse_opt(it.next().ok_or(ParseError::BadArity)?)?;
-            let span = parse_opt(it.next().ok_or(ParseError::BadArity)?)?;
-            if it.next().is_some() {
-                return Err(ParseError::BadArity);
-            }
+            let sc = parse_opt(next()?)?;
+            let span = parse_opt(next()?)?;
+            expect_end(&mut it)?;
             Ok(TraceRecord::Free {
                 ptr,
                 size_hint,
@@ -134,7 +180,63 @@ pub fn parse_trace_line(line: &str) -> Result<TraceRecord, ParseError> {
                 span,
             })
         }
+        "REFILL" | "FLUSH" => {
+            let cpu = parse_u64(next()?)?;
+            let sc = parse_u64(next()?)?;
+            let count = parse_u64(next()?)?;
+            let label = next()?.to_string();
+            expect_end(&mut it)?;
+            if verb == "REFILL" {
+                Ok(TraceRecord::Refill {
+                    cpu,
+                    sc,
+                    count,
+                    source: label,
+                })
+            } else {
+                Ok(TraceRecord::Flush {
+                    cpu,
+                    sc,
+                    count,
+                    target: label,
+                })
+            }
+        }
+        "SPAN_ALLOC" => {
+            let arena = parse_u64(next()?)?;
+            let sc = parse_u64(next()?)?;
+            let span = parse_u64(next()?)?;
+            let pages = parse_u64(next()?)?;
+            let hugepage = parse_opt(next()?)?;
+            expect_end(&mut it)?;
+            Ok(TraceRecord::SpanAlloc {
+                arena,
+                sc,
+                span,
+                pages,
+                hugepage,
+            })
+        }
+        "RELEASE" => {
+            // range token is "base:len"; state is a free-form word.
+            let range = next()?;
+            let (base_tok, len_tok) = range.split_once(':').ok_or(ParseError::BadField)?;
+            let base = parse_addr(base_tok)?;
+            let len = parse_u64(len_tok)?;
+            let state = next()?.to_string();
+            expect_end(&mut it)?;
+            Ok(TraceRecord::Release { base, len, state })
+        }
         _ => Err(ParseError::UnknownVerb),
+    }
+}
+
+/// Error if the iterator has any tokens left (line too long for its verb).
+fn expect_end<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<(), ParseError> {
+    if it.next().is_some() {
+        Err(ParseError::BadArity)
+    } else {
+        Ok(())
     }
 }
 
@@ -194,6 +296,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_refill_flush_span_release() {
+        assert_eq!(
+            parse_trace_line("REFILL 3 1 32 central").unwrap(),
+            TraceRecord::Refill {
+                cpu: 3,
+                sc: 1,
+                count: 32,
+                source: "central".to_string()
+            }
+        );
+        assert_eq!(
+            parse_trace_line("FLUSH 3 1 16 transfer").unwrap(),
+            TraceRecord::Flush {
+                cpu: 3,
+                sc: 1,
+                count: 16,
+                target: "transfer".to_string()
+            }
+        );
+        assert_eq!(
+            parse_trace_line("SPAN_ALLOC 0 1 7 1 2").unwrap(),
+            TraceRecord::SpanAlloc {
+                arena: 0,
+                sc: 1,
+                span: 7,
+                pages: 1,
+                hugepage: Some(2)
+            }
+        );
+        assert_eq!(
+            parse_trace_line("SPAN_ALLOC 0 1 8 1 -").unwrap(),
+            TraceRecord::SpanAlloc {
+                arena: 0,
+                sc: 1,
+                span: 8,
+                pages: 1,
+                hugepage: None
+            }
+        );
+        assert_eq!(
+            parse_trace_line("RELEASE 0x2000:4096 released").unwrap(),
+            TraceRecord::Release {
+                base: 0x2000,
+                len: 4096,
+                state: "released".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn rejects_garbage() {
         assert_eq!(parse_trace_line(""), Err(ParseError::Empty));
         assert_eq!(parse_trace_line("WAT 1 2 3"), Err(ParseError::UnknownVerb));
@@ -205,6 +357,14 @@ mod tests {
         assert_eq!(
             parse_trace_line("FREE 0xZZ 1 -> - -"),
             Err(ParseError::BadField)
+        );
+        assert_eq!(
+            parse_trace_line("RELEASE 0x2000 dirty"),
+            Err(ParseError::BadField)
+        );
+        assert_eq!(
+            parse_trace_line("REFILL 1 2 3 src extra"),
+            Err(ParseError::BadArity)
         );
     }
 }

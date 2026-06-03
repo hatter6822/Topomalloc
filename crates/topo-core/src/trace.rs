@@ -60,6 +60,48 @@ pub fn emit_free<W: Write>(
     )
 }
 
+/// Emit a `REFILL` line: `REFILL cpu sc count source` — a front-end cache pulled
+/// `count` objects of class `sc` from `source` (e.g. `"central"`/`"transfer"`).
+pub fn emit_refill<W: Write>(
+    w: &mut W,
+    cpu: u64,
+    sc: u64,
+    count: u64,
+    source: &str,
+) -> fmt::Result {
+    writeln!(w, "REFILL {cpu} {sc} {count} {source}")
+}
+
+/// Emit a `FLUSH` line: `FLUSH cpu sc count target` — a front-end cache pushed
+/// `count` objects of class `sc` to `target` (e.g. `"central"`/`"transfer"`).
+pub fn emit_flush<W: Write>(w: &mut W, cpu: u64, sc: u64, count: u64, target: &str) -> fmt::Result {
+    writeln!(w, "FLUSH {cpu} {sc} {count} {target}")
+}
+
+/// Emit a `SPAN_ALLOC` line: `SPAN_ALLOC arena sc span pages hugepage`.
+///
+/// `hugepage` is the backing hugepage id, or `None` for normal-page spans.
+pub fn emit_span_alloc<W: Write>(
+    w: &mut W,
+    arena: u64,
+    sc: u64,
+    span: u64,
+    pages: u64,
+    hugepage: Option<u64>,
+) -> fmt::Result {
+    writeln!(
+        w,
+        "SPAN_ALLOC {arena} {sc} {span} {pages} {}",
+        OptNum(hugepage)
+    )
+}
+
+/// Emit a `RELEASE` line: `RELEASE base:len state` — the range `[base, base+len)`
+/// transitioned to `state` (e.g. `"dirty"`/`"muzzy"`/`"released"`).
+pub fn emit_release<W: Write>(w: &mut W, base: usize, len: usize, state: &str) -> fmt::Result {
+    writeln!(w, "RELEASE {base:#x}:{len} {state}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +125,23 @@ mod tests {
         let mut s = std::string::String::new();
         emit_free(&mut s, 0x1000, 24, Some(1), Some(5)).unwrap();
         assert_eq!(s, "FREE 0x1000 24 -> 1 5\n");
+    }
+
+    #[test]
+    fn middle_and_back_end_lines_match_grammar() {
+        let mut s = std::string::String::new();
+        emit_refill(&mut s, 3, 1, 32, "central").unwrap();
+        emit_flush(&mut s, 3, 1, 16, "transfer").unwrap();
+        emit_span_alloc(&mut s, 0, 1, 7, 1, Some(2)).unwrap();
+        emit_span_alloc(&mut s, 0, 1, 8, 1, None).unwrap();
+        emit_release(&mut s, 0x2000, 4096, "released").unwrap();
+        assert_eq!(
+            s,
+            "REFILL 3 1 32 central\n\
+             FLUSH 3 1 16 transfer\n\
+             SPAN_ALLOC 0 1 7 1 2\n\
+             SPAN_ALLOC 0 1 8 1 -\n\
+             RELEASE 0x2000:4096 released\n"
+        );
     }
 }

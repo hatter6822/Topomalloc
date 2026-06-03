@@ -3,8 +3,12 @@
 //! composes the others into the exact sequence CI runs.
 
 use std::path::Path;
+use std::process::Command;
 
 use crate::util::{have, Outcome, Runner};
+
+/// Directories never scanned by the built-in file checks (build outputs, VCS).
+const SKIP_DIRS: &[&str] = &["target", ".git", ".lake", "book", "node_modules"];
 
 /// True if `args` contains the bare `flag`.
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -69,20 +73,13 @@ pub fn setup(root: &Path, args: &[String]) -> Outcome {
         &["component", "add", "rustfmt", "clippy"],
     );
 
-    if have("elan") {
-        let toolchain = std::fs::read_to_string(root.join("lean-toolchain")).unwrap_or_default();
-        let toolchain = toolchain.trim();
-        if !toolchain.is_empty() {
-            // Best-effort: some networks block the Lean release host; CI installs
-            // Lean via the official action regardless.
-            r.run_optional(
-                "lean toolchain (elan)",
-                "elan",
-                &["toolchain", "install", toolchain],
-            );
-        }
+    // Lean toolchain via the direct-download script (robust behind egress
+    // gateways where elan's release host is unreachable). Best-effort: the
+    // ~260 MB download must not fail `setup`, and a dev box may not want Lean.
+    if root.join("scripts/setup_lean.sh").exists() {
+        r.run_optional("lean toolchain", "bash", &["scripts/setup_lean.sh"]);
     } else {
-        r.note("elan not found; install it to build /lean locally (https://github.com/leanprover/elan)");
+        r.note("scripts/setup_lean.sh missing; cannot install Lean");
     }
     r.finish()
 }
@@ -211,13 +208,16 @@ pub fn fmt(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `lint` — clippy (`-D warnings`), SPDX headers, markdownlint, Lean style.
+/// `lint` — clippy, SPDX, Lean style, license boundary, markdownlint, shellcheck, deny.
 pub fn lint(root: &Path, _args: &[String]) -> Outcome {
     let mut r = Runner::new(root);
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
+    r.record("Lean style", check_lean_style(root));
+    r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
-    r.note("Lean style: SPDX checked above; richer Lean lints arrive with plan 02");
+    shellcheck_step(&mut r, root);
+    deny_step(&mut r);
     r.finish()
 }
 
@@ -261,7 +261,11 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     // Lint gates.
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
+    r.record("Lean style", check_lean_style(root));
+    r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
+    shellcheck_step(&mut r, root);
+    deny_step(&mut r);
 
     // Build matrix: host {debug, performance} + AArch64 {debug} (DD-2).
     r.run("build host (debug)", "cargo", &["build", "--workspace"]);
@@ -293,9 +297,35 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
     );
 
+    // C ABI compile-link-run (§34.1) + rustdoc intra-doc-link check.
+    abi_test_steps(&mut r, root);
+    doc_steps(&mut r);
+
     // Lean: gating in CI (where lake is installed), best-effort locally.
     lean_steps(&mut r, true);
 
+    r.finish()
+}
+
+/// `abi-test` — compile a C harness against `include/topomalloc.h`, link the
+/// staticlib, and run it (§34.1): proves the hand-written header matches the ABI.
+pub fn abi_test(root: &Path) -> Outcome {
+    let mut r = Runner::new(root);
+    abi_test_steps(&mut r, root);
+    r.finish()
+}
+
+/// `doc` — build the docs with `-D warnings` to catch broken intra-doc links.
+pub fn doc(root: &Path) -> Outcome {
+    let mut r = Runner::new(root);
+    doc_steps(&mut r);
+    r.finish()
+}
+
+/// `deny` — supply-chain audit (licenses, advisories, bans) via cargo-deny.
+pub fn deny(root: &Path) -> Outcome {
+    let mut r = Runner::new(root);
+    deny_step(&mut r);
     r.finish()
 }
 
@@ -379,25 +409,30 @@ fn fuzz_steps(r: &mut Runner<'_>) {
 // ---------------------------------------------------------------------------
 // Built-in SPDX header check (W0-12). No external dependency.
 
-/// Verify every source file carries an `SPDX-License-Identifier` header.
+/// Whether the first few lines of a file carry an SPDX identifier (pure; tested).
+fn has_spdx_header(content: &str) -> bool {
+    content
+        .lines()
+        .take(5)
+        .any(|l| l.contains("SPDX-License-Identifier:"))
+}
+
+/// Verify every source/config file carries an `SPDX-License-Identifier` header.
 fn check_spdx(root: &Path) -> bool {
-    const EXTS: &[&str] = &["rs", "lean", "h", "c", "sh"];
-    const SKIP_DIRS: &[&str] = &["target", ".git", ".lake", "book", "node_modules"];
+    const EXTS: &[&str] = &["rs", "lean", "h", "c", "sh", "toml", "yml", "yaml"];
     let mut missing = Vec::new();
     visit_files(root, SKIP_DIRS, &mut |path| {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !EXTS.contains(&ext) {
             return;
         }
-        let head = std::fs::read_to_string(path)
-            .map(|c| c.lines().take(5).collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default();
-        if !head.contains("SPDX-License-Identifier:") {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        if !has_spdx_header(&content) {
             missing.push(path.display().to_string());
         }
     });
     if missing.is_empty() {
-        println!("  · SPDX: every .rs/.lean/.h/.c/.sh file carries a license header");
+        println!("  · SPDX: every source/config file carries a license header");
         true
     } else {
         for m in &missing {
@@ -405,6 +440,181 @@ fn check_spdx(root: &Path) -> bool {
         }
         false
     }
+}
+
+/// Lean-style issues in one file's content (pure; tested): hard tabs, trailing
+/// whitespace, missing final newline. Returns `(line_or_0, reason)` pairs.
+fn lean_style_issues(content: &str) -> Vec<(usize, &'static str)> {
+    let mut issues = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if line.contains('\t') {
+            issues.push((i + 1, "hard tab"));
+        }
+        if line.len() != line.trim_end().len() {
+            issues.push((i + 1, "trailing whitespace"));
+        }
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        issues.push((0, "missing final newline"));
+    }
+    issues
+}
+
+/// Built-in Lean style check (W0-6): no hard tabs, no trailing whitespace, and a
+/// trailing newline. Richer semantic Lean lints arrive with plan 02.
+fn check_lean_style(root: &Path) -> bool {
+    let mut issues = Vec::new();
+    visit_files(root, SKIP_DIRS, &mut |path| {
+        if path.extension().and_then(|e| e.to_str()) != Some("lean") {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for (line, reason) in lean_style_issues(&content) {
+            issues.push(format!("{}:{}: {reason}", path.display(), line));
+        }
+    });
+    if issues.is_empty() {
+        println!("  · Lean style: no tabs / trailing whitespace; files end with a newline");
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ Lean style: {it}");
+        }
+        false
+    }
+}
+
+/// Run `shellcheck` over every `.sh` file, if it is installed.
+fn shellcheck_step(r: &mut Runner<'_>, root: &Path) {
+    if !have("shellcheck") {
+        r.note("shellcheck not found; skipping (CI runs it). Install: apt-get install shellcheck");
+        return;
+    }
+    let files = collect_files(root, &["sh"]);
+    if files.is_empty() {
+        return;
+    }
+    let strs: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let mut args: Vec<&str> = vec!["--severity=warning"];
+    args.extend(strs.iter().map(String::as_str));
+    r.run("shellcheck", "shellcheck", &args);
+}
+
+/// Collect files with one of `exts` under `root` (sorted, skipping build dirs).
+fn collect_files(root: &Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    visit_files(root, SKIP_DIRS, &mut |path| {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if exts.contains(&ext) {
+                out.push(path.to_path_buf());
+            }
+        }
+    });
+    out.sort();
+    out
+}
+
+/// Enforce the D5 license boundary: the default (MIT) build of `topo-abi` must
+/// not link the GPL `topo-backend-sele4n` crate. Uses `cargo tree` on the normal
+/// (non-dev) dependency edges with default features.
+fn check_license_boundary(root: &Path) -> bool {
+    let output = Command::new("cargo")
+        .args([
+            "tree",
+            "-p",
+            "topo-abi",
+            "--no-default-features",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(root)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if s.contains("topo-backend-sele4n") {
+                eprintln!("  ✗ license boundary: the MIT default build of topo-abi links GPL topo-backend-sele4n");
+                false
+            } else {
+                println!("  · license boundary: MIT default build does not link the GPL seLe4n crate (D5)");
+                true
+            }
+        }
+        Ok(o) => {
+            eprintln!(
+                "  ✗ license boundary: cargo tree failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("  ✗ license boundary: could not run cargo tree: {e}");
+            false
+        }
+    }
+}
+
+/// Build the staticlib, then compile + link + run the C ABI harness (§34.1).
+fn abi_test_steps(r: &mut Runner<'_>, root: &Path) {
+    let cc = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        r.note("no C compiler (cc/gcc) found; skipping C ABI test (CI installs one).");
+        return;
+    };
+    if !r.run(
+        "build staticlib (topo-abi)",
+        "cargo",
+        &["build", "-p", "topo-abi"],
+    ) {
+        return;
+    }
+    let out = root.join("target/debug/abi_smoke");
+    let out_str = out.to_string_lossy().into_owned();
+    let ok = r.run(
+        "compile + link C ABI harness",
+        cc,
+        &[
+            "tests/c/abi_smoke.c",
+            "-I",
+            "include",
+            "-o",
+            out_str.as_str(),
+            "target/debug/libtopo_abi.a",
+            "-lpthread",
+            "-ldl",
+            "-lm",
+        ],
+    );
+    if ok {
+        r.run("run C ABI harness", out_str.as_str(), &[]);
+    }
+}
+
+/// Build the docs with broken-link detection (`RUSTDOCFLAGS=-D warnings`).
+fn doc_steps(r: &mut Runner<'_>) {
+    // Propagates to the child cargo; a broken intra-doc link then fails the build.
+    std::env::set_var("RUSTDOCFLAGS", "-D warnings");
+    r.run(
+        "cargo doc (-D warnings)",
+        "cargo",
+        &["doc", "--no-deps", "--workspace"],
+    );
+}
+
+/// Run cargo-deny (licenses + advisories + bans), if it is installed.
+fn deny_step(r: &mut Runner<'_>) {
+    if !have("cargo-deny") {
+        r.note("cargo-deny not found; skipping (CI runs it). Install: cargo install cargo-deny");
+        return;
+    }
+    r.run("cargo deny check", "cargo", &["deny", "check"]);
 }
 
 /// Recursively visit files under `dir`, skipping any directory named in `skip`.
@@ -425,5 +635,73 @@ fn visit_files(dir: &Path, skip: &[&str], f: &mut impl FnMut(&Path)) {
         } else {
             f(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_parsing() {
+        let a = argv(&[
+            "build",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--profile",
+            "performance",
+        ]);
+        assert!(has_flag(&a, "--target"));
+        assert!(!has_flag(&a, "--nope"));
+        assert_eq!(
+            flag_value(&a, "--target"),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(flag_value(&a, "--profile"), Some("performance"));
+        assert_eq!(flag_value(&a, "--missing"), None);
+        // A trailing flag with no following token yields None.
+        assert_eq!(flag_value(&argv(&["--check"]), "--check"), None);
+    }
+
+    #[test]
+    fn compile_verb_uses_build_for_host_targets() {
+        assert_eq!(compile_verb(None), "build");
+        assert_eq!(compile_verb(Some("x86_64-unknown-linux-gnu")), "build");
+    }
+
+    #[test]
+    fn spdx_header_detection() {
+        assert!(has_spdx_header(
+            "// SPDX-License-Identifier: MIT\nfn main() {}\n"
+        ));
+        assert!(has_spdx_header(
+            "#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\n"
+        ));
+        // Beyond the first 5 lines does not count.
+        assert!(!has_spdx_header(
+            "a\nb\nc\nd\ne\n// SPDX-License-Identifier: MIT\n"
+        ));
+        assert!(!has_spdx_header(""));
+    }
+
+    #[test]
+    fn lean_style_detection() {
+        assert!(lean_style_issues("def x := 1\n").is_empty());
+        assert_eq!(
+            lean_style_issues("def x := 1\tfoo\n"),
+            vec![(1, "hard tab")]
+        );
+        assert_eq!(
+            lean_style_issues("def x := 1 \n"),
+            vec![(1, "trailing whitespace")]
+        );
+        assert_eq!(
+            lean_style_issues("def x := 1"),
+            vec![(0, "missing final newline")]
+        );
     }
 }

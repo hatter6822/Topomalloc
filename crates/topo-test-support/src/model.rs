@@ -36,8 +36,9 @@ impl LiveModel {
     /// Apply one record, checking the invariants. Returns the offending pointer
     /// wrapped in a [`ModelError`] on violation, leaving the model unchanged.
     pub fn apply(&mut self, rec: &TraceRecord) -> Result<(), ModelError> {
-        match *rec {
+        match rec {
             TraceRecord::Alloc { ptr, .. } => {
+                let ptr = *ptr;
                 if ptr == 0 {
                     return Ok(()); // allocation failed; nothing becomes live
                 }
@@ -47,6 +48,7 @@ impl LiveModel {
                 Ok(())
             }
             TraceRecord::Free { ptr, .. } => {
+                let ptr = *ptr;
                 if ptr == 0 {
                     return Ok(()); // free(NULL) is a no-op (§9.6)
                 }
@@ -55,6 +57,10 @@ impl LiveModel {
                 }
                 Ok(())
             }
+            // Middle/back-end events (REFILL/FLUSH/SPAN_ALLOC/RELEASE) do not
+            // change the live-object set; richer conservation checks over them
+            // arrive with the cache/central-list model (plan 02/08).
+            _ => Ok(()),
         }
     }
 

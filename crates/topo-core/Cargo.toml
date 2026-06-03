@@ -13,9 +13,16 @@ license = "MIT"
 default = []
 # Pull in `std` (only the test harness needs it; the crate is otherwise no_std).
 std = []
-# Debug/hardened invariant checks (Appendix B) compiled in. Profiles are
-# features, not forks (overview principle 8).
+# Debug/hardened invariant checks (Appendix B) compiled in.
 debug-checks = []
+# Profiles are features, not forks (overview principle 8; §30.1). Each selects a
+# feature set; their behaviour is filled in as subsystems land (plans 04/05/08).
+# See profiles/README.md for the full mapping.
+hardened = ["debug-checks"]
+debug = ["debug-checks"]
+deterministic-test = []
+low-rss = []
+hugepage-optimized = []
 
 [dependencies]
 

@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 license = "MIT"
+publish = false
 
 [[bin]]
 name = "trace-replay"

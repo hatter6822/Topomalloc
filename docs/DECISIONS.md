@@ -22,6 +22,19 @@ It orchestrates **both** toolchains: `cargo` for Rust and `lake` for Lean, plus
 the codegen pipeline and cross builds. CI invokes the same subcommands, so no
 build logic lives only in YAML. See [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
+### Lean toolchain pin (W0-3, related to D8)
+
+`lean-toolchain` pins **`leanprover/lean4:v4.28.0`** — deliberately the same Lean
+version upstream seLe4n uses (per its `scripts/setup_lean_env.sh`), so the Lean
+bridge (which imports seLe4n's public model at M1, D2) never suffers toolchain
+skew. It is installed by [`scripts/setup_lean.sh`](../scripts/setup_lean.sh),
+which downloads the toolchain tarball directly from GitHub releases and verifies
+its SHA-256 (the technique adapted from seLe4n), instead of letting `elan`
+resolve it through `release.lean-lang.org` (unreachable from some sandboxed/
+proxied environments). seLe4n's Rust MSRV is **1.82**; TopoMalloc pins a newer
+stable (`rust-toolchain.toml`) which satisfies it, so the pinned seLe4n crates
+(D8) build cleanly under our toolchain.
+
 ## D4 — Allocator page and `small_max`
 
 The allocator page is **16 KiB** (server default, Appendix C). `small_max` (the
@@ -86,6 +99,9 @@ W0:
 At M0 the dependency is **recorded but not yet linked**: `topo-backend-sele4n`
 ships only the host `Sele4nSim` (no upstream dependency), so the M0 build stays
 hermetic. M1 (plan 09 W22-0) enables the pinned git dependency behind the
-`real-abi` feature and compiles `Sele4nBackingProvider` against it. Because the
+`real-abi` feature and compiles `Sele4nBackingProvider` against it. The vendored
+mirror is produced by [`scripts/vendor_sele4n.sh`](../scripts/vendor_sele4n.sh),
+which clones the exact pinned SHA into `vendor/sele4n/` (GPL-3.0-or-later, on the
+seLe4n side of the D5 boundary) for hermetic/offline builds. Because the
 simulator mirrors the pinned ABI surface, any upstream drift becomes a compile
 error (risk R13). See [`docs/ABI.md`](ABI.md).

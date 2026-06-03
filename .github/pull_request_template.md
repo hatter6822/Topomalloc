@@ -4,6 +4,10 @@
 <!-- What does this change do, and which WU / milestone / SPEC section does it
 implement? Link the plan item (e.g. "plan 03 W2-3a") and SPEC anchors. -->
 
+> Review against the coding standards in [`docs/CONVENTIONS.md`](../docs/CONVENTIONS.md)
+> (transition tagging, `assert!`/`debug_assert!` profile gating, the error taxonomy,
+> `unsafe`/`no_std` discipline). Run `cargo xtask ci` before requesting review.
+
 ## Definition of Done
 
 <!-- From planning/plans/README.md §8. Tick every box or explain the exception. -->

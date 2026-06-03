@@ -10,7 +10,7 @@ authors.workspace = true
 license = "MIT"
 
 [dependencies]
-topo-core = { path = "../topo-core" }
+topo-core = { path = "../topo-core", version = "0.1.0" }
 
 [dev-dependencies]
 # Used only to assert the emitted stats JSON is well-formed and additive.

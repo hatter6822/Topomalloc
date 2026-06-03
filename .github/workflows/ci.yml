@@ -25,17 +25,22 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # G-build (lint half): rustfmt + clippy -D warnings + SPDX + markdownlint.
+  # G-build (static half): rustfmt + clippy -D warnings + SPDX + Lean style +
+  # license boundary + markdownlint + shellcheck + cargo-deny (all via xtask).
   lint:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install markdownlint
         run: npm install -g markdownlint-cli2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
       - run: cargo xtask fmt --check
       - run: cargo xtask lint
 
@@ -44,13 +49,14 @@ jobs:
     name: gen-golden-diff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask gen --check
 
-  # G-build: {x86-64, aarch64} x {debug, performance}. AArch64 is co-primary (DD-2).
+  # G-build: {x86-64, aarch64} x {debug, performance}. AArch64 is co-primary,
+  # cross-linked here and run under QEMU in the `test` job (DD-2).
   build:
     name: build (${{ matrix.target }}, ${{ matrix.profile }})
     runs-on: ubuntu-latest
@@ -60,16 +66,23 @@ jobs:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
         profile: [debug, performance]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-${{ matrix.profile }}
-      - name: Install AArch64 cross toolchain
+      - name: Install AArch64 cross toolchain (linker + dev libc)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - run: cargo xtask build --target ${{ matrix.target }} --profile ${{ matrix.profile }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Build (retry once on AArch64 infra flake, DD-2)
+        run: |
+          attempt() { cargo xtask build --target ${{ matrix.target }} --profile ${{ matrix.profile }}; }
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            attempt || { echo "::warning::AArch64 build flaked; retrying once (DD-2)"; attempt; }
+          else
+            attempt
+          fi
 
   # G-core: tests on both arches; AArch64 runs under qemu-user (the asm/RSEQ
   # battery lands here from plan 05). The host run also exercises the seLe4n
@@ -82,38 +95,69 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.target }}
-      - name: Install AArch64 runtime (cross linker + qemu-user)
+      - name: Install AArch64 runtime (cross linker + dev libc + qemu-user)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user qemu-user-static
-      - name: Test (host, x86-64) — includes G-sim
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo xtask test
-      - name: Test (AArch64 under qemu)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo xtask test --target ${{ matrix.target }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user qemu-user-static
+      - name: Test (retry once on AArch64 infra flake, DD-2)
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo xtask test   # host: includes the G-sim vertical slice
+          else
+            attempt() { cargo xtask test --target ${{ matrix.target }}; }
+            attempt || { echo "::warning::AArch64 test flaked; retrying once (DD-2)"; attempt; }
+          fi
 
-  # G-build -> G-model: the Lean model builds and `lake exe check` passes.
+  # ABI compatibility (§34.1): compile + link + run the C harness against the
+  # generated header and the staticlib.
+  abi-test:
+    name: abi-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask abi-test
+
+  # rustdoc with -D warnings (broken intra-doc links fail the build).
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask doc
+
+  # G-build -> G-model: the Lean model builds and `lake exe check` passes. Lean
+  # is installed via the repo's direct-download script (robust behind egress
+  # gateways; the same script `xtask setup` uses).
   lean:
     name: lean
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: lean
-      - name: Install elan + pinned Lean toolchain
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --default-toolchain "$(cat lean-toolchain)"
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Install zstd (toolchain archive format)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+      - name: Cache Lean toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: lean-${{ hashFiles('lean-toolchain') }}
+      - name: Install pinned Lean toolchain
+        run: bash scripts/setup_lean.sh
       - name: Cache Lake build
         uses: actions/cache@v4
         with:
@@ -127,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install mdbook
         uses: taiki-e/install-action@v2
         with:

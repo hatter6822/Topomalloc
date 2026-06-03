@@ -15,7 +15,7 @@ authors.workspace = true
 license = "GPL-3.0-or-later"
 
 [dependencies]
-topo-core = { path = "../topo-core" }
+topo-core = { path = "../topo-core", version = "0.1.0" }
 
 # D8 — the real seLe4n ABI is pinned to a reviewed SHA and wired at M1 (W22-0).
 # It is declared here as documentation of the pin; it is brought in as an

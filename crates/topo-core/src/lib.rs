@@ -19,6 +19,7 @@ pub mod error;
 pub mod generated;
 pub mod ids;
 pub mod overflow;
+pub mod profile;
 pub mod size_class;
 pub mod skeleton;
 pub mod trace;
@@ -33,6 +34,7 @@ pub use backend::{Region, Rights, TopoBackingProvider};
 pub use classify::{classify, Request, RequestKind};
 pub use error::BackendError;
 pub use ids::{ArenaId, Label, SizeClassId};
+pub use profile::{active_profile, debug_checks_enabled};
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
 

@@ -42,6 +42,9 @@ fn main() -> ExitCode {
         "lint" => commands::lint(&root, rest),
         "lean" => commands::lean(&root, rest),
         "bench" => commands::bench(&root, rest),
+        "abi-test" => commands::abi_test(&root),
+        "doc" => commands::doc(&root),
+        "deny" => commands::deny(&root),
         "ci" => commands::ci(&root, rest),
         "-h" | "--help" | "help" => {
             print_help();
@@ -73,9 +76,12 @@ COMMANDS
   test  [--kind unit|prop|diff|fuzz]
                               run the test suites (all kinds if omitted)
   fmt   [--check]             rustfmt (--check reproduces the CI gate)
-  lint                        clippy -D warnings + SPDX headers + markdownlint + Lean style
+  lint                        clippy -D warnings + SPDX + Lean style + license boundary + markdownlint + shellcheck + deny
   lean  [--check]             build the Lean package and run `lake exe check`
   bench                       run criterion benches (non-gating)
+  abi-test                    compile + link + run the C ABI harness (§34.1)
+  doc                         build docs with -D warnings (broken-link check)
+  deny                        cargo-deny: licenses + advisories + bans
   ci                          the exact sequence CI runs, end to end
 
 EXAMPLES

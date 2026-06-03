@@ -9,7 +9,8 @@ use proptest::prelude::*;
 
 use topo_abi::{topomalloc_calloc, topomalloc_free};
 use topo_backend_posix::PosixBackingProvider;
-use topo_core::SkeletonAllocator;
+use topo_core::{trace, SkeletonAllocator};
+use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
     /// Across an arbitrary request stream, every successful allocation is
@@ -73,6 +74,67 @@ proptest! {
                 }
             }
             topomalloc_free(p);
+        }
+    }
+}
+
+proptest! {
+    /// The trace spine round-trips: anything `topo_core::trace` emits parses back
+    /// to an equal record (the emit and parse sides share one grammar, §33.7).
+    #[test]
+    fn alloc_trace_roundtrips(
+        rid in any::<u32>(),
+        size in any::<u32>(),
+        align in any::<u32>(),
+        arena in any::<u16>(),
+        flags in any::<u16>(),
+        ptr in any::<u64>(),
+        usable in any::<u32>(),
+        sc in proptest::option::of(any::<u32>()),
+        span in proptest::option::of(any::<u32>()),
+    ) {
+        let mut s = String::new();
+        trace::emit_alloc(
+            &mut s, rid as u64, size as usize, align as usize, arena as u32, flags as u32,
+            ptr as usize, usable as usize, sc.map(u64::from), span.map(u64::from),
+        ).unwrap();
+        let parsed = parse_trace_line(s.trim_end()).expect("emitted ALLOC must parse");
+        prop_assert_eq!(parsed, TraceRecord::Alloc {
+            request_id: rid as u64, size: size as u64, align: align as u64,
+            arena: arena as u64, flags: flags as u64, ptr,
+            usable_size: usable as u64, sc: sc.map(u64::from), span: span.map(u64::from),
+        });
+    }
+}
+
+proptest! {
+    /// Ownership conservation (§34.3): under any well-formed ALLOC/FREE stream the
+    /// executable model's live set tracks a reference set exactly, and never
+    /// reports a spurious violation.
+    #[test]
+    fn live_model_matches_reference(ops in prop::collection::vec((any::<bool>(), 1u64..=64), 0..200)) {
+        let mut model = LiveModel::new();
+        let mut reference = std::collections::BTreeSet::new();
+        for (is_alloc, addr) in ops {
+            if is_alloc {
+                if reference.contains(&addr) {
+                    continue; // skip would-be double-alloc to keep the stream well-formed
+                }
+                let rec = TraceRecord::Alloc {
+                    request_id: 0, size: 8, align: 8, arena: 0, flags: 0,
+                    ptr: addr, usable_size: 16, sc: Some(0), span: Some(0),
+                };
+                model.apply(&rec).expect("well-formed alloc accepted");
+                reference.insert(addr);
+            } else {
+                if !reference.contains(&addr) {
+                    continue; // skip would-be free-of-unknown
+                }
+                let rec = TraceRecord::Free { ptr: addr, size_hint: 0, sc: None, span: None };
+                model.apply(&rec).expect("well-formed free accepted");
+                reference.remove(&addr);
+            }
+            prop_assert_eq!(model.live_count(), reference.len());
         }
     }
 }
