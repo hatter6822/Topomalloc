@@ -87,7 +87,10 @@ pub fn new_allocator_named(name: &str, heap_bytes: usize) -> Option<AnyAllocator
 }
 
 /// The process-wide skeleton allocator, initialized once from the environment.
-static GLOBAL: OnceLock<AnyAllocator> = OnceLock::new();
+/// `None` records that initialization failed (e.g. the host could not reserve
+/// the skeleton heap); the C ABI then reports OOM as a null result instead of
+/// aborting the process across the `extern "C"` boundary.
+static GLOBAL: OnceLock<Option<AnyAllocator>> = OnceLock::new();
 
 /// The selected backend name: `$TOPOMALLOC_BACKEND` or `"posix"`. An unknown or
 /// unavailable name falls back to POSIX so the default artifact is always usable.
@@ -95,14 +98,17 @@ fn selected_backend_name() -> String {
     std::env::var("TOPOMALLOC_BACKEND").unwrap_or_else(|_| "posix".into())
 }
 
-/// The lazily-initialized global allocator.
-fn global() -> &'static AnyAllocator {
-    GLOBAL.get_or_init(|| {
-        let name = selected_backend_name();
-        new_allocator_named(&name, SKELETON_HEAP_BYTES)
-            .or_else(|| new_allocator_named("posix", SKELETON_HEAP_BYTES))
-            .expect("topomalloc: failed to initialize the skeleton heap")
-    })
+/// The lazily-initialized global allocator, or `None` if the skeleton heap could
+/// not be reserved. The result is memoized: a process that cannot reserve the
+/// heap once keeps reporting OOM (a null `malloc`) rather than retrying.
+fn global() -> Option<&'static AnyAllocator> {
+    GLOBAL
+        .get_or_init(|| {
+            let name = selected_backend_name();
+            new_allocator_named(&name, SKELETON_HEAP_BYTES)
+                .or_else(|| new_allocator_named("posix", SKELETON_HEAP_BYTES))
+        })
+        .as_ref()
 }
 
 // ---------------------------------------------------------------------------
@@ -112,14 +118,18 @@ fn global() -> &'static AnyAllocator {
 /// `void* topomalloc_malloc(size_t size)`.
 #[no_mangle]
 pub extern "C" fn topomalloc_malloc(size: usize) -> *mut c_void {
-    global().malloc(size, MIN_ALIGN).cast::<c_void>()
+    global().map_or(ptr::null_mut(), |a| {
+        a.malloc(size, MIN_ALIGN).cast::<c_void>()
+    })
 }
 
 /// `void topomalloc_free(void* ptr)`. `free(NULL)` is a no-op (§9.6).
 #[no_mangle]
 pub extern "C" fn topomalloc_free(ptr: *mut c_void) {
     if !ptr.is_null() {
-        global().free(ptr.cast::<u8>());
+        if let Some(a) = global() {
+            a.free(ptr.cast::<u8>());
+        }
     }
 }
 
@@ -130,7 +140,10 @@ pub extern "C" fn topomalloc_calloc(n: usize, size: usize) -> *mut c_void {
     let Some(total) = array_bytes(n, size) else {
         return ptr::null_mut();
     };
-    let p = global().malloc(total, MIN_ALIGN);
+    let Some(a) = global() else {
+        return ptr::null_mut();
+    };
+    let p = a.malloc(total, MIN_ALIGN);
     if !p.is_null() && total > 0 {
         // SAFETY: `malloc` returned a non-null pointer to at least `total`
         // committed bytes; zeroing the whole region is in bounds.
@@ -146,7 +159,9 @@ pub extern "C" fn topomalloc_aligned_alloc(alignment: usize, size: usize) -> *mu
     if !alignment.is_power_of_two() {
         return ptr::null_mut();
     }
-    global().malloc(size, alignment).cast::<c_void>()
+    global().map_or(ptr::null_mut(), |a| {
+        a.malloc(size, alignment).cast::<c_void>()
+    })
 }
 
 /// `const char* topomalloc_version(void)` — the NUL-terminated version string.
@@ -166,7 +181,7 @@ pub extern "C" fn topomalloc_version() -> *const c_char {
 /// `const char* topomalloc_backend(void)` — the active backend name (W0-14b).
 #[no_mangle]
 pub extern "C" fn topomalloc_backend() -> *const c_char {
-    match global().backend_name() {
+    match global().map_or("posix", |a| a.backend_name()) {
         "sele4n-sim" => c"sele4n-sim".as_ptr(),
         _ => c"posix".as_ptr(),
     }
@@ -183,11 +198,13 @@ pub struct TopoMallocGlobal;
 // is always memory-safe). These satisfy the `GlobalAlloc` contract.
 unsafe impl GlobalAlloc for TopoMallocGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        global().malloc(layout.size(), layout.align())
+        global().map_or(ptr::null_mut(), |a| a.malloc(layout.size(), layout.align()))
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        global().free(ptr);
+        if let Some(a) = global() {
+            a.free(ptr);
+        }
     }
 }
 
