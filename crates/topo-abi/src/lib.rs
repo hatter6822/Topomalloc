@@ -227,7 +227,7 @@ pub extern "C" fn topomalloc_backend() -> *const c_char {
 /// The Rust [`GlobalAlloc`] adapter (D1). Suitable for opt-in use as the process
 /// `#[global_allocator]`: the first allocation lazily initializes the skeleton
 /// heap, and a per-thread bootstrap guard serves the initializer's own
-/// allocations from the system allocator so it cannot deadlock (see [`global`]).
+/// allocations from the system allocator so it cannot deadlock (see `global`).
 /// It is intentionally **not** registered here, so linking this crate never
 /// replaces a test or dependent crate's allocator.
 pub struct TopoMallocGlobal;
