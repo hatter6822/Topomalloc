@@ -625,7 +625,7 @@ Debug validation SHOULD periodically sample free structures and check:
 * no duplicate pointer across lists,
 * pointer belongs to the advertised size class,
 * pointer belongs to the advertised arena,
-* pointer is not live according to span bitmap,
+* pointer is not live -- determined from the span's owner model (the five-term partition of 16.4), not from the central `free_bitmap` alone, since a cached free object has `bit(i) = 0` exactly like a live object; the check MUST therefore also consult cache residency (for example `cache_bitmap`),
 * pointer's span exists and agrees with pagemap.
 
 ## 8.5 Metadata duplication rule
@@ -634,9 +634,9 @@ Duplicated metadata is allowed only when one copy is declared authoritative for 
 
 Example:
 
-* The span free count MAY duplicate the free bitmap.
-* The free bitmap is authoritative for object state within the span.
-* The free count is a cached aggregate.
+* The span central-free count MAY duplicate the free bitmap.
+* The free bitmap is authoritative for *central-list residency* within the span (16.4), not for liveness: an object cached in a per-CPU, thread, or transfer cache is free yet has `bit(i) = 0`. Liveness is determined from the owner model, optionally accelerated by `cache_bitmap`.
+* The central-free count is a cached aggregate (`central_free_count = popcount(free_bitmap)`).
 * Every transition that changes the bitmap MUST update the free count in the same critical section or atomic/RSEQ transaction.
 
 ## 8.6 Statistics consistency
@@ -1055,16 +1055,23 @@ reach a central or transfer structure under the wrong arena. Two conforming desi
    arena-scoped caches and central lists and MAY bypass the per-CPU fast path. This keeps each
    `(cpu, sc)` slot single-arena and makes the refill (14.3) and flush (14.4) pseudocode exact as
    written for the bound arena.
-2. **Arena-partitioned flush.** A `(cpu, sc)` slot MAY hold mixed-arena objects, but flush MUST
-   partition the popped objects by arena (recovered via the pagemap) and insert each group into
-   its owning arena's transfer/central structure. This costs a classification pass per flush and
-   is worthwhile only when explicit-arena traffic is hot enough to need the per-CPU path.
+2. **Arena-qualified per-CPU slots.** To serve more than one arena from the per-CPU path while
+   preserving arena isolation, the cache MUST be keyed by `(cpu, arena, sc)` -- a separate slot per
+   arena -- so that pop, refill, and flush are all arena-qualified. An allocation for arena A pops
+   only from `cpu_cache[cpu][A][sc]`; a free pushes to the slot for the arena recovered from the
+   pagemap. A single mixed-arena slot partitioned only at flush time is NOT permitted: allocation
+   pops *before* any flush, so a mixed slot could hand arena A's caller an object owned by arena B,
+   violating arena isolation (22.7) and the reset/destroy guarantees (22.5, 22.6). Per-arena slots
+   cost cache footprint proportional to the number of hot arenas, so this design suits a small
+   number of explicit arenas.
 
-In both designs the fully-qualified indexing is `transfer_cache[domain][arena][sc]` and
-`central_free_list[node][arena][sc]`; the refill/flush snippets in 14.3-14.4 and A.4 elide the
-arena subscript only because they describe the bound-arena case. The choice MUST be documented
-per build. The free-routing rule -- an object always returns to its owning arena's structures --
-is a safety property (it follows from ownership uniqueness, 8.2), not a policy.
+In both designs the fully-qualified indexing is `cpu_cache[cpu][arena][sc]`,
+`transfer_cache[domain][arena][sc]`, and `central_free_list[node][arena][sc]`; the refill/flush
+snippets in 14.3-14.4 and A.4 elide the arena subscript only because they describe the
+bound-arena case. The choice MUST be documented per build. Two safety properties hold under both
+designs: the free-routing rule (an object always returns to its owning arena's structures) and
+its allocation dual (an allocation from arena A returns only an object owned by A). Both follow
+from ownership uniqueness and arena isolation (8.2, 22.7); they are safety properties, not policy.
 
 # 12. RSEQ contract and fallback modes
 
@@ -2941,7 +2948,7 @@ The client library MUST be correct even if the resource server denies a slow-pat
 
 ### 36.3.3 Lean bridge modules
 
-The integration SHOULD add a bridge package with a shape similar to:
+A conforming microkernel integration MUST provide a bridge package with a shape similar to:
 
 ```text
 TopoMalloc/SeLe4n/
@@ -3342,7 +3349,7 @@ Required tests:
 
 ## 36.17 Formal theorem checklist for the bridge
 
-The following theorem families SHOULD be part of the seLe4n bridge acceptance criteria.
+The following theorem families MUST be part of the seLe4n bridge acceptance criteria.
 
 Theorem families:
 
@@ -3358,7 +3365,7 @@ Theorem families:
 * `per_core_cache_abort_no_change`: aborted per-core fast paths leave allocator-visible state unchanged.
 * `stats_observation_noninterference`: authorized stats observations do not reveal forbidden higher-domain state.
 
-The first integration milestone MAY prove these for a simplified single-core model. The SMP/per-core theorem set SHOULD be staged after seLe4n's multicore resource invariants stabilize.
+For microkernel-integration conformance the bridge package MUST exist and compile, and the single-core forms of these theorem families MUST be proved; the first integration milestone MAY establish them in a simplified single-core model. The SMP/per-core extensions of the set MAY be staged after seLe4n's multicore resource invariants stabilize, consistent with V-004, which allows implementation paths to be documented as refinements even where a machine-level proof is still incomplete. Staging applies only to the SMP/per-core extensions; it does not make the bridge package or the single-core checklist optional.
 
 ## 36.18 Deployment profiles
 
