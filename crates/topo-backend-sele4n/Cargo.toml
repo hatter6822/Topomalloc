@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This crate is the seLe4n backend. It is GPL-3.0-or-later (D5, W0-12): at M1 it
+# links the GPLv3 `sele4n-abi`/`sele4n-types` crates, so the license boundary is
+# drawn here, before the first byte of seLe4n-linked code (W0-12 best practice).
+# The default MIT TopoMalloc artifact never links this crate.
+[package]
+name = "topo-backend-sele4n"
+description = "Sele4nSim + (at M1) Sele4nBackingProvider over the real seLe4n ABI. Separately licensed (GPL-3.0-or-later)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+topo-core = { path = "../topo-core" }
+
+# D8 — the real seLe4n ABI is pinned to a reviewed SHA and wired at M1 (W22-0).
+# It is declared here as documentation of the pin; it is brought in as an
+# optional dependency under `--features real-abi` so the M0 host simulator stays
+# hermetic and the pin is recorded now (W0-1).
+#   sele4n-abi   = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-abi" }
+#   sele4n-types = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-types" }
+
+[features]
+default = []
+# Reserved for M1: compile the provider against the pinned real seLe4n ABI.
+real-abi = []
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-abi"
+description = "C ABI exports (topomalloc_*) + the Rust GlobalAlloc adapter. The default artifact is MIT/POSIX-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[lib]
+# rlib for in-tree consumers/tests; cdylib + staticlib for deployment (§35.1).
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+topo-core = { path = "../topo-core" }
+topo-backend-posix = { path = "../topo-backend-posix" }
+# GPL backend is optional and OFF by default; enabling `sele4n-sim` produces a
+# GPL-3.0-or-later artifact (libtopomalloc-sele4n, §36.3.2). See NOTICE.
+topo-backend-sele4n = { path = "../topo-backend-sele4n", optional = true }
+
+[features]
+default = []
+sele4n-sim = ["dep:topo-backend-sele4n"]
+
+[dev-dependencies]
+# Micro-benchmark harness (W0-8, §34.6).
+criterion = "0.5"
+
+[[bench]]
+name = "alloc"
+harness = false
+
+[lints]
+workspace = true

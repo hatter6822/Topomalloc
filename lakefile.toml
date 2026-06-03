@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Lake package for the TopoMalloc formal model (plan 02). The Rust workspace and
+# this package are driven together by `cargo xtask` (D3): `xtask build`/`xtask
+# lean` run `lake build` and `lake exe check` so "build" is never Rust-only.
+name = "TopoMalloc"
+version = "0.1.0"
+defaultTargets = ["TopoMalloc", "check"]
+
+[[lean_lib]]
+name = "TopoMalloc"
+srcDir = "lean"
+
+# `lake exe check` (CI job `lean`, W0-5c): replays the generated size-class table
+# through the Lean well-formedness predicate — the single-source-of-truth loop
+# (DD-1) closed on the Lean side.
+[[lean_exe]]
+name = "check"
+root = "Check"
+srcDir = "lean"

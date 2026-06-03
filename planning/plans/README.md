@@ -173,16 +173,19 @@ These are the seams between domain plans; changing one is a cross-cutting WU tou
   behind `TopoBackingProvider`; `Sele4nSim` is a host double sharing the real `sele4n-abi`/`sele4n-types`
   surface; M8 runs on the real kernel. Capability arenas/labels/quotas are core types from M1.
 
-### 4.2 Open decisions to ratify in W0 (defaults below; close before the dependent milestone)
+### 4.2 Decisions ratified in W0 (W0-1)
 
-| ID | Decision | Default | Needed by |
+D3–D8 are **ratified**; the full record (outcome + rationale) is in
+[`docs/DECISIONS.md`](../../docs/DECISIONS.md). Summary:
+
+| ID | Decision | Outcome | Status |
 |---|---|---|---|
-| D3 | Build orchestration | Cargo workspace + `cargo xtask` driving `lake` + codegen | M0 |
-| D4 | Allocator page / `small_max` | `16 KiB` page, `32 KiB` small_max (generated constants) | M1 |
-| D5 | Licensing (seLe4n GPLv3 vs core, §36.20) | core **MIT**; `/sele4n` separately-licensed + `NOTICE` | W0 (before any `/sele4n` code) |
-| D6 | Arena routing in caches (§11.7) | bound-arena fast path → arena-qualified slots at M4 | M2 |
-| D7 | Property/fuzz stack | `proptest` + `cargo-fuzz`; custom differential harness | M1/M7 |
-| D8 | Consuming seLe4n crates | git dep pinned to a SHA + vendored mirror + periodic bump WU | M1 |
+| D3 | Build orchestration | Cargo workspace + `cargo xtask` driving `lake` + codegen | Ratified, implemented (W0-4) |
+| D4 | Allocator page / `small_max` | `16 KiB` page; `small_max` (→`32 KiB`) finalized with the tuned table at M1 | Ratified (page); `small_max` at M1 |
+| D5 | Licensing (seLe4n GPLv3 vs core, §36.20) | core **MIT**; seLe4n integration **GPL-3.0-or-later** + `NOTICE` | Ratified, implemented (W0-12) |
+| D6 | Arena routing in caches (§11.7) | bound-arena fast path → arena-qualified slots at M4 | Ratified, deferred to M2 |
+| D7 | Property/fuzz stack | `proptest` + `cargo-fuzz`; custom differential harness | Ratified, scaffolded (W0-7) |
+| D8 | Consuming seLe4n crates | git dep pinned to SHA `57c1105…` + vendored mirror + periodic-bump WU | Ratified; pin recorded |
 
 ---
 

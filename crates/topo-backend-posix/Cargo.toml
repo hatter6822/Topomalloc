@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-backend-posix"
+description = "PosixBackingProvider: the degenerate single-authority, single-label backend (the M0 skeleton; real mmap/madvise land in plan 04)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[dependencies]
+topo-core = { path = "../topo-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Cross-compilation + execution config for the AArch64 co-primary target (DD-2).
+#
+# CI installs `gcc-aarch64-linux-gnu` (the linker) and `qemu-user` (the runner),
+# so `cargo build/test --target aarch64-unknown-linux-gnu` links and runs the
+# asm/RSEQ paths on the real instruction set. On a dev box without those tools,
+# `xtask` uses `cargo check` for AArch64 (compile-only), so this config is inert
+# there (no link, no run).
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+runner = "qemu-aarch64 -L /usr/aarch64-linux-gnu"

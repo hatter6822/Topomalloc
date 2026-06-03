@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-test-support"
+description = "Trace grammar (§33.7) parser, a deterministic PRNG/harness (§30.4), and property op generators (plan 08)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[dependencies]
+topo-core = { path = "../topo-core" }
+
+[lints]
+workspace = true

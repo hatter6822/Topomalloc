@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: MIT
+#
+# TopoMalloc CI (W0-5). Guiding rule: every job calls `cargo xtask` verbatim —
+# no build logic lives only in this YAML, so `cargo xtask ci` reproduces CI
+# locally. The job graph mirrors the plan (W0-5a..f) and is additive per
+# milestone. Configure these as required status checks on the protected branch
+# so a red job blocks merge.
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # G-build (lint half): rustfmt + clippy -D warnings + SPDX + markdownlint.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install markdownlint
+        run: npm install -g markdownlint-cli2
+      - run: cargo xtask fmt --check
+      - run: cargo xtask lint
+
+  # G-table: the generated tables match the golden (single source of truth, DD-1).
+  gen-golden-diff:
+    name: gen-golden-diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask gen --check
+
+  # G-build: {x86-64, aarch64} x {debug, performance}. AArch64 is co-primary (DD-2).
+  build:
+    name: build (${{ matrix.target }}, ${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        profile: [debug, performance]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.profile }}
+      - name: Install AArch64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - run: cargo xtask build --target ${{ matrix.target }} --profile ${{ matrix.profile }}
+
+  # G-core: tests on both arches; AArch64 runs under qemu-user (the asm/RSEQ
+  # battery lands here from plan 05). The host run also exercises the seLe4n
+  # simulator vertical slice (G-sim).
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.target }}
+      - name: Install AArch64 runtime (cross linker + qemu-user)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user qemu-user-static
+      - name: Test (host, x86-64) — includes G-sim
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo xtask test
+      - name: Test (AArch64 under qemu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo xtask test --target ${{ matrix.target }}
+
+  # G-build -> G-model: the Lean model builds and `lake exe check` passes.
+  lean:
+    name: lean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lean
+      - name: Install elan + pinned Lean toolchain
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain "$(cat lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Cache Lake build
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: lake-${{ hashFiles('lean-toolchain', 'lakefile.toml', 'lean/**/*.lean') }}
+      - run: cargo xtask lean
+
+  # Non-gating until plan 10: the mdbook site builds.
+  docs:
+    name: docs (non-gating)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - run: mdbook build docs

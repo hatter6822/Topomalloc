@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+#
+# Cross-crate integration tests (repo layout `/tests`). The default build is
+# MIT/POSIX-only; the `sele4n-sim` feature additionally links the GPL seLe4n
+# backend for the dual-backend (G-sim) test and yields GPL test binaries.
+[package]
+name = "topo-tests"
+description = "Cross-crate integration, ABI, and property tests (plan 08)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+sele4n-sim = ["dep:topo-backend-sele4n"]
+
+[dependencies]
+topo-core = { path = "../crates/topo-core" }
+topo-abi = { path = "../crates/topo-abi" }
+topo-backend-posix = { path = "../crates/topo-backend-posix" }
+topo-backend-sele4n = { path = "../crates/topo-backend-sele4n", optional = true }
+topo-stats = { path = "../crates/topo-stats" }
+topo-control = { path = "../crates/topo-control" }
+topo-test-support = { path = "../crates/topo-test-support" }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

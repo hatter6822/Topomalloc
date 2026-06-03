@@ -2839,7 +2839,6 @@ Each phase MUST be reentrancy-safe.
 
 At process exit, TopoMalloc SHOULD avoid complex teardown unless explicitly requested. Many allocators intentionally leak allocator metadata at exit because the OS reclaims process memory. Explicit teardown for tests MUST be available.
 
-
 # 36. seLe4n integration profile
 
 The seLe4n/seL4-style integration profile defined in this section is a **required** part of

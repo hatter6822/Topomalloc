@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hatter6822/topomalloc/security/advisories/new
+    about: Report memory-safety / security issues privately — see SECURITY.md. Do NOT open a public issue.
+  - name: Specification & implementation plan
+    url: https://github.com/hatter6822/topomalloc/blob/main/planning/plans/README.md
+    about: Read the SPEC and the workstream plan before proposing design changes.

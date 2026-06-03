@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "xtask"
+description = "The single build/codegen/CI driver (D3, W0-4). CI runs `cargo xtask ci` verbatim."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+# Intentionally dependency-free: xtask must build from a bare toolchain so a
+# fresh clone can run `cargo xtask setup` before anything else is fetched.
+[dependencies]
+
+[lints]
+workspace = true

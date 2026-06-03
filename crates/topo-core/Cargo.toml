@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "topo-core"
+description = "TopoMalloc core: classifier, size classes, the backing-provider seam, and the M0 skeleton allocator. no_std-capable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[features]
+default = []
+# Pull in `std` (only the test harness needs it; the crate is otherwise no_std).
+std = []
+# Debug/hardened invariant checks (Appendix B) compiled in. Profiles are
+# features, not forks (overview principle 8).
+debug-checks = []
+
+[dependencies]
+
+[lints]
+workspace = true

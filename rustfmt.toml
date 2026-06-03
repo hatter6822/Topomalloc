@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Formatting policy (W0-6). `cargo xtask fmt --check` reproduces the CI gate.
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

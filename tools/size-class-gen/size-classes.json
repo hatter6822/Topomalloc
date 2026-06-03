@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "GOLDEN size-class table — the single source of truth (DD-1, W0-14d).",
+    "tools/size-class-gen reads this file and emits the Rust table, the C header,",
+    "and the Lean table; CI golden-diffs the emitted artifacts (G-table, W0-5e).",
+    "Never hand-edit the emitted files; edit this golden and re-run `xtask gen`.",
+    "",
+    "M0 NOTE: this is a deliberately TRIVIAL placeholder table — a uniform",
+    "quantum-spaced set of 8 classes covering [1, 128] B. The tuned, non-uniform",
+    "table that meets the full Section 9.4 spacing-ratio targets up to small_max =",
+    "32 KiB is emitted by the Lean model in plan 02 (W1-4e) at M1 and replaces this",
+    "golden then. Uniform 16 B spacing is the *minimum achievable* under a 16 B ABI",
+    "quantum, so every class here is alignment-optimal and provably sound."
+  ],
+  "schema_version": 1,
+  "page_size": 16384,
+  "quantum": 16,
+  "tiny_min": 16,
+  "small_max": 128,
+  "classes": [
+    { "size": 16,  "align": 16, "slab_pages": 1, "objects_per_slab": 1024, "batch": 32, "max_local_capacity": 256 },
+    { "size": 32,  "align": 16, "slab_pages": 1, "objects_per_slab": 512,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 48,  "align": 16, "slab_pages": 1, "objects_per_slab": 341,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 64,  "align": 16, "slab_pages": 1, "objects_per_slab": 256,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 80,  "align": 16, "slab_pages": 1, "objects_per_slab": 204,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 96,  "align": 16, "slab_pages": 1, "objects_per_slab": 170,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 112, "align": 16, "slab_pages": 1, "objects_per_slab": 146,  "batch": 32, "max_local_capacity": 256 },
+    { "size": 128, "align": 16, "slab_pages": 1, "objects_per_slab": 128,  "batch": 32, "max_local_capacity": 256 }
+  ]
+}
