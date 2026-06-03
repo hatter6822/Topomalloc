@@ -1098,7 +1098,7 @@ rseq_push(cache, ptr):
         all invariants are preserved
 ```
 
-`LivePending` is an implementation-proof state used during an allocation return. It is not visible in runtime metadata.
+`LivePending` is an implementation-proof state used during an allocation return. It is not visible in runtime metadata, and it collapses to `Owner.live` at the operation's linearization point (27.1). The abstract RSEQ contract (33.5) therefore models a successful pop as transitioning ownership directly from `CpuCache(cpu, sc)` to `Owner.live`; `LivePending` appears only in the finer-grained refinement between the successful RSEQ commit and the return to the caller.
 
 ## 12.3 RSEQ implementation requirements
 
