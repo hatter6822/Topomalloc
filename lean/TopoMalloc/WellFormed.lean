@@ -2,12 +2,13 @@
 /-
 The `WellFormed` predicate (SPEC §33.3, plan 02 W1-3).
 
-`WellFormed` is a *total* predicate (defined on every `State`) built from twelve
+`WellFormed` is a *total* predicate (defined on every `State`) built from thirteen
 named clauses, each a standalone `def` cross-referenced to its SPEC bullet so a
 transition proof can cite exactly the ones it preserves. Eleven clauses are the
-§33.3 bullets; the twelfth (`WfSlabLayout`) is the §9.5/§16.3 slab-layout backbone
-("alignment is sufficient"), which the §33.4 `malloc_success_…` theorem needs and
-which the SPEC's eleven-bullet *minimum* leaves implicit.
+§33.3 bullets; two more — `WfSlabLayout` (the §9.5/§16.3 slab-layout backbone,
+"alignment is sufficient") and `WfSpansDisjoint` (the §16.1/§22.7 span-tiling
+backbone) — make explicit what the §33.4 `malloc_success_…` and span split/merge
+theorems need and what the SPEC's eleven-bullet *minimum* leaves implicit.
 
 Clause 1 is stated for *all* blocks, not only live ones. This strengthens §33.3
 bullet 1 ("live ranges disjoint", §8.3) to the slab-structural truth (§9.5:
@@ -15,7 +16,7 @@ bullet 1 ("live ranges disjoint", §8.3) to the slab-structural truth (§9.5:
 regardless of liveness. `WellFormed.liveRangesDisjoint` recovers the exact SPEC
 statement, so nothing is weakened.
 
-`setOwner` (the relabel primitive) preserves the eight *owner-independent* clauses
+`setOwner` (the relabel primitive) preserves the nine *owner-independent* clauses
 unconditionally; the four owner-dependent clauses (caches/central consistency,
 released-no-live, capacities) are re-established per transition. Those preservation
 lemmas live here so every transition reuses them.
@@ -37,7 +38,7 @@ def maxLocalCapacity (sc : SizeClassId) : Nat :=
   | none => 0
 
 /- ----------------------------------------------------------------------- -/
-/- The twelve clauses (§33.3 bullets 1–11 + the §9.5/§16.3 layout backbone). -/
+/- The thirteen clauses (§33.3 bullets 1–11 + the §9.5/§16 structural backbones). -/
 /- ----------------------------------------------------------------------- -/
 
 /-- Clause 1 (§33.3.1, §8.3, §9.5): block ranges are pairwise disjoint. Stated for
@@ -212,7 +213,7 @@ theorem countOwned_setOwner_le_of_ne {o' : Owner} (hne : o' ≠ o) :
   · exact hx
 
 /- ----------------------------------------------------------------------- -/
-/- `setOwner` preserves the eight owner-independent clauses.                -/
+/- `setOwner` preserves the nine owner-independent clauses.                 -/
 /- ----------------------------------------------------------------------- -/
 
 theorem WfRangesDisjoint.setOwner (h : WfRangesDisjoint s) :

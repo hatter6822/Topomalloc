@@ -6,15 +6,21 @@ Three layers, smallest blast radius first (so a generator change re-checks
 cheaply rather than re-proving the whole table):
 
 * `SizeClassRow` + the decidable well-formedness predicate `tableOk` (§9.3/§9.5).
-  The `check` executable replays the *generated* table (the single source of
-  truth) through it, closing the DD-1 loop on the Lean side.
-* `Params` + `buildTable` (W1-4a): the table *derives from build constants*, with
-  no hand-written literals — a pure function of the D4 parameters.
-* The machine-checked obligations (W1-4b..e): the spacing-dominated ratio bound
-  (§9.4), the alignment-dominated waste caveat (§9.4), the layout lemmas (§9.5),
-  and lookup totality/coverage (§9.5). `size_class_table_covers_all_small_requests`
-  (§33.4) is discharged for the generated table in `TopoMalloc.SizeClassFacts`,
-  which also proves `buildTable` *equals* the generated golden (single source).
+  The `check` executable replays the *generated tuned table* (the single source of
+  truth — 72 non-uniform classes to 32 KiB) through it, closing the DD-1 loop on
+  the Lean side.
+* `Params` + `buildTable` (W1-4a): a *parameterized uniform* table that derives
+  from build constants with no hand-written literals — a pure function of the D4
+  parameters. It is the vehicle for the general §9.4/§9.5 obligations below; it is
+  **not** the emitted table (the runtime table is the tuned, non-uniform one, whose
+  coverage is proved separately — see `TopoMalloc.Theorems.SizeClass`).
+* The machine-checked obligations (W1-4b..e) for `buildTable`: the spacing-dominated
+  ratio bound (§9.4), the alignment-dominated waste caveat (§9.4), the layout lemmas
+  (§9.5), and lookup totality/coverage (`buildTable_covers`, §9.5). The named
+  `size_class_table_covers_all_small_requests` (§33.4) for the *generated tuned*
+  table lives in `TopoMalloc.Theorems.SizeClass`, discharged from the decidable
+  per-granule predicate `coversAllB` that `lake exe check` evaluates (the tuned
+  lookup is too large to reduce in the kernel).
 -/
 import TopoMalloc.Types
 
@@ -271,8 +277,8 @@ theorem uniformClassOf_lt_length (p : Params) (hp : p.Valid) (req : Nat)
 /-- **`size_class_table_covers_all_small_requests` (§33.4), general form.** Every
 request `1 ≤ req ≤ smallMax` maps to an in-bounds class whose size is at least
 the request (sufficient) and is the smallest such class (minimal): the previous
-class is too small. The named instance for the generated table is in
-`TopoMalloc.SizeClassFacts`. -/
+class is too small. The named `size_class_table_covers_all_small_requests` for the
+generated tuned table is in `TopoMalloc.Theorems.SizeClass`. -/
 theorem buildTable_covers (p : Params) (hp : p.Valid) (req : Nat)
     (h1 : 1 ≤ req) (h2 : req ≤ p.smallMax) :
     ∃ row, (buildTable p)[uniformClassOf p req]? = some row ∧

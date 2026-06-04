@@ -3,20 +3,25 @@
 The bridge preservation/simulation theorems (SPEC §36.17, plan 02 W1-12b/c/d).
 
 * `backing_descends_from_untyped`, `no_live_object_released`            (W1-12b)
-* `destroy_revokes_descendants`, `label_partition_preserved`,
-  `scrub_before_downgrade`                                              (W1-12c)
+* `destroy_revokes_descendants`, `label_partition_preserved`
+  (and its general/`free` forms), `scrub_before_downgrade`             (W1-12c)
 * `topo_step_preserves_sele4n_invariants`                              (W1-12d)
+* the **coupled** `allocStep`/`freeStep` and their
+  `*_preserves_invariants` simulations: TopoMalloc and the seLe4n quota move as one
+  step, preserving the whole `TopoSeLe4nWellFormed` bundle (W1-12b)
 
 Each is proved single-core. The release/destroy families lift the corresponding §33.4
 theorems (`release_to_os_preserves_live_objects`, the arena lifecycle theorems) to the
 combined state; the provenance family reads the §36.6 reachability built into `R`; and
 `topo_step_preserves_sele4n_invariants` holds because the TopoMalloc fast/slow paths
-leave the capability system untouched (`withTopo`).
+leave the capability system untouched (`withTopo`). The coupled steps additionally
+charge/credit the arena quota, so they preserve the §36.4 quota accounting too.
 
 GPL-3.0-or-later (D5).
 -/
 import TopoMalloc.Transitions
 import TopoMalloc.Theorems.Malloc
+import TopoMalloc.Theorems.Free
 import TopoMalloc.Theorems.Release
 import TopoMalloc.SeLe4n.Bridge
 import TopoMalloc.SeLe4n.InformationFlow
@@ -113,37 +118,75 @@ def TopoSeLe4n.freeStep (st : TopoSeLe4n) (b : BlockId) (a : ArenaId) (sc : Size
 @[simp] theorem allocStep_topo (st : TopoSeLe4n) (b a size) :
     (st.allocStep b a size).topo = malloc st.topo b := rfl
 
-/-- The per-arena update predicate is unaffected by charging (it preserves `arena`). -/
-private theorem chargeArena_pred (a size : Nat) (x : ArenaId) :
+/-- The per-arena update predicate is unaffected by any update that preserves `arena`. -/
+private theorem find_if_pred (a x : ArenaId) (f : ArenaAuth → ArenaAuth)
+    (hf : ∀ au, (f au).arena = au.arena) :
     ((fun au => decide (au.arena = x)) ∘
-      (fun au : ArenaAuth => if au.arena = a then au.charge size else au))
+      (fun au : ArenaAuth => if au.arena = a then f au else au))
       = (fun au => decide (au.arena = x)) := by
-  funext au; simp only [Function.comp]; by_cases hh : au.arena = a <;> simp [hh]
+  funext au; simp only [Function.comp]; by_cases hh : au.arena = a <;> simp [hh, hf]
+
+/-- A per-arena authority update preserving `arena` leaves the list of arena ids unchanged
+(hence the authority-uniqueness invariant). Shared by `chargeArena`/`creditArena`. -/
+private theorem map_if_arena (arenas : List ArenaAuth) (a : ArenaId) (f : ArenaAuth → ArenaAuth)
+    (hf : ∀ au, (f au).arena = au.arena) :
+    ((arenas.map (fun au => if au.arena = a then f au else au)).map (·.arena)) = arenas.map (·.arena) := by
+  simp only [List.map_map]; apply List.map_congr_left; intro x _
+  by_cases h : x.arena = a <;> simp [h, hf]
+
+/-- A per-arena update preserving `arena` preserves "arena `x` is a known authority"
+(it changes `used`, not presence). -/
+private theorem find_if_isSome (arenas : List ArenaAuth) (a : ArenaId) (f : ArenaAuth → ArenaAuth)
+    (hf : ∀ au, (f au).arena = au.arena) {x : ArenaId}
+    (h : (arenas.find? (fun au => decide (au.arena = x))).isSome) :
+    ((arenas.map (fun au => if au.arena = a then f au else au)).find?
+      (fun au => decide (au.arena = x))).isSome := by
+  rw [List.find?_map, find_if_pred a x f hf]
+  cases hfd : arenas.find? (fun au => decide (au.arena = x)) with
+  | none => rw [hfd] at h; simp at h
+  | some au => simp
+
+/-- A per-arena update preserving `arena` and `label` changes no arena's label. -/
+private theorem find_if_label (arenas : List ArenaAuth) (a : ArenaId) (f : ArenaAuth → ArenaAuth)
+    (hf_arena : ∀ au, (f au).arena = au.arena) (hf_label : ∀ au, (f au).label = au.label)
+    (x : ArenaId) :
+    ((arenas.map (fun au => if au.arena = a then f au else au)).find?
+      (fun au => decide (au.arena = x))).map (·.label)
+      = (arenas.find? (fun au => decide (au.arena = x))).map (·.label) := by
+  rw [List.find?_map, Option.map_map, find_if_pred a x f hf_arena]
+  cases hfd : arenas.find? (fun au => decide (au.arena = x)) with
+  | none => simp
+  | some au => by_cases hh : au.arena = a <;> simp [Function.comp, hh, hf_label]
 
 /-- Charging preserves each arena's identity, hence the authority-uniqueness invariant. -/
 theorem chargeArena_map_arena (sys : SystemState) (a size : Nat) :
-    (sys.chargeArena a size).arenas.map (·.arena) = sys.arenas.map (·.arena) := by
-  simp only [SystemState.chargeArena, List.map_map]
-  apply List.map_congr_left; intro x _; by_cases h : x.arena = a <;> simp [h]
+    (sys.chargeArena a size).arenas.map (·.arena) = sys.arenas.map (·.arena) :=
+  map_if_arena sys.arenas a (·.charge size) (fun _ => rfl)
 
 /-- Charging preserves "arena `x` is a known authority" (it changes `used`, not presence). -/
 theorem chargeArena_arenaAuthOf_isSome (sys : SystemState) (a size : Nat) {x : ArenaId}
-    (h : (sys.arenaAuthOf x).isSome) : ((sys.chargeArena a size).arenaAuthOf x).isSome := by
-  simp only [SystemState.arenaAuthOf, SystemState.chargeArena, List.find?_map, chargeArena_pred]
-  simp only [SystemState.arenaAuthOf] at h
-  cases hf : sys.arenas.find? (fun au => decide (au.arena = x)) with
-  | none => rw [hf] at h; simp at h
-  | some au => simp
+    (h : (sys.arenaAuthOf x).isSome) : ((sys.chargeArena a size).arenaAuthOf x).isSome :=
+  find_if_isSome sys.arenas a (·.charge size) (fun _ => rfl) h
 
 /-- Charging does not change any arena's label, so block labels are unchanged. -/
 theorem chargeArena_label (sys : SystemState) (a size : Nat) (x : ArenaId) :
     ((sys.chargeArena a size).arenaAuthOf x).map (·.label) =
-      (sys.arenaAuthOf x).map (·.label) := by
-  simp only [SystemState.arenaAuthOf, SystemState.chargeArena, List.find?_map, Option.map_map,
-    chargeArena_pred]
-  cases hf : sys.arenas.find? (fun au => decide (au.arena = x)) with
-  | none => simp
-  | some au => by_cases hh : au.arena = a <;> simp [Function.comp, hh]
+      (sys.arenaAuthOf x).map (·.label) :=
+  find_if_label sys.arenas a (·.charge size) (fun _ => rfl) (fun _ => rfl) x
+
+/-- Crediting (the free-side mirror) likewise preserves arena identity, presence, and label. -/
+theorem creditArena_map_arena (sys : SystemState) (a size : Nat) :
+    (sys.creditArena a size).arenas.map (·.arena) = sys.arenas.map (·.arena) :=
+  map_if_arena sys.arenas a (·.credit size) (fun _ => rfl)
+
+theorem creditArena_arenaAuthOf_isSome (sys : SystemState) (a size : Nat) {x : ArenaId}
+    (h : (sys.arenaAuthOf x).isSome) : ((sys.creditArena a size).arenaAuthOf x).isSome :=
+  find_if_isSome sys.arenas a (·.credit size) (fun _ => rfl) h
+
+theorem creditArena_label (sys : SystemState) (a size : Nat) (x : ArenaId) :
+    ((sys.creditArena a size).arenaAuthOf x).map (·.label) =
+      (sys.arenaAuthOf x).map (·.label) :=
+  find_if_label sys.arenas a (·.credit size) (fun _ => rfl) (fun _ => rfl) x
 
 /-- **Quota preservation under a coupled allocation (§36.17).** If the charged arena had
 budget (`used + size ≤ quota`), the allocation keeps every arena's quota sound. -/
@@ -156,6 +199,20 @@ theorem chargeArena_preserves_quota (sys : SystemState) (a size : Nat)
   obtain ⟨au0, hau0, rfl⟩ := hau
   by_cases hc : au0.arena = a
   · rw [if_pos hc]; show au0.used + size ≤ au0.quota; exact hbudget au0 hau0 hc
+  · rw [if_neg hc]; exact h au0 hau0
+
+/-- **Quota preservation under a coupled free (§36.17).** Crediting bytes back keeps every
+arena's quota sound *unconditionally* — `used` only decreases (`used - size ≤ used ≤
+quota`), so no budget guard is needed. -/
+theorem creditArena_preserves_quota (sys : SystemState) (a size : Nat)
+    (h : ∀ au ∈ sys.arenas, au.quotaOk) :
+    ∀ au ∈ (sys.creditArena a size).arenas, au.quotaOk := by
+  intro au hau
+  simp only [SystemState.creditArena, List.mem_map] at hau
+  obtain ⟨au0, hau0, rfl⟩ := hau
+  by_cases hc : au0.arena = a
+  · rw [if_pos hc]; show au0.used - size ≤ au0.quota
+    have := h au0 hau0; unfold ArenaAuth.quotaOk at this; omega
   · rw [if_neg hc]; exact h au0 hau0
 
 /-- Two combined states with the same TopoMalloc state and the same block labels share the
@@ -281,6 +338,44 @@ theorem label_partition_preserved_free (st : TopoSeLe4n) (b : BlockId) (a : Aren
         st.blockLabel blkb = st.blockLabel c) :
     LabelPartition (st.withTopo (st.topo.setOwner b (Owner.centralFree a sc))) :=
   label_partition_preserved_setOwner st b (Owner.centralFree a sc) huniq h hmatch
+
+/-- **The coupled free preserves `TopoSeLe4nWellFormed` (§36.17).** Symmetric to
+`allocStep_preserves_invariants`: TopoMalloc well-formedness comes from `free` into the
+central list of `(a, sc)` (which requires the freed slot belong to arena `a` — `hcentral`),
+the seLe4n quota stays sound because crediting only lowers `used` (no budget guard), the
+abstraction relation survives crediting, and the label partition holds because the freed
+slot's label matches the central list (`hmatch`) and crediting changes no label. -/
+theorem freeStep_preserves_invariants (st : TopoSeLe4n) (b : BlockId) (a : ArenaId)
+    (sc : SizeClassId) (size : Nat) (hwf : TopoSeLe4nWellFormed st)
+    (hcentral : ∀ blk ∈ st.topo.blocks, blk.id = b →
+      ∃ d ∈ st.topo.spans, d.id = blk.span ∧ d.arena = a)
+    (hmatch : ∀ blkb ∈ st.topo.blocks, blkb.id = b → ∀ c ∈ st.topo.blocks, c.id ≠ b →
+      c.owner = Owner.centralFree a sc → st.blockLabel blkb = st.blockLabel c) :
+    TopoSeLe4nWellFormed (st.freeStep b a sc size) where
+  topoWf := free_preserves_wellformed_for_valid_pointer st.topo b (Owner.centralFree a sc)
+    hwf.topoWf (by simp) (by intro cpu sc'; simp)
+    (by intro blk _ _ sc' hsc'; simp [Owner.cacheSizeClass?] at hsc')
+    (by intro blk hblk hid a' ha'
+        simp only [Owner.arena?, Option.some.injEq] at ha'; subst ha'
+        exact hcentral blk hblk hid)
+  sysInv :=
+    { quota := creditArena_preserves_quota st.sys a size hwf.sysInv.quota
+      arenasNodup := by
+        have := hwf.sysInv.arenasNodup
+        rw [← creditArena_map_arena st.sys a size] at this; exact this }
+  rel := by
+    refine ⟨fun d hd => ?_, fun bk hbk => hwf.rel.2 bk hbk⟩
+    exact creditArena_arenaAuthOf_isSome st.sys a size (hwf.rel.1 d hd)
+  labels := by
+    refine LabelPartition_of_same (st1 := st.freeStep b a sc size)
+      (st2 := st.withTopo (st.topo.setOwner b (Owner.centralFree a sc))) rfl ?_
+      (label_partition_preserved_free st b a sc hwf.topoWf.uniqueOwner hwf.labels hmatch)
+    intro blk
+    simp only [TopoSeLe4n.blockLabel, TopoSeLe4n.blockArena, TopoSeLe4n.freeStep, withTopo_topo,
+      withTopo_sys]
+    cases (st.topo.setOwner b (Owner.centralFree a sc)).spanById blk.span with
+    | none => rfl
+    | some d => simp only [Option.map_some, Option.bind_some]; exact creditArena_label st.sys a size d.arena
 
 /-- Downgrade a backing frame to a lower label, *only* if it has been scrubbed
 (`AllocatorMuzzyOrScrubbed`, §36.7). -/

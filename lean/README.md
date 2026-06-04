@@ -60,11 +60,13 @@ from the MIT core. It imports TopoMalloc's model and seLe4n's *public* shapes on
 | `SeLe4n/Refinement.lean` | **coupled** alloc/free steps (topo+sys move together), destroy revokes backings, label partition (incl. `free`), provenance/release/scrub families | W1-12b/c/d |
 | `SeLe4n/SMP.lean` | the **multicore** model: conservation/isolation/abort/non-interference over *every* interleaving | W1-14 |
 
-The coupled `allocStep` makes the TopoMalloc malloc and the seLe4n quota accounting one
-step (`allocStep_preserves_invariants` preserves the whole `TopoSeLe4nWellFormed` bundle)
-— the simulation the bridge is about. `SMP.lean` proves the §36.17 SMP forms by interleaving
-semantics: with the RSEQ contract giving atomic per-core steps, correctness is "the
-invariant holds for every schedule", by induction over the schedule.
+The coupled `allocStep`/`freeStep` make the TopoMalloc malloc/free and the seLe4n quota
+accounting one step (`allocStep_preserves_invariants`/`freeStep_preserves_invariants` each
+preserve the whole `TopoSeLe4nWellFormed` bundle — well-formedness, quota, the abstraction
+relation, and the label partition together) — the simulation the bridge is about. `SMP.lean`
+proves the §36.17 SMP forms by interleaving semantics: with the RSEQ contract giving atomic
+per-core steps, correctness is "the invariant holds for every schedule", by induction over
+the schedule.
 
 ## What is proved vs. deliberately abstracted
 

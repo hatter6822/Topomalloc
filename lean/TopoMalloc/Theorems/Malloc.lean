@@ -5,7 +5,7 @@
 * `malloc_preserves_wellformed`
 * `malloc_success_returns_aligned_sufficient_disjoint_object`
 
-`malloc` relabels one cached slot to `live`. Preservation of the eight
+`malloc` relabels one cached slot to `live`. Preservation of the nine
 owner-independent clauses is automatic; the four owner-dependent clauses are
 discharged from: `live` is neither a cache owner (clause 3) nor arena-qualified
 (clause 4), `live` is not a per-CPU cache so capacity cannot rise (clause 11), and

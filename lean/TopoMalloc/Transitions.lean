@@ -9,7 +9,7 @@ on `State`. Each is tagged with the §7 state-machine transition it models.
 at the range level in `Theorems/Span.lean`.
 
 The reusable engine is `relabelAll` and the lemmas below: a batch of `setOwner`s
-preserves the eight owner-independent well-formedness clauses, frames every block
+preserves the nine owner-independent well-formedness clauses, frames every block
 outside the batch, conserves block ids, and cannot raise the count of any owner
 other than the target. Every batch transition's §33.4 theorem is then a short
 instantiation.
@@ -123,7 +123,7 @@ theorem relabelAll_countOwned_le_of_ne (o : Owner) {o' : Owner} (hne : o' ≠ o)
     rw [relabelAll_cons]
     exact Nat.le_trans (ih _) (countOwned_setOwner_le_of_ne s b o hne)
 
-/- The eight owner-independent clauses survive a batch relabel. -/
+/- The nine owner-independent clauses survive a batch relabel. -/
 
 theorem relabelAll_rangesDisjoint (s : State) (batch : List BlockId) (o : Owner)
     (h : WfRangesDisjoint s) : WfRangesDisjoint (relabelAll s batch o) :=
