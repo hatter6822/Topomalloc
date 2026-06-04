@@ -35,16 +35,29 @@ proxied environments). seLe4n's Rust MSRV is **1.82**; TopoMalloc pins a newer
 stable (`rust-toolchain.toml`) which satisfies it, so the pinned seLe4n crates
 (D8) build cleanly under our toolchain.
 
-## D4 — Allocator page and `small_max`
+## D4 — Allocator page, `small_max`, and the medium/large boundary
 
-The allocator page is **16 KiB** (server default, Appendix C). `small_max` (the
-largest size served by the front-end size-class table) is targeted at **32 KiB**
-but is finalized when the Lean model emits the tuned, non-uniform size-class
-table at M1 (plan 02 W1-4e). The M0 walking skeleton ships a deliberately
-**trivial** table (`page = 16 KiB`, `small_max = 128 B`, uniform 16-byte
-spacing) purely to exercise the single-source-of-truth pipeline (DD-1); it is
-mathematically sound but is a placeholder, replaced at M1. All values are
-generated constants — never hand-edited (Appendix F).
+The allocator page is **16 KiB** (server default, Appendix C). `small_max` — the
+largest size served by the front-end size-class table — is **finalized at 32 KiB**
+with the tuned, non-uniform table the Lean model emits and verifies (plan 02
+W1-4e): 72 classes over `[1, 32768] B`, 16 B-spaced in the alignment-dominated
+tiny region and eight geometric classes per power-of-two octave above it
+(worst-case spacing ratio 1.125, within the §9.4 targets).
+
+Above the small path the classifier (plan 03 W2-3) splits requests into
+**Medium** — a page-rounded extent — up to the hugepage boundary
+`huge_threshold = 2 MiB` (= 128 pages; Appendix C `hugepage_size`), and **Large**
+at or above it (§9.2 / §A.1 / §18.5). The boundary is decided on
+`max(size, alignment)`, so an over-aligned request whose alignment alone reaches
+the hugepage threshold is routed to the Large/hugepage path rather than the
+medium extent allocator (§9.3 / §25.5).
+
+`huge_threshold` is authored in the golden; `MAX_ALIGN` — the widest class
+alignment, used to reject an over-aligned request in O(1) before the lookup — is
+**derived** by the generator. Like every size-class value these are generated
+constants, never hand-edited (Appendix F). The earlier M0 placeholder table
+(`small_max = 128 B`, uniform) existed only to exercise the single-source
+pipeline (DD-1) and has been replaced by the tuned table.
 
 ## D5 — Licensing (closed before the first `/sele4n` byte, W0-12)
 

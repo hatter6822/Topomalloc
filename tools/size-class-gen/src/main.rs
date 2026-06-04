@@ -215,9 +215,22 @@ fn emit_rust(t: &Table) -> String {
     s.push_str("/// Smallest size class in bytes.\n");
     s.push_str(&format!("pub const TINY_MIN: usize = {};\n", t.tiny_min));
     s.push_str("/// Largest small-path request the table serves, in bytes.\n");
+    s.push_str(&format!("pub const SMALL_MAX: usize = {};\n", t.small_max));
+    s.push_str(
+        "/// First request size served by the hugepage/region backend rather than the\n\
+         /// small slab or medium extent path, in bytes (§9.2/§A.1/§18.5).\n",
+    );
     s.push_str(&format!(
-        "pub const SMALL_MAX: usize = {};\n\n",
-        t.small_max
+        "pub const HUGE_THRESHOLD: usize = {};\n",
+        t.huge_threshold
+    ));
+    s.push_str(
+        "/// Largest natural alignment any size class provides, in bytes. A request\n\
+         /// needing more than this can never be served by a small class.\n",
+    );
+    s.push_str(&format!(
+        "pub const MAX_ALIGN: usize = {};\n\n",
+        t.max_align
     ));
     s.push_str("/// The size-class table (index = `SizeClassId`).\n");
     s.push_str("pub const SIZE_CLASSES: &[SizeClassRow] = &[\n");
@@ -247,6 +260,11 @@ fn emit_c(t: &Table) -> String {
     s.push_str(&format!("#define TOPOMALLOC_QUANTUM {}u\n", t.quantum));
     s.push_str(&format!("#define TOPOMALLOC_TINY_MIN {}u\n", t.tiny_min));
     s.push_str(&format!("#define TOPOMALLOC_SMALL_MAX {}u\n", t.small_max));
+    s.push_str(&format!(
+        "#define TOPOMALLOC_HUGE_THRESHOLD {}u\n",
+        t.huge_threshold
+    ));
+    s.push_str(&format!("#define TOPOMALLOC_MAX_ALIGN {}u\n", t.max_align));
     s.push_str(&format!(
         "#define TOPOMALLOC_NUM_SIZE_CLASSES {}u\n\n",
         t.classes.len()
@@ -286,7 +304,12 @@ fn emit_lean(t: &Table) -> String {
     s.push_str(&format!("def pageSize : Nat := {}\n", t.page_size));
     s.push_str(&format!("def quantum : Nat := {}\n", t.quantum));
     s.push_str(&format!("def tinyMin : Nat := {}\n", t.tiny_min));
-    s.push_str(&format!("def smallMax : Nat := {}\n\n", t.small_max));
+    s.push_str(&format!("def smallMax : Nat := {}\n", t.small_max));
+    s.push_str(&format!(
+        "def hugeThreshold : Nat := {}\n",
+        t.huge_threshold
+    ));
+    s.push_str(&format!("def maxAlign : Nat := {}\n\n", t.max_align));
     s.push_str("def sizeClasses : List SizeClassRow := [\n");
     for (i, c) in t.classes.iter().enumerate() {
         let comma = if i + 1 < t.classes.len() { "," } else { "" };
@@ -318,6 +341,7 @@ mod tests {
             quantum: 16,
             tiny_min: 16,
             small_max: 32,
+            huge_threshold: 2097152,
             classes: vec![
                 ClassRow {
                     size: 16,
@@ -398,5 +422,13 @@ mod tests {
         assert!(emit_rust(&t).contains("SPDX-License-Identifier: MIT"));
         assert!(emit_c(&t).contains("TOPOMALLOC_TABLES_H"));
         assert!(emit_lean(&t).contains("TopoMalloc.Generated"));
+        // The medium/large boundary and the derived max-alignment are emitted to
+        // all three artifacts from the single source (DD-1).
+        assert!(emit_rust(&t).contains("HUGE_THRESHOLD"));
+        assert!(emit_rust(&t).contains("MAX_ALIGN"));
+        assert!(emit_c(&t).contains("TOPOMALLOC_HUGE_THRESHOLD"));
+        assert!(emit_c(&t).contains("TOPOMALLOC_MAX_ALIGN"));
+        assert!(emit_lean(&t).contains("hugeThreshold"));
+        assert!(emit_lean(&t).contains("maxAlign"));
     }
 }

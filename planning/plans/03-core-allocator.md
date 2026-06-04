@@ -298,7 +298,9 @@ generator, never a literal.
 
 ## Best-practices checklist
 
-- [ ] Over-aligned requests never share a slab (W2-3b).
+- [x] Over-aligned requests never share a slab (W2-3b) — `size_class` routes them to
+      a sufficiently-aligned class or out to medium/large; the runtime `MAX_ALIGN`
+      fast-reject and the `over_alignment_never_widens_a_shared_slab` test enforce it.
 - [ ] One critical section updates bitmap **and** count together (W5-2); no torn accounting.
 - [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
       the hot path.

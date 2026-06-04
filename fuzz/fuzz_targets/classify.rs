@@ -7,6 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use topo_core::classify::RequestKind;
+use topo_core::generated::tables::PAGE_SIZE;
 use topo_core::{classify, usable_size};
 
 fuzz_target!(|data: &[u8]| {
@@ -19,18 +20,22 @@ fuzz_target!(|data: &[u8]| {
     let align = 1usize << (data[8] % 32);
 
     if let Some(req) = classify(size, align, 0) {
+        // The validated alignment is echoed back verbatim.
+        assert_eq!(req.align, align);
         // Whatever it returns must satisfy the request without wrapping.
         match req.kind {
             RequestKind::Small { sc, usable } => {
                 assert_eq!(usable, usable_size(sc));
                 assert!(usable >= size.max(1));
                 // A small class was chosen, so its natural alignment covers the
-                // request (otherwise classify would have routed to Large).
+                // request (otherwise classify would have routed to medium/large).
                 assert!(usable >= align);
             }
-            RequestKind::Large { bytes } => {
+            RequestKind::Medium { bytes } | RequestKind::Large { bytes } => {
                 assert!(bytes >= size.max(1));
                 assert!(bytes >= align);
+                // Medium/Large extents are always whole allocator pages (§9.7).
+                assert_eq!(bytes % PAGE_SIZE, 0);
             }
         }
     }

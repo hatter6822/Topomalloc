@@ -27,6 +27,10 @@ pub struct Golden {
     pub quantum: u32,
     pub tiny_min: u32,
     pub small_max: u32,
+    /// First request size (in bytes) served by the hugepage/region backend
+    /// rather than the small slab or medium extent path (§9.2, §A.1, §18.5). A
+    /// platform/D4 parameter equal to the hugepage size by default (Appendix C).
+    pub huge_threshold: u32,
     pub classes: Vec<ClassRow>,
 }
 
@@ -37,6 +41,14 @@ pub struct Table {
     pub quantum: u32,
     pub tiny_min: u32,
     pub small_max: u32,
+    /// First size served by the hugepage/region backend (§9.2/§A.1). Authored in
+    /// the golden; validated `> small_max` and a whole multiple of `page_size`.
+    pub huge_threshold: u32,
+    /// Largest natural alignment any class provides (`max` over the rows). Derived
+    /// here — never authored — so it cannot drift from the table. The runtime uses
+    /// it to reject, in O(1), an over-aligned request no small class can satisfy
+    /// (it routes to medium/large instead of widening a shared slab, §9.3/§25.5).
+    pub max_align: u32,
     pub classes: Vec<ClassRow>,
     /// `size_to_class[(size-1)/quantum]` = class index, for sizes in `1..=small_max`.
     pub size_to_class: Vec<u8>,
@@ -65,6 +77,22 @@ impl Table {
             return Err(format!(
                 "small_max {} must be a multiple of quantum {} (granule lookup soundness)",
                 g.small_max, g.quantum
+            ));
+        }
+        // The hugepage/region boundary (§9.2/§A.1/§18.5). It must lie strictly
+        // above the small path so the medium range `(small_max, huge_threshold)`
+        // is well-defined, and be a whole number of allocator pages so a medium
+        // request that page-rounds can never reach into the large regime.
+        if g.huge_threshold <= g.small_max {
+            return Err(format!(
+                "huge_threshold {} must exceed small_max {} (the medium range must be non-empty)",
+                g.huge_threshold, g.small_max
+            ));
+        }
+        if !g.huge_threshold.is_multiple_of(g.page_size) {
+            return Err(format!(
+                "huge_threshold {} must be a whole multiple of page_size {}",
+                g.huge_threshold, g.page_size
             ));
         }
         if g.classes.is_empty() {
@@ -220,11 +248,22 @@ impl Table {
             }
         }
 
+        // Derived, never authored: the largest alignment any class provides. The
+        // table is non-empty (checked above), so `max` is total.
+        let max_align = g
+            .classes
+            .iter()
+            .map(|c| c.align)
+            .max()
+            .expect("non-empty table checked above");
+
         Ok(Table {
             page_size: g.page_size,
             quantum: g.quantum,
             tiny_min: g.tiny_min,
             small_max: g.small_max,
+            huge_threshold: g.huge_threshold,
+            max_align,
             classes: g.classes,
             size_to_class,
         })
@@ -242,6 +281,7 @@ mod tests {
             quantum: 16,
             tiny_min: 16,
             small_max: 48,
+            huge_threshold: 2097152,
             classes: vec![
                 ClassRow {
                     size: 16,
@@ -275,6 +315,33 @@ mod tests {
     fn accepts_good_table() {
         let t = Table::validate(good()).expect("valid");
         assert_eq!(t.size_to_class, vec![0, 1, 2]);
+        // `max_align` is derived from the rows, not authored.
+        assert_eq!(t.max_align, 16);
+        assert_eq!(t.huge_threshold, 2097152);
+    }
+
+    #[test]
+    fn rejects_huge_threshold_below_small_max() {
+        let mut g = good();
+        g.huge_threshold = 48; // == small_max, so the medium range would be empty
+        assert!(Table::validate(g).is_err());
+    }
+
+    #[test]
+    fn rejects_huge_threshold_not_page_multiple() {
+        let mut g = good();
+        g.huge_threshold = 2097152 + 1; // not a whole number of pages
+        assert!(Table::validate(g).is_err());
+    }
+
+    #[test]
+    fn derives_max_align_from_widest_class() {
+        let mut g = good();
+        // A genuinely over-aligned class (size 32 is a multiple of align 32) lifts
+        // the derived MAX_ALIGN to 32 — proving it tracks the widest row.
+        g.classes[1].align = 32;
+        let t = Table::validate(g).expect("valid");
+        assert_eq!(t.max_align, 32);
     }
 
     #[test]

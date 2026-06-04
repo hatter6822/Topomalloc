@@ -9,7 +9,10 @@ use proptest::prelude::*;
 
 use topo_abi::{topomalloc_calloc, topomalloc_free};
 use topo_backend_posix::PosixBackingProvider;
-use topo_core::{trace, SkeletonAllocator};
+use topo_core::classify::RequestKind;
+use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
+use topo_core::size_class::row;
+use topo_core::{classify, trace, usable_size, ArenaId, SkeletonAllocator};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -138,6 +141,53 @@ proptest! {
                 reference.remove(&slot);
             }
             prop_assert_eq!(model.live_count(), reference.len());
+        }
+    }
+}
+
+proptest! {
+    /// Request classification (§A.1, plan 03 W2-3/W2-4) is total, deterministic,
+    /// and sound over an arbitrary `(size, align)`: it never panics and never
+    /// wraps; whatever it returns satisfies the request with the alignment
+    /// honored *naturally* (never by offset-adjusting a shared slab, §9.3/§25.5);
+    /// and every medium/large extent is a whole number of allocator pages.
+    #[test]
+    fn classify_is_total_deterministic_and_sound(
+        size in 0usize..=(1usize << 48),
+        align_exp in 0u32..=48,
+        flags in any::<u32>(),
+    ) {
+        let align = 1usize << align_exp;
+        // Determinism: a pure function of its inputs (W2-3a "deterministic").
+        prop_assert_eq!(classify(size, align, flags), classify(size, align, flags));
+
+        let Some(req) = classify(size, align, flags) else { return Ok(()); };
+        prop_assert_eq!(req.align, align);
+        prop_assert_eq!(req.flags, flags);
+        prop_assert_eq!(req.arena, ArenaId::DEFAULT);
+
+        let span = size.max(1).max(align); // effective size folded with alignment
+        match req.kind {
+            RequestKind::Small { sc, usable } => {
+                prop_assert_eq!(usable, usable_size(sc));
+                prop_assert!(usable >= size.max(1));
+                // The class's natural alignment covers the request and its size is
+                // an integer multiple of it — the slab needs no offset adjustment.
+                let r = row(sc);
+                prop_assert!(r.align as usize >= align);
+                prop_assert_eq!(r.size % r.align, 0);
+                prop_assert!(align <= MAX_ALIGN);
+            }
+            RequestKind::Medium { bytes } => {
+                prop_assert!(bytes >= span);
+                prop_assert_eq!(bytes % PAGE_SIZE, 0);
+                prop_assert!(span < HUGE_THRESHOLD);
+            }
+            RequestKind::Large { bytes } => {
+                prop_assert!(bytes >= span);
+                prop_assert_eq!(bytes % PAGE_SIZE, 0);
+                prop_assert!(span >= HUGE_THRESHOLD);
+            }
         }
     }
 }

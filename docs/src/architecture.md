@@ -7,7 +7,8 @@ vertical slice through it.
 
 ```text
 Public API:  C ABI (topomalloc_*) + Rust GlobalAlloc        topo-abi
-Request classifier: size class, align, arena, label         topo-core (classify)
+Request classifier: small/medium/large, size class,         topo-core (classify)
+                    align, arena, label, hints
 Front/middle/back ends (M1+)                                 topo-core, plans 03/05
         ─────────────────  S E A M  ─────────────────
 trait TopoBackingProvider                                    topo-core (backend)
@@ -33,10 +34,15 @@ Formal: Lean model + seLe4n bridge                           lean/
 
 `tools/size-class-gen` reads the committed golden
 `tools/size-class-gen/size-classes.json` and emits the Rust table, the C header,
-and the Lean table — all checked byte-for-byte in CI (G-table). No table value
-is ever hand-edited. The Lean model additionally proves `buildTable_eq_generated`:
-its own parameterized table builder reproduces the emitted golden exactly, so the
-generated artifact provably cannot drift from the model.
+and the Lean table — including the size-regime constants `HUGE_THRESHOLD` (the
+medium/large boundary, authored) and `MAX_ALIGN` (the widest class alignment,
+*derived* so over-alignment routing cannot drift) — all checked byte-for-byte in
+CI (G-table). No table value is ever hand-edited. On the Lean side, `lake exe
+check` replays the *generated* table through the well-formedness predicate
+(`tableOk`) and the decidable lookup-coverage and §9.4-spacing gates
+(`coversAllB`, `spacingOkB`); the §9.5/§33.4 coverage and §9.4 spacing theorems
+are proved generally and discharged on the emitted table through those
+predicates, so the shipped artifact provably cannot drift from a sound table.
 
 ## Formal model (`lean/`, plan 02 W1)
 

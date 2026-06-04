@@ -8,6 +8,8 @@ def pageSize : Nat := 16384
 def quantum : Nat := 16
 def tinyMin : Nat := 16
 def smallMax : Nat := 32768
+def hugeThreshold : Nat := 2097152
+def maxAlign : Nat := 16
 
 def sizeClasses : List SizeClassRow := [
   { size := 16, align := 16, slabPages := 1, objectsPerSlab := 1024, batch := 32, maxLocalCapacity := 256 },

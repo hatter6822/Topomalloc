@@ -14,6 +14,12 @@ pub const QUANTUM: usize = 16;
 pub const TINY_MIN: usize = 16;
 /// Largest small-path request the table serves, in bytes.
 pub const SMALL_MAX: usize = 32768;
+/// First request size served by the hugepage/region backend rather than the
+/// small slab or medium extent path, in bytes (§9.2/§A.1/§18.5).
+pub const HUGE_THRESHOLD: usize = 2097152;
+/// Largest natural alignment any size class provides, in bytes. A request
+/// needing more than this can never be served by a small class.
+pub const MAX_ALIGN: usize = 16;
 
 /// The size-class table (index = `SizeClassId`).
 pub const SIZE_CLASSES: &[SizeClassRow] = &[

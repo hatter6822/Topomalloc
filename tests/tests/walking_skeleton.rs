@@ -25,7 +25,7 @@ fn classify_allocate_emit_parse_replay() {
         let req = classify(size, 16, 0).expect("classifiable");
         let (usable, sc) = match req.kind {
             RequestKind::Small { sc, usable } => (usable, Some(sc.index() as u64)),
-            RequestKind::Large { bytes } => (bytes, None),
+            RequestKind::Medium { bytes } | RequestKind::Large { bytes } => (bytes, None),
         };
         let ptr = alloc.malloc(size, 16);
         assert!(!ptr.is_null(), "alloc of {size} failed");
