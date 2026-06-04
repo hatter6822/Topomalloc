@@ -54,10 +54,11 @@ theorem set is complete:
 - **§9.4/§9.5 size classes** — the spacing-dominated ratio bound, the
   alignment-dominated waste caveat, the slab-layout lemmas, and lookup coverage.
 - **seLe4n bridge (§36, GPL-3.0-or-later)** — the abstraction relation and
-  `TopoSeLe4nWellFormed`, the §36.6 backing-provider state machine, and the
-  single-core §36.17 families (authority/quota, provenance/release,
-  destroy/label/scrub, per-core/stats/non-interference). SMP forms are staged as
-  tracked V-004 debt.
+  `TopoSeLe4nWellFormed`, the §36.6 backing-provider state machine, the §36.17
+  families (authority/quota, provenance/release, destroy/label/scrub,
+  per-core/stats/non-interference), and a *coupled* TopoMalloc↔seLe4n step whose
+  whole invariant bundle is preserved together. The SMP/multicore forms are
+  **proved** by interleaving semantics over all schedules (not staged).
 - **Executable model (§33.7)** — a proof-grade trace-replay oracle that checks
   well-formedness at trace boundaries and flags injected violations; `lake exe
   check` runs it as a CI gate alongside the G-table check.
