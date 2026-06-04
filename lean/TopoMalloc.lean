@@ -1,10 +1,23 @@
 -- SPDX-License-Identifier: MIT
 /-
 Root module of the TopoMalloc formal model (plan 02). Importing it brings in the
-core types, the size-class predicate, the generated (single-source-of-truth)
-table, and the (empty at M0) seLe4n bridge.
+whole single-core model:
+
+* the core types (§33.2) and the size-class model + §9.4/§9.5 proofs (W1-4);
+* the abstract `State`, the twelve-clause `WellFormed` predicate (§33.3, W1-3),
+  the total transitions (§33.4 subjects, W1-5), and the RSEQ contract (§33.5, W1-7);
+* the §33.4 theorem families (W1-6/W1-8/W1-9) and the named coverage theorem (W1-4e);
+* the executable model + trace replay (§33.7, W1-10);
+* the generated, single-source-of-truth size-class table (DD-1); and
+* the seLe4n bridge package (§36.3.3, W1-11/W1-12/W1-13), which builds without seLe4n.
 -/
 import TopoMalloc.Types
 import TopoMalloc.SizeClass
 import TopoMalloc.Generated.SizeClasses
-import TopoMalloc.SeLe4n.Bridge
+import TopoMalloc.State
+import TopoMalloc.WellFormed
+import TopoMalloc.Transitions
+import TopoMalloc.Rseq
+import TopoMalloc.Theorems
+import TopoMalloc.Exec
+import TopoMalloc.SeLe4n

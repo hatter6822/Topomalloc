@@ -12,6 +12,13 @@ and the trace oracle.
 > production hot path (§33.1). Its three deliverables make conformance real: (a) the generated/verified
 > tables consumed by the implementation, (b) the trace-replay oracle for differential testing, (c) the proofs.
 
+> **▸ Implementation status.** The single-core set is **landed** in [`lean/`](../../lean/) and gated in CI
+> (`lake build` proof-checks every module; `lake exe check` runs the G-table and trace-oracle gates). All
+> §33.4 theorems and all single-core §36.17 bridge families are proved and named exactly per the SPEC; the
+> §9.4/§9.5 size-class lemmas and the executable trace oracle (W1-10) are complete. No `sorry`s; the only
+> trusted axioms are the four §33.5 RSEQ primitives. W1-14 (SMP forms) is staged as tracked V-004 debt in
+> `lean/TopoMalloc/SeLe4n/SMP.lean`, as §36.17 permits. Module map: [`lean/README.md`](../../lean/README.md).
+
 ---
 
 ## Lean module layout (the artifact this plan builds)
