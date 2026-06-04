@@ -13,4 +13,5 @@ import TopoMalloc.Theorems.Span
 import TopoMalloc.Theorems.Pagemap
 import TopoMalloc.Theorems.Release
 import TopoMalloc.Theorems.Arena
+import TopoMalloc.Theorems.Allocate
 import TopoMalloc.Theorems.Demo
