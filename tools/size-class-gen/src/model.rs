@@ -152,17 +152,30 @@ impl Table {
                     c.max_local_capacity
                 ));
             }
-            // Strictly increasing sizes; loose universal spacing sanity (ratio ≤ 2).
+            // Strictly increasing sizes; and the §9.4 per-range spacing-ratio targets
+            // (the policy bound the Lean model proves achievable). Below the q/W tiny
+            // boundary the regime is alignment-dominated and the bound is the quantum
+            // (ratio ≤ 2); above it the spacing ratio tightens by size range.
             if i > 0 {
                 if c.size <= prev_size {
                     return Err(format!("{}: sizes must be strictly increasing", at()));
                 }
-                if c.size as u64 > 2 * prev_size as u64 {
+                let (num, den, target): (u64, u64, &str) = if c.size <= 48 {
+                    (2, 1, "≤ 2.0 (tiny, alignment-dominated)")
+                } else if c.size <= 128 {
+                    (4, 3, "≤ 1.33")
+                } else if c.size <= 1024 {
+                    (6, 5, "≤ 1.20")
+                } else {
+                    (9, 8, "≤ 1.125")
+                };
+                if c.size as u64 * den > num * prev_size as u64 {
                     return Err(format!(
-                        "{}: spacing ratio {}/{} exceeds the 2.0 sanity bound",
+                        "{}: spacing ratio {}/{} exceeds the §9.4 target {}",
                         at(),
                         c.size,
-                        prev_size
+                        prev_size,
+                        target
                     ));
                 }
             }
