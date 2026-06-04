@@ -108,10 +108,17 @@ tile the address space without overlap. This is what span split/merge preserve a
 what makes the §22.7 isolation invariant geometric, not just id-level. -/
 def WfSpansDisjoint (s : State) : Prop := (s.spans.map (·.range)).Pairwise Range.Disjoint
 
+/-- Clause 14 (supplement, §16.2/§16.3): a block's size class matches its span's size
+class — a span is carved into slots of a *single* class, so every block in it is that
+class. Without this, the occupancy/capacity clause (6) and slab layout (12) could
+describe a block by one class while its span's metadata uses another. -/
+def WfBlockSpanClass (s : State) : Prop :=
+  ∀ blk ∈ s.blocks, ∀ d ∈ s.spans, d.id = blk.span → blk.sc = d.sc
+
 /-- `WellFormed` (§33.3): the conjunction of all clauses, with named projections so a
 transition proof cites exactly what it preserves. Clauses 1–11 are the §33.3 bullets;
-12 (`slabLayout`) and 13 (`spansDisjoint`) are the §9.5/§16 structural backbones the
-§33.4 theorems consume. -/
+12 (`slabLayout`), 13 (`spansDisjoint`), and 14 (`blockSpanClass`) are the §9.5/§16
+structural backbones the §33.4 theorems consume. -/
 structure WellFormed (s : State) : Prop where
   rangesDisjoint : WfRangesDisjoint s
   uniqueOwner : WfUniqueOwner s
@@ -126,6 +133,7 @@ structure WellFormed (s : State) : Prop where
   cacheCapacities : WfCacheCapacities s
   slabLayout : WfSlabLayout s
   spansDisjoint : WfSpansDisjoint s
+  blockSpanClass : WfBlockSpanClass s
 
 /-- A symmetric pairwise relation holds between any two *distinct* members of a
 list (no `Nodup` needed: distinct values cannot share an index). -/
@@ -181,6 +189,7 @@ theorem wellFormed_empty : WellFormed State.empty where
     intro cpu sc; simp only [State.countOwned, State.empty, List.countP_nil]; exact Nat.zero_le _
   slabLayout := by simp [WfSlabLayout, State.empty]
   spansDisjoint := by simp [WfSpansDisjoint, State.empty]
+  blockSpanClass := by simp [WfBlockSpanClass, State.empty]
 
 /-- Recover the exact §33.3 bullet 1: *live* ranges are pairwise disjoint. -/
 theorem WellFormed.liveRangesDisjoint {s : State} (h : WellFormed s) :
@@ -244,6 +253,13 @@ theorem WfBitmapsAgree.setOwner (h : WfBitmapsAgree s) :
 theorem WfSpansDisjoint.setOwner (h : WfSpansDisjoint s) :
     WfSpansDisjoint (s.setOwner b o) := by
   unfold WfSpansDisjoint; rw [setOwner_spans]; exact h
+
+theorem WfBlockSpanClass.setOwner (h : WfBlockSpanClass s) :
+    WfBlockSpanClass (s.setOwner b o) := by
+  intro blk' hblk' d hd hdid
+  rw [setOwner_spans] at hd
+  obtain ⟨blk, hblk, _, _, hsc, hspan⟩ := s.setOwner_mem b o hblk'
+  rw [hsc]; exact h blk hblk d hd (hdid.trans hspan)
 
 theorem WfPagemapAgrees.setOwner (h : WfPagemapAgrees s) :
     WfPagemapAgrees (s.setOwner b o) := by

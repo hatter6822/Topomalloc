@@ -40,7 +40,7 @@ table), `Malloc.lean`, `Free.lean`, `Cache.lean` (refill/flush conservation **pr
 the live set**, capacity-under-filling, and the fast paths consuming the W1-7 frame),
 `Central.lean`, `Span.lean` (split/merge lifted to `State`, preserving the span-range
 disjointness clause), `Pagemap.lean`, `Release.lean`, `Arena.lean`, and `Demo.lean` (all
-13 clauses jointly satisfiable on a real state + a malloc→free round-trip).
+14 clauses jointly satisfiable on a real state + a malloc→free round-trip).
 
 ## seLe4n bridge (GPL-3.0-or-later, D5)
 
@@ -75,12 +75,15 @@ gaps — each is a stated modelling choice, not an unproven claim):
 
 - **Ownership = membership.** Caches/lists are owners in one block list, so clauses 3/4/6
   ("caches/bitmaps agree with ownership") are rendered as size-class/arena consistency and
-  occupancy counts rather than reconciliation against a separate bitmap structure.
+  occupancy counts rather than reconciliation against a separate bitmap structure. Block↔span
+  class consistency *is* enforced (clause 14, `WfBlockSpanClass`).
 - **Pagemap/hugepage (clauses 7/8)** are modelled as containment + entry agreement; a full
-  hugepage occupancy-count metric (§19.7) is not modelled.
-- **RSEQ is a trusted primitive (§33.5).** Its contract asserts well-formedness preservation
-  and the frame condition; the hardware↔model refinement (the asm itself) is the trusted
-  boundary (open question 7 / W1-14 per-arch verification).
+  hugepage occupancy-count metric (§19.7) is not modelled. `arenaDestroy` filters the
+  pagemap so no entry dangles to a removed span.
+- **RSEQ is a trusted primitive (§33.5).** Its success contract pins the successor to the
+  exact owner relabel (`s' = setOwner p …`), so it frames *all* non-owner geometry; the
+  remaining trust is the hardware↔model refinement (the asm itself) — open question 7 /
+  W1-14 per-arch verification.
 - **The executable oracle** (`Exec.lean`) checks the cardinal live-set invariants on the
   §33.7 trace; a full State-level decidable `WellFormed` over a State reconstructed from the
   trace is future work (the trace grammar does not carry full block structure). The

@@ -12,12 +12,14 @@ The three outcomes are deliberately **distinct**:
 
 * `abort` — preempted/migrated; the state is unchanged and the caller retries.
 * `empty`/`full` — genuine logical underflow/overflow that routes to the slow path.
-* `success` — exactly one block changes owner, under a **frame condition**.
+* `success` — the successor is **exactly the owner relabel** (`s' = setOwner p …`).
 
-The frame clause ("only the popped/pushed block changes owner") is load-bearing:
-the refill/flush conservation theorems (§33.4, W1-6c) cannot be proved without it,
-and conflating `abort` with `empty`/`full` would let the model "prove" progress the
-implementation never makes.
+Pinning `success` to the relabel (not just constraining `ownerOf`) is load-bearing: it
+frames *all* non-owner geometry — ranges, spans, size classes, the pagemap, released
+ranges — so a successful fast path cannot silently move another object, and the
+owner-only frame the refill/flush conservation theorems (§33.4, W1-6c) consume is a
+corollary. Conflating `abort` with `empty`/`full` would let the model "prove" progress
+the implementation never makes.
 
 **Consistency.** Postulating `rseqPop`/`rseqPush` plus their contracts is sound:
 the interpretation that *always* returns `.abort` satisfies every contract (the
@@ -57,31 +59,33 @@ axiom rseqPop : State → CpuId → SizeClassId → RseqPop
 axiom rseqPush : State → CpuId → SizeClassId → BlockId → RseqPush
 
 /-- **The RSEQ pop contract (§33.5).** `abort` ⇒ nothing asserted (state untouched);
-`empty` ⇒ the per-CPU cache for this class is genuinely empty; `success p s'` ⇒ `p`
-moves from `cpuCache cpu sc` to `live`, `s'` is well-formed, and **only `p` changes
-owner** (the frame condition). -/
+`empty` ⇒ the per-CPU cache for this class is genuinely empty; `success p s'` ⇒ `p` was
+cached for this class and the successor is **exactly the owner relabel** `s' = setOwner p
+live`, which is well-formed. Pinning `s'` to `setOwner p live` (rather than only
+constraining `ownerOf`) frames *all* non-owner geometry — ranges, spans, size classes,
+the pagemap, released ranges — so a successful pop cannot silently move another object;
+the owner-level frame (`rseq_pop_success_frame`) is then a corollary. -/
 axiom rseq_pop_contract (s : State) (cpu : CpuId) (sc : SizeClassId) (hwf : WellFormed s) :
     match rseqPop s cpu sc with
     | .abort => True
     | .empty => s.countOwned (Owner.cpuCache cpu sc) = 0
     | .success p s' =>
         s.ownerOf p = some (Owner.cpuCache cpu sc) ∧
-        s'.ownerOf p = some Owner.live ∧
-        WellFormed s' ∧
-        (∀ q, q ≠ p → s'.ownerOf q = s.ownerOf q)
+        s' = s.setOwner p Owner.live ∧
+        WellFormed s'
 
 /-- **The RSEQ push contract (§33.5).** Symmetric to the pop contract: `full` ⇒ the
-cache is genuinely at capacity; `success s'` ⇒ the live block `p` moves to
-`cpuCache cpu sc`, `s'` is well-formed, and only `p` changes owner. -/
+cache is genuinely at capacity; `success s'` ⇒ the successor is exactly `s' = setOwner p
+(cpuCache cpu sc)` (the live block `p` relabelled into the cache), which is well-formed —
+framing all non-owner geometry. -/
 axiom rseq_push_contract (s : State) (cpu : CpuId) (sc : SizeClassId) (p : BlockId)
     (hwf : WellFormed s) (hlive : s.ownerOf p = some Owner.live) :
     match rseqPush s cpu sc p with
     | .abort => True
     | .full => maxLocalCapacity sc ≤ s.countOwned (Owner.cpuCache cpu sc)
     | .success s' =>
-        s'.ownerOf p = some (Owner.cpuCache cpu sc) ∧
-        WellFormed s' ∧
-        (∀ q, q ≠ p → s'.ownerOf q = s.ownerOf q)
+        s' = s.setOwner p (Owner.cpuCache cpu sc) ∧
+        WellFormed s'
 
 /-- Apply the pop primitive: on `success` advance to the successor state; on
 `abort`/`empty` the state is unchanged (the caller retries or takes the slow path).
@@ -109,15 +113,35 @@ theorem rseqPushStep_abort_no_change (s : State) (cpu : CpuId) (sc : SizeClassId
     (h : rseqPush s cpu sc p = RseqPush.abort) : rseqPushStep s cpu sc p = s := by
   unfold rseqPushStep; rw [h]
 
+/-- The successor of a successful pop is exactly the owner relabel — so all non-owner
+geometry (ranges, spans, size classes, pagemap, released) is framed. -/
+theorem rseq_pop_success_eq (s : State) (cpu : CpuId) (sc : SizeClassId)
+    (hwf : WellFormed s) {p : BlockId} {s' : State} (h : rseqPop s cpu sc = RseqPop.success p s') :
+    s.ownerOf p = some (Owner.cpuCache cpu sc) ∧ s' = s.setOwner p Owner.live ∧ WellFormed s' := by
+  have hc := rseq_pop_contract s cpu sc hwf; rw [h] at hc; exact hc
+
 /-- A successful pop conserves ownership: every block other than the popped one is
-unchanged (the §33.4 frame condition, the corollary W1-6c consumes). -/
+unchanged (the §33.4 frame condition, the corollary W1-6c consumes). Derived from the
+owner-relabel contract (`rseq_pop_success_eq`). -/
 theorem rseq_pop_success_frame (s : State) (cpu : CpuId) (sc : SizeClassId)
     (hwf : WellFormed s) {p : BlockId} {s' : State} (h : rseqPop s cpu sc = RseqPop.success p s') :
     s.ownerOf p = some (Owner.cpuCache cpu sc) ∧ s'.ownerOf p = some Owner.live ∧
       WellFormed s' ∧ (∀ q, q ≠ p → s'.ownerOf q = s.ownerOf q) := by
-  have hc := rseq_pop_contract s cpu sc hwf
-  rw [h] at hc
-  exact hc
+  obtain ⟨hp, heq, hwf'⟩ := rseq_pop_success_eq s cpu sc hwf h
+  have hpres : (s.blockById p).isSome := by
+    cases hb : s.blockById p with
+    | none => simp [State.ownerOf, hb] at hp
+    | some blk => rfl
+  refine ⟨hp, ?_, hwf', ?_⟩
+  · rw [heq]; exact setOwner_ownerOf_self s p Owner.live hpres
+  · intro q hq; rw [heq]; exact setOwner_ownerOf_ne s p Owner.live hq
+
+/-- The successor of a successful push is exactly the owner relabel into the cache. -/
+theorem rseq_push_success_eq (s : State) (cpu : CpuId) (sc : SizeClassId) (p : BlockId)
+    (hwf : WellFormed s) (hlive : s.ownerOf p = some Owner.live) {s' : State}
+    (h : rseqPush s cpu sc p = RseqPush.success s') :
+    s' = s.setOwner p (Owner.cpuCache cpu sc) ∧ WellFormed s' := by
+  have hc := rseq_push_contract s cpu sc p hwf hlive; rw [h] at hc; exact hc
 
 /-- A successful push conserves ownership symmetrically. -/
 theorem rseq_push_success_frame (s : State) (cpu : CpuId) (sc : SizeClassId) (p : BlockId)
@@ -125,8 +149,13 @@ theorem rseq_push_success_frame (s : State) (cpu : CpuId) (sc : SizeClassId) (p 
     (h : rseqPush s cpu sc p = RseqPush.success s') :
     s'.ownerOf p = some (Owner.cpuCache cpu sc) ∧ WellFormed s' ∧
       (∀ q, q ≠ p → s'.ownerOf q = s.ownerOf q) := by
-  have hc := rseq_push_contract s cpu sc p hwf hlive
-  rw [h] at hc
-  exact hc
+  obtain ⟨heq, hwf'⟩ := rseq_push_success_eq s cpu sc p hwf hlive h
+  have hpres : (s.blockById p).isSome := by
+    cases hb : s.blockById p with
+    | none => simp [State.ownerOf, hb] at hlive
+    | some blk => rfl
+  refine ⟨?_, hwf', ?_⟩
+  · rw [heq]; exact setOwner_ownerOf_self s p (Owner.cpuCache cpu sc) hpres
+  · intro q hq; rw [heq]; exact setOwner_ownerOf_ne s p (Owner.cpuCache cpu sc) hq
 
 end TopoMalloc

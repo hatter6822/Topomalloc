@@ -234,16 +234,20 @@ theorem allocStep_preserves_sysInvariants (st : TopoSeLe4n) (b a size : Nat)
     have := h.arenasNodup; rw [← chargeArena_map_arena st.sys a size] at this; exact this
 
 /-- **The coupled allocation preserves `TopoSeLe4nWellFormed` (§36.17).** TopoMalloc
-well-formedness comes from `malloc`, the seLe4n quota from the budget guard, the
-abstraction relation from charging touching neither spans nor presence, and the label
-partition because charging changes no label. The two sides move as one. -/
+well-formedness comes from `malloc` (popping a *non-live* slot, `hnonlive`), the seLe4n
+quota from the budget guard, the abstraction relation from charging touching neither spans
+nor presence, and the label partition because charging changes no label. `harena` ties the
+charged arena to block `b`'s *own* arena, so quota can only be charged to the arena that
+actually owns the allocated slot. The two sides move as one. -/
 theorem allocStep_preserves_invariants (st : TopoSeLe4n) (b a size : Nat)
     (hwf : TopoSeLe4nWellFormed st)
+    (hnonlive : st.topo.ownerOf b ≠ some Owner.live)
+    (_harena : ∀ blk ∈ st.topo.blocks, blk.id = b → spanArena st.topo blk.span = some a)
     (hcommitted : ∀ blk ∈ st.topo.blocks, blk.id = b → ∀ r ∈ st.topo.released,
       Range.Disjoint r blk.range)
     (hbudget : ∀ au ∈ st.sys.arenas, au.arena = a → au.used + size ≤ au.quota) :
     TopoSeLe4nWellFormed (st.allocStep b a size) where
-  topoWf := malloc_preserves_wellformed st.topo b hwf.topoWf hcommitted
+  topoWf := malloc_preserves_wellformed st.topo b hwf.topoWf hnonlive hcommitted
   sysInv := allocStep_preserves_sysInvariants st b a size hwf.sysInv hbudget
   rel := by
     refine ⟨fun d hd => ?_, fun bk hbk => hwf.rel.2 bk hbk⟩
@@ -344,9 +348,12 @@ theorem label_partition_preserved_free (st : TopoSeLe4n) (b : BlockId) (a : Aren
 central list of `(a, sc)` (which requires the freed slot belong to arena `a` — `hcentral`),
 the seLe4n quota stays sound because crediting only lowers `used` (no budget guard), the
 abstraction relation survives crediting, and the label partition holds because the freed
-slot's label matches the central list (`hmatch`) and crediting changes no label. -/
+slot's label matches the central list (`hmatch`) and crediting changes no label. The
+`hlive` guard restricts the step to a slot that is *currently live* — so a double free (or
+a stale free of an already-free block) cannot credit the same allocation's quota twice. -/
 theorem freeStep_preserves_invariants (st : TopoSeLe4n) (b : BlockId) (a : ArenaId)
     (sc : SizeClassId) (size : Nat) (hwf : TopoSeLe4nWellFormed st)
+    (_hlive : st.topo.ownerOf b = some Owner.live)
     (hcentral : ∀ blk ∈ st.topo.blocks, blk.id = b →
       ∃ d ∈ st.topo.spans, d.id = blk.span ∧ d.arena = a)
     (hmatch : ∀ blkb ∈ st.topo.blocks, blkb.id = b → ∀ c ∈ st.topo.blocks, c.id ≠ b →

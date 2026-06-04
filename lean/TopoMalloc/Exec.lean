@@ -42,6 +42,10 @@ inductive ExecError where
   | doubleAlloc (ptr : Nat)
   /-- A free of a pointer that is not currently live (S-009). -/
   | freeOfUnknown (ptr : Nat)
+  /-- A line that is not blank/comment yet does not parse in the §33.7 grammar
+  (an unknown verb, or a known verb with malformed fields) — rejected, not skipped,
+  to stay in differential lockstep with the host replayer. -/
+  | malformedLine
   deriving Repr, DecidableEq
 
 /-- The executable model: the set of currently-live pointers. -/
@@ -113,23 +117,39 @@ def parseAddr (s : String) : Option Nat :=
       (some 0)
   else s.toNat?
 
-/-- Parse one line of the §33.7 grammar into a `TraceEvent`, reading the live-set-relevant
-fields (the `ptr` for `ALLOC`/`FREE`). Returns `none` on a malformed or unknown line. The
-middle/back-end verbs parse to live-set-neutral events. -/
-def parseTraceLine (line : String) : Option TraceEvent :=
-  let toks := (line.splitOn " ").filter (· ≠ "")
-  match toks with
-  | "ALLOC" :: rest =>
-    -- ALLOC request_id size align arena flags -> ptr usable_size sc span
-    match rest.dropWhile (· ≠ "->") with
-    | _ :: ptr :: _ => (parseAddr ptr).map .alloc
-    | _ => none
-  | "FREE" :: ptr :: _ => (parseAddr ptr).map .free
-  | "REFILL" :: _ => some (.refill 0 0 0)
-  | "FLUSH" :: _ => some (.flush 0 0 0)
-  | "SPAN_ALLOC" :: _ => some (.spanAlloc 0 0 0 0 none)
-  | "RELEASE" :: _ => some (.release 0 0)
-  | _ => none
+/-- The result of parsing one trace line. -/
+inductive LineParse where
+  /-- A recognized event (drives the live-set oracle). -/
+  | event (e : TraceEvent)
+  /-- A blank line or a `#` comment — skipped, by design. -/
+  | skip
+  /-- A line that is neither blank/comment nor a valid §33.7 record (unknown verb or a
+  known verb with malformed fields) — a parse failure to be reported, not skipped. -/
+  | malformed
+  deriving Repr, DecidableEq
+
+/-- Parse one line of the §33.7 grammar, reading the live-set-relevant fields (the `ptr`
+for `ALLOC`/`FREE`). Blank and `#`-comment lines are `skip`; a recognized verb with good
+fields is an `event`; anything else (unknown verb, or a known verb with an unparseable
+pointer) is `malformed` — so the oracle rejects exactly what the host parser rejects. -/
+def parseTraceLine (line : String) : LineParse :=
+  match (line.splitOn " ").filter (· ≠ "") with
+  | [] => .skip
+  | first :: rest =>
+    if first.startsWith "#" then .skip
+    else match first, rest with
+      -- ALLOC request_id size align arena flags -> ptr usable_size sc span
+      | "ALLOC", _ =>
+        match rest.dropWhile (· ≠ "->") with
+        | _ :: ptr :: _ => match parseAddr ptr with | some p => .event (.alloc p) | none => .malformed
+        | _ => .malformed
+      | "FREE", ptr :: _ => match parseAddr ptr with | some p => .event (.free p) | none => .malformed
+      | "FREE", [] => .malformed
+      | "REFILL", _ => .event (.refill 0 0 0)
+      | "FLUSH", _ => .event (.flush 0 0 0)
+      | "SPAN_ALLOC", _ => .event (.spanAlloc 0 0 0 0 none)
+      | "RELEASE", _ => .event (.release 0 0)
+      | _, _ => .malformed
 
 /-- Replay a whole *text* trace (blank lines and `#` comments skipped), parsing each line
 in the §33.7 grammar and checking the cardinal invariants — the proof-grade counterpart of
@@ -141,11 +161,10 @@ where
   go : List String → ExecModel → Nat → Except (Nat × ExecError) ExecModel
   | [], m, _ => .ok m
   | line :: rest, m, n =>
-    -- blank, comment, and unknown lines parse to `none` and are skipped
-    -- (forward-compatible with grammar extensions)
     match parseTraceLine line with
-    | none => go rest m (n + 1)
-    | some e => match m.apply e with
+    | .skip => go rest m (n + 1)           -- blank / `#` comment only
+    | .malformed => .error (n, .malformedLine)  -- reject, don't skip (lockstep)
+    | .event e => match m.apply e with
       | .ok m' => go rest m' (n + 1)
       | .error err => .error (n, err)
 

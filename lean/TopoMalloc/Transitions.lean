@@ -161,6 +161,10 @@ theorem relabelAll_spansDisjoint (s : State) (batch : List BlockId) (o : Owner)
     (h : WfSpansDisjoint s) : WfSpansDisjoint (relabelAll s batch o) :=
   relabelAll_preserves o WfSpansDisjoint (fun s' b' h => WfSpansDisjoint.setOwner s' b' o h) s batch h
 
+theorem relabelAll_blockSpanClass (s : State) (batch : List BlockId) (o : Owner)
+    (h : WfBlockSpanClass s) : WfBlockSpanClass (relabelAll s batch o) :=
+  relabelAll_preserves o WfBlockSpanClass (fun s' b' h => WfBlockSpanClass.setOwner s' b' o h) s batch h
+
 /-- The batch version: relabelling a whole batch to a non-live owner preserves
 clause 10 (released ranges contain no live block). -/
 theorem relabelAll_releasedNoLive (s : State) (batch : List BlockId) (o : Owner)
@@ -260,11 +264,13 @@ def arenaReset (s : State) (a : ArenaId) : State :=
     (arenaReset s a).blocks = s.blocks.map (fun blk =>
       if spanArena s blk.span = some a then { blk with owner := Owner.backendFree a } else blk) := rfl
 
-/-- `arena_destroy`: reset plus removal of arena `a`'s spans and slots (§22.6). -/
+/-- `arena_destroy`: reset plus removal of arena `a`'s spans and slots (§22.6), and the
+pagemap entries naming those spans — so no entry dangles to a removed span (clause 7). -/
 def arenaDestroy (s : State) (a : ArenaId) : State :=
   { s with
     blocks := s.blocks.filter (fun blk => ! decide (spanArena s blk.span = some a))
-    spans := s.spans.filter (fun d => ! decide (d.arena = a)) }
+    spans := s.spans.filter (fun d => ! decide (d.arena = a))
+    pagemap := s.pagemap.filter (fun e => ! decide (spanArena s e.2 = some a)) }
 
 @[simp] theorem arenaDestroy_blocks (s : State) (a : ArenaId) :
     (arenaDestroy s a).blocks = s.blocks.filter (fun blk => ! decide (spanArena s blk.span = some a)) :=
@@ -272,5 +278,9 @@ def arenaDestroy (s : State) (a : ArenaId) : State :=
 
 @[simp] theorem arenaDestroy_spans (s : State) (a : ArenaId) :
     (arenaDestroy s a).spans = s.spans.filter (fun d => ! decide (d.arena = a)) := rfl
+
+@[simp] theorem arenaDestroy_pagemap (s : State) (a : ArenaId) :
+    (arenaDestroy s a).pagemap =
+      s.pagemap.filter (fun e => ! decide (spanArena s e.2 = some a)) := rfl
 
 end TopoMalloc

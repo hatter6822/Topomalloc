@@ -18,10 +18,13 @@ namespace TopoMalloc
 
 open State
 
-/-- **`malloc_preserves_wellformed` (§33.4).** Popping a free slot to `live`
-preserves every well-formedness clause, given that the slot's range is disjoint
-from all released memory (it is committed). -/
+/-- **`malloc_preserves_wellformed` (§33.4).** Popping a *non-live* (free/cached) slot to
+`live` preserves every well-formedness clause, given that the slot's range is disjoint
+from all released memory (it is committed). The `hnonlive` guard restricts the theorem to
+a genuine allocation — a slot that was not already live — rather than an idempotent
+relabel of a live object. -/
 theorem malloc_preserves_wellformed (s : State) (b : BlockId) (hwf : WellFormed s)
+    (_hnonlive : s.ownerOf b ≠ some Owner.live)
     (hcommitted : ∀ blk ∈ s.blocks, blk.id = b → ∀ r ∈ s.released, Range.Disjoint r blk.range) :
     WellFormed (malloc s b) := by
   unfold malloc
@@ -42,7 +45,8 @@ theorem malloc_preserves_wellformed (s : State) (b : BlockId) (hwf : WellFormed 
         Nat.le_trans (countOwned_setOwner_le_of_ne s b Owner.live (by simp))
           (hwf.cacheCapacities cpu sc)
       slabLayout := WfSlabLayout.setOwner s b Owner.live hwf.slabLayout
-      spansDisjoint := WfSpansDisjoint.setOwner s b Owner.live hwf.spansDisjoint }
+      spansDisjoint := WfSpansDisjoint.setOwner s b Owner.live hwf.spansDisjoint
+      blockSpanClass := WfBlockSpanClass.setOwner s b Owner.live hwf.blockSpanClass }
 
 /-- **`malloc_success_returns_aligned_sufficient_disjoint_object` (§33.4).** The
 slot handed out is live; its range is at least as large as the request and aligned
@@ -52,10 +56,12 @@ size-class row, which the classifier guarantees the request fits. -/
 theorem malloc_success_returns_aligned_sufficient_disjoint_object
     (s : State) (b : BlockId) (hwf : WellFormed s)
     (blk : Block) (hb : s.blockById b = some blk)
+    (hnonlive : blk.owner ≠ Owner.live)
     (req reqAlign : Nat)
     (hreq : ∀ row, sizeClassRow blk.sc = some row → req ≤ row.size)
     (hralign : ∀ row, sizeClassRow blk.sc = some row → reqAlign ∣ row.align) :
-    (malloc s b).ownerOf b = some Owner.live ∧
+    s.ownerOf b ≠ some Owner.live ∧
+      (malloc s b).ownerOf b = some Owner.live ∧
       req ≤ blk.range.len ∧
       reqAlign ∣ blk.range.base ∧
       (∀ blk', blk' ∈ s.blocks → blk'.id ≠ b → Range.Disjoint blk.range blk'.range) := by
@@ -63,8 +69,10 @@ theorem malloc_success_returns_aligned_sufficient_disjoint_object
   have hbid : blk.id = b := by
     have h := List.find?_some hb; simp only [decide_eq_true_eq] at h; exact h
   obtain ⟨row, hrow, hlen, hdvd⟩ := hwf.slabLayout blk hmem
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · -- live
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · -- the slot was genuinely free (not already live) before the allocation
+    rw [State.ownerOf, hb]; intro hc; injection hc with hc; exact hnonlive hc
+  · -- live after
     unfold malloc
     exact setOwner_ownerOf_self s b Owner.live (by rw [hb]; rfl)
   · -- sufficient: req ≤ row.size = blk.range.len
