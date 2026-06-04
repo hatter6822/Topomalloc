@@ -2,13 +2,19 @@
 /-
 The `WellFormed` predicate (SPEC §33.3, plan 02 W1-3).
 
-`WellFormed` is a *total* predicate (defined on every `State`) built from thirteen
+`WellFormed` is a *total* predicate (defined on every `State`) built from fourteen
 named clauses, each a standalone `def` cross-referenced to its SPEC bullet so a
 transition proof can cite exactly the ones it preserves. Eleven clauses are the
-§33.3 bullets; two more — `WfSlabLayout` (the §9.5/§16.3 slab-layout backbone,
-"alignment is sufficient") and `WfSpansDisjoint` (the §16.1/§22.7 span-tiling
-backbone) — make explicit what the §33.4 `malloc_success_…` and span split/merge
-theorems need and what the SPEC's eleven-bullet *minimum* leaves implicit.
+§33.3 bullets; three more — `WfSlabLayout` (the §9.5/§16.3 slab-layout backbone,
+"alignment is sufficient"), `WfSpansDisjoint` (the §16.1/§22.7 span-tiling
+backbone), and `WfBlockSpanClass` (the §16.2 single-class-per-span backbone) — make
+explicit what the §33.4 `malloc_success_…` and span split/merge theorems need and
+what the SPEC's eleven-bullet *minimum* leaves implicit.
+
+Block-id uniqueness (`ownerOf` single-valued, §33.3.2) is clause 2 (`WfUniqueOwner`);
+the byte-exact quota accounting (`ArenaQuotaExact`, §36.17) reuses *that* clause for
+its "a relabel touches exactly one slot" lemma — there is no separate id-uniqueness
+clause.
 
 Clause 1 is stated for *all* blocks, not only live ones. This strengthens §33.3
 bullet 1 ("live ranges disjoint", §8.3) to the slab-structural truth (§9.5:
@@ -38,7 +44,7 @@ def maxLocalCapacity (sc : SizeClassId) : Nat :=
   | none => 0
 
 /- ----------------------------------------------------------------------- -/
-/- The thirteen clauses (§33.3 bullets 1–11 + the §9.5/§16 structural backbones). -/
+/- The fourteen clauses (§33.3 bullets 1–11 + the §9.5/§16 structural backbones). -/
 /- ----------------------------------------------------------------------- -/
 
 /-- Clause 1 (§33.3.1, §8.3, §9.5): block ranges are pairwise disjoint. Stated for
@@ -115,17 +121,10 @@ describe a block by one class while its span's metadata uses another. -/
 def WfBlockSpanClass (s : State) : Prop :=
   ∀ blk ∈ s.blocks, ∀ d ∈ s.spans, d.id = blk.span → blk.sc = d.sc
 
-/-- Clause 15 (supplement, §33.2): block identifiers are unique — a `BlockId` names at
-most one slot. `blockById`/`setOwner` are written as `find?`/`map`, so without this a
-single id could name several slots and a relabel would silently move *all* of them; the
-exact byte-accounting invariant (`ArenaQuotaExact`, §36.17) depends on a relabel touching
-exactly one slot's contribution. -/
-def WfUniqueIds (s : State) : Prop := (s.blocks.map (·.id)).Nodup
-
 /-- `WellFormed` (§33.3): the conjunction of all clauses, with named projections so a
 transition proof cites exactly what it preserves. Clauses 1–11 are the §33.3 bullets;
-12 (`slabLayout`), 13 (`spansDisjoint`), 14 (`blockSpanClass`), and 15 (`uniqueIds`) are
-the §9.5/§16/§33.2 structural backbones the §33.4 theorems consume. -/
+12 (`slabLayout`), 13 (`spansDisjoint`), and 14 (`blockSpanClass`) are the §9.5/§16
+structural backbones the §33.4 theorems consume. -/
 structure WellFormed (s : State) : Prop where
   rangesDisjoint : WfRangesDisjoint s
   uniqueOwner : WfUniqueOwner s
@@ -141,7 +140,6 @@ structure WellFormed (s : State) : Prop where
   slabLayout : WfSlabLayout s
   spansDisjoint : WfSpansDisjoint s
   blockSpanClass : WfBlockSpanClass s
-  uniqueIds : WfUniqueIds s
 
 /-- A symmetric pairwise relation holds between any two *distinct* members of a
 list (no `Nodup` needed: distinct values cannot share an index). -/
@@ -198,7 +196,6 @@ theorem wellFormed_empty : WellFormed State.empty where
   slabLayout := by simp [WfSlabLayout, State.empty]
   spansDisjoint := by simp [WfSpansDisjoint, State.empty]
   blockSpanClass := by simp [WfBlockSpanClass, State.empty]
-  uniqueIds := by simp [WfUniqueIds, State.empty]
 
 /-- Recover the exact §33.3 bullet 1: *live* ranges are pairwise disjoint. -/
 theorem WellFormed.liveRangesDisjoint {s : State} (h : WellFormed s) :
@@ -269,9 +266,6 @@ theorem WfBlockSpanClass.setOwner (h : WfBlockSpanClass s) :
   rw [setOwner_spans] at hd
   obtain ⟨blk, hblk, _, _, hsc, hspan⟩ := s.setOwner_mem b o hblk'
   rw [hsc]; exact h blk hblk d hd (hdid.trans hspan)
-
-theorem WfUniqueIds.setOwner (h : WfUniqueIds s) : WfUniqueIds (s.setOwner b o) := by
-  unfold WfUniqueIds; rw [setOwner_map_id]; exact h
 
 theorem WfPagemapAgrees.setOwner (h : WfPagemapAgrees s) :
     WfPagemapAgrees (s.setOwner b o) := by

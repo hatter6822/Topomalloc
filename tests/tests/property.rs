@@ -110,29 +110,32 @@ proptest! {
 proptest! {
     /// Ownership conservation (§34.3): under any well-formed ALLOC/FREE stream the
     /// executable model's live set tracks a reference set exactly, and never
-    /// reports a spurious violation.
+    /// reports a spurious violation. Each slot `k` is the range `[16k, 16k+16)`, so
+    /// distinct slots are disjoint — a well-formed stream under the model's
+    /// range-disjointness check (§8.3), not merely under address-distinctness.
     #[test]
     fn live_model_matches_reference(ops in prop::collection::vec((any::<bool>(), 1u64..=64), 0..200)) {
         let mut model = LiveModel::new();
         let mut reference = std::collections::BTreeSet::new();
-        for (is_alloc, addr) in ops {
+        for (is_alloc, slot) in ops {
+            let base = slot * 16; // disjoint 16-byte ranges, one per slot
             if is_alloc {
-                if reference.contains(&addr) {
-                    continue; // skip would-be double-alloc to keep the stream well-formed
+                if reference.contains(&slot) {
+                    continue; // skip re-allocating a still-live slot (its range would overlap itself)
                 }
                 let rec = TraceRecord::Alloc {
                     request_id: 0, size: 8, align: 8, arena: 0, flags: 0,
-                    ptr: addr, usable_size: 16, sc: Some(0), span: Some(0),
+                    ptr: base, usable_size: 16, sc: Some(0), span: Some(0),
                 };
                 model.apply(&rec).expect("well-formed alloc accepted");
-                reference.insert(addr);
+                reference.insert(slot);
             } else {
-                if !reference.contains(&addr) {
+                if !reference.contains(&slot) {
                     continue; // skip would-be free-of-unknown
                 }
-                let rec = TraceRecord::Free { ptr: addr, size_hint: 0, sc: None, span: None };
+                let rec = TraceRecord::Free { ptr: base, size_hint: 0, sc: None, span: None };
                 model.apply(&rec).expect("well-formed free accepted");
-                reference.remove(&addr);
+                reference.remove(&slot);
             }
             prop_assert_eq!(model.live_count(), reference.len());
         }

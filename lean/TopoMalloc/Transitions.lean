@@ -165,9 +165,6 @@ theorem relabelAll_blockSpanClass (s : State) (batch : List BlockId) (o : Owner)
     (h : WfBlockSpanClass s) : WfBlockSpanClass (relabelAll s batch o) :=
   relabelAll_preserves o WfBlockSpanClass (fun s' b' h => WfBlockSpanClass.setOwner s' b' o h) s batch h
 
-theorem relabelAll_uniqueIds (s : State) (batch : List BlockId) (o : Owner)
-    (h : WfUniqueIds s) : WfUniqueIds (relabelAll s batch o) :=
-  relabelAll_preserves o WfUniqueIds (fun s' b' h => WfUniqueIds.setOwner s' b' o h) s batch h
 
 /-- The batch version: relabelling a whole batch to a non-live owner preserves
 clause 10 (released ranges contain no live block). -/
@@ -324,7 +321,7 @@ private theorem sum_relabel_balance (L : List Block) (b : BlockId) (a : ArenaId)
 /-- **State-level balance (§36.17).** The relabel balance lifted to `arenaLiveBytes`:
 relabelling the unique block `b` to `o` moves exactly `b`'s contribution to arena `a'`. -/
 theorem arenaLiveBytes_setOwner_balance (s : State) (b : BlockId) (a' : ArenaId) (o : Owner)
-    (blk_b : Block) (huniq : WfUniqueIds s) (hb : blk_b ∈ s.blocks) (hbid : blk_b.id = b) :
+    (blk_b : Block) (huniq : WfUniqueOwner s) (hb : blk_b ∈ s.blocks) (hbid : blk_b.id = b) :
     (s.setOwner b o).arenaLiveBytes a'
       + (if blk_b.owner = Owner.live ∧ spanArena s blk_b.span = some a' then blk_b.range.len else 0)
     = s.arenaLiveBytes a'

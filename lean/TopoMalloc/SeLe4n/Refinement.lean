@@ -273,7 +273,7 @@ theorem allocStep_preserves_invariants (st : TopoSeLe4n) (b a size : Nat)
     obtain ⟨au0, hau0, rfl⟩ := hau
     have hq0 : au0.used = st.topo.arenaLiveBytes au0.arena := hwf.quotaExact au0 hau0
     have hbal := arenaLiveBytes_setOwner_balance st.topo b au0.arena Owner.live blk_b
-      hwf.topoWf.uniqueIds hmem hbid
+      hwf.topoWf.uniqueOwner hmem hbid
     rw [if_neg (fun h => hnl h.1)] at hbal
     show (if au0.arena = a then au0.charge size else au0).used
       = (st.topo.setOwner b Owner.live).arenaLiveBytes
@@ -424,7 +424,7 @@ theorem freeStep_preserves_invariants (st : TopoSeLe4n) (b : BlockId) (a : Arena
     obtain ⟨au0, hau0, rfl⟩ := hau
     have hq0 : au0.used = st.topo.arenaLiveBytes au0.arena := hwf.quotaExact au0 hau0
     have hbal := arenaLiveBytes_setOwner_balance st.topo b au0.arena (Owner.centralFree a sc) blk_b
-      hwf.topoWf.uniqueIds hmem hbid
+      hwf.topoWf.uniqueOwner hmem hbid
     show (if au0.arena = a then au0.credit size else au0).used
       = (st.topo.setOwner b (Owner.centralFree a sc)).arenaLiveBytes
           (if au0.arena = a then au0.credit size else au0).arena

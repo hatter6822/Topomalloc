@@ -105,6 +105,25 @@ structure TopoSeLe4nWellFormed (st : TopoSeLe4n) : Prop where
   labels : LabelPartition st
   quotaExact : ArenaQuotaExact st
 
+/-- The empty combined state: the empty allocator with no arenas, backings, or authorized
+untypeds. -/
+def TopoSeLe4n.empty : TopoSeLe4n :=
+  { topo := State.empty, sys := { arenas := [], backings := [], authorizedUntypeds := [] } }
+
+/-- **`TopoSeLe4nWellFormed` is inhabited** — the empty combined state satisfies the whole
+bundle (every component vacuously, including `ArenaQuotaExact`). A witness that the bridge
+invariant and its preservation theorems (`allocStep`/`freeStep`) are not vacuously true:
+the predicate they preserve is genuinely satisfiable. -/
+theorem topoSeLe4nWellFormed_empty : TopoSeLe4nWellFormed TopoSeLe4n.empty where
+  topoWf := wellFormed_empty
+  sysInv :=
+    { quota := by intro au ha; simp [TopoSeLe4n.empty] at ha
+      arenasNodup := by simp [TopoSeLe4n.empty] }
+  rel := ⟨by intro d hd; simp [TopoSeLe4n.empty, State.empty] at hd,
+          by intro bk hbk; simp [TopoSeLe4n.empty] at hbk⟩
+  labels := by intro blk1 h1; simp [TopoSeLe4n.empty, State.empty] at h1
+  quotaExact := by intro au ha; simp [TopoSeLe4n.empty] at ha
+
 /-- Lift a TopoMalloc transition to the combined state, leaving the seLe4n system
 unchanged (the topo fast/slow paths do not touch capability state). -/
 def TopoSeLe4n.withTopo (st : TopoSeLe4n) (s' : State) : TopoSeLe4n := { st with topo := s' }

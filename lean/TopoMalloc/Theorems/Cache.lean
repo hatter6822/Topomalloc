@@ -86,8 +86,7 @@ theorem cache_refill_preserves_wellformed
             (hwf.cacheCapacities cpu' sc')
       slabLayout := relabelAll_slabLayout s batch _ hwf.slabLayout
       spansDisjoint := relabelAll_spansDisjoint s batch _ hwf.spansDisjoint
-      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass
-      uniqueIds := relabelAll_uniqueIds s batch _ hwf.uniqueIds }
+      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass }
 
 /- ----------------------------------------------------------------------- -/
 /- The per-CPU fast paths — where the W1-7 RSEQ contract is load-bearing.   -/

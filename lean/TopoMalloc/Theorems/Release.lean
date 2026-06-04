@@ -48,7 +48,6 @@ theorem release_to_os_preserves_wellformed (s : State) (r : Range) (hwf : WellFo
       cacheCapacities := hwf.cacheCapacities
       slabLayout := hwf.slabLayout
       spansDisjoint := hwf.spansDisjoint
-      blockSpanClass := hwf.blockSpanClass
-      uniqueIds := hwf.uniqueIds }
+      blockSpanClass := hwf.blockSpanClass }
 
 end TopoMalloc

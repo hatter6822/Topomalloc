@@ -26,7 +26,7 @@ single-source check is fully constructive. Verify with `#print axioms <thm>`.
 | `TopoMalloc/SizeClass.lean` | `SizeClassRow` predicate; `Params`/`buildTable`; the §9.4/§9.5 proofs | W1-4 |
 | `TopoMalloc/Generated/SizeClasses.lean` | **generated** tuned table (72 classes to 32 KiB) — single source (DD-1) | W1-4e |
 | `TopoMalloc/State.lean` | abstract `State`, ownership map, the `setOwner` frame primitive | W1-5 |
-| `TopoMalloc/WellFormed.lean` | the **15** named `WellFormed` clauses (§33.3 + §9.5/§16/§33.2 backbones) + preservation | W1-3 |
+| `TopoMalloc/WellFormed.lean` | the **14** named `WellFormed` clauses (§33.3 + §9.5/§16 backbones) + preservation | W1-3 |
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions | W1-5 |
 | `TopoMalloc/Rseq.lean` | the RSEQ contract — trusted primitive + frame condition (§33.5) | W1-7 |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family, incl. `Demo.lean` (a concrete non-empty witness) | W1-4e/6/8/9 |
@@ -40,7 +40,7 @@ table), `Malloc.lean`, `Free.lean`, `Cache.lean` (refill/flush conservation **pr
 the live set**, capacity-under-filling, and the fast paths consuming the W1-7 frame),
 `Central.lean`, `Span.lean` (split/merge lifted to `State`, preserving the span-range
 disjointness clause), `Pagemap.lean`, `Release.lean`, `Arena.lean`, and `Demo.lean` (all
-15 clauses jointly satisfiable on a real state + a malloc→free round-trip).
+14 clauses jointly satisfiable on a real state + a malloc→free round-trip).
 
 ## seLe4n bridge (GPL-3.0-or-later, D5)
 
@@ -68,7 +68,9 @@ not merely bounded (`used ≤ quota`): `ArenaQuotaExact` pins each arena's `used
 *actual* live bytes (`State.arenaLiveBytes`), and the steps preserve it because each ties
 the charge/credit to the allocated slot's own arena and size (and pops/frees a
 non-live/live slot) — so the model cannot under- or over-charge, nor double-credit a free.
-This is the simulation the bridge is about. `SMP.lean`
+`topoSeLe4nWellFormed_empty` witnesses that this whole bundle is *inhabited* (the empty
+combined state satisfies it), so the preservation theorems are not vacuous. This is the
+simulation the bridge is about. `SMP.lean`
 proves the §36.17 SMP forms by interleaving semantics: with the RSEQ contract giving atomic
 per-core steps, correctness is "the invariant holds for every schedule", by induction over
 the schedule.
@@ -91,10 +93,12 @@ gaps — each is a stated modelling choice, not an unproven claim):
   W1-14 per-arch verification.
 - **The executable oracle** (`Exec.lean`) checks live **range-disjointness** on the §33.7
   trace — an allocation whose `[ptr, ptr+usable_size)` range overlaps a live object is
-  rejected (`replay_disjoint`), not merely an equal base address. A full State-level
-  decidable `WellFormed` over a State reconstructed from the trace is future work (the trace
-  grammar does not carry full block structure). The structural `WellFormed` clauses are
-  decidable and `decide`-checked on `demoState`.
+  rejected (`replay_disjoint`), not merely an equal base address. The host-side Rust oracle
+  (`topo_test_support::LiveModel`) performs the *same* range check, so the two replayers stay
+  in differential lockstep (plan 08). A full State-level decidable `WellFormed` over a State
+  reconstructed from the trace is future work (the trace grammar does not carry full block
+  structure). The structural `WellFormed` clauses are decidable and `decide`-checked on
+  `demoState`.
 
 ## Building
 

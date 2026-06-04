@@ -44,8 +44,7 @@ theorem free_preserves_wellformed_for_valid_pointer (s : State) (b : BlockId) (o
           (hwf.cacheCapacities cpu sc)
       slabLayout := WfSlabLayout.setOwner s b o hwf.slabLayout
       spansDisjoint := WfSpansDisjoint.setOwner s b o hwf.spansDisjoint
-      blockSpanClass := WfBlockSpanClass.setOwner s b o hwf.blockSpanClass
-      uniqueIds := WfUniqueIds.setOwner s b o hwf.uniqueIds }
+      blockSpanClass := WfBlockSpanClass.setOwner s b o hwf.blockSpanClass }
 
 /-- **`free_removes_liveness_and_adds_exactly_one_free_owner` (§33.4).** After `free`,
 the slot is no longer live, it is owned by the free owner `o`, and **only** that slot
