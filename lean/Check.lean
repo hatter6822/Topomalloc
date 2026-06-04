@@ -25,11 +25,15 @@ generated tuned table by evaluation (the kernel cannot `decide` the 2048-granule
 def tableGate : Bool := tableOk pageSize quantum smallMax sizeClasses && coversAllB
 
 /-- The executable model (W1-10) replays a good trace cleanly and flags the injected
-violation in the bad trace at the expected line. -/
+violation in the bad trace at the expected line — both for the structured event list and
+for the **§33.7 text grammar** the Rust emitter produces (the differential-replay loop). -/
 def oracleGate : Bool :=
-  match replay sampleGoodTrace, replay sampleBadTrace with
-  | .ok ⟨[]⟩, .error (3, .freeOfUnknown 0x1000) => true
-  | _, _ => false
+  (match replay sampleGoodTrace, replay sampleBadTrace with
+    | .ok ⟨[]⟩, .error (3, .freeOfUnknown 0x1000) => true
+    | _, _ => false) &&
+  (match replayText sampleText, replayText sampleTextBad with
+    | .ok ⟨[]⟩, .error (3, .freeOfUnknown 0x1000) => true
+    | _, _ => false)
 
 def main : IO UInt32 := do
   let mut ok := true

@@ -94,6 +94,61 @@ theorem ExecModel.apply_preserves_nodup {m m' : ExecModel} {e : TraceEvent}
   | spanAlloc _ _ _ _ _ => simp only [ExecModel.apply] at h; injection h with h; subst h; exact hwf
   | release _ _ => simp only [ExecModel.apply] at h; injection h with h; subst h; exact hwf
 
+/- ----------------------------------------------------------------------- -/
+/- Parsing the §33.7 *text* grammar — closing the differential loop with the  -/
+/- Rust trace emitter (`topo_core::trace`) / host replayer.                   -/
+/- ----------------------------------------------------------------------- -/
+
+/-- A single hex digit's value, if valid. -/
+def hexDigit? (c : Char) : Option Nat :=
+  if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
+  else if 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+  else if 'A' ≤ c ∧ c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
+  else none
+
+/-- Parse an address field: `0x`-prefixed hex (as emitted) or plain decimal. -/
+def parseAddr (s : String) : Option Nat :=
+  if s.startsWith "0x" || s.startsWith "0X" then
+    (s.toList.drop 2).foldl (fun acc c => acc.bind fun n => (hexDigit? c).map fun d => n * 16 + d)
+      (some 0)
+  else s.toNat?
+
+/-- Parse one line of the §33.7 grammar into a `TraceEvent`, reading the live-set-relevant
+fields (the `ptr` for `ALLOC`/`FREE`). Returns `none` on a malformed or unknown line. The
+middle/back-end verbs parse to live-set-neutral events. -/
+def parseTraceLine (line : String) : Option TraceEvent :=
+  let toks := (line.splitOn " ").filter (· ≠ "")
+  match toks with
+  | "ALLOC" :: rest =>
+    -- ALLOC request_id size align arena flags -> ptr usable_size sc span
+    match rest.dropWhile (· ≠ "->") with
+    | _ :: ptr :: _ => (parseAddr ptr).map .alloc
+    | _ => none
+  | "FREE" :: ptr :: _ => (parseAddr ptr).map .free
+  | "REFILL" :: _ => some (.refill 0 0 0)
+  | "FLUSH" :: _ => some (.flush 0 0 0)
+  | "SPAN_ALLOC" :: _ => some (.spanAlloc 0 0 0 0 none)
+  | "RELEASE" :: _ => some (.release 0 0)
+  | _ => none
+
+/-- Replay a whole *text* trace (blank lines and `#` comments skipped), parsing each line
+in the §33.7 grammar and checking the cardinal invariants — the proof-grade counterpart of
+the Rust host replayer (`topo_test_support`/`tools/trace-replay`), so the two agree by
+differential replay (plan 08). -/
+def replayText (input : String) : Except (Nat × ExecError) ExecModel :=
+  go (input.splitOn "\n") ExecModel.empty 1
+where
+  go : List String → ExecModel → Nat → Except (Nat × ExecError) ExecModel
+  | [], m, _ => .ok m
+  | line :: rest, m, n =>
+    -- blank, comment, and unknown lines parse to `none` and are skipped
+    -- (forward-compatible with grammar extensions)
+    match parseTraceLine line with
+    | none => go rest m (n + 1)
+    | some e => match m.apply e with
+      | .ok m' => go rest m' (n + 1)
+      | .error err => .error (n, err)
+
 /-- Replay a whole trace, reporting the 1-based line of the first violation. -/
 def replay (events : List TraceEvent) : Except (Nat × ExecError) ExecModel :=
   go events ExecModel.empty 1
@@ -138,5 +193,19 @@ example : replay sampleGoodTrace = .ok ⟨[]⟩ := by rfl
 
 /-- The injected double-free is flagged at its line with the offending pointer. -/
 example : replay sampleBadTrace = .error (3, .freeOfUnknown 0x1000) := by rfl
+
+/-- A recorded trace in the **exact §33.7 text grammar** the Rust emitter (`topo_core::trace`)
+produces. `lake exe check` replays it through the Lean oracle (the differential loop with the
+Rust host replayer). The text parsing is evaluated, not kernel-reduced. -/
+def sampleText : String :=
+  "ALLOC 0 24 16 0 0 -> 0x1000 32 1 5\n\
+   ALLOC 1 24 16 0 0 -> 0x2000 32 1 5\n\
+   REFILL 3 1 32 central\n\
+   FREE 0x1000 32 -> 1 5\n\
+   FREE 0x2000 32 -> 1 5\n"
+
+/-- The same text grammar with an injected double-free, for the negative replay check. -/
+def sampleTextBad : String :=
+  "ALLOC 0 8 8 0 0 -> 0x1000 16 0 0\nFREE 0x1000 8 -> 0 0\nFREE 0x1000 8 -> 0 0\n"
 
 end TopoMalloc
