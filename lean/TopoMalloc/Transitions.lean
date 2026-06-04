@@ -76,6 +76,41 @@ theorem relabelAll_ownerOf_not_mem (o : Owner) {q : BlockId} :
     simp only [List.mem_cons, not_or] at hq
     rw [relabelAll_cons, ih _ hq.2, setOwner_ownerOf_ne s b o hq.1]
 
+/-- A batch block relabelled to a **non-live** owner is not live afterwards (whether or
+not it is present): its owner is `o ≠ live`, or it does not exist. -/
+theorem relabelAll_ownerOf_mem_ne_live (o : Owner) (ho : o ≠ Owner.live) {q : BlockId} :
+    ∀ (s : State) (batch : List BlockId), q ∈ batch →
+      (relabelAll s batch o).ownerOf q ≠ some Owner.live := by
+  intro s batch
+  induction batch generalizing s with
+  | nil => intro h; exact absurd h (by simp)
+  | cons b rest ih =>
+    intro hq
+    rw [relabelAll_cons]
+    by_cases hqr : q ∈ rest
+    · exact ih _ hqr
+    · have hqb : q = b := (List.mem_cons.mp hq).resolve_right hqr
+      subst hqb
+      rw [relabelAll_ownerOf_not_mem o (s.setOwner q o) rest hqr]
+      cases hp : s.blockById q with
+      | none => simp [State.ownerOf, blockById_setOwner, hp]
+      | some blk =>
+        rw [setOwner_ownerOf_self s q o (by rw [hp]; rfl)]
+        exact fun hc => ho (Option.some.inj hc)
+
+/-- **Live-set conservation for a free-batch relabel.** If the target owner is not
+`live` and every batch block was already non-live, then relabelling the batch changes
+*no* address's liveness — the live set is exactly preserved. This is the real content of
+"ownership conservation" for cache refill/flush. -/
+theorem relabelAll_isLive_iff (o : Owner) (ho : o ≠ Owner.live) (s : State)
+    (batch : List BlockId) (hfree : ∀ q ∈ batch, ¬ s.IsLive q) :
+    ∀ q, (relabelAll s batch o).IsLive q ↔ s.IsLive q := by
+  intro q
+  by_cases hq : q ∈ batch
+  · exact iff_of_false (relabelAll_ownerOf_mem_ne_live o ho s batch hq) (hfree q hq)
+  · show (relabelAll s batch o).ownerOf q = some Owner.live ↔ s.ownerOf q = some Owner.live
+    rw [relabelAll_ownerOf_not_mem o s batch hq]
+
 /-- No owner other than the target `o` gains blocks under a batch relabel
 (the capacity-clause accounting for non-refill transitions). -/
 theorem relabelAll_countOwned_le_of_ne (o : Owner) {o' : Owner} (hne : o' ≠ o) :
@@ -121,6 +156,10 @@ theorem relabelAll_arenaUnique (s : State) (batch : List BlockId) (o : Owner)
 theorem relabelAll_slabLayout (s : State) (batch : List BlockId) (o : Owner)
     (h : WfSlabLayout s) : WfSlabLayout (relabelAll s batch o) :=
   relabelAll_preserves o WfSlabLayout (fun s' b' h => WfSlabLayout.setOwner s' b' o h) s batch h
+
+theorem relabelAll_spansDisjoint (s : State) (batch : List BlockId) (o : Owner)
+    (h : WfSpansDisjoint s) : WfSpansDisjoint (relabelAll s batch o) :=
+  relabelAll_preserves o WfSpansDisjoint (fun s' b' h => WfSpansDisjoint.setOwner s' b' o h) s batch h
 
 /-- The batch version: relabelling a whole batch to a non-live owner preserves
 clause 10 (released ranges contain no live block). -/

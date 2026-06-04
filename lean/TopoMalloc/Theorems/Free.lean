@@ -42,7 +42,8 @@ theorem free_preserves_wellformed_for_valid_pointer (s : State) (b : BlockId) (o
       cacheCapacities := fun cpu sc =>
         Nat.le_trans (countOwned_setOwner_le_of_ne s b o (hne_cpu cpu sc).symm)
           (hwf.cacheCapacities cpu sc)
-      slabLayout := WfSlabLayout.setOwner s b o hwf.slabLayout }
+      slabLayout := WfSlabLayout.setOwner s b o hwf.slabLayout
+      spansDisjoint := WfSpansDisjoint.setOwner s b o hwf.spansDisjoint }
 
 /-- **`free_removes_liveness_and_adds_exactly_one_free_owner` (§33.4).** After `free`,
 the slot is no longer live, it is owned by the free owner `o`, and **only** that slot

@@ -41,7 +41,8 @@ theorem malloc_preserves_wellformed (s : State) (b : BlockId) (hwf : WellFormed 
       cacheCapacities := fun cpu sc =>
         Nat.le_trans (countOwned_setOwner_le_of_ne s b Owner.live (by simp))
           (hwf.cacheCapacities cpu sc)
-      slabLayout := WfSlabLayout.setOwner s b Owner.live hwf.slabLayout }
+      slabLayout := WfSlabLayout.setOwner s b Owner.live hwf.slabLayout
+      spansDisjoint := WfSpansDisjoint.setOwner s b Owner.live hwf.spansDisjoint }
 
 /-- **`malloc_success_returns_aligned_sufficient_disjoint_object` (§33.4).** The
 slot handed out is live; its range is at least as large as the request and aligned

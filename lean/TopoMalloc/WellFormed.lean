@@ -64,10 +64,13 @@ def WfCentralConsistent (s : State) : Prop :=
 def WfObjectsFitSpans (s : State) : Prop :=
   ∀ blk ∈ s.blocks, ∃ d ∈ s.spans, d.id = blk.span ∧ blk.range.Subset d.range
 
-/-- Clause 6 (§33.3.6, §16.4): a span's recorded object count agrees with the
-blocks attributed to it (the abstract analogue of "bitmaps agree with ownership"). -/
+/-- Clause 6 (§33.3.6, §16.4): a span's recorded object count agrees with the blocks
+attributed to it (the abstract analogue of "bitmaps agree with ownership"), and that
+count never exceeds the slab capacity its size class is carved for (§9.5). -/
 def WfBitmapsAgree (s : State) : Prop :=
-  ∀ d ∈ s.spans, s.blocks.countP (fun blk => decide (blk.span = d.id)) = d.objCount
+  ∀ d ∈ s.spans,
+    s.blocks.countP (fun blk => decide (blk.span = d.id)) = d.objCount ∧
+      ∀ r, sizeClassRow d.sc = some r → d.objCount ≤ r.objectsPerSlab
 
 /-- Clause 7 (§33.3.7, §17.2): every pagemap entry names an existing span whose
 range covers that whole page. -/
@@ -99,8 +102,15 @@ def WfSlabLayout (s : State) : Prop :=
   ∀ blk ∈ s.blocks, ∃ r, sizeClassRow blk.sc = some r ∧
     blk.range.len = r.size ∧ r.align ∣ blk.range.base
 
-/-- `WellFormed` (§33.3): the conjunction of all twelve clauses, with named
-projections so a transition proof cites exactly what it preserves. -/
+/-- Clause 13 (supplement, §16.1/§22.7): span ranges are pairwise disjoint — spans
+tile the address space without overlap. This is what span split/merge preserve and
+what makes the §22.7 isolation invariant geometric, not just id-level. -/
+def WfSpansDisjoint (s : State) : Prop := (s.spans.map (·.range)).Pairwise Range.Disjoint
+
+/-- `WellFormed` (§33.3): the conjunction of all clauses, with named projections so a
+transition proof cites exactly what it preserves. Clauses 1–11 are the §33.3 bullets;
+12 (`slabLayout`) and 13 (`spansDisjoint`) are the §9.5/§16 structural backbones the
+§33.4 theorems consume. -/
 structure WellFormed (s : State) : Prop where
   rangesDisjoint : WfRangesDisjoint s
   uniqueOwner : WfUniqueOwner s
@@ -114,6 +124,7 @@ structure WellFormed (s : State) : Prop where
   releasedNoLive : WfReleasedNoLive s
   cacheCapacities : WfCacheCapacities s
   slabLayout : WfSlabLayout s
+  spansDisjoint : WfSpansDisjoint s
 
 /-- A symmetric pairwise relation holds between any two *distinct* members of a
 list (no `Nodup` needed: distinct values cannot share an index). -/
@@ -158,6 +169,7 @@ theorem wellFormed_empty : WellFormed State.empty where
   cacheCapacities := by
     intro cpu sc; simp only [State.countOwned, State.empty, List.countP_nil]; exact Nat.zero_le _
   slabLayout := by simp [WfSlabLayout, State.empty]
+  spansDisjoint := by simp [WfSpansDisjoint, State.empty]
 
 /-- Recover the exact §33.3 bullet 1: *live* ranges are pairwise disjoint. -/
 theorem WellFormed.liveRangesDisjoint {s : State} (h : WellFormed s) :
@@ -217,6 +229,10 @@ theorem WfBitmapsAgree.setOwner (h : WfBitmapsAgree s) :
   rw [s.setOwner_countP_of_owner_indep b o (fun blk => decide (blk.span = d.id))
         (fun _ _ => rfl)]
   exact h d hd
+
+theorem WfSpansDisjoint.setOwner (h : WfSpansDisjoint s) :
+    WfSpansDisjoint (s.setOwner b o) := by
+  unfold WfSpansDisjoint; rw [setOwner_spans]; exact h
 
 theorem WfPagemapAgrees.setOwner (h : WfPagemapAgrees s) :
     WfPagemapAgrees (s.setOwner b o) := by
