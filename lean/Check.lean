@@ -18,11 +18,13 @@ import TopoMalloc
 open TopoMalloc
 open TopoMalloc.Generated
 
-/-- The generated table passes the Lean §9.3/§9.5 predicate, and its emitted lookup is
-sound for every small request (`coversAllB`) — the hypothesis the §33.4
-`size_class_table_covers_all_small_requests` theorem consumes, discharged here on the
-generated tuned table by evaluation (the kernel cannot `decide` the 2048-granule lookup). -/
-def tableGate : Bool := tableOk pageSize quantum smallMax sizeClasses && coversAllB
+/-- The generated table passes the Lean §9.3/§9.5 predicate, its emitted lookup is sound
+for every small request (`coversAllB`), and it satisfies the §9.4 per-range spacing policy
+(`spacingOkB`) — the hypotheses the §33.4 `size_class_table_covers_all_small_requests` and
+`generated_table_spacing` theorems consume, discharged here on the generated tuned table by
+evaluation (the kernel cannot `decide` the 2048-granule lookup / the spacing products). -/
+def tableGate : Bool :=
+  tableOk pageSize quantum smallMax sizeClasses && coversAllB && spacingOkB
 
 /-- The executable model (W1-10) replays a good trace cleanly and flags the injected
 violation in the bad trace at the expected line — both for the structured event list and

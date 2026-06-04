@@ -63,6 +63,24 @@ def monotone : List SizeClassRow → Bool
   | [_] => true
   | a :: b :: rest => Nat.blt a.size b.size && monotone (b :: rest)
 
+/-- §9.4 per-range geometric spacing, as a `Bool` on an adjacent pair `(a, b)`: tiny
+classes (≤ 48 B) are alignment-dominated (ratio ≤ 2/1); above that the ratio tightens to
+4/3 (≤ 128 B), 6/5 (≤ 1024 B), and 9/8 (larger). Mirrors the size-class generator's §9.4
+policy check (`tools/size-class-gen/src/model.rs`), so the Lean side re-verifies the
+*shipped* table — not only the parameterized one. -/
+def spacingStepB (a b : SizeClassRow) : Bool :=
+  if b.size ≤ 48 then Nat.ble b.size (2 * a.size)
+  else if b.size ≤ 128 then Nat.ble (b.size * 3) (4 * a.size)
+  else if b.size ≤ 1024 then Nat.ble (b.size * 5) (6 * a.size)
+  else Nat.ble (b.size * 8) (9 * a.size)
+
+/-- §9.4 spacing over a whole table: every adjacent pair is within range ratio. Bool-valued
+(decidable by evaluation), like `monotone`. -/
+def spacingOk : List SizeClassRow → Bool
+  | [] => true
+  | [_] => true
+  | a :: b :: rest => spacingStepB a b && spacingOk (b :: rest)
+
 /-- Whole-table well-formedness: non-empty, every row sound, strictly
 increasing, and the largest class equals `smallMax` (coverage upper bound). -/
 def tableOk (pageSize quantum smallMax : Nat) (rows : List SizeClassRow) : Bool :=
