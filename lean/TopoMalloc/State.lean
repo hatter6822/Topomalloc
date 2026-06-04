@@ -98,6 +98,14 @@ def relabel (b : BlockId) (o : Owner) (blk : Block) : Block :=
 @[simp] theorem relabel_span (b o blk) : (relabel b o blk).span = blk.span := by
   unfold relabel; split <;> rfl
 
+/-- Off the target id, `relabel` is the identity (the frame at the element level). -/
+theorem relabel_of_ne (b : BlockId) (o : Owner) {blk : Block} (h : blk.id ≠ b) :
+    relabel b o blk = blk := by unfold relabel; rw [if_neg h]
+
+/-- On the target id, `relabel` just rewrites the owner. -/
+theorem relabel_of_eq (b : BlockId) (o : Owner) {blk : Block} (h : blk.id = b) :
+    relabel b o blk = { blk with owner := o } := by unfold relabel; rw [if_pos h]
+
 /-- Relabel block `b` to owner `o`. The only state change is that block's owner. -/
 def setOwner (s : State) (b : BlockId) (o : Owner) : State :=
   { s with blocks := s.blocks.map (relabel b o) }

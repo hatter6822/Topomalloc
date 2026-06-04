@@ -16,6 +16,7 @@ private kernel internals, so the MIT core still builds without seLe4n.
 GPL-3.0-or-later (D5).
 -/
 import TopoMalloc.WellFormed
+import TopoMalloc.Transitions
 import TopoMalloc.SeLe4n.CapBackedArena
 import TopoMalloc.SeLe4n.UntypedProvider
 import TopoMalloc.SeLe4n.VSpaceProvider
@@ -85,15 +86,24 @@ def LabelPartition (st : TopoSeLe4n) : Prop :=
   ∀ blk1 ∈ st.topo.blocks, ∀ blk2 ∈ st.topo.blocks,
     blk1.owner = blk2.owner → blk1.owner ≠ Owner.live → st.blockLabel blk1 = st.blockLabel blk2
 
+/-- **Exact byte accounting (§36.17).** Every arena authority's `used` counter equals the
+*actual* live bytes charged to that arena (`State.arenaLiveBytes`). This is strictly
+stronger than `quotaOk` (which only bounds `used`): it pins the counter to reality, so a
+coupled alloc/free can neither under- nor over-charge, and a stale/double free cannot
+credit bytes that were never live. -/
+def ArenaQuotaExact (st : TopoSeLe4n) : Prop :=
+  ∀ au ∈ st.sys.arenas, au.used = st.topo.arenaLiveBytes au.arena
+
 /-- **`TopoSeLe4nWellFormed` (§36.3.3, W1-11c).** The single composite predicate:
 TopoMalloc well-formedness, the seLe4n invariant bundle, the abstraction relation,
-and the label partition. Total (defined on every combined state); each clause is
-cross-referenced to its SPEC bullet. -/
+the label partition, and exact byte accounting. Total (defined on every combined state);
+each clause is cross-referenced to its SPEC bullet. -/
 structure TopoSeLe4nWellFormed (st : TopoSeLe4n) : Prop where
   topoWf : WellFormed st.topo
   sysInv : SysInvariants st.sys
   rel : R st
   labels : LabelPartition st
+  quotaExact : ArenaQuotaExact st
 
 /-- Lift a TopoMalloc transition to the combined state, leaving the seLe4n system
 unchanged (the topo fast/slow paths do not touch capability state). -/

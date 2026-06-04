@@ -165,6 +165,10 @@ theorem relabelAll_blockSpanClass (s : State) (batch : List BlockId) (o : Owner)
     (h : WfBlockSpanClass s) : WfBlockSpanClass (relabelAll s batch o) :=
   relabelAll_preserves o WfBlockSpanClass (fun s' b' h => WfBlockSpanClass.setOwner s' b' o h) s batch h
 
+theorem relabelAll_uniqueIds (s : State) (batch : List BlockId) (o : Owner)
+    (h : WfUniqueIds s) : WfUniqueIds (relabelAll s batch o) :=
+  relabelAll_preserves o WfUniqueIds (fun s' b' h => WfUniqueIds.setOwner s' b' o h) s batch h
+
 /-- The batch version: relabelling a whole batch to a non-live owner preserves
 clause 10 (released ranges contain no live block). -/
 theorem relabelAll_releasedNoLive (s : State) (batch : List BlockId) (o : Owner)
@@ -253,6 +257,81 @@ def releaseToOs (s : State) (r : Range) : State := { s with released := r :: s.r
 
 /-- The arena a block belongs to (read through its span). -/
 def spanArena (s : State) (sp : SpanId) : Option ArenaId := (s.spanById sp).map (·.arena)
+
+@[simp] theorem spanArena_setOwner (s : State) (b : BlockId) (o : Owner) (sp : SpanId) :
+    spanArena (s.setOwner b o) sp = spanArena s sp := by
+  unfold spanArena State.spanById; rw [State.setOwner_spans]
+
+/-- Live bytes charged to arena `a` (§36.17): the total `range.len` over the blocks that
+are both currently live and (through their span) owned by `a`. This is the *actual*
+usage the seLe4n quota counter must equal — `ArenaQuotaExact` pins `used` to it. -/
+def State.arenaLiveBytes (s : State) (a : ArenaId) : Nat :=
+  (s.blocks.map (fun blk =>
+    if blk.owner = Owner.live ∧ spanArena s blk.span = some a then blk.range.len else 0)).sum
+
+/-- **The relabel balance lemma (§36.17 accounting core).** With unique ids, relabelling
+the block `b` to owner `o` touches exactly that one slot's contribution: the relabelled
+live-byte total for any arena `a`, plus `b`'s *old* contribution, equals the old total
+plus `b`'s *new* contribution. Every other slot's contribution is framed. Stated over an
+abstract span→arena map `spA` for a clean induction. -/
+private theorem sum_relabel_balance (L : List Block) (b : BlockId) (a : ArenaId)
+    (o : Owner) (spA : SpanId → Option ArenaId) (blk_b : Block) (hbid : blk_b.id = b) :
+    (L.map (·.id)).Nodup → blk_b ∈ L →
+    (L.map (fun blk =>
+        if (relabel b o blk).owner = Owner.live ∧ spA (relabel b o blk).span = some a
+        then (relabel b o blk).range.len else 0)).sum
+      + (if blk_b.owner = Owner.live ∧ spA blk_b.span = some a then blk_b.range.len else 0)
+    = (L.map (fun blk =>
+        if blk.owner = Owner.live ∧ spA blk.span = some a then blk.range.len else 0)).sum
+      + (if o = Owner.live ∧ spA blk_b.span = some a then blk_b.range.len else 0) := by
+  induction L with
+  | nil => intro _ hb; simp at hb
+  | cons hd tl ih =>
+    intro huniq hb
+    rw [List.map_cons, List.nodup_cons] at huniq
+    obtain ⟨hnotin, htl⟩ := huniq
+    simp only [List.map_cons, List.sum_cons]
+    by_cases hhd : hd.id = b
+    · -- `b` lives at the head; by uniqueness `blk_b = hd`, and the tail has no id `= b`.
+      have hbeq : blk_b = hd := by
+        rcases List.mem_cons.mp hb with h | h
+        · exact h
+        · exfalso; apply hnotin
+          have hmem : blk_b.id ∈ tl.map (·.id) := List.mem_map_of_mem h
+          rwa [hbid, ← hhd] at hmem
+      have htl_eq : (tl.map (fun blk =>
+            if (relabel b o blk).owner = Owner.live ∧ spA (relabel b o blk).span = some a
+            then (relabel b o blk).range.len else 0)).sum
+          = (tl.map (fun blk =>
+            if blk.owner = Owner.live ∧ spA blk.span = some a then blk.range.len else 0)).sum := by
+        congr 1; apply List.map_congr_left; intro x hx
+        have hxb : x.id ≠ b := by
+          intro hxb; apply hnotin
+          have hmem : x.id ∈ tl.map (·.id) := List.mem_map_of_mem hx
+          rwa [hxb, ← hhd] at hmem
+        rw [relabel_of_ne b o hxb]
+      subst hbeq
+      rw [htl_eq, relabel_of_eq b o hhd]; dsimp only; omega
+    · -- `b` is in the tail; the head is framed (`relabel` identity), recurse.
+      have hbtl : blk_b ∈ tl := by
+        rcases List.mem_cons.mp hb with h | h
+        · exact absurd (h ▸ hbid) hhd
+        · exact h
+      rw [relabel_of_ne b o hhd]
+      have key := ih htl hbtl
+      omega
+
+/-- **State-level balance (§36.17).** The relabel balance lifted to `arenaLiveBytes`:
+relabelling the unique block `b` to `o` moves exactly `b`'s contribution to arena `a'`. -/
+theorem arenaLiveBytes_setOwner_balance (s : State) (b : BlockId) (a' : ArenaId) (o : Owner)
+    (blk_b : Block) (huniq : WfUniqueIds s) (hb : blk_b ∈ s.blocks) (hbid : blk_b.id = b) :
+    (s.setOwner b o).arenaLiveBytes a'
+      + (if blk_b.owner = Owner.live ∧ spanArena s blk_b.span = some a' then blk_b.range.len else 0)
+    = s.arenaLiveBytes a'
+      + (if o = Owner.live ∧ spanArena s blk_b.span = some a' then blk_b.range.len else 0) := by
+  unfold State.arenaLiveBytes
+  simp only [setOwner_blocks, spanArena_setOwner, List.map_map]
+  exact sum_relabel_balance s.blocks b a' o (spanArena s) blk_b hbid huniq hb
 
 /-- `arena_reset`: discard every allocation of arena `a`, returning its slots to the
 backend free list; other arenas are untouched. SPEC-transition: arena reset (§22.5). -/

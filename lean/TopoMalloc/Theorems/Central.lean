@@ -43,7 +43,8 @@ theorem central_batch_remove_preserves_wellformed
           (hwf.cacheCapacities cpu' sc')
       slabLayout := relabelAll_slabLayout s batch _ hwf.slabLayout
       spansDisjoint := relabelAll_spansDisjoint s batch _ hwf.spansDisjoint
-      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass }
+      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass
+      uniqueIds := relabelAll_uniqueIds s batch _ hwf.uniqueIds }
 
 /-- **`central_batch_insert_preserves_wellformed` (§33.4).** Moving a batch belonging
 to arena `a` from a transfer cache back into the central list preserves
@@ -73,6 +74,7 @@ theorem central_batch_insert_preserves_wellformed
           (hwf.cacheCapacities cpu' sc')
       slabLayout := relabelAll_slabLayout s batch _ hwf.slabLayout
       spansDisjoint := relabelAll_spansDisjoint s batch _ hwf.spansDisjoint
-      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass }
+      blockSpanClass := relabelAll_blockSpanClass s batch _ hwf.blockSpanClass
+      uniqueIds := relabelAll_uniqueIds s batch _ hwf.uniqueIds }
 
 end TopoMalloc

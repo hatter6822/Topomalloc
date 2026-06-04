@@ -3,7 +3,7 @@
 A concrete, non-empty `WellFormed` witness exercised end-to-end (plan 02 W1, gap
 closure for the non-vacuity evidence).
 
-`wellFormed_empty` shows the predicate holds *vacuously*; this file shows all fourteen
+`wellFormed_empty` shows the predicate holds *vacuously*; this file shows all fifteen
 clauses are *jointly* satisfiable by a real state with actual blocks — a live object and
 a cached free object in one span on a page — and that `malloc` then `free` round-trip on
 it. This rules out a hidden over-constraint among the clauses and exercises the
@@ -32,7 +32,7 @@ private theorem mem_demoBlocks {blk : Block} (h : blk ∈ [demoBlock0, demoBlock
   · exact Or.inl rfl
   · exact Or.inr (List.mem_singleton.mp h)
 
-/-- **All fourteen `WellFormed` clauses hold jointly on a real, non-empty state.** -/
+/-- **All fifteen `WellFormed` clauses hold jointly on a real, non-empty state.** -/
 theorem wellFormed_demoState : WellFormed demoState where
   rangesDisjoint := by unfold WfRangesDisjoint; decide
   uniqueOwner := by unfold WfUniqueOwner; decide
@@ -83,6 +83,7 @@ theorem wellFormed_demoState : WellFormed demoState where
     · exact ⟨_, rfl, by decide, by decide⟩
   spansDisjoint := by unfold WfSpansDisjoint; decide
   blockSpanClass := by unfold WfBlockSpanClass; decide
+  uniqueIds := by unfold WfUniqueIds; decide
 
 /-- The cached slot `0` is not live in the demo state. -/
 theorem demo_block0_not_live : ¬ demoState.IsLive 0 := by unfold State.IsLive; decide

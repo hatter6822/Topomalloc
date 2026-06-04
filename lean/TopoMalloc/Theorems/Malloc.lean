@@ -46,7 +46,8 @@ theorem malloc_preserves_wellformed (s : State) (b : BlockId) (hwf : WellFormed 
           (hwf.cacheCapacities cpu sc)
       slabLayout := WfSlabLayout.setOwner s b Owner.live hwf.slabLayout
       spansDisjoint := WfSpansDisjoint.setOwner s b Owner.live hwf.spansDisjoint
-      blockSpanClass := WfBlockSpanClass.setOwner s b Owner.live hwf.blockSpanClass }
+      blockSpanClass := WfBlockSpanClass.setOwner s b Owner.live hwf.blockSpanClass
+      uniqueIds := WfUniqueIds.setOwner s b Owner.live hwf.uniqueIds }
 
 /-- **`malloc_success_returns_aligned_sufficient_disjoint_object` (§33.4).** The
 slot handed out is live; its range is at least as large as the request and aligned

@@ -94,6 +94,12 @@ def ArenaAuth.credit (au : ArenaAuth) (size : Nat) : ArenaAuth := { au with used
     (au.charge size).arena = au.arena := rfl
 @[simp] theorem ArenaAuth.charge_label (au : ArenaAuth) (size : Nat) :
     (au.charge size).label = au.label := rfl
+@[simp] theorem ArenaAuth.charge_used (au : ArenaAuth) (size : Nat) :
+    (au.charge size).used = au.used + size := rfl
+@[simp] theorem ArenaAuth.credit_arena (au : ArenaAuth) (size : Nat) :
+    (au.credit size).arena = au.arena := rfl
+@[simp] theorem ArenaAuth.credit_used (au : ArenaAuth) (size : Nat) :
+    (au.credit size).used = au.used - size := rfl
 
 /-- Charge `size` bytes against arena `a`'s quota. -/
 def SystemState.chargeArena (sys : SystemState) (a : ArenaId) (size : Nat) : SystemState :=
@@ -236,13 +242,17 @@ theorem allocStep_preserves_sysInvariants (st : TopoSeLe4n) (b a size : Nat)
 /-- **The coupled allocation preserves `TopoSeLe4nWellFormed` (§36.17).** TopoMalloc
 well-formedness comes from `malloc` (popping a *non-live* slot, `hnonlive`), the seLe4n
 quota from the budget guard, the abstraction relation from charging touching neither spans
-nor presence, and the label partition because charging changes no label. `harena` ties the
-charged arena to block `b`'s *own* arena, so quota can only be charged to the arena that
-actually owns the allocated slot. The two sides move as one. -/
+nor presence, and the label partition because charging changes no label. The accounting is
+**exact**: `harena` ties the charge to block `b`'s *own* arena, `hsize` ties the charged
+byte-count to `b`'s actual size, and (with unique ids) the balance lemma proves the new
+`used` equals the new live bytes for every arena — so the step neither under- nor
+over-charges. The two sides move as one. -/
 theorem allocStep_preserves_invariants (st : TopoSeLe4n) (b a size : Nat)
     (hwf : TopoSeLe4nWellFormed st)
+    (blk_b : Block) (hb : st.topo.blockById b = some blk_b)
     (hnonlive : st.topo.ownerOf b ≠ some Owner.live)
-    (_harena : ∀ blk ∈ st.topo.blocks, blk.id = b → spanArena st.topo blk.span = some a)
+    (harena : spanArena st.topo blk_b.span = some a)
+    (hsize : size = blk_b.range.len)
     (hcommitted : ∀ blk ∈ st.topo.blocks, blk.id = b → ∀ r ∈ st.topo.released,
       Range.Disjoint r blk.range)
     (hbudget : ∀ au ∈ st.sys.arenas, au.arena = a → au.used + size ≤ au.quota) :
@@ -252,6 +262,30 @@ theorem allocStep_preserves_invariants (st : TopoSeLe4n) (b a size : Nat)
   rel := by
     refine ⟨fun d hd => ?_, fun bk hbk => hwf.rel.2 bk hbk⟩
     exact chargeArena_arenaAuthOf_isSome st.sys a size (hwf.rel.1 d hd)
+  quotaExact := by
+    intro au hau
+    have hmem : blk_b ∈ st.topo.blocks := List.mem_of_find?_eq_some hb
+    have hbid : blk_b.id = b := by
+      have h := List.find?_some hb; simp only [decide_eq_true_eq] at h; exact h
+    have hown : st.topo.ownerOf b = some blk_b.owner := by simp [State.ownerOf, hb]
+    have hnl : blk_b.owner ≠ Owner.live := fun hc => hnonlive (by rw [hown, hc])
+    simp only [TopoSeLe4n.allocStep, SystemState.chargeArena, List.mem_map] at hau
+    obtain ⟨au0, hau0, rfl⟩ := hau
+    have hq0 : au0.used = st.topo.arenaLiveBytes au0.arena := hwf.quotaExact au0 hau0
+    have hbal := arenaLiveBytes_setOwner_balance st.topo b au0.arena Owner.live blk_b
+      hwf.topoWf.uniqueIds hmem hbid
+    rw [if_neg (fun h => hnl h.1)] at hbal
+    show (if au0.arena = a then au0.charge size else au0).used
+      = (st.topo.setOwner b Owner.live).arenaLiveBytes
+          (if au0.arena = a then au0.charge size else au0).arena
+    by_cases hc : au0.arena = a
+    · rw [if_pos hc]
+      simp only [ArenaAuth.charge_used, ArenaAuth.charge_arena]
+      rw [if_pos ⟨rfl, harena.trans (congrArg some hc.symm)⟩] at hbal
+      omega
+    · rw [if_neg hc]
+      rw [if_neg (fun h => hc ((Option.some.inj (harena.symm.trans h.2)).symm))] at hbal
+      omega
   labels := by
     -- `allocStep` and `withTopo (setOwner b live)` share a topo, and their block labels
     -- agree because charging changes no label; reduce to the malloc label-partition.
@@ -346,14 +380,19 @@ theorem label_partition_preserved_free (st : TopoSeLe4n) (b : BlockId) (a : Aren
 /-- **The coupled free preserves `TopoSeLe4nWellFormed` (§36.17).** Symmetric to
 `allocStep_preserves_invariants`: TopoMalloc well-formedness comes from `free` into the
 central list of `(a, sc)` (which requires the freed slot belong to arena `a` — `hcentral`),
-the seLe4n quota stays sound because crediting only lowers `used` (no budget guard), the
-abstraction relation survives crediting, and the label partition holds because the freed
-slot's label matches the central list (`hmatch`) and crediting changes no label. The
-`hlive` guard restricts the step to a slot that is *currently live* — so a double free (or
-a stale free of an already-free block) cannot credit the same allocation's quota twice. -/
+the seLe4n quota stays sound because crediting only lowers `used`, the abstraction relation
+survives crediting, and the label partition holds because the freed slot's label matches the
+central list (`hmatch`) and crediting changes no label. The accounting stays **exact**: the
+`hlive` guard restricts the step to a *currently live* slot, `harena`/`hsize` tie the credit
+to that slot's own arena and size, and the balance lemma proves the new `used` still equals
+the new live bytes — so a double free (or a stale free of an already-free block) cannot
+credit the same allocation's quota twice. -/
 theorem freeStep_preserves_invariants (st : TopoSeLe4n) (b : BlockId) (a : ArenaId)
     (sc : SizeClassId) (size : Nat) (hwf : TopoSeLe4nWellFormed st)
-    (_hlive : st.topo.ownerOf b = some Owner.live)
+    (blk_b : Block) (hb : st.topo.blockById b = some blk_b)
+    (hlive : st.topo.ownerOf b = some Owner.live)
+    (harena : spanArena st.topo blk_b.span = some a)
+    (hsize : size = blk_b.range.len)
     (hcentral : ∀ blk ∈ st.topo.blocks, blk.id = b →
       ∃ d ∈ st.topo.spans, d.id = blk.span ∧ d.arena = a)
     (hmatch : ∀ blkb ∈ st.topo.blocks, blkb.id = b → ∀ c ∈ st.topo.blocks, c.id ≠ b →
@@ -373,6 +412,32 @@ theorem freeStep_preserves_invariants (st : TopoSeLe4n) (b : BlockId) (a : Arena
   rel := by
     refine ⟨fun d hd => ?_, fun bk hbk => hwf.rel.2 bk hbk⟩
     exact creditArena_arenaAuthOf_isSome st.sys a size (hwf.rel.1 d hd)
+  quotaExact := by
+    intro au hau
+    have hmem : blk_b ∈ st.topo.blocks := List.mem_of_find?_eq_some hb
+    have hbid : blk_b.id = b := by
+      have h := List.find?_some hb; simp only [decide_eq_true_eq] at h; exact h
+    have hlv : blk_b.owner = Owner.live := by
+      have hown : st.topo.ownerOf b = some blk_b.owner := by simp [State.ownerOf, hb]
+      rw [hown] at hlive; exact Option.some.inj hlive
+    simp only [TopoSeLe4n.freeStep, SystemState.creditArena, List.mem_map] at hau
+    obtain ⟨au0, hau0, rfl⟩ := hau
+    have hq0 : au0.used = st.topo.arenaLiveBytes au0.arena := hwf.quotaExact au0 hau0
+    have hbal := arenaLiveBytes_setOwner_balance st.topo b au0.arena (Owner.centralFree a sc) blk_b
+      hwf.topoWf.uniqueIds hmem hbid
+    show (if au0.arena = a then au0.credit size else au0).used
+      = (st.topo.setOwner b (Owner.centralFree a sc)).arenaLiveBytes
+          (if au0.arena = a then au0.credit size else au0).arena
+    by_cases hc : au0.arena = a
+    · rw [if_pos hc]
+      simp only [ArenaAuth.credit_used, ArenaAuth.credit_arena]
+      rw [if_pos ⟨hlv, harena.trans (congrArg some hc.symm)⟩,
+        if_neg (fun h => Owner.noConfusion h.1)] at hbal
+      omega
+    · rw [if_neg hc]
+      rw [if_neg (fun h => hc ((Option.some.inj (harena.symm.trans h.2)).symm)),
+        if_neg (fun h => Owner.noConfusion h.1)] at hbal
+      omega
   labels := by
     refine LabelPartition_of_same (st1 := st.freeStep b a sc size)
       (st2 := st.withTopo (st.topo.setOwner b (Owner.centralFree a sc))) rfl ?_
