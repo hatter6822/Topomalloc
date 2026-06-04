@@ -25,18 +25,22 @@ namespace TopoMalloc.SeLe4n
 
 open TopoMalloc State
 
-/-- A backing frame's provenance and lifecycle position (§36.6). -/
+/-- A backing frame's provenance and lifecycle position (§36.6). `origin` is the untyped
+capability it was retyped from; `arena` is the authority domain it backs. -/
 structure Backing where
   origin : Nat
   state : BackingState
   label : Label
+  arena : ArenaId
   deriving Repr, DecidableEq
 
-/-- An abstract seLe4n system state: the capability-backed arenas (§36.4) and the
-backing frames (§36.6). -/
+/-- An abstract seLe4n system state: the capability-backed arenas (§36.4), the backing
+frames (§36.6), and the set of authorized untyped capabilities the frames must descend
+from (§36.5 provenance roots). -/
 structure SystemState where
   arenas : List ArenaAuth
   backings : List Backing
+  authorizedUntypeds : List Nat
   deriving Repr
 
 /-- The authority for arena `a`, if the system knows it. -/
@@ -59,10 +63,13 @@ def TopoSeLe4n.blockLabel (st : TopoSeLe4n) (blk : Block) : Option Label :=
   (st.blockArena blk).bind (fun a => (st.sys.arenaAuthOf a).map (·.label))
 
 /-- **The abstraction relation `R` (§36.3.3/§36.7, W1-11a).** Every span's arena is a
-known authority, and every backing frame descends from authorized untyped memory. -/
+known authority, and every backing frame both (a) has an `origin` that is a genuinely
+*authorized* untyped capability and (b) sits at a §36.6-reachable lifecycle state. Clause
+(a) is a real provenance constraint — not every state is admissible. -/
 def R (st : TopoSeLe4n) : Prop :=
   (∀ d ∈ st.topo.spans, (st.sys.arenaAuthOf d.arena).isSome) ∧
-    (∀ bk ∈ st.sys.backings, BackingState.Reaches BackingState.authorizedUntyped bk.state)
+    (∀ bk ∈ st.sys.backings, bk.origin ∈ st.sys.authorizedUntypeds ∧
+      BackingState.Reaches BackingState.authorizedUntyped bk.state)
 
 /-- The seLe4n invariant bundle (§36.4/§36.6): quota accounting is sound and arena
 authorities are unique. -/

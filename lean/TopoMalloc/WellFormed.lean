@@ -139,6 +139,16 @@ theorem pairwise_rel_of_ne {α} {R : α → α → Prop} {l : List α} (hsymm : 
   · subst h; exact absurd rfl hxy
   · exact hsymm _ _ (hp j i hj hi h)
 
+/-- Unique ownership (clause 2) is injectivity of `id` on the block list: two listed
+blocks with the same id are the same block. -/
+theorem WfUniqueOwner.eq_of_id_eq {s : State} (h : WfUniqueOwner s) {b1 b2 : Block}
+    (h1 : b1 ∈ s.blocks) (h2 : b2 ∈ s.blocks) (hid : b1.id = b2.id) : b1 = b2 := by
+  have hh : (s.blocks.map (·.id)).Pairwise (· ≠ ·) := h
+  have hpw : s.blocks.Pairwise (fun a c => a.id ≠ c.id) := List.pairwise_map.mp hh
+  by_cases hc : b1 = b2
+  · exact hc
+  · exact absurd hid (pairwise_rel_of_ne (fun _ _ hh2 => hh2.symm) hpw h1 h2 hc)
+
 /-- Any two blocks with distinct ids have disjoint ranges (the form the
 `malloc_success` disjointness obligation consumes). -/
 theorem WellFormed.disjoint_of_id_ne {s : State} (hwf : WellFormed s) {blk1 blk2 : Block}
