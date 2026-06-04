@@ -72,7 +72,7 @@ def HostLockstep (host : HostReplay) : Prop :=
 
 /-- **Conditional safety (sorry-free).** Under lockstep, whenever the host *accepts* a
 trace the Lean oracle accepts it too — so every accepted-trace guarantee the oracle proves
-(live-set disjointness / no double-free, §8.3, via `replay_nodup`) transfers to the host. -/
+(live-set disjointness / no double-free, §8.3, via `replay_disjoint`) transfers to the host. -/
 theorem host_accept_imp_model_accept (host : HostReplay) (hl : HostLockstep host)
     (trace : String) (h : (host trace).isOk = true) : (replayText trace).isOk = true := by
   rw [← hl trace]; exact h

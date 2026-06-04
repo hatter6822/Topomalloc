@@ -89,10 +89,12 @@ gaps — each is a stated modelling choice, not an unproven claim):
   exact owner relabel (`s' = setOwner p …`), so it frames *all* non-owner geometry; the
   remaining trust is the hardware↔model refinement (the asm itself) — open question 7 /
   W1-14 per-arch verification.
-- **The executable oracle** (`Exec.lean`) checks the cardinal live-set invariants on the
-  §33.7 trace; a full State-level decidable `WellFormed` over a State reconstructed from the
-  trace is future work (the trace grammar does not carry full block structure). The
-  structural `WellFormed` clauses are decidable and `decide`-checked on `demoState`.
+- **The executable oracle** (`Exec.lean`) checks live **range-disjointness** on the §33.7
+  trace — an allocation whose `[ptr, ptr+usable_size)` range overlaps a live object is
+  rejected (`replay_disjoint`), not merely an equal base address. A full State-level
+  decidable `WellFormed` over a State reconstructed from the trace is future work (the trace
+  grammar does not carry full block structure). The structural `WellFormed` clauses are
+  decidable and `decide`-checked on `demoState`.
 
 ## Building
 
