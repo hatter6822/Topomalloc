@@ -18,8 +18,11 @@ import TopoMalloc
 open TopoMalloc
 open TopoMalloc.Generated
 
-/-- The generated table passes the Lean §9.3/§9.5 predicate. -/
-def tableGate : Bool := tableOk pageSize quantum smallMax sizeClasses
+/-- The generated table passes the Lean §9.3/§9.5 predicate, and its emitted lookup is
+sound for every small request (`coversAllB`) — the hypothesis the §33.4
+`size_class_table_covers_all_small_requests` theorem consumes, discharged here on the
+generated tuned table by evaluation (the kernel cannot `decide` the 2048-granule lookup). -/
+def tableGate : Bool := tableOk pageSize quantum smallMax sizeClasses && coversAllB
 
 /-- The executable model (W1-10) replays a good trace cleanly and flags the injected
 violation in the bad trace at the expected line. -/
