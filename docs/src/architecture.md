@@ -9,6 +9,8 @@ vertical slice through it.
 Public API:  C ABI (topomalloc_*) + Rust GlobalAlloc        topo-abi
 Request classifier: small/medium/large, size class,         topo-core (classify)
                     align, arena, label, hints
+Metadata substrate: bootstrap bump alloc, pagemap,          topo-core (bootstrap,
+  span/large descriptors, pointer classification              pagemap, span, ptr_class)
 Front/middle/back ends (M1+)                                 topo-core, plans 03/05
         ─────────────────  S E A M  ─────────────────
 trait TopoBackingProvider                                    topo-core (backend)
@@ -51,6 +53,69 @@ the plan-06 API boundary. The Lean model mirrors the classifier and proves both
 the size-coverage invariant (plan 02 W1-4) and the over-alignment-sufficiency
 invariant (plan 03 W2-3b: the lookup only ever returns a class whose natural
 alignment covers the request).
+
+## Metadata, pagemap & pointer classification (plan 03 W3)
+
+Below the classifier sits the metadata substrate every later layer reads (§16/§17):
+turn a request into a span, find the descriptor that owns *any* address, and do it
+while spans are concurrently created and recycled. Four modules in `topo-core`:
+
+- **Bootstrap metadata allocator** (`bootstrap.rs`, W3-1, §17.4/S-007). A monotonic
+  bump arena over a small static (or early-reserved) region — the floor everything
+  else stands on. It has no dependency on the public `malloc` (it only bumps an
+  atomic cursor), is lock-free before threading, fails safely on exhaustion
+  (`None`, never a wrap), and has an idempotent init plus a hand-off flag for the
+  transition to the normal metadata allocator once arenas exist. Span descriptors
+  and the pagemap's radix nodes both come from this seam (`MetadataAlloc`), so the
+  node source can change at hand-off without the pagemap caring. This is the
+  metadata analogue of the §27.5 TLS bootstrap rule: the path that builds the
+  allocator must never re-enter it.
+
+- **Span & large descriptors** (`span.rs`, W3-2/W3-5, §16.2/§17.2). The `SpanDescriptor`
+  carries the §16.2 fields and *derives the §16.4 conservation law*
+  `object_count = live + local_cached + transfer_cached + central_free + quarantined`
+  with `central_free = popcount(free_bitmap)` as the authoritative, cheap central
+  residency. The cached terms are logical quantities reconstructed in debug (W5-3c)
+  and trivially zero before caches exist (M1), so empty-span detection (§16.5) never
+  reads a cached free object as live. Every concurrently-read field is atomic, and a
+  `generation` counter (W3-5, §16.6/§27.5) is bumped on recycle so a stale reference
+  captured before the recycle is detectably invalid (`GenGuard`).
+
+- **Pagemap** (`pagemap.rs`, W3-3/W3-6, §17.1/DD-1). A fixed-fan-out **three-level
+  radix over allocator-page numbers** (chosen over a flat array, which wastes virtual
+  space on 64-bit, and a hash map, which has worst-case/resize hazards on the hot
+  path): O(1) worst-case lookup, lazily populated from bootstrap metadata, no resize,
+  interior-pointer lookup by masking an address to its page. For the 16 KiB page (D4)
+  the levels are 11/11/12 bits over a 34-bit page number (48-bit VA); a leaf covers
+  64 MiB. Leaf slots are **tagged pointers** — `Empty` (the zero word, a non-owned
+  page, P-Map-002), `Small`/`Large` (a descriptor pointer), or `ReleasedRetained`
+  (a span kept so a released page cannot be reused without recommit, P-Map-005);
+  descriptors are ≥ 8-aligned so the low three bits carry the tag. The **publish/read
+  protocol** (W3-3c/P-Map-006) is the subtle part: a leaf slot is filled with a
+  *release store* only after its descriptor is fully initialized, readers
+  *acquire-load*, and new radix nodes are zeroed before being linked with a release
+  CAS — so a concurrent classifier sees either `Empty` or a fully-formed entry, never
+  a half-built node. Because descriptors live in monotonic metadata and are recycled
+  in place with a generation bump, a stale pointer is always dereferenceable and the
+  generation flags the reuse (the §27.5 use-after-free the SPEC warns of). **This
+  module is the single mutator** (W3-6): span split/merge (plan 04 W4-2b) and span
+  lifecycle (W5-5) route every pagemap change through `install_span`/`release_span`/
+  `retire_span`/`install_large`, never poking a leaf directly.
+
+- **Pointer classification** (`ptr_class.rs`, W3-4, §17.5). `classify_ptr` consults
+  the pagemap and the metadata ranges and returns the §17.5 class — `Null`, `Small`
+  (with the object index, by the §16.3 slab-layout inverse), `Large`, `Interior`,
+  `Metadata`, `Released`, `Quarantined`, or `External`. `free` requires a **base
+  pointer** (§17.5); `validate_free` enforces exactly that, mapping a base pointer or
+  `Null` to a `FreeTarget` and an interior/foreign/released/metadata/quarantined
+  pointer to an `InvalidFree` that debug/hardened builds *detect and report* — never
+  act on (W3-4b, ties plan 08 W18-2).
+
+The runtime pagemap is held to the **same soundness property the Lean model proves**:
+`pagemap_lookup_sound` (plan 02 W1-8b) — "if the pagemap maps an address's page to a
+span, that span is real and its range contains the address" — is discharged against
+the radix implementation by the W3-3d property test (`tests/tests/pagemap.rs`), so a
+divergence between the proof and the implementation fails CI.
 
 ## Single source of truth (DD-1)
 

@@ -40,3 +40,37 @@ impl SizeClassId {
         self.0 as usize
     }
 }
+
+/// Identifies a span (the §16.2 descriptor that owns a slab of small objects, a
+/// medium allocation, or part of a large allocation). Mirrors the Lean model's
+/// `SpanId` (§33.2) so the proof and the runtime name the same descriptor.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SpanId(pub u32);
+
+/// Identifies a large-allocation descriptor (§17.2 P-Map-004): the metadata for a
+/// single `>= HUGE_THRESHOLD` allocation served by the region/hugepage backend.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct LargeId(pub u32);
+
+/// A span generation counter (§16.6 / §27.5). Bumped whenever a span descriptor
+/// is recycled for a different size class, arena, or allocation type, so a stale
+/// reference captured before the recycle can be detected (ABA / use-after-free
+/// protection on the classification path, W3-5).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Generation(pub u32);
+
+impl Generation {
+    /// The generation of a freshly created (never-recycled) span.
+    pub const FIRST: Generation = Generation(0);
+
+    /// The next generation, saturating at `u32::MAX` so a recycle can never wrap a
+    /// generation back onto a value a live stale reference might still hold (a
+    /// wrap would defeat the ABA guard, §27.5). Saturation is safe: `2^32`
+    /// recycles of one descriptor slot without the address space being reused is
+    /// not reachable, and pinning at the top only makes the guard *more*
+    /// conservative (every further compare reports "stale").
+    #[inline]
+    pub const fn next(self) -> Generation {
+        Generation(self.0.saturating_add(1))
+    }
+}

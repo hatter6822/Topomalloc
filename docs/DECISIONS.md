@@ -160,3 +160,60 @@ Four W2 implementation choices are ratified here; the module docs
   obligation as a verified, overflow-safe primitive; the classifier still
   page-rounds Large until the hugepage backend (plan 04) sets the §18.6
   region-cache policy that governs whole-hugepage rounding.
+
+## W3 — metadata, pagemap & classification design notes (plan 03)
+
+The W3 metadata substrate (`crates/topo-core/src/{bootstrap,span,pagemap,ptr_class}.rs`)
+makes five implementation choices; the module docs carry the detail.
+
+* **Bootstrap = a region-agnostic bump core plus a lifecycle wrapper.** The
+  monotonic bump arena (`BumpArena`, W3-1a) is split from the process-wide
+  idempotent-init/hand-off state machine (`Bootstrap`, W3-1b), so the carving logic
+  is unit-tested over a caller-provided buffer with no global state, and the
+  lifecycle (double-init no-op, safe-failure, `Active → HandedOff`) is tested
+  independently. Both expose the `MetadataAlloc` seam the pagemap allocates nodes
+  through, so the node source can change at hand-off (§17.4) without the pagemap
+  caring. The arena is **never** freed — metadata a classifier may reach must
+  outlive every classifier (§27.5) — so a descriptor pointer is always valid and
+  logical reuse is detected by a generation, not by reclaiming the memory.
+
+* **Pagemap radix: 11/11/12 bits, uniform interior nodes, tagged-pointer leaves.**
+  A three-level radix over the 34-bit allocator-page number (48-bit VA, 16 KiB page,
+  D4). The two interior levels share an 11-bit width so root and mid nodes are one
+  type (16 KiB each); leaves are 12-bit (32 KiB, covering 64 MiB). An address at or
+  beyond the supported VA is guarded to `Empty` rather than indexing out of range,
+  keeping lookup total. Leaf entries are tagged pointers (low 3 bits, descriptors are
+  ≥ 8-aligned): `Empty`=0 so a zeroed leaf is valid, `Small`/`Large`, and
+  `ReleasedRetained` (P-Map-005). Chosen over (a) a flat array — wastes virtual space
+  and forbids lazy population — and (b) a hash map — worst-case lookup and resize
+  hazards on the free hot path (DD-1).
+
+* **Publish/read with release/acquire + a single mutator (W3-6).** Leaf entries are
+  filled with a release store *after* the descriptor is initialized; readers
+  acquire-load; new nodes are zeroed before a release-CAS links them — so a
+  classifier sees `Empty` or a fully-formed entry, never a torn node (failure mode
+  F1). The pagemap is the **only** mutator (F3): plan 04 W4-2b and plan 03 W5-5 must
+  route through `install_span`/`release_span`/`retire_span`/`install_large`. The
+  pagemap's own operations are lock-free (atomic publish), so they acquire no lock
+  and cannot violate the §27.2 hierarchy; they run inside the caller's span critical
+  section (P-Map-006).
+
+* **Generation-validated descriptor reuse, not reclamation (W3-5).** Span/large
+  descriptors carry an atomic `generation` bumped on recycle (§16.6/§27.5).
+  Concurrent classification reads the current descriptor through release/acquire and
+  is always sound because the memory is never freed; a `GenGuard` lets sampled/debug
+  paths that *stash* a descriptor reference across a window detect a recycle (ABA).
+  This is the chosen answer to "descriptors MUST NOT be freed while a thread may
+  still classify a pointer to them" (§27.5) without an epoch/RCU reclaimer at M1.
+
+* **Conservation law derived, not tracked; inline bitmap at M1.** `central_free ==
+  popcount(free_bitmap)` is the authoritative, cheap central-residency count, updated
+  with the bitmap in one descriptor method (the §8.5 same-critical-section rule, which
+  the span lock wraps at W5-2). The cached `local`/`transfer`/`quarantined` terms are
+  logical — reconstructed in debug (W5-3c), zero before caches exist — so
+  `is_empty` (§16.5) takes them as explicit inputs and never infers liveness from the
+  bitmap (the DD-3 catastrophe guard). The free bitmap is **inline**, sized to the
+  widest slab in the generated table (1024 objects ⇒ 128 bytes); this favours a
+  self-contained, allocation-free descriptor at M1 over footprint, and a later
+  revision can move large bitmaps out-of-line without changing the contract. The
+  descriptor's fixed-header size is asserted at compile time (W3-2).

@@ -14,15 +14,19 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod backend;
+pub mod bootstrap;
 pub mod classify;
 pub mod error;
 pub mod flags;
 pub mod generated;
 pub mod ids;
 pub mod overflow;
+pub mod pagemap;
 pub mod profile;
+pub mod ptr_class;
 pub mod size_class;
 pub mod skeleton;
+pub mod span;
 pub mod trace;
 
 /// The TopoMalloc version string, reported by stats JSON (Appendix D) and the
@@ -32,13 +36,20 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Convenience re-exports for the common surface.
 pub use backend::{Region, Rights, TopoBackingProvider};
+pub use bootstrap::{Bootstrap, BumpArena, MetadataAlloc};
 pub use classify::{classify, Request, RequestKind};
 pub use error::BackendError;
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
-pub use ids::{ArenaId, Label, SizeClassId};
+pub use ids::{ArenaId, Generation, Label, LargeId, SizeClassId, SpanId};
+pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
+pub use ptr_class::{classify_ptr, validate_free, InvalidFree, PointerClass};
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
+pub use span::{
+    FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency, SpanDescriptor,
+    SpanFlags, SpanState,
+};
 
 #[cfg(test)]
 mod tests {

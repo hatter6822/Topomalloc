@@ -305,5 +305,11 @@ generator, never a literal.
 - [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
       the hot path.
 - [ ] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for.
-- [ ] Pagemap and span state never move in separate critical sections (W3-6).
+- [x] Pagemap and span state never move in separate critical sections (W3-6) — the
+      pagemap (`crates/topo-core/src/pagemap.rs`) is the **single** mutator: every
+      change goes through `install_span`/`release_span`/`retire_span`/`install_large`,
+      which pair the descriptor's state change with the entry publish (e.g.
+      `release_span` debug-asserts the span is marked `Released` first) under
+      release/acquire ordering. W4-2b (split/merge) and W5-5 (span lifecycle) route
+      through these and never poke a leaf directly.
 - [ ] Span creation stays out of the locked central critical section (W5-4b returns `empty`).
