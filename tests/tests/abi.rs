@@ -26,8 +26,13 @@ fn free_null_is_noop() {
 
 #[test]
 fn calloc_overflow_returns_null() {
+    // Product overflow (§26.1 multiplication check).
     assert!(topomalloc_calloc(usize::MAX, 2).is_null());
     assert!(topomalloc_calloc(1 << 40, 1 << 40).is_null());
+    // §26.1 second clause: the product fits, but the *subsequent* page-rounding
+    // would overflow — calloc must still return null, never a too-small region.
+    assert!(topomalloc_calloc(1, usize::MAX - 100).is_null());
+    assert!(topomalloc_calloc(usize::MAX - 100, 1).is_null());
 }
 
 #[test]

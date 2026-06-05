@@ -8,7 +8,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 
 use topo_abi::new_allocator_named;
-use topo_core::{classify, size_class, MIN_ALIGN};
+use topo_core::{classify, size_class, RequestFlags, MIN_ALIGN};
 
 fn bench_size_class(c: &mut Criterion) {
     c.bench_function("size_class(64,16)", |b| {
@@ -19,6 +19,19 @@ fn bench_size_class(c: &mut Criterion) {
 fn bench_classify(c: &mut Criterion) {
     c.bench_function("classify(100,16)", |b| {
         b.iter(|| classify(black_box(100), black_box(16), 0))
+    });
+}
+
+fn bench_classify_flags(c: &mut Criterion) {
+    // A non-trivial valid flag word, so the §10.4 flag validation + arena/hint
+    // decode cost is measured — not just the flags == 0 fast case.
+    let flags = RequestFlags::NONE
+        .with_zero()
+        .with_arena(1)
+        .expect("arena 1 encodes")
+        .raw();
+    c.bench_function("classify(100,16,flags)", |b| {
+        b.iter(|| classify(black_box(100), black_box(16), black_box(flags)))
     });
 }
 
@@ -38,5 +51,11 @@ fn bench_malloc(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_size_class, bench_classify, bench_malloc);
+criterion_group!(
+    benches,
+    bench_size_class,
+    bench_classify,
+    bench_classify_flags,
+    bench_malloc
+);
 criterion_main!(benches);

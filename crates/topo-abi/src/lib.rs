@@ -166,16 +166,24 @@ pub extern "C" fn topomalloc_free(ptr: *mut c_void) {
     }
 }
 
-/// `void* topomalloc_calloc(size_t n, size_t size)`. Overflow-checked (§26.1):
-/// an overflowing `n * size` returns null rather than wrapping.
+/// `void* topomalloc_calloc(size_t n, size_t size)`. Overflow-checked in both
+/// clauses of §26.1: (1) the `n * size` product is checked here via
+/// [`array_bytes`]; (2) the *subsequent* size-class/page rounding of that product
+/// is checked downstream — `malloc` classifies `total`, and `classify`'s checked
+/// `align_up` returns null rather than wrapping if the rounding would overflow.
+/// So a product that fits but rounds past `usize::MAX` still yields null, never a
+/// too-small region.
 #[no_mangle]
 pub extern "C" fn topomalloc_calloc(n: usize, size: usize) -> *mut c_void {
+    // §26.1 clause 1: reject an overflowing product before allocating.
     let Some(total) = array_bytes(n, size) else {
         return ptr::null_mut();
     };
     let Some(a) = global() else {
         return ptr::null_mut();
     };
+    // §26.1 clause 2: `malloc` → `classify` re-checks the post-product rounding and
+    // returns null on overflow; we propagate that null without zeroing.
     let p = a.malloc(total, MIN_ALIGN);
     if !p.is_null() && total > 0 {
         // SAFETY: `malloc` returned a non-null pointer to at least `total`

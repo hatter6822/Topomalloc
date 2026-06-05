@@ -9,7 +9,10 @@ use proptest::prelude::*;
 
 use topo_abi::{topomalloc_calloc, topomalloc_free};
 use topo_backend_posix::PosixBackingProvider;
-use topo_core::{trace, SkeletonAllocator};
+use topo_core::classify::RequestKind;
+use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
+use topo_core::size_class::row;
+use topo_core::{classify, trace, usable_size, RequestFlags, SkeletonAllocator};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -138,6 +141,65 @@ proptest! {
                 reference.remove(&slot);
             }
             prop_assert_eq!(model.live_count(), reference.len());
+        }
+    }
+}
+
+proptest! {
+    /// Request classification (§A.1, plan 03 W2-3/W2-4) is total, deterministic,
+    /// and sound over an arbitrary `(size, align)`: it never panics and never
+    /// wraps; whatever it returns satisfies the request with the alignment
+    /// honored *naturally* (never by offset-adjusting a shared slab, §9.3/§25.5);
+    /// and every medium/large extent is a whole number of allocator pages.
+    #[test]
+    fn classify_is_total_deterministic_and_sound(
+        // Include sizes near usize::MAX so the overflow → None path is exercised,
+        // not just the comfortable range.
+        size in prop_oneof![0usize..=(1usize << 48), (usize::MAX - 65_536)..=usize::MAX],
+        align_exp in 0u32..=48,
+        // Mostly-valid flag words (no reserved bits) plus some fully-random ones,
+        // so both the accept and the §10.4 reject paths get coverage.
+        flags in prop_oneof![3 => 0u32..(1u32 << 23), 1 => any::<u32>()],
+    ) {
+        let align = 1usize << align_exp;
+        // Determinism: a pure function of its inputs (W2-3a "deterministic").
+        prop_assert_eq!(classify(size, align, flags), classify(size, align, flags));
+
+        // §10.4: an invalid flag word is rejected deterministically. `align` is a
+        // valid power of two here, so the only other failure source is overflow.
+        if RequestFlags::from_raw(flags).is_none() {
+            prop_assert!(classify(size, align, flags).is_none());
+            return Ok(());
+        }
+
+        let Some(req) = classify(size, align, flags) else { return Ok(()); }; // remaining None ⇒ overflow
+        prop_assert_eq!(req.align, align);
+        prop_assert_eq!(req.flags.raw(), flags);
+        // The arena is decoded from the flag word (§A.1 choose_arena).
+        prop_assert_eq!(req.arena, RequestFlags::from_raw(flags).unwrap().arena());
+
+        let span = size.max(1).max(align); // effective size folded with alignment
+        match req.kind {
+            RequestKind::Small { sc, usable } => {
+                prop_assert_eq!(usable, usable_size(sc));
+                prop_assert!(usable >= size.max(1));
+                // The class's natural alignment covers the request and its size is
+                // an integer multiple of it — the slab needs no offset adjustment.
+                let r = row(sc);
+                prop_assert!(r.align as usize >= align);
+                prop_assert_eq!(r.size % r.align, 0);
+                prop_assert!(align <= MAX_ALIGN);
+            }
+            RequestKind::Medium { bytes } => {
+                prop_assert!(bytes >= span);
+                prop_assert_eq!(bytes % PAGE_SIZE, 0);
+                prop_assert!(span < HUGE_THRESHOLD);
+            }
+            RequestKind::Large { bytes } => {
+                prop_assert!(bytes >= span);
+                prop_assert_eq!(bytes % PAGE_SIZE, 0);
+                prop_assert!(span >= HUGE_THRESHOLD);
+            }
         }
     }
 }

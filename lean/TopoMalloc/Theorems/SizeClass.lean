@@ -41,6 +41,52 @@ def coversAllB : Bool := (List.range (smallMax / quantum)).all granuleOk
 Bool is *evaluated* by `lake exe check` (the products would strain in-kernel `decide`). -/
 def spacingOkB : Bool := spacingOk sizeClasses
 
+/-- The generated `maxAlign` equals the widest class alignment. The Rust runtime rejects an
+over-aligned request in O(1) when `align > MAX_ALIGN`; that is sound only if `maxAlign` is the
+true maximum, so the `lake exe check` gate re-derives it from the emitted rows (DD-1). -/
+def maxAlignOkB : Bool := maxAlign == maxAlignOf sizeClasses
+
+/-- The generated `hugeThreshold` (medium/large boundary, §9.2/§A.1) is well-formed: strictly
+above the small path and a whole number of allocator pages, so the medium range is non-empty
+and a page-rounded medium request can never reach the large regime. -/
+def hugeThresholdOkB : Bool :=
+  decide (smallMax < hugeThreshold) && decide (hugeThreshold % pageSize = 0)
+
+/-- Granule `g`'s lookup is *minimal*, not merely covering: the class before the chosen one is
+too small for the granule's smallest request `g*quantum + 1`, so no smaller class fits. With
+`coversAllB` (coverage) this pins the emitted lookup to the unique smallest-fitting class —
+the same property the Rust `lookup_matches_linear_scan` test checks, so both languages agree. -/
+def granuleMinimalB (g : Nat) : Bool :=
+  match sizeToClass[g]? with
+  | none => false
+  | some 0 => true
+  | some (p + 1) =>
+    match sizeClasses[p]? with
+    | none => false
+    | some prev => decide (prev.size < g * quantum + 1)
+
+/-- The whole emitted lookup is minimal: every granule up to `small_max` maps to the smallest
+fitting class. Evaluated by `lake exe check`, like `coversAllB`. -/
+def minimalLookupB : Bool := (List.range (smallMax / quantum)).all granuleMinimalB
+
+/-- The model's *own* lookup, computed from the row sizes alone (not read off the emitted
+table): the first class index whose size covers `req`. -/
+def firstFitIdx (req : Nat) : Option Nat :=
+  (List.range sizeClasses.length).find? (fun i =>
+    match sizeClasses[i]? with
+    | some r => Nat.ble req r.size
+    | none => false)
+
+/-- **Model-vs-emitted lookup differential (DD-1).** For every granule the *emitted*
+`sizeToClass` entry equals the index the model independently computes from the class sizes
+(`firstFitIdx` of the granule's smallest request). This is a genuine cross-source check — the
+emitted table provably *is* the model's lookup, not merely "both came from one generator". On
+the Rust side `lookup_matches_generated_granule_map` ties `size_class` to the same emitted
+table, closing the Rust ↔ emitted ↔ model loop. Evaluated by `lake exe check`. -/
+def lookupMatchesModelB : Bool :=
+  (List.range (smallMax / quantum)).all (fun g =>
+    sizeToClass[g]? == firstFitIdx (g * quantum + 1))
+
 /-- A sound granule yields its covering class and row. -/
 theorem granuleOk_elim {g : Nat} (h : granuleOk g = true) :
     ∃ ci row, sizeToClass[g]? = some ci ∧ sizeClasses[ci]? = some row ∧
@@ -81,6 +127,67 @@ theorem size_class_table_covers_all_small_requests (hcov : coversAllB = true)
       = quantum * ((req - 1) / quantum) + quantum := by
     rw [Nat.add_one_mul, Nat.mul_comm]
   omega
+
+/- ------------------------------------------------------------------------- -/
+/- W2-1 — the evaluated gates, lifted to theorems (matching the coverage one). -/
+/- ------------------------------------------------------------------------- -/
+
+/-- From a minimal granule plus the chosen class's predecessor, the predecessor is
+strictly below the granule's smallest request. -/
+theorem granuleMinimalB_elim {g p : Nat} {prev : SizeClassRow} (ci : Nat)
+    (h : granuleMinimalB g = true)
+    (hlut : sizeToClass[g]? = some ci) (hci : ci = p + 1)
+    (hprev : sizeClasses[p]? = some prev) :
+    prev.size < g * quantum + 1 := by
+  unfold granuleMinimalB at h
+  simp only [hlut, hci, hprev, decide_eq_true_eq] at h
+  exact h
+
+/-- **§9.5 lookup minimality**, lifted from the evaluated `minimalLookupB` gate: the class the
+emitted lookup selects for `req` has no smaller class that also fits — its immediate
+predecessor is strictly below `req`. With `size_class_table_covers_all_small_requests`
+(coverage) this pins the lookup to the unique smallest fitting class, matching the Rust
+`lookup_matches_linear_scan` test. -/
+theorem size_class_lookup_minimal (hmin : minimalLookupB = true)
+    (req : Nat) (h1 : 1 ≤ req) (h2 : req ≤ smallMax)
+    {ci p : Nat} {prev : SizeClassRow}
+    (hlut : sizeToClass[(req - 1) / quantum]? = some ci)
+    (hci : ci = p + 1) (hprev : sizeClasses[p]? = some prev) :
+    prev.size < req := by
+  have hq : 0 < quantum := by decide
+  have hdvd : quantum ∣ smallMax := by decide
+  have hg : (req - 1) / quantum < smallMax / quantum := by
+    have hle : (req - 1) / quantum ≤ (smallMax - 1) / quantum :=
+      Nat.div_le_div_right (by omega)
+    have hpred := pred_div_lt_of_dvd hdvd (show 0 < smallMax by decide)
+    omega
+  have hgmin : granuleMinimalB ((req - 1) / quantum) = true := by
+    rw [minimalLookupB, List.all_eq_true] at hmin
+    exact hmin _ (List.mem_range.mpr hg)
+  have hlt := granuleMinimalB_elim ci hgmin hlut hci hprev
+  have hle2 : (req - 1) / quantum * quantum + 1 ≤ req := by
+    have := Nat.div_mul_le_self (req - 1) quantum
+    omega
+  omega
+
+/-- **`MAX_ALIGN` soundness**, lifted from the evaluated `maxAlignOkB` gate: `maxAlign` is an
+upper bound on every class's alignment, so the runtime `align > MAX_ALIGN` fast-reject can
+never discard a request some class could actually serve. -/
+theorem maxAlign_is_upper_bound (h : maxAlignOkB = true)
+    {i : Nat} {r : SizeClassRow} (hr : sizeClasses[i]? = some r) :
+    r.align ≤ maxAlign := by
+  have hmem : r ∈ sizeClasses := List.mem_of_getElem? hr
+  have heq : maxAlign = maxAlignOf sizeClasses := eq_of_beq h
+  rw [heq]
+  exact mem_align_le_maxAlignOf hmem
+
+/-- **`huge_threshold` well-formedness**, lifted from the `hugeThresholdOkB` gate: the
+medium/large boundary lies strictly above the small path and is a whole number of pages. -/
+theorem huge_threshold_wellformed (h : hugeThresholdOkB = true) :
+    smallMax < hugeThreshold ∧ hugeThreshold % pageSize = 0 := by
+  unfold hugeThresholdOkB at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  exact h
 
 /- ------------------------------------------------------------------------- -/
 /- §9.4 spacing for the *shipped* tuned table (not only the uniform builder). -/

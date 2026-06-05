@@ -19,12 +19,15 @@ open TopoMalloc
 open TopoMalloc.Generated
 
 /-- The generated table passes the Lean §9.3/§9.5 predicate, its emitted lookup is sound
-for every small request (`coversAllB`), and it satisfies the §9.4 per-range spacing policy
-(`spacingOkB`) — the hypotheses the §33.4 `size_class_table_covers_all_small_requests` and
-`generated_table_spacing` theorems consume, discharged here on the generated tuned table by
-evaluation (the kernel cannot `decide` the 2048-granule lookup / the spacing products). -/
+(`coversAllB`) and minimal (`minimalLookupB`) for every small request, it satisfies the §9.4
+per-range spacing policy (`spacingOkB`), and the derived size-regime constants are consistent
+with the rows (`maxAlignOkB` = widest alignment; `hugeThresholdOkB` = well-formed medium/large
+boundary). These discharge — by evaluation on the generated tuned table — the hypotheses the
+§33.4 `size_class_table_covers_all_small_requests` and `generated_table_spacing` theorems
+consume (the kernel cannot `decide` the 2048-granule lookup / the spacing products). -/
 def tableGate : Bool :=
   tableOk pageSize quantum smallMax sizeClasses && coversAllB && spacingOkB
+    && minimalLookupB && lookupMatchesModelB && maxAlignOkB && hugeThresholdOkB
 
 /-- The executable model (W1-10) replays a good trace cleanly and flags the injected
 violation in the bad trace at the expected line — both for the structured event list and
@@ -40,7 +43,7 @@ def oracleGate : Bool :=
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
-    IO.println s!"lake check: size-class table OK ({sizeClasses.length} classes, small_max={smallMax})"
+    IO.println s!"lake check: size-class table OK ({sizeClasses.length} classes, small_max={smallMax}, huge_threshold={hugeThreshold}, max_align={maxAlign})"
   else
     IO.eprintln "lake check: size-class table FAILED well-formedness (§9.3/§9.5)"
     ok := false

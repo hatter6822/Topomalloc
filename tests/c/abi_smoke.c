@@ -52,6 +52,10 @@ int main(void) {
     assert(TOPOMALLOC_QUANTUM == 16u);
     assert(TOPOMALLOC_NUM_SIZE_CLASSES >= 1u);
     assert(topomalloc_size_classes[0].size == TOPOMALLOC_TINY_MIN);
+    /* medium/large boundary and derived max-alignment (plan 03 W2) */
+    assert(TOPOMALLOC_HUGE_THRESHOLD > TOPOMALLOC_SMALL_MAX);
+    assert((TOPOMALLOC_HUGE_THRESHOLD % TOPOMALLOC_PAGE_SIZE) == 0u);
+    assert(TOPOMALLOC_MAX_ALIGN == 16u);
 
     printf("C ABI smoke: OK (version=%s, backend=%s, %u size classes)\n",
            v, backend, (unsigned) TOPOMALLOC_NUM_SIZE_CLASSES);

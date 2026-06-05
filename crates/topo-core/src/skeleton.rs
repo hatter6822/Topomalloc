@@ -60,7 +60,7 @@ impl<P: TopoBackingProvider> SkeletonAllocator<P> {
         let req = classify(size, align, 0)?;
         let need = match req.kind {
             RequestKind::Small { usable, .. } => usable,
-            RequestKind::Large { bytes } => bytes,
+            RequestKind::Medium { bytes } | RequestKind::Large { bytes } => bytes,
         };
         let align = req.align.max(MIN_ALIGN);
         let base_addr = self.region.base as usize;
