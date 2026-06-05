@@ -47,8 +47,8 @@ pub use ptr_class::{classify_ptr, validate_free, InvalidFree, PointerClass};
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
 pub use span::{
-    FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency, SpanDescriptor,
-    SpanFlags, SpanState,
+    ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
+    SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,
 };
 
 #[cfg(test)]

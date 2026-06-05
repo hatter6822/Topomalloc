@@ -18,7 +18,7 @@ use proptest::prelude::*;
 
 use topo_core::generated::tables::PAGE_SIZE;
 use topo_core::ids::{ArenaId, SizeClassId, SpanId};
-use topo_core::pagemap::{PageMap, PAGENO_BITS, PAGE_SHIFT};
+use topo_core::pagemap::PageMap;
 use topo_core::span::SpanDescriptor;
 use topo_core::BumpArena;
 
@@ -35,20 +35,24 @@ fn leak_arena(bytes: usize) -> BumpArena {
 /// Build descriptors at sequential, non-overlapping page ranges from `(pages, gap)`
 /// specs (a `gap` of unowned pages precedes each span). Disjoint by construction,
 /// so each page maps to at most one span (P-Map-001).
-fn lay_out_spans(specs: &[(u32, u32)]) -> Vec<SpanDescriptor> {
+fn lay_out_spans(specs: &[(u32, u32)], meta: &BumpArena) -> Vec<SpanDescriptor> {
     let mut base = 0x4000_0000usize;
     let mut spans = Vec::with_capacity(specs.len());
     for (i, &(pages, gap)) in specs.iter().enumerate() {
         base += gap as usize * PAGE_SIZE;
-        spans.push(SpanDescriptor::new(
-            SpanId(i as u32),
-            ArenaId::DEFAULT,
-            SizeClassId::new(0),
-            base,
-            pages,
-            64,
-            0,
-        ));
+        spans.push(
+            SpanDescriptor::new(
+                SpanId(i as u32),
+                ArenaId::DEFAULT,
+                SizeClassId::new(0),
+                base,
+                pages,
+                64,
+                0,
+                meta,
+            )
+            .expect("bitmap"),
+        );
         base += pages as usize * PAGE_SIZE;
     }
     spans
@@ -63,7 +67,7 @@ proptest! {
     fn pagemap_lookup_is_sound(specs in prop::collection::vec((1u32..=4, 0u32..=3), 0..40)) {
         let meta = leak_arena(8 * 1024 * 1024);
         let pm = PageMap::new();
-        let spans = lay_out_spans(&specs);
+        let spans = lay_out_spans(&specs, &meta);
         // Descriptors are fixed in `spans` (no realloc after this), so the raw
         // pointers the pagemap stores remain valid for the lookups below.
         for s in &spans {
@@ -92,14 +96,16 @@ proptest! {
 }
 
 proptest! {
-    /// P-Map-002: an address beyond every installed span (and beyond the supported
-    /// VA) is non-owned. Complements the soundness direction above.
+    /// P-Map-002: any address outside every installed span is non-owned — and the
+    /// full-range radix never panics its index, for *any* `usize` (no VA cap).
     #[test]
     fn unowned_addresses_are_non_owned(addr in any::<u64>()) {
         let meta = leak_arena(1024 * 1024);
         let pm = PageMap::new();
-        // One span at a fixed, low window; anything far above it is non-owned.
-        let s = SpanDescriptor::new(SpanId(0), ArenaId::DEFAULT, SizeClassId::new(0), 0x4000_0000, 1, 64, 0);
+        // One span at a fixed, low window; anything outside it is non-owned.
+        let s = SpanDescriptor::new(
+            SpanId(0), ArenaId::DEFAULT, SizeClassId::new(0), 0x4000_0000, 1, 64, 0, &meta,
+        ).expect("bitmap");
         pm.install_span(&meta, &s).unwrap();
 
         let addr = addr as usize;
@@ -111,10 +117,65 @@ proptest! {
         } else {
             prop_assert!(entry.is_empty(), "addr {addr:#x} outside the span must be non-owned");
         }
-        // An address at/above the supported VA is always non-owned (and never
-        // panics the radix index).
-        if addr >> (PAGENO_BITS + PAGE_SHIFT) != 0 {
-            prop_assert!(pm.lookup(addr).is_empty());
-        }
+        // The very top of the address space classifies without panicking the index.
+        prop_assert!(pm.lookup(usize::MAX).is_empty());
+    }
+}
+
+/// The Rust half of the W3-3d **differential vs the Lean executable pagemap**: it
+/// replays the *same* install/lookup trace as the Lean `samplePagemapTrace`
+/// (`lean/TopoMalloc/Theorems/PagemapExec.lean`, checked by `lake exe check`) against
+/// the runtime radix and asserts the *same* `addr -> span-id` results. A divergence on
+/// either side fails CI; the Lean side additionally *proves* the lookups sound
+/// (`install_lookup_sound`, mirroring `pagemap_lookup_sound`).
+#[test]
+fn pagemap_matches_lean_replay_differential() {
+    let meta = leak_arena(2 * 1024 * 1024);
+    let pm = PageMap::new();
+    // install 1 @ 0x4000_0000 (2 pages); install 2 @ 0x8000_0000 (1 page).
+    let s1 = SpanDescriptor::new(
+        SpanId(1),
+        ArenaId::DEFAULT,
+        SizeClassId::new(0),
+        0x4000_0000,
+        2,
+        64,
+        0,
+        &meta,
+    )
+    .expect("bitmap");
+    let s2 = SpanDescriptor::new(
+        SpanId(2),
+        ArenaId::DEFAULT,
+        SizeClassId::new(0),
+        0x8000_0000,
+        1,
+        64,
+        0,
+        &meta,
+    )
+    .expect("bitmap");
+    pm.install_span(&meta, &s1).unwrap();
+    pm.install_span(&meta, &s2).unwrap();
+
+    // `(addr, expected span id)` — byte-for-byte the Lean trace's `expect` lines.
+    let cases: [(usize, Option<u32>); 7] = [
+        (0x4000_0000, Some(1)), // first byte of span 1
+        (0x4000_0001, Some(1)), // interior of span 1's first page
+        (0x4000_4000, Some(1)), // span 1's second page (+ one PAGE_SIZE)
+        (0x4000_8000, None),    // one page past span 1
+        (0x8000_0000, Some(2)), // span 2
+        (0x3FFF_FFFF, None),    // one page below span 1
+        (0xDEAD_0000, None),    // unrelated
+    ];
+    for (addr, expected) in cases {
+        // Map an owned lookup to the span's id, the same observable the Lean model
+        // checks (`lookup addr = some span-id`).
+        // SAFETY: a non-null span pointer is `&s1`/`&s2`, both live for the test.
+        let got = pm.lookup(addr).span_ptr().map(|p| unsafe { &*p }.id().0);
+        assert_eq!(
+            got, expected,
+            "lookup {addr:#x} disagrees with the Lean model"
+        );
     }
 }

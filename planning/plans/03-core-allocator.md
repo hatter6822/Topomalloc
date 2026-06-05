@@ -301,7 +301,12 @@ generator, never a literal.
 - [x] Over-aligned requests never share a slab (W2-3b) — `size_class` routes them to
       a sufficiently-aligned class or out to medium/large; the runtime `MAX_ALIGN`
       fast-reject and the `over_alignment_never_widens_a_shared_slab` test enforce it.
-- [ ] One critical section updates bitmap **and** count together (W5-2); no torn accounting.
+- [x] One critical section updates bitmap **and** count together (W5-2); no torn
+      accounting — `SpanDescriptor` owns a per-span lock (§27.2/§8.5); the bitmap edit
+      and the cached `central_free_count` move together through the `SpanGuard`
+      (`central_insert`/`central_remove`), the only mutation path, so the
+      `central_free == popcount` invariant is never observed torn. W5 wires the central
+      list around this lock.
 - [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
       the hot path.
 - [ ] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for.

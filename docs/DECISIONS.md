@@ -164,56 +164,70 @@ Four W2 implementation choices are ratified here; the module docs
 ## W3 — metadata, pagemap & classification design notes (plan 03)
 
 The W3 metadata substrate (`crates/topo-core/src/{bootstrap,span,pagemap,ptr_class}.rs`)
-makes five implementation choices; the module docs carry the detail.
+makes six implementation choices; the module docs carry the detail.
 
-* **Bootstrap = a region-agnostic bump core plus a lifecycle wrapper.** The
-  monotonic bump arena (`BumpArena`, W3-1a) is split from the process-wide
-  idempotent-init/hand-off state machine (`Bootstrap`, W3-1b), so the carving logic
-  is unit-tested over a caller-provided buffer with no global state, and the
-  lifecycle (double-init no-op, safe-failure, `Active → HandedOff`) is tested
-  independently. Both expose the `MetadataAlloc` seam the pagemap allocates nodes
-  through, so the node source can change at hand-off (§17.4) without the pagemap
-  caring. The arena is **never** freed — metadata a classifier may reach must
-  outlive every classifier (§27.5) — so a descriptor pointer is always valid and
-  logical reuse is detected by a generation, not by reclaiming the memory.
+* **Bootstrap = bump core + lifecycle, with a real hand-off, a static global, and a
+  re-entrancy guard.** The monotonic bump arena (`BumpArena`, W3-1a) is split from the
+  idempotent-init/hand-off state machine (`Bootstrap`, W3-1b), so the carving logic is
+  unit-tested over a caller buffer with no global state. The hand-off is **real**:
+  `hand_off_to(successor)` routes new metadata to the normal allocator (§17.4) while
+  already-vended bytes stay valid; `Bootstrap::global()` binds a `BOOTSTRAP_REGION_BYTES`
+  static reserve lazily (DD-2's "static reservation"). A debug **re-entrancy guard**
+  (`is_in_alloc()`, a thread-local under `std`/tests, a no-op leaf otherwise) traps the
+  S-007 bug of the metadata path re-entering the allocator. The arena is **never** freed
+  — metadata a classifier may reach must outlive it (§27.5) — so logical reuse is caught
+  by a generation, not by reclaiming memory.
 
-* **Pagemap radix: 11/11/12 bits, uniform interior nodes, tagged-pointer leaves.**
-  A three-level radix over the 34-bit allocator-page number (48-bit VA, 16 KiB page,
-  D4). The two interior levels share an 11-bit width so root and mid nodes are one
-  type (16 KiB each); leaves are 12-bit (32 KiB, covering 64 MiB). An address at or
-  beyond the supported VA is guarded to `Empty` rather than indexing out of range,
-  keeping lookup total. Leaf entries are tagged pointers (low 3 bits, descriptors are
-  ≥ 8-aligned): `Empty`=0 so a zeroed leaf is valid, `Small`/`Large`, and
-  `ReleasedRetained` (P-Map-005). Chosen over (a) a flat array — wastes virtual space
-  and forbids lazy population — and (b) a hash map — worst-case lookup and resize
-  hazards on the free hot path (DD-1).
+* **Pagemap radix: derived depth over the full `usize` range, uniform 8 KiB nodes.**
+  The depth is `ceil((usize::BITS − PAGE_SHIFT) / RADIX_BITS)` with `RADIX_BITS = 10`
+  (5 levels on a 64-bit / 16 KiB-page target, 2 on 32-bit), so the radix covers the
+  **entire address space with no virtual-address-width assumption** — an address from
+  5-level paging / a 57-bit VA maps as readily as a 48-bit one (the earlier 48-bit cap
+  mis-mapped owned memory on such hosts). Uniform 1024-slot (8 KiB) nodes keep the
+  resident footprint low (lazy population, the `low-rss` interest); the cost is a
+  couple more dependent loads on the *slow* path only. Leaf entries are tagged pointers
+  (low 3 bits; descriptors are ≥ 8-aligned): `Empty` = 0 (a zeroed leaf is valid),
+  `Small`/`Large`, `ReleasedRetained` (P-Map-005). Chosen over a flat array (wastes
+  virtual space) and a hash map (worst-case/resize hazards), DD-1. `metadata_bytes()`
+  reports the bounded overhead.
 
-* **Publish/read with release/acquire + a single mutator (W3-6).** Leaf entries are
-  filled with a release store *after* the descriptor is initialized; readers
-  acquire-load; new nodes are zeroed before a release-CAS links them — so a
-  classifier sees `Empty` or a fully-formed entry, never a torn node (failure mode
-  F1). The pagemap is the **only** mutator (F3): plan 04 W4-2b and plan 03 W5-5 must
-  route through `install_span`/`release_span`/`retire_span`/`install_large`. The
-  pagemap's own operations are lock-free (atomic publish), so they acquire no lock
-  and cannot violate the §27.2 hierarchy; they run inside the caller's span critical
-  section (P-Map-006).
+* **Publish/read with release/acquire + a single lock-free mutator (W3-6).** Leaf
+  entries are release-stored *after* the descriptor is initialized; readers
+  acquire-load; new nodes are zeroed before a release-CAS links them — so a classifier
+  sees `Empty` or a fully-formed entry, never a torn node (F1). The pagemap is the
+  **only** mutator (F3): W4-2b and W5-5 route through
+  `install_span`/`release_span`/`retire_span`/`install_large` (guarded in debug against
+  a double-install over a different descriptor and a non-page-aligned span base). Its
+  operations are lock-free (atomic publish), so they acquire no lock and cannot violate
+  the §27.2 hierarchy; they run inside the caller's span critical section (P-Map-006).
 
-* **Generation-validated descriptor reuse, not reclamation (W3-5).** Span/large
-  descriptors carry an atomic `generation` bumped on recycle (§16.6/§27.5).
-  Concurrent classification reads the current descriptor through release/acquire and
-  is always sound because the memory is never freed; a `GenGuard` lets sampled/debug
-  paths that *stash* a descriptor reference across a window detect a recycle (ABA).
-  This is the chosen answer to "descriptors MUST NOT be freed while a thread may
-  still classify a pointer to them" (§27.5) without an epoch/RCU reclaimer at M1.
+* **Generation for identity + a seqlock for read-consistency (W3-5/W3-4).** Span/large
+  descriptors carry a `generation` bumped on recycle (§16.6/§27.5); `GenGuard` lets a
+  stashed reference detect a recycle (ABA), and descriptors are never freed, so the
+  pointer stays valid. Separately, a **seqlock** version brackets a recycle's geometry
+  writes, and `classify_ptr` reads the geometry through it — so a classification racing
+  a recycle (a use-after-free signal) is never composed from two incarnations; a
+  persistently racing recycle resolves conservatively to `External`. An integrity tag
+  (§17.3, FNV-1a over the read-mostly header) lets debug/hardened detect a corrupted
+  descriptor.
 
-* **Conservation law derived, not tracked; inline bitmap at M1.** `central_free ==
-  popcount(free_bitmap)` is the authoritative, cheap central-residency count, updated
-  with the bitmap in one descriptor method (the §8.5 same-critical-section rule, which
-  the span lock wraps at W5-2). The cached `local`/`transfer`/`quarantined` terms are
-  logical — reconstructed in debug (W5-3c), zero before caches exist — so
-  `is_empty` (§16.5) takes them as explicit inputs and never infers liveness from the
-  bitmap (the DD-3 catastrophe guard). The free bitmap is **inline**, sized to the
-  widest slab in the generated table (1024 objects ⇒ 128 bytes); this favours a
-  self-contained, allocation-free descriptor at M1 over footprint, and a later
-  revision can move large bitmaps out-of-line without changing the contract. The
-  descriptor's fixed-header size is asserted at compile time (W3-2).
+* **§8.5 in one critical section via a per-span lock.** `central_free ==
+  popcount(free_bitmap)` is the authoritative central count; the bitmap edit and the
+  count update move together under a lightweight per-span spinlock (§27.2's span lock,
+  which W5 adopts), reachable only through a `SpanGuard` — so the invariant is updated
+  atomically and never observed torn. The cached `local`/`transfer`/`quarantined` terms
+  are logical (reconstructed in debug W5-3c, zero before caches), so `is_empty` (§16.5)
+  takes them as explicit inputs and never infers liveness from the bitmap (the DD-3
+  catastrophe guard).
+
+* **Hybrid bitmap: inline-small, out-of-line-large.** A slab of ≤ `INLINE_BITS` (128)
+  objects keeps its bitmap inline; the few high-count classes allocate a class-sized
+  bitmap from the metadata seam. The descriptor stays a fixed, compact 96 bytes for
+  every class (the earlier all-inline design carried a 128-byte bitmap in *every*
+  descriptor), and recycle grows the out-of-line block only when a larger class needs
+  it. The descriptor footprint is asserted (W3-2). The pagemap's runtime soundness is
+  tied to the proof by an **executable Lean pagemap model** (`PagemapExec.lean`):
+  `install_lookup_sound` is kernel-checked (mirroring `pagemap_lookup_sound`), and a
+  recorded install/lookup trace is replayed by `lake exe check` and by the Rust
+  `pagemap_matches_lean_replay_differential` test against the radix — the W3-3d
+  differential loop.

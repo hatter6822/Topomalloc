@@ -20,25 +20,42 @@
 //! checks the central-only law exactly and the full law against caller-supplied
 //! reconstructed terms.
 //!
+//! **§8.5 single critical section (per-span lock).** The bitmap and its cached
+//! `central_free_count` MUST move together. The descriptor owns a lightweight
+//! **span lock** (§27.2's "Span lock"); the *only* way to mutate the accounting is
+//! through the [`SpanGuard`] returned by [`SpanDescriptor::lock`], so the
+//! `central_free == popcount` invariant is updated atomically as a pair and can
+//! never be observed torn by another lock-holder. (Lock-free *approximate* reads of
+//! the cached count remain available for stats.)
+//!
+//! **Hybrid bitmap (footprint).** Small slabs keep the bitmap **inline**
+//! ([`INLINE_BITS`] objects); larger slabs put it **out-of-line**, sized to the
+//! class, from the [`MetadataAlloc`] seam — so a descriptor stays compact whatever
+//! the class, and only the few high-count classes pay an extra (tiny) allocation.
+//!
 //! **Concurrency (W3-3c/W3-5).** A descriptor is published into the pagemap by a
 //! release-store and reached by concurrent classifiers through a raw pointer
 //! (§17.5). Descriptors are **never freed** — they live in monotonic metadata and
 //! are *recycled in place* with a [`Generation`] bump (§27.5) — so a classifier's
 //! pointer is always dereferenceable; the generation flags a logical reuse. Every
-//! field a classifier may read concurrently is therefore atomic, so even a read
+//! geometry field a classifier may read concurrently is atomic, so even a read
 //! racing a recycle is well-defined and the generation guard ([`GenGuard`])
 //! detects the identity change.
 
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 
+use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::{PAGE_SIZE, SIZE_CLASSES};
 use crate::ids::{ArenaId, Generation, LargeId, SizeClassId, SpanId};
 use crate::overflow::align_up;
 use crate::size_class;
 
 /// Largest `objects_per_slab` over every size class in the generated table — the
-/// number of bits a [`FreeBitmap`] must cover. Computed from the table (a `const`
-/// scan) so it cannot drift from the shipped size classes (DD-1).
+/// number of bits the widest slab's bitmap must cover. Computed from the table (a
+/// `const` scan) so it cannot drift from the shipped size classes (DD-1).
 const fn max_objects_per_slab() -> usize {
     let mut max = 0usize;
     let mut i = 0;
@@ -52,90 +69,160 @@ const fn max_objects_per_slab() -> usize {
     max
 }
 
-/// Number of `u64` words a [`FreeBitmap`] needs to cover every class's slab.
-pub const BITMAP_WORDS: usize = max_objects_per_slab().div_ceil(64);
+/// Words of inline bitmap storage carried in every descriptor. Two `u64`s cover
+/// 128 objects inline; in the shipped table only the seven highest-count classes
+/// (sizes `< 128 B`) exceed this and spill out-of-line.
+const INLINE_WORDS: usize = 2;
 
-/// Number of object slots a [`FreeBitmap`] can address (`BITMAP_WORDS * 64`).
-pub const BITMAP_CAPACITY: usize = BITMAP_WORDS * 64;
+/// Objects addressable by the inline bitmap (`INLINE_WORDS * 64`). At/under this
+/// the bitmap is inline; above it the bitmap is allocated out-of-line.
+pub const INLINE_BITS: usize = INLINE_WORDS * 64;
 
-/// The §16.4 free bitmap: `bit(i) = 1` ⟺ object `i` is **resident in this span's
-/// central free list**. Fixed inline storage sized to the widest slab in the
-/// generated table (W3-2).
-///
-/// Each word is atomic so an individual set/clear is well-defined under concurrent
-/// reads (e.g. a debug [`count`](Self::count) sweep). The *pairing* of a bitmap
-/// edit with the cached `central_free_count` into one critical section is the span
-/// lock's job (§8.5, W5-2); [`SpanDescriptor::central_insert`] /
-/// [`central_remove`](SpanDescriptor::central_remove) update both together so the
-/// `central_free == popcount` invariant can never tear within the descriptor.
-///
-/// > **Footprint (M1 trade-off).** The widest slab is the 16-byte class: 1024
-/// > objects ⇒ a 128-byte bitmap inline in every descriptor. M1 favours a simple,
-/// > self-contained descriptor over footprint; a later revision can move large
-/// > bitmaps out-of-line (the `central_free == popcount` contract is unchanged).
-#[repr(C)]
-pub struct FreeBitmap {
-    words: [AtomicU64; BITMAP_WORDS],
+/// Maximum bitmap words any class can need (`ceil(max_objects_per_slab / 64)`),
+/// the largest out-of-line block.
+pub const MAX_BITMAP_WORDS: usize = max_objects_per_slab().div_ceil(64);
+
+/// Allocate `words` zeroed `AtomicU64`s of bitmap storage from `meta`, or `None`
+/// on exhaustion. Zeroing makes a valid all-clear bitmap.
+fn alloc_bitmap_words(meta: &dyn MetadataAlloc, words: usize) -> Option<NonNull<AtomicU64>> {
+    let bytes = words.checked_mul(core::mem::size_of::<AtomicU64>())?;
+    let mem = meta.alloc(bytes, core::mem::align_of::<AtomicU64>())?;
+    // SAFETY: `mem` is a fresh, exclusively-owned, 8-aligned region of `bytes`
+    // bytes; zeroing yields `words` valid `AtomicU64(0)`s (an all-clear bitmap).
+    unsafe { ptr::write_bytes(mem.as_ptr(), 0, bytes) };
+    Some(mem.cast::<AtomicU64>())
 }
 
+/// The §16.4 free bitmap: `bit(i) = 1` ⟺ object `i` is **resident in this span's
+/// central free list**. Storage is **hybrid** — inline for slabs of at most
+/// [`INLINE_BITS`] objects, else an out-of-line, class-sized block from the
+/// metadata seam (W3-2).
+///
+/// The bitmap is *unsynchronized on its own*; the owning [`SpanDescriptor`]'s span
+/// lock makes a bitmap edit and the cached count one critical section (§8.5), so
+/// these primitives are reachable only through a held [`SpanGuard`].
+#[repr(C)]
+pub struct FreeBitmap {
+    /// Inline storage, used when `out_of_line` is null.
+    inline: [AtomicU64; INLINE_WORDS],
+    /// Out-of-line storage (null ⇒ inline). Points at `cap_words` `AtomicU64`s in
+    /// monotonic metadata (never freed).
+    out_of_line: AtomicPtrU64,
+    /// Active word count (`ceil(object_count / 64)`); the bitmap addresses
+    /// `words * 64` objects.
+    words: AtomicU32,
+    /// Allocated capacity in words (`INLINE_WORDS` while inline, else the
+    /// out-of-line block size). A recycle grows the block only when it must.
+    cap_words: AtomicU32,
+}
+
+/// Newtype around `AtomicPtr<AtomicU64>` so the file reads cleanly.
+type AtomicPtrU64 = core::sync::atomic::AtomicPtr<AtomicU64>;
+
 impl FreeBitmap {
-    /// An empty bitmap (no object resident in the central list).
+    /// Build a bitmap sized for `object_count` objects (inline or out-of-line via
+    /// `meta`). `None` if an out-of-line block is needed but cannot be allocated.
+    fn new_for(object_count: u32, meta: &dyn MetadataAlloc) -> Option<FreeBitmap> {
+        let words = (object_count as usize).div_ceil(64).max(1);
+        let (out_of_line, cap) = if words <= INLINE_WORDS {
+            (ptr::null_mut(), INLINE_WORDS)
+        } else {
+            (alloc_bitmap_words(meta, words)?.as_ptr(), words)
+        };
+        Some(FreeBitmap {
+            inline: [const { AtomicU64::new(0) }; INLINE_WORDS],
+            out_of_line: AtomicPtrU64::new(out_of_line),
+            words: AtomicU32::new(words as u32),
+            cap_words: AtomicU32::new(cap as u32),
+        })
+    }
+
+    /// Re-point this bitmap at a slab of `object_count` objects, growing the
+    /// out-of-line block only if the new size exceeds the current capacity (the old
+    /// block then leaks — monotonic metadata is never freed). Clears all bits.
+    /// `false` on a needed-but-failed growth (safe failure). Called under the span
+    /// lock during recycle.
+    fn recycle_to(&self, object_count: u32, meta: &dyn MetadataAlloc) -> bool {
+        let new_words = (object_count as usize).div_ceil(64).max(1);
+        if new_words > self.cap_words.load(Ordering::Acquire) as usize {
+            let block = match alloc_bitmap_words(meta, new_words) {
+                Some(b) => b,
+                None => return false,
+            };
+            self.out_of_line.store(block.as_ptr(), Ordering::Release);
+            self.cap_words.store(new_words as u32, Ordering::Release);
+        }
+        self.words.store(new_words as u32, Ordering::Release);
+        self.clear();
+        true
+    }
+
+    /// Number of active words.
     #[inline]
-    pub const fn new() -> Self {
-        // `[const { … }; N]` initializes each element with a fresh atomic.
-        Self {
-            words: [const { AtomicU64::new(0) }; BITMAP_WORDS],
+    fn active_words(&self) -> usize {
+        self.words.load(Ordering::Acquire) as usize
+    }
+
+    /// Number of object slots the bitmap currently addresses.
+    #[inline]
+    pub fn capacity_bits(&self) -> usize {
+        self.active_words() * 64
+    }
+
+    /// `&AtomicU64` for word `w` (`w < active_words()`), inline or out-of-line.
+    #[inline]
+    fn word(&self, w: usize) -> &AtomicU64 {
+        let oo = self.out_of_line.load(Ordering::Acquire);
+        if oo.is_null() {
+            &self.inline[w]
+        } else {
+            // SAFETY: `oo` points at `cap_words` `AtomicU64`s in metadata (never
+            // freed), and `w < active_words() <= cap_words`.
+            unsafe { &*oo.add(w) }
         }
     }
 
-    /// Mark object `i` resident in the central list. Returns `true` iff the bit
-    /// was previously clear — a `false` signals a **double insert** (the same
-    /// object returned to the central list twice), the bitmap face of a
-    /// double-free (caught by debug/hardened, plan 08 W18-2).
+    /// Mark object `i` resident in the central list. `true` iff newly set — a
+    /// `false` is a **double insert** (the bitmap face of a double-free, plan 08
+    /// W18-2).
     #[inline]
     pub fn insert(&self, i: usize) -> bool {
-        debug_assert!(i < BITMAP_CAPACITY, "object index out of bitmap range");
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
         let (w, bit) = (i / 64, 1u64 << (i % 64));
-        let prev = self.words[w].fetch_or(bit, Ordering::Relaxed);
-        prev & bit == 0
+        self.word(w).fetch_or(bit, Ordering::Relaxed) & bit == 0
     }
 
-    /// Clear object `i` from the central list (it is being carved into a batch).
-    /// Returns `true` iff the bit was previously set — a `false` signals removing
-    /// an object that was not central-resident.
+    /// Clear object `i` from the central list. `true` iff it was set.
     #[inline]
     pub fn remove(&self, i: usize) -> bool {
-        debug_assert!(i < BITMAP_CAPACITY, "object index out of bitmap range");
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
         let (w, bit) = (i / 64, 1u64 << (i % 64));
-        let prev = self.words[w].fetch_and(!bit, Ordering::Relaxed);
-        prev & bit != 0
+        self.word(w).fetch_and(!bit, Ordering::Relaxed) & bit != 0
     }
 
-    /// Whether object `i` is currently resident in the central list.
+    /// Whether object `i` is central-resident.
     #[inline]
     pub fn contains(&self, i: usize) -> bool {
-        debug_assert!(i < BITMAP_CAPACITY, "object index out of bitmap range");
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
         let (w, bit) = (i / 64, 1u64 << (i % 64));
-        self.words[w].load(Ordering::Relaxed) & bit != 0
+        self.word(w).load(Ordering::Relaxed) & bit != 0
     }
 
-    /// Number of objects resident in the central list (`popcount`). This is the
-    /// authoritative central count `central_free_count` must equal (§16.4).
+    /// Number of central-resident objects (`popcount`). The value
+    /// `central_free_count` must equal (§16.4).
     #[inline]
     pub fn count(&self) -> usize {
-        self.words
-            .iter()
-            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+        (0..self.active_words())
+            .map(|w| self.word(w).load(Ordering::Relaxed).count_ones() as usize)
             .sum()
     }
 
-    /// Mark objects `[0, n)` resident and clear the rest — the bitmap half of
-    /// activating a freshly carved slab (every object starts in the central list).
-    /// `n` must be `<= BITMAP_CAPACITY`.
+    /// Set objects `[0, n)` resident, clear the rest — the bitmap half of activating
+    /// a freshly carved slab. `n <= capacity_bits()`.
     #[inline]
     pub fn fill_below(&self, n: usize) {
-        debug_assert!(n <= BITMAP_CAPACITY, "fill count out of bitmap range");
-        for (w, word) in self.words.iter().enumerate() {
+        debug_assert!(n <= self.capacity_bits(), "fill count out of bitmap range");
+        for w in 0..self.active_words() {
             let lo = w * 64;
             let val = if n >= lo + 64 {
                 u64::MAX
@@ -144,19 +231,57 @@ impl FreeBitmap {
             } else {
                 (1u64 << (n - lo)) - 1
             };
-            word.store(val, Ordering::Relaxed);
+            self.word(w).store(val, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear every active bit.
+    #[inline]
+    fn clear(&self) {
+        for w in 0..self.active_words() {
+            self.word(w).store(0, Ordering::Relaxed);
         }
     }
 }
 
-impl Default for FreeBitmap {
-    fn default() -> Self {
-        Self::new()
+/// A lightweight per-span spinlock (§27.2 "Span lock"). The critical section is a
+/// couple of atomic edits, and there is no contention before the caches/central
+/// list exist (M1), so a test-and-test-and-set spinlock is the right tool; W5
+/// adopts it as the span lock in the lock hierarchy.
+struct SpanLock {
+    locked: AtomicBool,
+}
+
+impl SpanLock {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn acquire(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Spin on a relaxed load (test-and-test-and-set) to avoid hammering the
+            // cache line with CAS while another holder runs.
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline]
+    fn release(&self) {
+        self.locked.store(false, Ordering::Release);
     }
 }
 
-/// Lifecycle state of a span (§7.3, the slice classification needs). Stored as a
-/// `u8` so it is read atomically by concurrent classifiers (W3-3c).
+/// Lifecycle state of a span (§7.3, what classification needs). Stored as a `u8`
+/// so concurrent classifiers read it atomically (W3-3c).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum SpanState {
@@ -192,8 +317,8 @@ impl SpanFlags {
 }
 
 /// The non-central terms of the §16.4 partition (`local_cached`, `transfer_cached`,
-/// `quarantined`). These are *logical* quantities the descriptor does not track
-/// per-op; a caller reconstructs them in debug (W5-3c) and passes them to the
+/// `quarantined`) — *logical* quantities the descriptor does not track per-op; a
+/// caller reconstructs them in debug (W5-3c) and passes them to the
 /// conservation/empty checks. All zero before caches exist (M1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NonCentralResidency {
@@ -207,33 +332,67 @@ pub struct NonCentralResidency {
 
 impl NonCentralResidency {
     /// The trivial residency before any cache exists (M1): every cached/quarantined
-    /// term is zero, so the conservation law reduces to `object_count = live +
-    /// central_free`.
+    /// term is zero, so the law reduces to `object_count = live + central_free`.
     pub const NONE: NonCentralResidency = NonCentralResidency {
         local_cached: 0,
         transfer_cached: 0,
         quarantined: 0,
     };
 
-    /// Sum of the three non-central terms.
+    /// Sum of the three non-central terms (saturating, to stay total).
     #[inline]
     pub const fn total(self) -> u32 {
-        // None of these can realistically overflow `u32` (each is bounded by a
-        // span's object count), but use a saturating sum to stay total.
         self.local_cached
             .saturating_add(self.transfer_cached)
             .saturating_add(self.quarantined)
     }
 }
 
-/// The §16.2 span descriptor (W3-2). See the module docs for the conservation law
-/// and the concurrency model. Every concurrently-mutable field is atomic so a
-/// classifier reaching this descriptor through the pagemap races nothing (W3-3c).
+/// FNV-1a-style mix of metadata header fields into an integrity tag (§17.3
+/// "checksums or generation tags for … headers in hardened mode"). Not a security
+/// hash — a cheap corruption detector for read-mostly metadata.
+#[inline]
+fn header_checksum(parts: &[u64]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a 64-bit offset basis
+    let mut i = 0;
+    while i < parts.len() {
+        h ^= parts[i];
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
+        i += 1;
+    }
+    h
+}
+
+/// A consistent snapshot of the geometry pointer classification needs (§16.3 /
+/// §17.5), produced by [`SpanDescriptor::read_consistent_geometry`] under the
+/// seqlock so every field belongs to one incarnation (W3-4).
+#[derive(Clone, Copy, Debug)]
+pub struct ClassifyGeometry {
+    /// The span's base address.
+    pub base: usize,
+    /// Base address of object 0 (`align_up(base + slab_header, sc.align)`).
+    pub object0: usize,
+    /// Bytes per object (the class's usable size).
+    pub object_size: usize,
+    /// Objects carved from the span.
+    pub object_count: usize,
+    /// The span's size class.
+    pub sc: SizeClassId,
+    /// The owning arena.
+    pub arena: ArenaId,
+    /// The span's lifecycle state.
+    pub state: SpanState,
+    /// Whether the span is flagged quarantined.
+    pub quarantined: bool,
+}
+
+/// The §16.2 span descriptor (W3-2). See the module docs for the conservation law,
+/// the per-span lock (§8.5), the hybrid bitmap, and the concurrency model.
 #[repr(C)]
 pub struct SpanDescriptor {
-    /// The span's base address `[base, base + page_count * PAGE_SIZE)`. Atomic so
-    /// a recycle (which re-bases the slot) cannot tear a concurrent classifier's
-    /// read; published before the pagemap entry (W3-6).
+    /// The span's base address `[base, base + page_count * PAGE_SIZE)`. Atomic so a
+    /// recycle (which re-bases the slot) cannot tear a concurrent classifier's read;
+    /// published before the pagemap entry (W3-6).
     base: AtomicUsize,
     /// Stable slot identity. Immutable for the descriptor's life (a recycle bumps
     /// `generation`, not `id`), so a plain read races no writer.
@@ -248,43 +407,55 @@ pub struct SpanDescriptor {
     /// out-of-line, §17.3 — the common case). Folds into the §16.3 slab layout.
     slab_header: AtomicU32,
     /// Span generation (§16.6 / §27.5). Bumped on recycle so a stale reference is
-    /// detectable.
+    /// detectable (the identity/ABA counter, distinct from `seq`).
     generation: AtomicU32,
+    /// A **seqlock** version for consistent geometry reads (W3-4). Even when the
+    /// geometry is stable, odd while a recycle is mid-update; a classifier brackets
+    /// its geometry read between two equal even reads, so it never composes a result
+    /// from two incarnations (a racing-free / use-after-free signal otherwise).
+    seq: AtomicU32,
     /// §16.2 `flags` (e.g. `QUARANTINED`).
     flags: AtomicU32,
-    /// Objects currently owned by the application.
+    /// Integrity tag over the geometry fields (§17.3), recomputed on new/recycle.
+    integrity: AtomicU64,
+    /// Objects currently owned by the application (span-lock protected).
     live_count: AtomicU32,
     /// `== popcount(free_bitmap)`: objects resident in the central free list (the
-    /// cached aggregate of §8.5, kept in lockstep with the bitmap).
+    /// cached aggregate of §8.5, span-lock protected alongside the bitmap).
     central_free_count: AtomicU32,
     /// Size class of every object in the span (changes on recycle, §16.6).
     sc: AtomicU16,
     /// [`SpanState`] as a `u8`.
     state: AtomicU8,
-    /// Explicit padding so the fixed header is a clean size (asserted below).
-    _pad: u8,
-    /// Authoritative central-residency bitmap (§16.4).
+    /// The §27.2 span lock guarding `free_bitmap` + `central_free_count` +
+    /// `live_count` as one critical section (§8.5).
+    lock: SpanLock,
+    /// Authoritative central-residency bitmap (§16.4), hybrid inline/out-of-line.
     free_bitmap: FreeBitmap,
 }
 
-/// Fixed (non-bitmap) header size of [`SpanDescriptor`]. Pinning it — rather than
-/// the whole struct — keeps the W3-2 size assertion meaningful when the table (and
-/// thus the bitmap width) is retuned.
-const SPAN_DESC_HEADER: usize = 48;
-
-// W3-2 acceptance: the descriptor's footprint is asserted. `repr(C)` makes the
-// layout deterministic; the descriptor is exactly its fixed header plus the
-// table-sized bitmap, with no hidden padding.
+// W3-2 acceptance: the descriptor footprint is asserted. `repr(C)` makes the
+// layout deterministic; this compile-time bound guards against a footprint
+// regression (the hybrid bitmap keeps the descriptor compact whatever the class),
+// and `descriptor_footprint_is_pinned` pins the exact size.
 const _: () = assert!(
-    core::mem::size_of::<SpanDescriptor>() == SPAN_DESC_HEADER + core::mem::size_of::<FreeBitmap>(),
-    "SpanDescriptor layout changed: re-check the W3-2 footprint assertion"
+    core::mem::size_of::<SpanDescriptor>() <= 128,
+    "SpanDescriptor footprint regressed past its 128-byte budget"
 );
+// Descriptors are pointed at by the pagemap, whose entry tag needs the low 3 bits
+// (W3-3b), so the descriptor must be at least 8-aligned.
+const _: () = assert!(core::mem::align_of::<SpanDescriptor>() >= 8);
+
+/// How many times a consistent geometry read retries a racing recycle before
+/// giving up and reporting the address as unowned (a pathological racing free).
+const SEQLOCK_RETRIES: u32 = 64;
 
 impl SpanDescriptor {
     /// Create a span descriptor for a freshly carved slab. The span starts with
     /// **no** central-resident objects and no live objects (counts zero, bitmap
     /// empty); the central list is populated by activation (W5-5). `generation`
-    /// starts at [`Generation::FIRST`].
+    /// starts at [`Generation::FIRST`]. `None` if an out-of-line bitmap is needed
+    /// but `meta` cannot supply it (safe failure).
     ///
     /// SPEC-transition: span `<new> -> Active` (§7.3)
     #[allow(clippy::too_many_arguments)]
@@ -296,8 +467,10 @@ impl SpanDescriptor {
         page_count: u32,
         object_count: u32,
         slab_header: u32,
-    ) -> Self {
-        Self {
+        meta: &dyn MetadataAlloc,
+    ) -> Option<Self> {
+        let free_bitmap = FreeBitmap::new_for(object_count, meta)?;
+        let desc = Self {
             base: AtomicUsize::new(base),
             id,
             arena: AtomicU32::new(arena.0),
@@ -305,14 +478,18 @@ impl SpanDescriptor {
             object_count: AtomicU32::new(object_count),
             slab_header: AtomicU32::new(slab_header),
             generation: AtomicU32::new(Generation::FIRST.0),
+            seq: AtomicU32::new(0),
             flags: AtomicU32::new(SpanFlags::NONE.0),
+            integrity: AtomicU64::new(0),
             live_count: AtomicU32::new(0),
             central_free_count: AtomicU32::new(0),
             sc: AtomicU16::new(sc.index() as u16),
             state: AtomicU8::new(SpanState::Active as u8),
-            _pad: 0,
-            free_bitmap: FreeBitmap::new(),
-        }
+            lock: SpanLock::new(),
+            free_bitmap,
+        };
+        desc.refresh_integrity();
+        Some(desc)
     }
 
     // --- immutable-after-publish geometry (read with Acquire by classifiers) ---
@@ -353,9 +530,8 @@ impl SpanDescriptor {
         self.object_count.load(Ordering::Acquire)
     }
 
-    /// Byte length of the span (`page_count * PAGE_SIZE`). Never overflows: a span
-    /// of `u32::MAX` pages would exceed the address space, which the backend never
-    /// reserves; the product is a `usize` on every supported target.
+    /// Byte length of the span (`page_count * PAGE_SIZE`). Never overflows for a
+    /// real span (its bytes fit the address space).
     #[inline]
     pub fn byte_len(&self) -> usize {
         self.page_count() as usize * PAGE_SIZE
@@ -380,6 +556,46 @@ impl SpanDescriptor {
         align_up(header, align)
     }
 
+    /// A **consistent** snapshot of the geometry a classifier needs (W3-4), read
+    /// under the `seq` seqlock so it never mixes two incarnations. A recycle racing
+    /// the read is retried; `None` only if the recycle is persistently in flight (the
+    /// retry budget is exhausted — a pathological racing free) or the §16.3 geometry
+    /// overflows. For a correct program (no concurrent recycle of a span being freed
+    /// into) the first read is always consistent.
+    pub fn read_consistent_geometry(&self) -> Option<ClassifyGeometry> {
+        for _ in 0..SEQLOCK_RETRIES {
+            let s0 = self.seq.load(Ordering::Acquire);
+            if s0 & 1 != 0 {
+                core::hint::spin_loop(); // a recycle is mid-update; let it finish
+                continue;
+            }
+            let base = self.base.load(Ordering::Acquire);
+            let slab_header = self.slab_header.load(Ordering::Acquire) as usize;
+            let sc = SizeClassId::new(self.sc.load(Ordering::Acquire) as usize);
+            let arena = ArenaId(self.arena.load(Ordering::Acquire));
+            let object_count = self.object_count.load(Ordering::Acquire) as usize;
+            let state = SpanState::from_u8(self.state.load(Ordering::Acquire));
+            let quarantined = self.flags.load(Ordering::Acquire) & SpanFlags::QUARANTINED != 0;
+            // The read is consistent iff the version is unchanged across it.
+            if self.seq.load(Ordering::Acquire) != s0 {
+                continue; // recycled during the read; retry
+            }
+            let align = size_class::align(sc);
+            let object0 = align_up(base.checked_add(slab_header)?, align)?;
+            return Some(ClassifyGeometry {
+                base,
+                object0,
+                object_size: size_class::usable_size(sc),
+                object_count,
+                sc,
+                arena,
+                state,
+                quarantined,
+            });
+        }
+        None
+    }
+
     // --- lifecycle / ABA (atomic) ---
 
     /// The current [`SpanState`].
@@ -388,8 +604,8 @@ impl SpanDescriptor {
         SpanState::from_u8(self.state.load(Ordering::Acquire))
     }
 
-    /// Set the span's state (e.g. `Active -> Released` at release-to-OS). Used by
-    /// the W3-6 sync protocol *before* it updates the pagemap entry.
+    /// Set the span's state (e.g. `Active -> Released`). Used by the W3-6 sync
+    /// protocol *before* it updates the pagemap entry.
     ///
     /// SPEC-transition: span state change (§7.3)
     #[inline]
@@ -432,11 +648,43 @@ impl SpanDescriptor {
         }
     }
 
+    /// Recompute and store the geometry integrity tag (§17.3). Called after every
+    /// geometry change (new/recycle).
+    #[inline]
+    fn refresh_integrity(&self) {
+        self.integrity
+            .store(self.compute_integrity(), Ordering::Release);
+    }
+
+    /// The checksum the geometry fields currently imply.
+    #[inline]
+    fn compute_integrity(&self) -> u64 {
+        header_checksum(&[
+            self.id.0 as u64,
+            self.base.load(Ordering::Relaxed) as u64,
+            self.arena.load(Ordering::Relaxed) as u64,
+            self.page_count.load(Ordering::Relaxed) as u64,
+            self.object_count.load(Ordering::Relaxed) as u64,
+            self.slab_header.load(Ordering::Relaxed) as u64,
+            self.sc.load(Ordering::Relaxed) as u64,
+            self.generation.load(Ordering::Relaxed) as u64,
+        ])
+    }
+
+    /// Whether the geometry integrity tag still matches the geometry (§17.3). A
+    /// `false` means the read-mostly header was corrupted by a wild write. Run in
+    /// debug/hardened when the span is quiescent (not mid-recycle).
+    #[inline]
+    pub fn validate_integrity(&self) -> bool {
+        self.integrity.load(Ordering::Acquire) == self.compute_integrity()
+    }
+
     /// Recycle this descriptor slot for a different span (§16.6): re-base, re-class,
-    /// re-arena, reset the accounting, and **bump the generation** so any reference
-    /// captured before this call is detectably stale (§27.5). The caller MUST have
-    /// already removed every pagemap entry that pointed here (W3-6) so no
-    /// classifier can observe the slot mid-recycle.
+    /// re-arena, **bump the generation**, resize+clear the bitmap, and reset the
+    /// accounting. `false` if the bitmap must grow but `meta` cannot supply it (safe
+    /// failure — the slot is left usable for its old geometry). The caller MUST have
+    /// removed every pagemap entry that pointed here (W3-6) so no classifier can
+    /// observe the slot mid-recycle.
     ///
     /// SPEC-transition: span `Empty -> recycled` (§7.3 / §16.6)
     #[allow(clippy::too_many_arguments)]
@@ -448,9 +696,27 @@ impl SpanDescriptor {
         page_count: u32,
         object_count: u32,
         slab_header: u32,
-    ) {
-        // Bump the generation first: a racing stale reader that re-reads the
-        // generation after this point sees the new value and reports "stale".
+        meta: &dyn MetadataAlloc,
+    ) -> bool {
+        // Resize/clear the bitmap first under the span lock; if it cannot grow, fail
+        // before mutating any geometry so the slot stays consistent.
+        self.lock.acquire();
+        let ok = self.free_bitmap.recycle_to(object_count, meta);
+        if ok {
+            self.live_count.store(0, Ordering::Relaxed);
+            self.central_free_count.store(0, Ordering::Relaxed);
+        }
+        self.lock.release();
+        if !ok {
+            return false;
+        }
+
+        // Open the seqlock (odd ⇒ geometry update in progress): a classifier that
+        // observes an odd version, or a version change across its read, retries
+        // rather than composing a result from two incarnations (W3-4).
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        // Bump the generation: a stale reference captured before the recycle now
+        // mismatches (§16.6 / §27.5 ABA guard).
         let next = self.generation().next();
         self.generation.store(next.0, Ordering::Release);
         self.arena.store(arena.0, Ordering::Release);
@@ -459,82 +725,157 @@ impl SpanDescriptor {
         self.page_count.store(page_count, Ordering::Release);
         self.object_count.store(object_count, Ordering::Release);
         self.slab_header.store(slab_header, Ordering::Release);
-        self.live_count.store(0, Ordering::Release);
-        self.central_free_count.store(0, Ordering::Release);
         self.flags.store(SpanFlags::NONE.0, Ordering::Release);
-        self.free_bitmap.fill_below(0);
         self.state.store(SpanState::Active as u8, Ordering::Release);
+        self.refresh_integrity();
+        // Close the seqlock (even ⇒ stable): publishes every geometry store to a
+        // classifier's acquire-load of the version.
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
-    // --- accounting (the conservation-law fields, §16.4) ---
+    // --- accounting: lock-free approximate reads (stats / classification) ---
 
-    /// Objects currently owned by the application.
+    /// Objects currently owned by the application (lock-free approximate read).
     #[inline]
     pub fn live_count(&self) -> u32 {
         self.live_count.load(Ordering::Relaxed)
     }
 
-    /// Objects resident in the central free list (`== popcount(free_bitmap)`).
+    /// Objects resident in the central free list (`== popcount(free_bitmap)`,
+    /// lock-free approximate read). For a consistent snapshot use [`lock`](Self::lock).
     #[inline]
     pub fn central_free_count(&self) -> u32 {
         self.central_free_count.load(Ordering::Relaxed)
     }
 
-    /// Read-only view of the free bitmap (for debug checks / classification).
+    // --- accounting: the §8.5 critical section (via the span lock) ---
+
+    /// Acquire the span lock (§27.2) and return a [`SpanGuard`]: the **only** way to
+    /// mutate the accounting, so a bitmap edit and the cached count always move
+    /// together (§8.5). Single-shot convenience wrappers below take and drop a guard
+    /// internally; hold the guard yourself to compose several edits atomically (the
+    /// W5 batch path).
     #[inline]
-    pub fn free_bitmap(&self) -> &FreeBitmap {
-        &self.free_bitmap
+    pub fn lock(&self) -> SpanGuard<'_> {
+        self.lock.acquire();
+        SpanGuard { span: self }
     }
 
-    /// Set the live count (testing / W5 activation accounting).
+    /// Whether the cached `central_free_count` equals `popcount(free_bitmap)` (the
+    /// §8.5 metadata-duplication invariant), read consistently under the lock.
     #[inline]
-    pub fn set_live_count(&self, n: u32) {
-        self.live_count.store(n, Ordering::Relaxed);
+    pub fn central_count_matches_bitmap(&self) -> bool {
+        self.lock().central_count_matches_bitmap()
     }
 
+    /// Whether the §16.4 conservation law holds, read consistently under the lock.
+    #[inline]
+    pub fn conservation_holds(&self, non_central: NonCentralResidency) -> bool {
+        self.lock().conservation_holds(non_central)
+    }
+
+    /// The central-only conservation law (M1: no caches).
+    #[inline]
+    pub fn conservation_holds_central_only(&self) -> bool {
+        self.conservation_holds(NonCentralResidency::NONE)
+    }
+
+    /// Whether the span is **empty** (§16.5), read consistently under the lock.
+    #[inline]
+    pub fn is_empty(&self, non_central: NonCentralResidency) -> bool {
+        self.lock().is_empty(non_central)
+    }
+
+    /// The M1 empty predicate (no caches).
+    #[inline]
+    pub fn is_empty_central_only(&self) -> bool {
+        self.is_empty(NonCentralResidency::NONE)
+    }
+}
+
+/// A held [`SpanDescriptor`] span lock (§27.2 / §8.5). While alive, the accounting
+/// (`free_bitmap`, `central_free_count`, `live_count`) is exclusively this holder's,
+/// so a bitmap edit and the count update are one critical section and a reader
+/// taking the lock sees them consistent. Released on drop.
+pub struct SpanGuard<'a> {
+    span: &'a SpanDescriptor,
+}
+
+impl SpanGuard<'_> {
     /// Return object `i` to the central free list: set its bitmap bit **and** bump
-    /// `central_free_count` so the `central_free == popcount` invariant holds across
-    /// the pair (§8.5). Returns `false` on a double insert (the object was already
-    /// central-resident) — a double-free signal (plan 08 W18-2). The span lock
-    /// makes the pair one critical section (W5-2).
+    /// `central_free_count` together (§8.5). `false` on a double insert (already
+    /// resident — a double-free signal, plan 08 W18-2), with no count change.
     ///
     /// SPEC-transition: object `* -> FreeInCentral` (§7.2)
     #[inline]
     pub fn central_insert(&self, i: usize) -> bool {
-        if self.free_bitmap.insert(i) {
-            self.central_free_count.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false // already resident — do not double-count
-        }
-    }
-
-    /// Remove object `i` from the central free list (it is being carved out): clear
-    /// its bitmap bit **and** decrement `central_free_count` together. Returns
-    /// `false` if the object was not central-resident.
-    ///
-    /// SPEC-transition: object `FreeInCentral -> *` (§7.2)
-    #[inline]
-    pub fn central_remove(&self, i: usize) -> bool {
-        if self.free_bitmap.remove(i) {
-            self.central_free_count.fetch_sub(1, Ordering::Relaxed);
+        if self.span.free_bitmap.insert(i) {
+            self.span.central_free_count.fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
         }
     }
 
-    /// Whether the cached `central_free_count` equals `popcount(free_bitmap)` — the
-    /// §8.5 metadata-duplication invariant. Always true outside a torn update;
-    /// debug checks assert it after every central transition (B.3, plan 08).
+    /// Remove object `i` from the central free list: clear its bitmap bit **and**
+    /// decrement `central_free_count` together. `false` if it was not resident.
+    ///
+    /// SPEC-transition: object `FreeInCentral -> *` (§7.2)
+    #[inline]
+    pub fn central_remove(&self, i: usize) -> bool {
+        if self.span.free_bitmap.remove(i) {
+            // The bit was set, so the count is `>= 1` under the §8.5 invariant; guard
+            // the subtraction in debug as defence-in-depth.
+            debug_assert!(
+                self.span.central_free_count.load(Ordering::Relaxed) > 0,
+                "central_free_count underflow: count/bitmap diverged"
+            );
+            self.span.central_free_count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the live count (testing / W5 activation accounting).
+    #[inline]
+    pub fn set_live_count(&self, n: u32) {
+        self.span.live_count.store(n, Ordering::Relaxed);
+    }
+
+    /// Objects owned by the application (consistent under the lock).
+    #[inline]
+    pub fn live_count(&self) -> u32 {
+        self.span.live_count.load(Ordering::Relaxed)
+    }
+
+    /// Objects resident in the central list (consistent under the lock).
+    #[inline]
+    pub fn central_free_count(&self) -> u32 {
+        self.span.central_free_count.load(Ordering::Relaxed)
+    }
+
+    /// Whether object `i` is central-resident (consistent under the lock).
+    #[inline]
+    pub fn central_resident(&self, i: usize) -> bool {
+        self.span.free_bitmap.contains(i)
+    }
+
+    /// `popcount(free_bitmap)` (consistent under the lock).
+    #[inline]
+    pub fn bitmap_popcount(&self) -> usize {
+        self.span.free_bitmap.count()
+    }
+
+    /// Whether `central_free_count == popcount(free_bitmap)` (§8.5), consistently.
     #[inline]
     pub fn central_count_matches_bitmap(&self) -> bool {
-        self.central_free_count() as usize == self.free_bitmap.count()
+        self.central_free_count() as usize == self.bitmap_popcount()
     }
 
     /// The five-term partition of §16.4 as `(live, local_cached, transfer_cached,
-    /// central_free, quarantined)`, given the caller's reconstructed non-central
-    /// terms. The central terms are read from the descriptor; the rest are supplied.
+    /// central_free, quarantined)`, given the reconstructed non-central terms.
     #[inline]
     pub fn partition(&self, non_central: NonCentralResidency) -> [u32; 5] {
         [
@@ -546,10 +887,8 @@ impl SpanDescriptor {
         ]
     }
 
-    /// Whether the §16.4 conservation law holds for this span given the
-    /// reconstructed non-central terms: the five terms **sum to `object_count`**
-    /// and `central_free == popcount(free_bitmap)`. No object is double-counted by
-    /// construction (the terms partition the slab).
+    /// Whether the §16.4 conservation law holds for the reconstructed non-central
+    /// terms: the five terms sum to `object_count` and `central_free == popcount`.
     #[inline]
     pub fn conservation_holds(&self, non_central: NonCentralResidency) -> bool {
         if !self.central_count_matches_bitmap() {
@@ -559,46 +898,33 @@ impl SpanDescriptor {
             .live_count()
             .saturating_add(non_central.total())
             .saturating_add(self.central_free_count());
-        sum == self.object_count()
-    }
-
-    /// The central-only form of the law (M1: no caches, so the cached/quarantined
-    /// terms are zero): `object_count == live + central_free` and
-    /// `central_free == popcount`.
-    #[inline]
-    pub fn conservation_holds_central_only(&self) -> bool {
-        self.conservation_holds(NonCentralResidency::NONE)
+        sum == self.span.object_count()
     }
 
     /// Whether the span is **empty** and may be returned to the backend (§16.5):
-    /// every non-central term is zero **and** `central_free == object_count`. It
-    /// never reads a cached free object as live — the cached terms are explicit
-    /// inputs, not inferred from the bitmap (§8.4).
-    ///
-    /// The central-only convenience [`is_empty_central_only`](Self::is_empty_central_only)
-    /// is the M1 form (no caches).
+    /// every non-central term is zero **and** `central_free == object_count`. Never
+    /// reads a cached free object as live — the cached terms are explicit inputs.
     #[inline]
     pub fn is_empty(&self, non_central: NonCentralResidency) -> bool {
         self.live_count() == 0
             && non_central.local_cached == 0
             && non_central.transfer_cached == 0
             && non_central.quarantined == 0
-            && self.central_free_count() == self.object_count()
+            && self.central_free_count() == self.span.object_count()
     }
+}
 
-    /// The M1 empty predicate (no caches): `live == 0 && central_free ==
-    /// object_count`.
+impl Drop for SpanGuard<'_> {
     #[inline]
-    pub fn is_empty_central_only(&self) -> bool {
-        self.is_empty(NonCentralResidency::NONE)
+    fn drop(&mut self) {
+        self.span.lock.release();
     }
 }
 
 /// A captured `(SpanId, Generation)` snapshot for stale-reference detection (§27.5,
-/// W3-5). Code that stashes a descriptor reference across a window where the span
-/// could be recycled (sampled/debug paths) captures a `GenGuard` and re-validates
-/// with [`matches`](Self::matches); a mismatch means the slot was recycled and the
-/// stashed reference is stale.
+/// W3-5). Code stashing a descriptor reference across a window where the span could
+/// be recycled (sampled/debug paths) captures a `GenGuard` and re-validates with
+/// [`matches`](Self::matches); a mismatch means the slot was recycled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GenGuard {
     id: SpanId,
@@ -640,11 +966,13 @@ impl LargeState {
 #[repr(C)]
 pub struct LargeDescriptor {
     /// Allocation base address.
-    base: usize,
+    base: AtomicUsize,
     /// Usable size in bytes (`>=` the request).
-    usable_size: usize,
+    usable_size: AtomicUsize,
     /// Required alignment (a power of two).
-    align: usize,
+    align: AtomicUsize,
+    /// Integrity tag over the header fields (§17.3), recomputed on new/recycle.
+    integrity: AtomicU64,
     /// Slot identity (immutable; a recycle bumps `generation`).
     id: LargeId,
     /// Owning arena.
@@ -659,15 +987,18 @@ impl LargeDescriptor {
     /// Create a descriptor for a live large allocation.
     pub fn new(id: LargeId, arena: ArenaId, base: usize, usable_size: usize, align: usize) -> Self {
         debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-        Self {
-            base,
-            usable_size,
-            align,
+        let desc = Self {
+            base: AtomicUsize::new(base),
+            usable_size: AtomicUsize::new(usable_size),
+            align: AtomicUsize::new(align),
+            integrity: AtomicU64::new(0),
             id,
             arena: AtomicU32::new(arena.0),
             generation: AtomicU32::new(Generation::FIRST.0),
             state: AtomicU8::new(LargeState::Active as u8),
-        }
+        };
+        desc.refresh_integrity();
+        desc
     }
 
     /// Slot identity.
@@ -679,19 +1010,19 @@ impl LargeDescriptor {
     /// Allocation base address.
     #[inline]
     pub fn base(&self) -> usize {
-        self.base
+        self.base.load(Ordering::Acquire)
     }
 
     /// Usable size in bytes.
     #[inline]
     pub fn usable_size(&self) -> usize {
-        self.usable_size
+        self.usable_size.load(Ordering::Acquire)
     }
 
     /// Required alignment.
     #[inline]
     pub fn align(&self) -> usize {
-        self.align
+        self.align.load(Ordering::Acquire)
     }
 
     /// Owning arena.
@@ -704,7 +1035,7 @@ impl LargeDescriptor {
     /// allocation (it is the end of a reserved region).
     #[inline]
     pub fn end(&self) -> usize {
-        self.base + self.usable_size
+        self.base() + self.usable_size()
     }
 
     /// The current [`LargeState`].
@@ -724,17 +1055,66 @@ impl LargeDescriptor {
     pub fn generation(&self) -> Generation {
         Generation(self.generation.load(Ordering::Acquire))
     }
+
+    /// Recycle this large descriptor slot for a different allocation (§27.5): re-set
+    /// the header and **bump the generation** so a stale reference is detectable. The
+    /// caller MUST have removed every pagemap entry pointing here first (W3-6).
+    ///
+    /// SPEC-transition: large descriptor recycled (§27.5)
+    pub fn recycle(&self, arena: ArenaId, base: usize, usable_size: usize, align: usize) {
+        debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        let next = self.generation().next();
+        self.generation.store(next.0, Ordering::Release);
+        self.arena.store(arena.0, Ordering::Release);
+        self.base.store(base, Ordering::Release);
+        self.usable_size.store(usable_size, Ordering::Release);
+        self.align.store(align, Ordering::Release);
+        self.state
+            .store(LargeState::Active as u8, Ordering::Release);
+        self.refresh_integrity();
+    }
+
+    #[inline]
+    fn refresh_integrity(&self) {
+        self.integrity
+            .store(self.compute_integrity(), Ordering::Release);
+    }
+
+    #[inline]
+    fn compute_integrity(&self) -> u64 {
+        header_checksum(&[
+            self.id.0 as u64,
+            self.base.load(Ordering::Relaxed) as u64,
+            self.usable_size.load(Ordering::Relaxed) as u64,
+            self.align.load(Ordering::Relaxed) as u64,
+            self.arena.load(Ordering::Relaxed) as u64,
+            self.generation.load(Ordering::Relaxed) as u64,
+        ])
+    }
+
+    /// Whether the header integrity tag still matches (§17.3) — a corruption check
+    /// for the read-mostly large header, run in debug/hardened.
+    #[inline]
+    pub fn validate_integrity(&self) -> bool {
+        self.integrity.load(Ordering::Acquire) == self.compute_integrity()
+    }
 }
 
-// SAFETY: every mutable field of `SpanDescriptor` is atomic and `id` is immutable,
-// so concurrent `&` access (a classifier through the pagemap plus the owner) is
-// data-race-free; it holds no non-atomic interior mutability or thread-affine state.
+// SAFETY: every mutable field of `FreeBitmap` is atomic, and `out_of_line` points
+// at `Sync` metadata that is never freed, so concurrent `&` access (always under
+// the owning span lock) is data-race-free.
+unsafe impl Sync for FreeBitmap {}
+// SAFETY: as the `Sync` impl — the bitmap is atomics plus a pointer into `Sync`,
+// never-freed metadata.
+unsafe impl Send for FreeBitmap {}
+// SAFETY: every mutable field of `SpanDescriptor` is atomic, `id` is immutable, and
+// the bitmap is `Sync`; concurrent `&` access (a classifier through the pagemap
+// plus the owner under the span lock) is data-race-free.
 unsafe impl Sync for SpanDescriptor {}
-// SAFETY: as the `Sync` impl — the descriptor is a bag of atomics and immutable
-// data, so moving it across threads is sound.
+// SAFETY: as the `Sync` impl — the descriptor is atomics and immutable data.
 unsafe impl Send for SpanDescriptor {}
-// SAFETY: every mutable field of `LargeDescriptor` is atomic and `id`/geometry are
-// immutable, so concurrent `&` access is data-race-free.
+// SAFETY: every mutable field of `LargeDescriptor` is atomic and `id` is immutable,
+// so concurrent `&` access is data-race-free.
 unsafe impl Sync for LargeDescriptor {}
 // SAFETY: as the `Sync` impl above.
 unsafe impl Send for LargeDescriptor {}
@@ -742,11 +1122,19 @@ unsafe impl Send for LargeDescriptor {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::BumpArena;
     use crate::ids::{ArenaId, LargeId, SizeClassId, SpanId};
 
-    fn span(object_count: u32) -> SpanDescriptor {
-        // Class 0 (16-byte), one 16 KiB page, base page-aligned. object0 == base
-        // since align (16) divides a page-aligned base and the header is 0.
+    /// A leaked heap arena for out-of-line bitmap allocation in tests.
+    fn meta(bytes: usize) -> BumpArena {
+        let buf = vec![0u8; bytes].into_boxed_slice();
+        let len = buf.len();
+        let ptr = Box::into_raw(buf).cast::<u8>();
+        // SAFETY: the leaked buffer is live for the process.
+        unsafe { BumpArena::new(ptr, len) }
+    }
+
+    fn span(object_count: u32, m: &BumpArena) -> SpanDescriptor {
         SpanDescriptor::new(
             SpanId(1),
             ArenaId::DEFAULT,
@@ -755,93 +1143,117 @@ mod tests {
             1,
             object_count,
             0,
+            m,
         )
+        .expect("bitmap")
     }
 
     #[test]
-    fn bitmap_covers_widest_slab() {
-        // The inline bitmap must address every object of the widest class (1024 for
-        // the 16-byte class in the shipped table), so no slab outruns it.
-        assert!(BITMAP_CAPACITY >= max_objects_per_slab());
-        assert_eq!(BITMAP_WORDS, max_objects_per_slab().div_ceil(64));
+    fn bitmap_covers_widest_slab_inline_and_out_of_line() {
+        assert!(MAX_BITMAP_WORDS * 64 >= max_objects_per_slab());
+        assert_eq!(MAX_BITMAP_WORDS, max_objects_per_slab().div_ceil(64));
+        let m = meta(64 * 1024);
+        // A small slab stays inline (no out-of-line allocation).
+        let used_before = m.used();
+        let b_small = FreeBitmap::new_for(64, &m).unwrap();
+        assert_eq!(m.used(), used_before, "small bitmap must be inline");
+        assert!(b_small.capacity_bits() >= 64);
+        // A 1024-object slab spills out-of-line (consumes metadata).
+        let b_big = FreeBitmap::new_for(1024, &m).unwrap();
+        assert!(m.used() > used_before, "large bitmap must be out-of-line");
+        assert!(b_big.capacity_bits() >= 1024);
     }
 
     #[test]
-    fn bitmap_insert_remove_count() {
-        let b = FreeBitmap::new();
-        assert_eq!(b.count(), 0);
-        assert!(b.insert(0));
-        assert!(b.insert(63));
-        assert!(b.insert(64)); // crosses a word boundary
-        assert!(!b.insert(0)); // double insert detected
-        assert_eq!(b.count(), 3);
-        assert!(b.contains(64));
-        assert!(b.remove(64));
-        assert!(!b.remove(64)); // already clear
-        assert_eq!(b.count(), 2);
+    fn bitmap_insert_remove_count_inline_and_out_of_line() {
+        let m = meta(64 * 1024);
+        for objects in [64u32, 1024] {
+            let b = FreeBitmap::new_for(objects, &m).unwrap();
+            let hi = (objects - 1) as usize; // distinct from 0 for both cases
+            assert_eq!(b.count(), 0);
+            assert!(b.insert(0));
+            assert!(b.insert(hi));
+            assert!(!b.insert(0)); // double insert detected, no double-count
+            assert_eq!(b.count(), 2);
+            assert!(b.contains(hi));
+            assert!(b.remove(hi));
+            assert!(!b.remove(hi)); // already clear
+            assert_eq!(b.count(), 1);
+            // The out-of-line case must also handle a cross-word bit.
+            if objects > 64 {
+                assert!(b.insert(64));
+                assert_eq!(b.count(), 2);
+            }
+        }
     }
 
     #[test]
-    fn bitmap_fill_below_sets_exact_prefix() {
-        let b = FreeBitmap::new();
-        b.fill_below(70);
-        assert_eq!(b.count(), 70);
-        for i in 0..70 {
+    fn bitmap_fill_below_sets_exact_prefix_out_of_line() {
+        let m = meta(64 * 1024);
+        let b = FreeBitmap::new_for(1024, &m).unwrap();
+        b.fill_below(200);
+        assert_eq!(b.count(), 200);
+        for i in 0..200 {
             assert!(b.contains(i), "bit {i} should be set");
         }
-        assert!(!b.contains(70));
-        b.fill_below(0);
-        assert_eq!(b.count(), 0);
+        assert!(!b.contains(200));
     }
 
     #[test]
-    fn descriptor_footprint_is_header_plus_bitmap() {
-        // W3-2 acceptance, restated as a runtime check for visibility.
-        assert_eq!(
-            core::mem::size_of::<SpanDescriptor>(),
-            SPAN_DESC_HEADER + core::mem::size_of::<FreeBitmap>()
-        );
-        // Descriptors are pointed at by the pagemap; their pointers must be at
-        // least 8-aligned so the tag bits in a `PageEntry` are free (W3-3b).
+    fn descriptor_footprint_is_pinned() {
+        // W3-2 "struct size asserted": the hybrid bitmap keeps the descriptor a
+        // fixed, compact size for every class — a 32-byte control block (inline
+        // 2-word bitmap + out-of-line pointer + word counts) plus a 64-byte header.
+        assert_eq!(core::mem::size_of::<FreeBitmap>(), 32);
+        assert_eq!(core::mem::size_of::<SpanDescriptor>(), 96);
+        // The old design carried a 128-byte inline bitmap in *every* descriptor; the
+        // hybrid is well under that whatever the class.
+        assert!(core::mem::size_of::<SpanDescriptor>() <= 128);
         assert!(core::mem::align_of::<SpanDescriptor>() >= 8);
         assert!(core::mem::align_of::<LargeDescriptor>() >= 8);
     }
 
     #[test]
     fn central_insert_remove_keep_count_and_bitmap_in_lockstep() {
-        let s = span(64);
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
         assert!(s.central_count_matches_bitmap());
-        assert!(s.central_insert(3));
-        assert!(s.central_insert(10));
-        assert_eq!(s.central_free_count(), 2);
-        assert!(s.central_count_matches_bitmap());
-        // Double insert does not double-count.
-        assert!(!s.central_insert(3));
-        assert_eq!(s.central_free_count(), 2);
-        assert!(s.central_remove(3));
-        assert_eq!(s.central_free_count(), 1);
-        assert!(s.central_count_matches_bitmap());
+        {
+            let g = s.lock();
+            assert!(g.central_insert(3));
+            assert!(g.central_insert(10));
+            assert_eq!(g.central_free_count(), 2);
+            assert!(g.central_count_matches_bitmap());
+            assert!(!g.central_insert(3)); // double insert does not double-count
+            assert_eq!(g.central_free_count(), 2);
+            assert!(g.central_remove(3));
+            assert_eq!(g.central_free_count(), 1);
+            assert!(g.central_count_matches_bitmap());
+        }
     }
 
     #[test]
     fn conservation_law_central_only_holds() {
-        // A 64-object span: carve all into the central list, then "allocate" 20
-        // (live) by removing them from central. The central-only law must hold at
-        // each step: object_count == live + central_free.
-        let s = span(64);
-        for i in 0..64 {
-            assert!(s.central_insert(i));
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        {
+            let g = s.lock();
+            for i in 0..64 {
+                assert!(g.central_insert(i));
+            }
+            g.set_live_count(0);
         }
-        s.set_live_count(0);
         assert!(s.conservation_holds_central_only());
         // All 64 objects central, none live ⇒ the span is empty (§16.5).
         assert!(s.is_empty_central_only());
 
-        // Hand out 20 objects: remove from central, bump live.
-        for i in 0..20 {
-            assert!(s.central_remove(i));
+        {
+            let g = s.lock();
+            for i in 0..20 {
+                assert!(g.central_remove(i));
+            }
+            g.set_live_count(20);
         }
-        s.set_live_count(20);
         assert!(s.conservation_holds_central_only());
         assert_eq!(s.live_count(), 20);
         assert_eq!(s.central_free_count(), 44);
@@ -850,79 +1262,119 @@ mod tests {
 
     #[test]
     fn conservation_law_with_reconstructed_cached_terms() {
-        // The full §16.4 law with non-zero cached terms (the M2 shape). A 64-object
-        // span: 10 live, 4 local-cached, 2 transfer-cached, 1 quarantined ⇒ 47
-        // central. The five terms must sum to object_count, and a cached object is
-        // NOT read as live (the empty predicate stays false).
-        let s = span(64);
-        for i in 0..47 {
-            assert!(s.central_insert(i));
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        {
+            let g = s.lock();
+            for i in 0..47 {
+                assert!(g.central_insert(i));
+            }
+            g.set_live_count(10);
         }
-        s.set_live_count(10);
         let nc = NonCentralResidency {
             local_cached: 4,
             transfer_cached: 2,
             quarantined: 1,
         };
         assert!(s.conservation_holds(nc));
-        assert_eq!(s.partition(nc), [10, 4, 2, 47, 1]);
-        // Even though only 10 are live and 47 central, the 7 cached/quarantined
-        // objects keep the span non-empty (§16.5 must account for all caches).
+        assert_eq!(s.lock().partition(nc), [10, 4, 2, 47, 1]);
         assert!(!s.is_empty(nc));
     }
 
     #[test]
     fn empty_detection_never_reads_a_cached_object_as_live() {
-        // The catastrophe guard (DD-3 F2): a span with 0 live and central_free ==
-        // object_count looks empty by the central-only test, but if a cache still
-        // holds one of its objects the FULL predicate must keep it non-empty.
-        let s = span(8);
-        // 7 central, 0 live — but 1 object sits in a transfer cache.
-        for i in 0..7 {
-            assert!(s.central_insert(i));
+        let m = meta(64 * 1024);
+        let s = span(8, &m);
+        {
+            let g = s.lock();
+            for i in 0..7 {
+                assert!(g.central_insert(i));
+            }
+            g.set_live_count(0);
         }
-        s.set_live_count(0);
         let cached = NonCentralResidency {
             transfer_cached: 1,
             ..NonCentralResidency::NONE
         };
-        // central_free (7) != object_count (8), and a cache holds the 8th ⇒ not empty.
         assert!(!s.is_empty(cached));
         assert!(s.conservation_holds(cached)); // 0 + 0 + 1 + 7 + 0 == 8 ✓
     }
 
     #[test]
     fn object0_base_is_base_for_page_aligned_span() {
-        let s = span(64);
-        // align (16) divides the page-aligned base and header is 0, so object 0
-        // starts at the span base (§16.3).
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
         assert_eq!(s.object0_base(), Some(s.base()));
     }
 
     #[test]
     fn recycle_bumps_generation_and_resets_accounting() {
-        let s = span(64);
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
         let guard = s.gen_guard();
         assert!(guard.matches(&s));
-        for i in 0..64 {
-            s.central_insert(i);
+        {
+            let g = s.lock();
+            for i in 0..64 {
+                g.central_insert(i);
+            }
         }
-        s.set_live_count(0);
 
-        // Recycle the slot for a different class/arena/base.
-        s.recycle(ArenaId(2), SizeClassId::new(5), 0x8000_0000, 2, 32, 0);
-        // The captured guard is now stale (generation bumped, W3-5).
-        assert!(!guard.matches(&s));
+        // Recycle the slot for a different class/arena/base (a smaller slab — no
+        // bitmap growth needed).
+        assert!(s.recycle(ArenaId(2), SizeClassId::new(5), 0x8000_0000, 1, 32, 0, &m));
+        assert!(!guard.matches(&s)); // captured guard is now stale (W3-5)
         assert_eq!(s.generation(), Generation::FIRST.next());
         assert_eq!(s.arena(), ArenaId(2));
         assert_eq!(s.object_count(), 32);
         assert_eq!(s.central_free_count(), 0);
         assert_eq!(s.live_count(), 0);
         assert!(s.central_count_matches_bitmap());
+        assert!(s.validate_integrity());
     }
 
     #[test]
-    fn large_descriptor_records_p_map_004_fields() {
+    fn recycle_grows_bitmap_from_inline_to_out_of_line() {
+        let m = meta(64 * 1024);
+        // Start inline (small slab), recycle to a 1024-object slab needing an
+        // out-of-line bitmap.
+        let s = span(8, &m);
+        assert!(s.recycle(
+            ArenaId::DEFAULT,
+            SizeClassId::new(0),
+            0x4000_0000,
+            1,
+            1024,
+            0,
+            &m
+        ));
+        assert_eq!(s.object_count(), 1024);
+        {
+            let g = s.lock();
+            for i in 0..1024 {
+                assert!(g.central_insert(i));
+            }
+            assert_eq!(g.central_free_count(), 1024);
+            assert!(g.central_count_matches_bitmap());
+        }
+        assert!(s.is_empty_central_only());
+    }
+
+    #[test]
+    fn integrity_tag_detects_geometry_corruption() {
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        assert!(s.validate_integrity());
+        // Simulate a wild write corrupting the object_count without updating the tag.
+        s.object_count.store(999, Ordering::Relaxed);
+        assert!(
+            !s.validate_integrity(),
+            "corruption must be detected (§17.3)"
+        );
+    }
+
+    #[test]
+    fn large_descriptor_records_p_map_004_fields_and_recycles() {
         let d = LargeDescriptor::new(LargeId(7), ArenaId(1), 0x10_0000, 3_000_000, 4096);
         assert_eq!(d.id(), LargeId(7));
         assert_eq!(d.base(), 0x10_0000);
@@ -931,7 +1383,41 @@ mod tests {
         assert_eq!(d.arena(), ArenaId(1));
         assert_eq!(d.end(), 0x10_0000 + 3_000_000);
         assert_eq!(d.state(), LargeState::Active);
+        assert!(d.validate_integrity());
         d.set_state(LargeState::Released);
         assert_eq!(d.state(), LargeState::Released);
+
+        // Recycle bumps the generation and re-sets the header (W3-5).
+        d.recycle(ArenaId(2), 0x20_0000, 5_000_000, 8192);
+        assert_eq!(d.generation(), Generation::FIRST.next());
+        assert_eq!(d.base(), 0x20_0000);
+        assert_eq!(d.usable_size(), 5_000_000);
+        assert_eq!(d.state(), LargeState::Active);
+        assert!(d.validate_integrity());
+    }
+
+    #[test]
+    fn span_lock_serializes_concurrent_central_inserts() {
+        // Each thread inserts a disjoint set of objects under the span lock; the
+        // count and bitmap stay in lockstep and end consistent (§8.5).
+        let m = meta(64 * 1024);
+        let span = span(256, &m);
+        let s = &span; // shared reference (SpanDescriptor is Sync), copied per thread
+        std::thread::scope(|sc| {
+            for t in 0..4u32 {
+                sc.spawn(move || {
+                    for i in 0..64u32 {
+                        let obj = (t * 64 + i) as usize;
+                        let g = s.lock();
+                        assert!(g.central_insert(obj));
+                        // Invariant holds at every critical-section boundary.
+                        assert!(g.central_count_matches_bitmap());
+                    }
+                });
+            }
+        });
+        let g = span.lock();
+        assert_eq!(g.central_free_count(), 256);
+        assert!(g.central_count_matches_bitmap());
     }
 }

@@ -166,38 +166,105 @@ unsafe impl Send for BumpArena {}
 // atomic cursor and receive disjoint ranges.
 unsafe impl Sync for BumpArena {}
 
+/// A debug **re-entrancy guard** (DD-2): the bootstrap metadata path must never
+/// re-enter a metadata allocation on the same thread (S-007). Under `std`/tests a
+/// thread-local flag makes a re-entry a debug abort and lets the public allocator
+/// query [`is_in_alloc`](Bootstrap::is_in_alloc) to refuse re-entering; in pure
+/// `no_std` it is a no-op (the bump core is a proven leaf — it only touches its
+/// atomic cursor, calling nothing).
+mod reentry {
+    #[cfg(any(test, feature = "std"))]
+    mod imp {
+        use core::cell::Cell;
+        std::thread_local! {
+            static IN_ALLOC: Cell<bool> = const { Cell::new(false) };
+        }
+        /// Whether this thread is inside a bootstrap metadata allocation.
+        pub(crate) fn active() -> bool {
+            IN_ALLOC.with(Cell::get)
+        }
+        /// Marks the current thread as inside a bootstrap allocation until dropped.
+        pub(crate) struct Guard(());
+        impl Guard {
+            #[inline]
+            pub(crate) fn enter() -> Guard {
+                // Re-entry is the S-007 bug: the metadata path called back into a
+                // metadata allocation (or the public allocator) on this thread.
+                debug_assert!(
+                    !active(),
+                    "bootstrap metadata allocator re-entered (S-007 violation)"
+                );
+                IN_ALLOC.with(|f| f.set(true));
+                Guard(())
+            }
+        }
+        impl Drop for Guard {
+            #[inline]
+            fn drop(&mut self) {
+                IN_ALLOC.with(|f| f.set(false));
+            }
+        }
+    }
+    #[cfg(not(any(test, feature = "std")))]
+    mod imp {
+        /// No thread-local without `std`; the bump core is a proven leaf.
+        pub(crate) fn active() -> bool {
+            false
+        }
+        /// A no-op guard.
+        pub(crate) struct Guard(());
+        impl Guard {
+            #[inline]
+            pub(crate) fn enter() -> Guard {
+                Guard(())
+            }
+        }
+    }
+    pub(crate) use imp::{active, Guard};
+}
+
 /// Lifecycle state of the process-wide [`Bootstrap`] allocator. A single
 /// `AtomicU8` so init is lock-free (§17.4 "no locks before threading").
 #[repr(u8)]
 enum State {
     /// Not yet initialized; no region bound.
     Uninit = 0,
-    /// One thread is binding the region (transient, holds the CAS winner).
+    /// One thread is binding the region (transient, holds the init-CAS winner).
     Initializing = 1,
-    /// Region bound; serving metadata allocations.
+    /// Region bound; serving metadata allocations from the bump arena.
     Active = 2,
-    /// Normal metadata allocator is available; bootstrap has handed off. Already
-    /// vended bytes remain valid (monotonic); new metadata SHOULD come from the
-    /// normal path. The arena still answers `alloc` (safe, monotonic) so a late
-    /// bootstrap request during the transition window cannot fault.
-    HandedOff = 3,
+    /// One thread is binding the successor (transient, holds the hand-off-CAS
+    /// winner); the arena keeps serving until `HandedOff` is published.
+    HandingOff = 3,
+    /// Handed off to the normal metadata allocator (§17.4). Already-vended bytes
+    /// remain valid (monotonic); new metadata routes to the successor if one was
+    /// given (`hand_off_to`), else still to the arena (`hand_off`, safe/monotonic),
+    /// so a request racing the hand-off never faults.
+    HandedOff = 4,
 }
 
 /// The process-wide bootstrap metadata allocator (W3-1b): an idempotent init
-/// state machine guarding one [`BumpArena`], plus the hand-off flag (§17.4).
+/// state machine guarding one [`BumpArena`], plus the hand-off to the normal
+/// metadata allocator (§17.4).
 ///
 /// Construct it `const` (so it can be a `static`), then [`init`](Self::init) it
-/// once with a region. `init` is idempotent — a second call (or a lost init race)
-/// is a no-op — and exhaustion is reported as `None`, never a panic (safe
-/// failure). It never calls back into the public allocator (S-007): an
-/// [`alloc`](Self::alloc) only touches the bound `BumpArena`.
+/// once with a region — or take the process-wide [`global`](Self::global), which
+/// lazily binds a static reserve. `init` is idempotent (a second call or a lost
+/// race is a no-op), and exhaustion is reported as `None`, never a panic (safe
+/// failure). The path provably never re-enters the public allocator (S-007): an
+/// [`alloc`](Self::alloc) only touches the bound arena (or the registered
+/// successor), under a debug re-entrancy guard.
 pub struct Bootstrap {
     state: AtomicU8,
     /// The guarded arena. Written exactly once, by the `Uninit -> Initializing`
     /// CAS winner, *before* it publishes `Active` with a release store; readers
-    /// that observe `Active`/`HandedOff` with an acquire load therefore see a
-    /// fully-initialized arena (the publish/consume ordering of §27.3).
+    /// that observe `>= Active` with an acquire load therefore see a fully
+    /// initialized arena (the publish/consume ordering of §27.3).
     arena: UnsafeCell<MaybeUninit<BumpArena>>,
+    /// The normal metadata allocator, set once by the `Active -> HandingOff` CAS
+    /// winner *before* it publishes `HandedOff`; reads after observing `HandedOff`
+    /// (acquire) see it. `None` ⇒ no successor (the arena keeps serving).
+    successor: UnsafeCell<Option<&'static dyn MetadataAlloc>>,
 }
 
 impl Bootstrap {
@@ -206,6 +273,7 @@ impl Bootstrap {
         Self {
             state: AtomicU8::new(State::Uninit as u8),
             arena: UnsafeCell::new(MaybeUninit::uninit()),
+            successor: UnsafeCell::new(None),
         }
     }
 
@@ -263,11 +331,11 @@ impl Bootstrap {
         self.state.load(Ordering::Acquire) == State::HandedOff as u8
     }
 
-    /// Record the hand-off to the normal metadata allocator (§17.4). Idempotent:
-    /// only an `Active -> HandedOff` transition does anything; calling it before
-    /// init or twice is a no-op. Returns `true` iff this call performed the
-    /// transition. The arena keeps serving (monotonic, safe) so a request racing
-    /// the hand-off cannot fault.
+    /// Record the hand-off (§17.4) **without** a successor: the bootstrap arena
+    /// keeps serving (monotonic, safe). Idempotent — only an `Active -> HandedOff`
+    /// transition does anything. Returns `true` iff this call performed it. Use
+    /// [`hand_off_to`](Self::hand_off_to) to route new metadata to the normal
+    /// allocator instead.
     ///
     /// SPEC-transition: bootstrap metadata `Active -> HandedOff` (§17.4)
     pub fn hand_off(&self) -> bool {
@@ -279,6 +347,45 @@ impl Bootstrap {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Hand off to the **normal metadata allocator** (§17.4): after this, new
+    /// [`alloc`](Self::alloc)s route to `successor`; bytes already vended by the
+    /// bootstrap arena stay valid (monotonic). Idempotent — only the first
+    /// `Active -> HandedOff` transition installs a successor; later calls are
+    /// no-ops returning `false`. The arena keeps serving through the (brief)
+    /// transition window, so a racing request never faults.
+    ///
+    /// SPEC-transition: bootstrap metadata `Active -> HandedOff` (§17.4)
+    pub fn hand_off_to(&self, successor: &'static dyn MetadataAlloc) -> bool {
+        // Claim the transition (`Active -> HandingOff`); only the winner installs
+        // the successor and then publishes `HandedOff`.
+        if self
+            .state
+            .compare_exchange(
+                State::Active as u8,
+                State::HandingOff as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        // SAFETY: we won the CAS, so we hold exclusive write access to `successor`
+        // (no other writer, and no reader routes to it until `HandedOff` is
+        // published below). We write it exactly once.
+        unsafe { *self.successor.get() = Some(successor) };
+        self.state.store(State::HandedOff as u8, Ordering::Release);
+        true
+    }
+
+    /// Whether the current thread is inside a bootstrap metadata allocation (DD-2).
+    /// The public allocator checks this to refuse re-entering the bootstrap path
+    /// (S-007). Always `false` in pure `no_std` (the bump core is a proven leaf).
+    #[inline]
+    pub fn is_in_alloc(&self) -> bool {
+        reentry::active()
     }
 
     /// The bound arena, if initialized. Acquire-loads the state so the arena read
@@ -297,11 +404,21 @@ impl Bootstrap {
     }
 
     /// Allocate `size` bytes aligned to `align` for metadata, or `None` if the
-    /// allocator is uninitialized or exhausted (safe failure, never a panic). This
-    /// path provably never re-enters the public allocator (S-007): it only bumps
-    /// the bound arena's cursor.
+    /// allocator is uninitialized or exhausted (safe failure, never a panic). After
+    /// a [`hand_off_to`](Self::hand_off_to) the request routes to the successor; else
+    /// it bumps the bound arena's cursor. A debug re-entrancy guard (DD-2) traps any
+    /// re-entry of the metadata path on this thread (S-007).
     #[inline]
     pub fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        let _guard = reentry::Guard::enter();
+        if self.is_handed_off() {
+            // SAFETY: `is_handed_off()` observed `HandedOff` with an acquire load,
+            // which synchronizes-with the release store in `hand_off_to` that
+            // followed the one-time successor write; `Option<&dyn …>` is `Copy`.
+            if let Some(successor) = unsafe { *self.successor.get() } {
+                return successor.alloc(size, align);
+            }
+        }
         self.arena()?.alloc(size, align)
     }
 
@@ -316,7 +433,44 @@ impl Bootstrap {
     pub fn used(&self) -> usize {
         self.arena().map_or(0, BumpArena::used)
     }
+
+    /// The process-wide bootstrap allocator over a **static reserve** (§17.4, DD-2's
+    /// "static reservation" — the floor everything stands on). Lazily and
+    /// idempotently bound on first use, so metadata is available before `main` /
+    /// before any arena exists, with no global allocator involvement. The reserve is
+    /// [`BOOTSTRAP_REGION_BYTES`] of BSS; once the normal allocator exists the caller
+    /// [`hands off`](Self::hand_off_to) to it.
+    pub fn global() -> &'static Bootstrap {
+        if !GLOBAL.is_initialized() {
+            // SAFETY: `REGION` is a `'static`, 16-aligned, `BOOTSTRAP_REGION_BYTES`
+            // reservation handed to a `BumpArena` only here; `init` is idempotent
+            // (its CAS picks a single winner), so a concurrent first-use race binds
+            // the region exactly once and is otherwise a no-op.
+            unsafe {
+                GLOBAL.init(REGION.0.get().cast::<u8>(), BOOTSTRAP_REGION_BYTES);
+            }
+        }
+        &GLOBAL
+    }
 }
+
+/// Bytes reserved for the process-wide bootstrap metadata region (the §17.4 floor
+/// before hand-off). Sized for early span descriptors and pagemap nodes; tunable.
+/// Reserved in BSS (zero-filled), so it costs virtual address space, not binary
+/// size, and faults in lazily.
+pub const BOOTSTRAP_REGION_BYTES: usize = 1 << 20; // 1 MiB
+
+/// The static reserve backing [`Bootstrap::global`].
+#[repr(C, align(16))]
+struct StaticRegion(UnsafeCell<[u8; BOOTSTRAP_REGION_BYTES]>);
+
+// SAFETY: the region is handed to exactly one `BumpArena` (via `global()`'s
+// idempotent init), which synchronizes every access through its atomic cursor; no
+// other path reads or writes the bytes.
+unsafe impl Sync for StaticRegion {}
+
+static REGION: StaticRegion = StaticRegion(UnsafeCell::new([0; BOOTSTRAP_REGION_BYTES]));
+static GLOBAL: Bootstrap = Bootstrap::new();
 
 impl Default for Bootstrap {
     fn default() -> Self {
@@ -501,5 +655,106 @@ mod tests {
         assert!(!boot.hand_off(), "second hand_off is a no-op");
         // Still serves after hand-off (monotonic, safe during the window).
         assert!(boot.alloc(16, 8).is_some());
+    }
+
+    #[test]
+    fn bootstrap_hand_off_to_routes_new_allocations_to_the_successor() {
+        // W3-1b real hand-off (§17.4): after handing off to the normal metadata
+        // allocator, new metadata comes from it; bytes already vended by the
+        // bootstrap arena stay valid (monotonic).
+        let (b1, l1) = region(64 * 1024);
+        let boot = Bootstrap::new();
+        // SAFETY: `region` leaks a live 64 KiB buffer.
+        unsafe { boot.init(b1, l1) };
+        // A pre-hand-off allocation comes from the bootstrap arena.
+        let early = boot.alloc(64, 16).unwrap();
+        assert!(boot.contains(early.as_ptr() as usize));
+        let arena_used = boot.used();
+
+        // The successor ("normal" metadata allocator), leaked to `'static`.
+        let (b2, l2) = region(64 * 1024);
+        // SAFETY: `region` leaks a live 64 KiB buffer for the process.
+        let successor: &'static BumpArena = Box::leak(Box::new(unsafe { BumpArena::new(b2, l2) }));
+        assert!(boot.hand_off_to(successor));
+        assert!(boot.is_handed_off());
+
+        // New allocations now route to the successor; the bootstrap arena is untouched.
+        let late = boot.alloc(128, 16).unwrap();
+        assert!(successor.contains(late.as_ptr() as usize));
+        assert!(!boot.contains(late.as_ptr() as usize));
+        assert_eq!(
+            boot.used(),
+            arena_used,
+            "bootstrap arena unchanged after hand-off"
+        );
+        // hand_off_to is idempotent.
+        assert!(!boot.hand_off_to(successor));
+    }
+
+    #[test]
+    fn bootstrap_global_serves_metadata_from_a_static_reserve() {
+        // DD-2 "static reservation": the process-wide bootstrap binds a static
+        // region lazily and serves metadata before any arena exists.
+        let g = Bootstrap::global();
+        assert!(g.is_initialized());
+        let p = g
+            .alloc(64, 16)
+            .expect("global serves from the static reserve");
+        assert!(g.contains(p.as_ptr() as usize));
+        assert_eq!(p.as_ptr() as usize % 16, 0);
+        // Idempotent: the same singleton each call.
+        assert!(core::ptr::eq(g, Bootstrap::global()));
+    }
+
+    #[test]
+    fn is_in_alloc_is_false_outside_the_bootstrap_path() {
+        let boot = Bootstrap::new();
+        assert!(!boot.is_in_alloc());
+        let (base, len) = region(1024);
+        // SAFETY: `region` leaks a live 1024-byte buffer.
+        unsafe { boot.init(base, len) };
+        boot.alloc(16, 8).unwrap();
+        // The guard is released when the allocation returns.
+        assert!(!boot.is_in_alloc());
+    }
+
+    /// A pathological successor that re-enters the bootstrap path — the S-007 bug
+    /// the DD-2 guard exists to trap.
+    struct ReentrantSuccessor {
+        boot: *const Bootstrap,
+    }
+    // SAFETY: the raw pointer is only dereferenced to call the (thread-safe)
+    // `Bootstrap::alloc`; it points at a leaked, `'static` `Bootstrap`.
+    unsafe impl Sync for ReentrantSuccessor {}
+    impl MetadataAlloc for ReentrantSuccessor {
+        fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+            // SAFETY: `boot` points at a live, leaked `Bootstrap`.
+            unsafe { (*self.boot).alloc(size, align) }
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)] // the guard is a debug_assert; in release it is compiled out
+    fn bootstrap_reentrancy_guard_traps_reentry() {
+        let (base, len) = region(64 * 1024);
+        let boot: &'static Bootstrap = Box::leak(Box::new(Bootstrap::new()));
+        // SAFETY: `region` leaks a live 64 KiB buffer.
+        unsafe { boot.init(base, len) };
+        let reentrant: &'static ReentrantSuccessor =
+            Box::leak(Box::new(ReentrantSuccessor { boot }));
+        assert!(boot.hand_off_to(reentrant));
+
+        // Suppress the expected panic's default message, then confirm the re-entry
+        // trips the S-007 guard (a debug abort caught here).
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| boot.alloc(16, 8)));
+        std::panic::set_hook(prev);
+        assert!(
+            result.is_err(),
+            "re-entering the bootstrap path must trip the S-007 guard"
+        );
+        // The guard was released on unwind, so the thread is clean again.
+        assert!(!boot.is_in_alloc());
     }
 }

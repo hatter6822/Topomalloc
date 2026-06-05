@@ -21,7 +21,6 @@
 
 use crate::ids::{ArenaId, SizeClassId};
 use crate::pagemap::{PageEntry, PageMap};
-use crate::size_class;
 use crate::span::{LargeDescriptor, LargeState, SpanDescriptor, SpanState};
 
 /// A set of allocator **metadata** address ranges, consulted when a pointer is not
@@ -128,62 +127,58 @@ pub fn classify_ptr(pm: &PageMap, meta: &dyn MetadataRegion, addr: usize) -> Poi
 
 /// Classify `addr`, known to lie in a `Small` span's page, by the §16.3 slab
 /// layout. A quarantined span short-circuits to `Quarantined` (§17.5).
+///
+/// The geometry is read as a **consistent snapshot** under the span seqlock
+/// (W3-4): a recycle racing the read (a use-after-free signal) never yields a
+/// result composed from two incarnations — a persistently racing recycle resolves
+/// to `External` (the address has no stable current owner, so a free of it is
+/// rejected rather than mis-targeted).
 fn classify_in_span(span_ptr: *const SpanDescriptor, addr: usize) -> PointerClass {
     // SAFETY: `span_ptr` came from a pagemap `Small` entry, which the single
     // mutator path (W3-6) only publishes for a live descriptor in monotonic
     // metadata; descriptors are never freed (§27.5), so the read is valid.
     let span = unsafe { &*span_ptr };
+    let geom = match span.read_consistent_geometry() {
+        Some(g) => g,
+        None => return PointerClass::External,
+    };
 
-    // Consult the descriptor's own state so classification stays consistent during
-    // the W3-6 release window — when the span is marked `Released` but its pagemap
-    // entries have not yet been overwritten, a stale `Small` entry must still
-    // classify as `Released` (the eventual `ReleasedRetained` entry does too).
-    if span.state() == SpanState::Released {
+    // Consult the snapshot's state so classification stays consistent during the
+    // W3-6 release window — a span marked `Released` whose pagemap entry is still a
+    // stale `Small` must classify as `Released` (the eventual `ReleasedRetained`
+    // entry does too).
+    if geom.state == SpanState::Released {
         return PointerClass::Released;
     }
-    if span.is_quarantined() {
+    if geom.quarantined {
         return PointerClass::Quarantined;
     }
 
-    let object0 = match span.object0_base() {
-        Some(b) => b,
-        // Geometry overflow is unreachable for a real span; treat defensively as
-        // interior to the span base rather than fabricating an object index.
-        None => {
-            return PointerClass::Interior {
-                base: span.base(),
-                offset: addr.wrapping_sub(span.base()),
-            }
-        }
-    };
-    let size = size_class::usable_size(span.size_class());
-    let object_count = span.object_count() as usize;
-
     // Below object 0 ⇒ in the slab header region (interior to the span).
-    if addr < object0 {
+    if addr < geom.object0 {
         return PointerClass::Interior {
-            base: span.base(),
-            offset: addr - span.base(),
+            base: geom.base,
+            offset: addr - geom.base,
         };
     }
-    let delta = addr - object0;
-    let index = delta / size;
-    let remainder = delta % size;
+    let delta = addr - geom.object0;
+    let index = delta / geom.object_size;
+    let remainder = delta % geom.object_size;
 
     // Past the last carved object ⇒ trailing padding (interior to the span).
-    if index >= object_count {
+    if index >= geom.object_count {
         return PointerClass::Interior {
-            base: span.base(),
-            offset: addr - span.base(),
+            base: geom.base,
+            offset: addr - geom.base,
         };
     }
-    let object_base = object0 + index * size;
+    let object_base = geom.object0 + index * geom.object_size;
     if remainder == 0 {
         // A clean base pointer to object `index`.
         PointerClass::Small {
             span: span_ptr,
-            sc: span.size_class(),
-            arena: span.arena(),
+            sc: geom.sc,
+            arena: geom.arena,
             object_index: index,
         }
     } else {
@@ -300,6 +295,9 @@ mod tests {
     }
 
     fn span(base: usize, sc: usize, objects: u32) -> SpanDescriptor {
+        // A throwaway leaked arena for any out-of-line bitmap (inline bitmaps don't
+        // touch it); the `BumpArena` struct dropping does not free its leaked region.
+        let m = meta_arena(64 * 1024);
         SpanDescriptor::new(
             SpanId(1),
             ArenaId::DEFAULT,
@@ -308,7 +306,9 @@ mod tests {
             1,
             objects,
             0,
+            &m,
         )
+        .expect("bitmap")
     }
 
     #[test]
@@ -540,7 +540,9 @@ mod tests {
             2,
             2048,
             0,
-        );
+            &m,
+        )
+        .expect("bitmap");
         pm.install_span(&m, &s).unwrap();
         let size = size_class::usable_size(s.size_class());
         let base0 = s.object0_base().unwrap();
@@ -555,5 +557,58 @@ mod tests {
             classify_ptr(&pm, &m, in_second_page + 3),
             PointerClass::Interior { .. }
         ));
+    }
+
+    #[test]
+    fn classify_is_consistent_under_concurrent_recycle() {
+        // W3-4 seqlock stress: one thread repeatedly recycles the span (changing its
+        // object_count) while classifier threads resolve object 0's base. The
+        // seqlock guarantees each classification reads a *single* incarnation, so the
+        // result is always the consistent `Small { object_index: 0 }` (or, only if a
+        // recycle is persistently in flight, the conservative `External`) — never a
+        // torn read, a wrong index, a panic, or a crash.
+        let m = meta_arena(256 * 1024);
+        // Leak the descriptor and arena so the spawned threads can borrow them for
+        // the scope without lifetime gymnastics; `meta_arena` already leaks.
+        let pm = PageMap::new();
+        let s = span(0x4000_0000, 0, 64);
+        pm.install_span(&m, &s).unwrap();
+        let obj0 = s.object0_base().unwrap();
+        let s = &s;
+        let pm = &pm;
+        let m = &m;
+
+        std::thread::scope(|sc| {
+            // Recycler: same base/class (so object 0 stays valid), object_count
+            // cycling in 1..=64 — all inline bitmaps, so no growth/allocation.
+            sc.spawn(move || {
+                for n in 0..20_000u32 {
+                    let oc = 1 + (n % 64);
+                    assert!(s.recycle(
+                        ArenaId::DEFAULT,
+                        SizeClassId::new(0),
+                        0x4000_0000,
+                        1,
+                        oc,
+                        0,
+                        m
+                    ));
+                }
+            });
+            for _ in 0..3 {
+                sc.spawn(move || {
+                    for _ in 0..20_000 {
+                        match classify_ptr(pm, m, obj0) {
+                            // The only admissible outcomes — never a torn class.
+                            PointerClass::Small {
+                                object_index: 0, ..
+                            }
+                            | PointerClass::External => {}
+                            other => panic!("torn classification under recycle: {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
     }
 }

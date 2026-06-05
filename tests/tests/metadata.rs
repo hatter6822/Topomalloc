@@ -41,18 +41,24 @@ fn bootstrap_metadata_drives_pagemap_and_classification_before_any_arena() {
         .alloc(size_of::<SpanDescriptor>(), align_of::<SpanDescriptor>())
         .expect("bootstrap serves a descriptor before any arena exists");
     let desc_ptr = mem.as_ptr().cast::<SpanDescriptor>();
+    // The bitmap for a 64-object slab is inline, so the descriptor needs no further
+    // metadata; the seam still receives `boot` (it would serve an out-of-line bitmap
+    // for a high-count class — also from bootstrap).
+    let descriptor = SpanDescriptor::new(
+        SpanId(1),
+        ArenaId::DEFAULT,
+        SizeClassId::new(0), // 16-byte class
+        span_addr,
+        1,  // one 16 KiB page
+        64, // 64 carved objects
+        0,
+        &boot,
+    )
+    .expect("bootstrap serves the descriptor's bitmap before any arena exists");
     // SAFETY: `mem` is a fresh, exclusively-owned, suitably-aligned allocation of
     // exactly `size_of::<SpanDescriptor>()` bytes; we initialize it in place.
     unsafe {
-        desc_ptr.write(SpanDescriptor::new(
-            SpanId(1),
-            ArenaId::DEFAULT,
-            SizeClassId::new(0), // 16-byte class
-            span_addr,
-            1,  // one 16 KiB page
-            64, // 64 carved objects
-            0,
-        ));
+        desc_ptr.write(descriptor);
     }
     // SAFETY: just initialized; the descriptor lives in the leaked region (`'static`).
     let span = unsafe { &*desc_ptr };

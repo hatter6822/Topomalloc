@@ -22,5 +22,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ptr_class"
+path = "fuzz_targets/ptr_class.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]

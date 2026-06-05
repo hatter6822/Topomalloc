@@ -5,16 +5,22 @@
 //! Every unsized `free`, `realloc`, `usable_size`, and debug check must map an
 //! arbitrary address to the descriptor that owns it (§17.1) in O(1), correctly
 //! classifying interior/foreign/released pointers, **while spans are concurrently
-//! created and recycled**. The lookup is on the free hot path; the update races
+//! created and recycled**. The lookup is on the free slow path; the update races
 //! span lifecycle.
 //!
-//! **Structure (W3-3a).** A fixed-fan-out, three-level radix over allocator-page
+//! **Structure (W3-3a).** A fixed-fan-out, multi-level radix over allocator-page
 //! numbers (DD-1 choice (c)): O(1) worst-case, lazily populated, no resize, and
 //! interior-pointer lookup by masking an address down to its page. A flat array
 //! would waste virtual space on 64-bit; a hash map has worst-case and resize
-//! hazards on the hot path. Interior nodes are allocated on first touch from the
-//! [`MetadataAlloc`] seam (bootstrap metadata now, the normal metadata allocator
-//! after hand-off, §17.4).
+//! hazards. The depth is **derived** from the page size and `usize::BITS`, so the
+//! radix covers the **entire address space** with no virtual-address-width
+//! assumption (an address from 5-level paging / a 57-bit VA maps as readily as a
+//! 48-bit one). Nodes are a uniform 8 KiB (1024 slots) and lazily allocated on
+//! first touch from the [`MetadataAlloc`] seam (bootstrap metadata now, the normal
+//! metadata allocator after hand-off, §17.4) — small nodes keep the resident
+//! footprint low (the `low-rss` profile's interest). The cost is a few extra
+//! dependent loads on the *slow* path (5 levels on a 64-bit/16 KiB-page target),
+//! which the free fast path never pays.
 //!
 //! **Entry encoding (W3-3b).** Each leaf slot is a tagged pointer: `Empty` (the
 //! zero word — a non-owned page, P-Map-002), `Small`/`Large` (a pointer to the
@@ -35,7 +41,9 @@
 //! F3): span split/merge (W4-2b) and span lifecycle (W5-5) MUST route every
 //! pagemap change through [`install_span`](PageMap::install_span) /
 //! [`release_span`](PageMap::release_span) / [`retire_span`](PageMap::retire_span)
-//! / [`install_large`](PageMap::install_large), never poking a leaf directly.
+//! / [`install_large`](PageMap::install_large), never poking a leaf directly. The
+//! mutators are lock-free (atomic publish), so they acquire no lock and cannot
+//! violate the §27.2 hierarchy; they run inside the caller's span critical section.
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -44,52 +52,59 @@ use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::PAGE_SIZE;
 use crate::span::{LargeDescriptor, SpanDescriptor, SpanState};
 
-// --- radix geometry (D4: chosen for the 16 KiB allocator page) --------------
+// --- radix geometry (D4: derived from the page size and the target word) -------
 
 /// `log2(PAGE_SIZE)` — the page-offset bit width (14 for a 16 KiB page).
 pub const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
 
-/// Supported virtual-address width. 48 bits covers 4-level paging on x86-64 and
-/// AArch64 (the deployment targets). An address at or beyond `2^VA_BITS` cannot be
-/// allocator-owned — we never reserve there — so it classifies as `Empty`
-/// (non-owned, P-Map-002) without indexing out of the radix.
-pub const VA_BITS: u32 = 48;
+/// Width of an allocator-page number: `usize::BITS - PAGE_SHIFT` (50 on a 64-bit
+/// target, 18 on a 32-bit one). The radix covers all of it, so **every** address
+/// is classifiable — there is no virtual-address-width assumption.
+pub const PAGENO_BITS: u32 = usize::BITS - PAGE_SHIFT;
 
-/// Width of an allocator-page number (`VA_BITS - PAGE_SHIFT` = 34 bits).
-pub const PAGENO_BITS: u32 = VA_BITS - PAGE_SHIFT;
+/// Bits of the page number resolved per radix level (the fan-out is `2^RADIX_BITS`
+/// = 1024 slots, an 8 KiB node on a 64-bit target). Chosen to keep nodes small for
+/// lazy population and the `low-rss` profile.
+pub const RADIX_BITS: u32 = 10;
 
-/// Bits of the page number consumed by each radix level (high → low). The three
-/// sum to [`PAGENO_BITS`]; the two interior levels share a width so root and mid
-/// nodes are one type.
-const ROOT_BITS: u32 = 11;
-const MID_BITS: u32 = 11;
-const LEAF_BITS: u32 = 12;
-const _: () = assert!(ROOT_BITS + MID_BITS + LEAF_BITS == PAGENO_BITS);
+/// Radix depth: `ceil(PAGENO_BITS / RADIX_BITS)` (5 on 64-bit, 2 on 32-bit). At
+/// least two so the root is always an interior node distinct from the leaf.
+pub const LEVELS: u32 = PAGENO_BITS.div_ceil(RADIX_BITS);
+const _: () = assert!(
+    LEVELS >= 2,
+    "the radix needs a root interior level and a leaf level"
+);
+const _: () = assert!(
+    LEVELS * RADIX_BITS >= PAGENO_BITS,
+    "the radix must cover the whole page-number range"
+);
 
-/// Child slots per interior node (root and mid).
-const INTERIOR_SLOTS: usize = 1 << ROOT_BITS; // == 1 << MID_BITS
-const _: () = assert!((1usize << ROOT_BITS) == (1usize << MID_BITS));
-/// Entries per leaf node (one per allocator page).
-const LEAF_SLOTS: usize = 1 << LEAF_BITS;
+/// Slots per radix node (interior children or leaf entries).
+const SLOTS: usize = 1 << RADIX_BITS;
+const SLOT_MASK: usize = SLOTS - 1;
 
-/// One interior radix node: a lazily-populated array of child pointers (root → mid
-/// nodes, mid → leaf nodes). Children are type-erased `*mut u8` and re-typed by
-/// level; `null` means "not populated".
+/// One interior radix node: a lazily-populated array of child pointers. Children
+/// are type-erased `*mut u8` and re-typed by level; `null` means "not populated".
 #[repr(C)]
 struct Interior {
-    slots: [AtomicPtr<u8>; INTERIOR_SLOTS],
+    slots: [AtomicPtr<u8>; SLOTS],
 }
 
 /// One leaf radix node: a [`PageEntry`]-encoded word per allocator page. The
 /// all-zero state is every-page-`Empty`, so a freshly zeroed leaf is valid.
 #[repr(C)]
 struct Leaf {
-    entries: [AtomicUsize; LEAF_SLOTS],
+    entries: [AtomicUsize; SLOTS],
 }
+
+const INTERIOR_SIZE: usize = core::mem::size_of::<Interior>();
+const INTERIOR_ALIGN: usize = core::mem::align_of::<Interior>();
+const LEAF_SIZE: usize = core::mem::size_of::<Leaf>();
+const LEAF_ALIGN: usize = core::mem::align_of::<Leaf>();
 
 // --- entry encoding (W3-3b) -------------------------------------------------
 
-/// Low-bit tag width. Descriptor pointers are ≥ 8-aligned, so three low bits are
+/// Low-bit tag mask. Descriptor pointers are ≥ 8-aligned, so three low bits are
 /// free for the tag.
 const TAG_MASK: usize = 0b111;
 const TAG_EMPTY: usize = 0; // the whole word is 0 ⇒ a non-owned page
@@ -178,6 +193,11 @@ pub struct PageMap {
     /// Root interior node, allocated on first install. `null` until then — a
     /// lookup before any install returns `Empty` (everything is non-owned).
     root: AtomicPtr<Interior>,
+    /// Total bytes of radix nodes allocated (the pagemap's metadata overhead, for
+    /// the Appendix-D `metadata.bytes` stat and the W3-3a "overhead … documented"
+    /// acceptance). Counts every node this pagemap caused to be allocated, including
+    /// the rare node a lost lazy-creation CAS leaks.
+    node_bytes: AtomicUsize,
 }
 
 impl PageMap {
@@ -186,45 +206,37 @@ impl PageMap {
     pub const fn new() -> Self {
         Self {
             root: AtomicPtr::new(ptr::null_mut()),
+            node_bytes: AtomicUsize::new(0),
         }
     }
 
-    // --- lookup (hot path, allocation-free) ---------------------------------
+    /// Total bytes of radix nodes this pagemap has allocated (its metadata
+    /// overhead). Bounded by the touched address range (W3-3a).
+    #[inline]
+    pub fn metadata_bytes(&self) -> usize {
+        self.node_bytes.load(Ordering::Relaxed)
+    }
+
+    // --- lookup (slow path, allocation-free) --------------------------------
 
     /// Look up the page containing `addr` and return its [`PageEntry`] (§17.1).
-    /// O(1): three array indexes with acquire loads. Never allocates; an unmapped
-    /// path or an address beyond the supported VA returns `Empty` (P-Map-002).
+    /// O(1): a fixed number of array indexes with acquire loads. Never allocates;
+    /// an unmapped path returns `Empty` (P-Map-002). Total over the whole address
+    /// space — there is no out-of-range address.
     ///
     /// Interior-pointer support: the lookup masks `addr` to its page, so any
     /// address *within* an owned page resolves to that page's descriptor — the
     /// caller (pointer classification, W3-4) decides base-vs-interior.
     #[inline]
     pub fn lookup(&self, addr: usize) -> PageEntry {
-        let p = addr >> PAGE_SHIFT;
-        // Beyond the supported VA ⇒ not owned (and not indexable). The shift is
-        // safe: `PAGENO_BITS < usize::BITS`.
-        if p >> PAGENO_BITS != 0 {
-            return PageEntry::Empty;
+        match self.find_leaf(page_of(addr)) {
+            Some(leaf) => {
+                // SAFETY: `find_leaf` returned a valid, published `Leaf`.
+                let bits = unsafe { (*leaf).entries[leaf_index(addr)].load(Ordering::Acquire) };
+                PageEntry::decode(bits)
+            }
+            None => PageEntry::Empty,
         }
-        let root = self.root.load(Ordering::Acquire);
-        if root.is_null() {
-            return PageEntry::Empty;
-        }
-        // SAFETY: a non-null `root` was published by `root_or_create` with a
-        // release store after being zeroed; it is a valid `Interior` for the
-        // pagemap's life (nodes are never freed).
-        let mid = unsafe { (*root).slots[root_index(p)].load(Ordering::Acquire) };
-        if mid.is_null() {
-            return PageEntry::Empty;
-        }
-        // SAFETY: a non-null mid child is a zeroed-then-published `Interior`.
-        let leaf = unsafe { (*mid.cast::<Interior>()).slots[mid_index(p)].load(Ordering::Acquire) };
-        if leaf.is_null() {
-            return PageEntry::Empty;
-        }
-        // SAFETY: a non-null leaf child is a zeroed-then-published `Leaf`.
-        let bits = unsafe { (*leaf.cast::<Leaf>()).entries[leaf_index(p)].load(Ordering::Acquire) };
-        PageEntry::decode(bits)
     }
 
     // --- the single mutator path (W3-6 / P-Map-006) -------------------------
@@ -232,8 +244,8 @@ impl PageMap {
     /// Install a span into the pagemap (P-Map-001/003): map every page the span
     /// covers to its descriptor with a **release store**, so a concurrent
     /// classifier that acquire-loads an entry sees the fully-initialized span. The
-    /// caller MUST have finished initializing `span` (geometry, generation, state)
-    /// before calling — the descriptor is the publish payload (W3-6).
+    /// caller MUST have finished initializing `span` before calling — the descriptor
+    /// is the publish payload (W3-6).
     ///
     /// Returns [`PagemapError::OutOfMetadata`] if a radix node cannot be allocated;
     /// no partial install is observable as a wrong owner (each page is published
@@ -245,8 +257,12 @@ impl PageMap {
         meta: &dyn MetadataAlloc,
         span: &SpanDescriptor,
     ) -> Result<(), PagemapError> {
+        let (base, stop) = span.range();
+        // Spans are page-aligned page runs, so every mapped page lies wholly inside
+        // the span — the precondition the §17.2 soundness theorem assumes.
+        debug_assert_eq!(base % PAGE_SIZE, 0, "span base must be page-aligned");
         let entry = PageEntry::Small(span as *const SpanDescriptor).encode();
-        self.publish_range(meta, span.range(), entry)
+        self.publish_range(meta, (base, stop), entry)
     }
 
     /// Install a large allocation into the pagemap (P-Map-001/004).
@@ -263,10 +279,8 @@ impl PageMap {
 
     /// Transition a span's pages to **released-but-retained** (P-Map-005): the
     /// entries keep pointing at the descriptor (now `state == Released`) so the
-    /// pages cannot be reused without recommit. The caller MUST set the span's
-    /// state to [`SpanState::Released`] *before* calling, so the published entry
-    /// and the descriptor agree (§17.2 P-Map-006). Allocation-free — the nodes
-    /// already exist from `install_span`.
+    /// pages cannot be reused without recommit. The caller MUST set the span's state
+    /// to [`SpanState::Released`] *before* calling (§17.2 P-Map-006). Allocation-free.
     ///
     /// SPEC-transition: span `Active -> Released`, pagemap retained (§20.1)
     pub fn release_span(&self, span: &SpanDescriptor) {
@@ -280,8 +294,7 @@ impl PageMap {
     }
 
     /// Retire a span's pages to `Empty` (the backing virtual range is being handed
-    /// back, P-Map-002): no descriptor owns these pages any more. Allocation-free.
-    /// After this, a classifier sees `Empty` (non-owned) for these pages.
+    /// back, P-Map-002). Allocation-free. After this a classifier sees `Empty`.
     ///
     /// SPEC-transition: pagemap clear on span teardown (§17.2 P-Map-006)
     pub fn retire_span(&self, span: &SpanDescriptor) {
@@ -307,23 +320,33 @@ impl PageMap {
     ) -> Result<(), PagemapError> {
         for p in page_range(base, stop) {
             let leaf = self.leaf_or_create(meta, p)?;
-            // SAFETY: `leaf_or_create` returned a valid, published `Leaf`. The
-            // release store publishes `entry` so an acquire-loading reader sees the
-            // descriptor it encodes fully initialized (W3-3c).
-            unsafe { (*leaf).entries[leaf_index(p)].store(entry, Ordering::Release) };
+            // SAFETY: `leaf_or_create` returned a valid, published `Leaf`.
+            let slot = unsafe { &(*leaf).entries[p & SLOT_MASK] };
+            // P-Map-001: a page maps to exactly one descriptor. An install over a
+            // page already owned by a *different* descriptor is a bug (a fresh page
+            // is `Empty`; a re-install of the same span publishes the same word).
+            debug_assert!(
+                {
+                    let prior = slot.load(Ordering::Acquire);
+                    prior == TAG_EMPTY || prior == entry
+                },
+                "P-Map-001: page already owned by a different descriptor"
+            );
+            // The release store publishes `entry` so an acquire-loading reader sees
+            // the descriptor it encodes fully initialized (W3-3c).
+            slot.store(entry, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Overwrite every *already-mapped* page in `[base, stop)` with `entry`. Used
-    /// by release/retire, which never need to create nodes (the pages were mapped
-    /// at install). A page whose node is absent is skipped (defensive: it was
-    /// already non-owned).
+    /// Overwrite every *already-mapped* page in `[base, stop)` with `entry`. Used by
+    /// release/retire, which never need to create nodes (the pages were mapped at
+    /// install). A page whose node is absent is skipped (already non-owned).
     fn overwrite_existing_range(&self, (base, stop): (usize, usize), entry: usize) {
         for p in page_range(base, stop) {
             if let Some(leaf) = self.find_leaf(p) {
                 // SAFETY: `find_leaf` returned a valid, published `Leaf`.
-                unsafe { (*leaf).entries[leaf_index(p)].store(entry, Ordering::Release) };
+                unsafe { (*leaf).entries[p & SLOT_MASK].store(entry, Ordering::Release) };
             }
         }
     }
@@ -334,7 +357,9 @@ impl PageMap {
         if !cur.is_null() {
             return Ok(cur);
         }
-        let node = alloc_interior(meta)?.cast::<Interior>();
+        let node = self
+            .alloc_node(meta, INTERIOR_SIZE, INTERIOR_ALIGN)?
+            .cast::<Interior>();
         match self.root.compare_exchange(
             ptr::null_mut(),
             node,
@@ -342,49 +367,98 @@ impl PageMap {
             Ordering::Acquire,
         ) {
             Ok(_) => Ok(node),
-            // Lost the race: another thread published a root first. Use it; our
-            // node leaks (monotonic metadata — never freed, a rare bounded waste).
+            // Lost the race: another thread published a root first. Use it; our node
+            // leaks (monotonic metadata — never freed, a rare bounded waste).
             Err(winner) => Ok(winner),
         }
     }
 
-    /// Walk to the leaf for page `p`, creating the root/mid/leaf nodes as needed.
+    /// Walk to the leaf for page `p`, creating the root/interior/leaf nodes as
+    /// needed. The walk descends from the root (top page-number group) to the leaf.
     fn leaf_or_create(
         &self,
         meta: &dyn MetadataAlloc,
         p: usize,
     ) -> Result<*mut Leaf, PagemapError> {
-        let root = self.root_or_create(meta)?;
-        // SAFETY: `root` is a valid published `Interior`.
-        let mid_slot = unsafe { &(*root).slots[root_index(p)] };
-        let mid = child_or_create(mid_slot, meta, alloc_interior)?.cast::<Interior>();
-        // SAFETY: `mid` is a valid published `Interior`.
-        let leaf_slot = unsafe { &(*mid).slots[mid_index(p)] };
-        let leaf = child_or_create(leaf_slot, meta, alloc_leaf)?.cast::<Leaf>();
-        Ok(leaf)
+        let mut node = self.root_or_create(meta)?;
+        // Follow children for groups LEVELS-1 .. 1; the group-1 child is the leaf.
+        for k in (1..LEVELS).rev() {
+            let idx = (p >> (k * RADIX_BITS)) & SLOT_MASK;
+            // SAFETY: `node` is a valid published `Interior`.
+            let slot = unsafe { &(*node).slots[idx] };
+            if k == 1 {
+                let leaf = self.child_or_create(slot, meta, LEAF_SIZE, LEAF_ALIGN)?;
+                return Ok(leaf.cast::<Leaf>());
+            }
+            let child = self.child_or_create(slot, meta, INTERIOR_SIZE, INTERIOR_ALIGN)?;
+            node = child.cast::<Interior>();
+        }
+        // Unreachable: LEVELS >= 2 guarantees the `k == 1` arm returns.
+        unreachable!("radix has at least two levels")
     }
 
     /// Walk to the leaf for page `p` without allocating; `None` if any node on the
     /// path is absent (the page is non-owned).
+    #[inline]
     fn find_leaf(&self, p: usize) -> Option<*mut Leaf> {
-        if p >> PAGENO_BITS != 0 {
+        let mut node = self.root.load(Ordering::Acquire);
+        if node.is_null() {
             return None;
         }
-        let root = self.root.load(Ordering::Acquire);
-        if root.is_null() {
-            return None;
+        for k in (1..LEVELS).rev() {
+            let idx = (p >> (k * RADIX_BITS)) & SLOT_MASK;
+            // SAFETY: `node` is a valid published `Interior`.
+            let child = unsafe { (*node).slots[idx].load(Ordering::Acquire) };
+            if child.is_null() {
+                return None;
+            }
+            if k == 1 {
+                return Some(child.cast::<Leaf>());
+            }
+            node = child.cast::<Interior>();
         }
-        // SAFETY: non-null root is a valid published `Interior`.
-        let mid = unsafe { (*root).slots[root_index(p)].load(Ordering::Acquire) };
-        if mid.is_null() {
-            return None;
+        unreachable!("radix has at least two levels")
+    }
+
+    /// Return the child in `slot`, creating it with a `size`/`align` node on first
+    /// touch. Lock-free: the creator zeroes the node, then publishes it with a
+    /// release CAS; a reader acquire-loads. If the CAS loses, the winner's node is
+    /// used and ours leaks (bounded, rare — monotonic metadata is never freed).
+    fn child_or_create(
+        &self,
+        slot: &AtomicPtr<u8>,
+        meta: &dyn MetadataAlloc,
+        size: usize,
+        align: usize,
+    ) -> Result<*mut u8, PagemapError> {
+        let cur = slot.load(Ordering::Acquire);
+        if !cur.is_null() {
+            return Ok(cur);
         }
-        // SAFETY: non-null mid child is a valid published `Interior`.
-        let leaf = unsafe { (*mid.cast::<Interior>()).slots[mid_index(p)].load(Ordering::Acquire) };
-        if leaf.is_null() {
-            return None;
+        let node = self.alloc_node(meta, size, align)?;
+        match slot.compare_exchange(ptr::null_mut(), node, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => Ok(node),
+            Err(winner) => Ok(winner),
         }
-        Some(leaf.cast::<Leaf>())
+    }
+
+    /// Allocate `size` bytes aligned `align` from `meta`, zero them so the result is
+    /// a valid all-`null`/all-`Empty` node *before* it is linked (init-before-publish,
+    /// failure mode F1), and account the bytes (W3-3a overhead metric).
+    fn alloc_node(
+        &self,
+        meta: &dyn MetadataAlloc,
+        size: usize,
+        align: usize,
+    ) -> Result<*mut u8, PagemapError> {
+        let node = meta.alloc(size, align).ok_or(PagemapError::OutOfMetadata)?;
+        // SAFETY: `meta.alloc` returned a fresh, exclusively-owned region of exactly
+        // `size` bytes; zeroing it makes a valid node whose every atomic slot is the
+        // zero (null / `Empty`) bit pattern. No other thread can observe it yet — it
+        // is not linked into the radix until the caller's release CAS/store.
+        unsafe { ptr::write_bytes(node.as_ptr(), 0, size) };
+        self.node_bytes.fetch_add(size, Ordering::Relaxed);
+        Ok(node.as_ptr())
     }
 }
 
@@ -395,77 +469,27 @@ impl Default for PageMap {
 }
 
 // SAFETY: all shared state is reached through atomics (the root pointer, every
-// interior slot, every leaf entry); nodes are zeroed before being published with a
-// release CAS/store and never freed, and the descriptors they point at are `Sync`.
-// Concurrent lookups and the single mutator path are therefore data-race-free.
+// interior slot, every leaf entry, the byte counter); nodes are zeroed before being
+// published with a release CAS/store and never freed, and the descriptors they
+// point at are `Sync`. Concurrent lookups and the single mutator path are therefore
+// data-race-free.
 unsafe impl Sync for PageMap {}
 // SAFETY: as the `Sync` impl above — the pagemap owns only atomics and pointers
 // into `Sync` metadata, so it is sound to move across threads.
 unsafe impl Send for PageMap {}
 
-// --- node allocation (lazy, lock-free) --------------------------------------
-
-/// Allocate and zero one interior node from `meta` (all children `null`).
-fn alloc_interior(meta: &dyn MetadataAlloc) -> Result<*mut u8, PagemapError> {
-    alloc_zeroed_node(
-        meta,
-        core::mem::size_of::<Interior>(),
-        core::mem::align_of::<Interior>(),
-    )
-}
-
-/// Allocate and zero one leaf node from `meta` (all entries `Empty`).
-fn alloc_leaf(meta: &dyn MetadataAlloc) -> Result<*mut u8, PagemapError> {
-    alloc_zeroed_node(
-        meta,
-        core::mem::size_of::<Leaf>(),
-        core::mem::align_of::<Leaf>(),
-    )
-}
-
-/// Allocate `size` bytes aligned `align` from `meta` and zero them, so the result
-/// is a valid all-`null`/all-`Empty` node *before* it is linked (init-before-publish,
-/// failure mode F1).
-fn alloc_zeroed_node(
-    meta: &dyn MetadataAlloc,
-    size: usize,
-    align: usize,
-) -> Result<*mut u8, PagemapError> {
-    let node = meta.alloc(size, align).ok_or(PagemapError::OutOfMetadata)?;
-    // SAFETY: `meta.alloc` returned a fresh, exclusively-owned region of exactly
-    // `size` bytes; zeroing it makes a valid node whose every atomic slot is the
-    // zero (null / `Empty`) bit pattern. No other thread can observe it yet — it is
-    // not linked into the radix until the caller's release CAS.
-    unsafe { ptr::write_bytes(node.as_ptr(), 0, size) };
-    Ok(node.as_ptr())
-}
-
-/// Return the child in `slot`, creating it with `make` on first touch. Lock-free:
-/// the creator zeroes the node, then publishes it with a release CAS; a reader
-/// acquire-loads. If the CAS loses, the winner's node is used and ours leaks
-/// (bounded, rare — monotonic metadata is never freed).
-fn child_or_create(
-    slot: &AtomicPtr<u8>,
-    meta: &dyn MetadataAlloc,
-    make: fn(&dyn MetadataAlloc) -> Result<*mut u8, PagemapError>,
-) -> Result<*mut u8, PagemapError> {
-    let cur = slot.load(Ordering::Acquire);
-    if !cur.is_null() {
-        return Ok(cur);
-    }
-    let node = make(meta)?;
-    match slot.compare_exchange(ptr::null_mut(), node, Ordering::Release, Ordering::Acquire) {
-        Ok(_) => Ok(node),
-        Err(winner) => Ok(winner),
-    }
-}
-
 // --- page-number arithmetic -------------------------------------------------
 
-/// The allocator-page number containing `addr`.
+/// The allocator-page number containing `addr` (`< 2^PAGENO_BITS` by construction).
 #[inline]
 fn page_of(addr: usize) -> usize {
     addr >> PAGE_SHIFT
+}
+
+/// The leaf-entry index for `addr` (its low page-number group).
+#[inline]
+fn leaf_index(addr: usize) -> usize {
+    page_of(addr) & SLOT_MASK
 }
 
 /// The inclusive range of page numbers covering `[base, stop)`. Empty if
@@ -473,26 +497,10 @@ fn page_of(addr: usize) -> usize {
 #[inline]
 fn page_range(base: usize, stop: usize) -> core::ops::RangeInclusive<usize> {
     if stop <= base {
-        // An empty byte range covers no pages: `1..=0` is an empty inclusive range.
         #[allow(clippy::reversed_empty_ranges)]
-        return 1..=0;
+        return 1..=0; // an empty byte range covers no pages
     }
     page_of(base)..=page_of(stop - 1)
-}
-
-#[inline]
-fn root_index(p: usize) -> usize {
-    (p >> (MID_BITS + LEAF_BITS)) & (INTERIOR_SLOTS - 1)
-}
-
-#[inline]
-fn mid_index(p: usize) -> usize {
-    (p >> LEAF_BITS) & (INTERIOR_SLOTS - 1)
-}
-
-#[inline]
-fn leaf_index(p: usize) -> usize {
-    p & (LEAF_SLOTS - 1)
 }
 
 #[cfg(test)]
@@ -510,7 +518,7 @@ mod tests {
         unsafe { BumpArena::new(ptr, len) }
     }
 
-    fn small_span(id: u32, base: usize, pages: u32, objects: u32) -> SpanDescriptor {
+    fn small_span(id: u32, base: usize, pages: u32, objects: u32, m: &BumpArena) -> SpanDescriptor {
         SpanDescriptor::new(
             SpanId(id),
             ArenaId::DEFAULT,
@@ -519,42 +527,50 @@ mod tests {
             pages,
             objects,
             0,
+            m,
         )
+        .expect("bitmap")
     }
 
     #[test]
     fn geometry_consts_are_consistent() {
         assert_eq!(PAGE_SHIFT, 14);
-        assert_eq!(PAGENO_BITS, 34);
-        assert_eq!(ROOT_BITS + MID_BITS + LEAF_BITS, PAGENO_BITS);
-        // Interior nodes are uniform (root and mid share a type/width).
-        assert_eq!(core::mem::size_of::<Interior>(), INTERIOR_SLOTS * 8);
-        assert_eq!(core::mem::size_of::<Leaf>(), LEAF_SLOTS * 8);
-        // A leaf covers exactly its page span; root covers the whole VA.
-        assert_eq!(LEAF_SLOTS * PAGE_SIZE, 64 * 1024 * 1024); // 64 MiB / leaf
+        assert_eq!(PAGENO_BITS, usize::BITS - 14);
+        assert_eq!(LEVELS, PAGENO_BITS.div_ceil(RADIX_BITS));
+        // Full coverage and `LEVELS >= 2` are enforced at compile time (above); the
+        // node geometry: uniform `usize`-sized slots (8 KiB nodes on a 64-bit target).
+        assert_eq!(
+            core::mem::size_of::<Interior>(),
+            SLOTS * core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::size_of::<Leaf>(),
+            SLOTS * core::mem::size_of::<usize>()
+        );
     }
 
     #[test]
     fn empty_pagemap_classifies_everything_external() {
-        // P-Map-002: with nothing installed (no root), every address is non-owned.
+        // P-Map-002: with nothing installed (no root), every address is non-owned —
+        // including the very top of the address space (no VA cap).
         let pm = PageMap::new();
         assert!(pm.lookup(0).is_empty());
         assert!(pm.lookup(0x4000_0000).is_empty());
         assert!(pm.lookup(usize::MAX).is_empty());
+        assert_eq!(pm.metadata_bytes(), 0);
     }
 
     #[test]
     fn entry_encoding_round_trips() {
-        // W3-3b: every PageEntry round-trips through the tagged-pointer encoding.
-        let s = small_span(1, 0x4000_0000, 1, 64);
+        let m = meta(64 * 1024);
+        let s = small_span(1, 0x4000_0000, 1, 64, &m);
         let sp = &s as *const SpanDescriptor;
         for e in [
             PageEntry::Empty,
             PageEntry::Small(sp),
             PageEntry::Released(sp),
         ] {
-            let back = PageEntry::decode(e.encode());
-            match (e, back) {
+            match (e, PageEntry::decode(e.encode())) {
                 (PageEntry::Empty, PageEntry::Empty) => {}
                 (PageEntry::Small(a), PageEntry::Small(b)) => assert_eq!(a, b),
                 (PageEntry::Released(a), PageEntry::Released(b)) => assert_eq!(a, b),
@@ -571,36 +587,49 @@ mod tests {
 
     #[test]
     fn install_then_lookup_returns_the_span_for_every_owned_page() {
-        // P-Map-001/003: every page of an installed span maps to that span; the
-        // pages just outside it stay non-owned (P-Map-002).
         let m = meta(256 * 1024);
         let pm = PageMap::new();
         let base = 0x4000_0000;
-        let s = small_span(1, base, 2, 64); // a 2-page span
+        let s = small_span(1, base, 2, 64, &m); // a 2-page span
         pm.install_span(&m, &s).unwrap();
 
         let (lo, hi) = s.range();
-        // Every address inside the span resolves to it.
         for addr in [lo, lo + 1, lo + PAGE_SIZE, hi - 1] {
             let sp = pm.lookup(addr).span_ptr().expect("owned page");
             assert_eq!(sp, &s as *const SpanDescriptor);
         }
-        // The page just before and just after are non-owned.
         assert!(pm.lookup(lo - 1).is_empty());
         assert!(pm.lookup(hi).is_empty());
+        // The pagemap allocated some node bytes (overhead metric, W3-3a).
+        assert!(pm.metadata_bytes() > 0);
+    }
+
+    #[test]
+    fn high_address_space_is_mappable_no_va_cap() {
+        // The full-range radix maps an address far above a 48-bit VA (e.g. a 5-level
+        // paging / 57-bit-VA host), which the old 48-bit-capped design mis-classified
+        // as foreign.
+        let m = meta(512 * 1024);
+        let pm = PageMap::new();
+        let high = 1usize << 52; // well beyond 2^48
+        let s = small_span(1, high, 1, 64, &m);
+        pm.install_span(&m, &s).unwrap();
+        assert_eq!(
+            pm.lookup(high).span_ptr().unwrap(),
+            &s as *const SpanDescriptor
+        );
+        assert!(pm.lookup(high + PAGE_SIZE).is_empty());
     }
 
     #[test]
     fn release_then_retire_transitions_entries() {
-        // P-Map-005 then P-Map-002: Active → Released (retained) → Empty.
         let m = meta(256 * 1024);
         let pm = PageMap::new();
-        let s = small_span(1, 0x4000_0000, 1, 64);
+        let s = small_span(1, 0x4000_0000, 1, 64, &m);
         pm.install_span(&m, &s).unwrap();
         let addr = s.base();
         assert!(matches!(pm.lookup(addr), PageEntry::Small(_)));
 
-        // Mark the descriptor Released first (W3-6 ordering), then the pagemap.
         s.set_state(SpanState::Released);
         pm.release_span(&s);
         match pm.lookup(addr) {
@@ -608,20 +637,17 @@ mod tests {
             other => panic!("expected Released, got {other:?}"),
         }
 
-        // Retire hands the pages back: non-owned again.
         pm.retire_span(&s);
         assert!(pm.lookup(addr).is_empty());
     }
 
     #[test]
     fn two_spans_map_their_own_pages_only() {
-        // P-Map-001: distinct spans own distinct pages; no page maps to two
-        // descriptors. Place them in adjacent leaves and in the same leaf.
-        let m = meta(512 * 1024);
+        let m = meta(2 * 1024 * 1024);
         let pm = PageMap::new();
-        let a = small_span(1, 0x4000_0000, 1, 64);
-        let b = small_span(2, 0x4000_0000 + PAGE_SIZE, 1, 64); // adjacent page, same leaf
-        let c = small_span(3, 0x8000_0000, 1, 64); // far away, different mid/leaf
+        let a = small_span(1, 0x4000_0000, 1, 64, &m);
+        let b = small_span(2, 0x4000_0000 + PAGE_SIZE, 1, 64, &m); // adjacent page
+        let c = small_span(3, 0x8000_0000, 1, 64, &m); // far away
         pm.install_span(&m, &a).unwrap();
         pm.install_span(&m, &b).unwrap();
         pm.install_span(&m, &c).unwrap();
@@ -642,17 +668,15 @@ mod tests {
 
     #[test]
     fn large_install_and_retire() {
-        let m = meta(512 * 1024);
+        let m = meta(2 * 1024 * 1024);
         let pm = PageMap::new();
-        // A 3 MiB large allocation spanning many pages.
         let d = LargeDescriptor::new(LargeId(1), ArenaId::DEFAULT, 0x1_0000_0000, 3_000_000, 4096);
         pm.install_large(&m, &d).unwrap();
         let lp = &d as *const LargeDescriptor;
         assert_eq!(pm.lookup(d.base()).large_ptr().unwrap(), lp);
         assert_eq!(pm.lookup(d.end() - 1).large_ptr().unwrap(), lp);
-        // The pagemap maps whole pages: `d.end()` lands in the last (partially
-        // used) owned page, so it is still owned. The first page *after* the
-        // allocation is non-owned.
+        // The pagemap maps whole pages: `d.end()` lands in the last (partially used)
+        // owned page; the first page after the allocation is non-owned.
         assert!(!pm.lookup(d.end()).is_empty());
         let first_unowned = (page_of(d.end() - 1) + 1) << PAGE_SHIFT;
         assert!(pm.lookup(first_unowned).is_empty());
@@ -664,47 +688,36 @@ mod tests {
     #[test]
     fn install_out_of_metadata_fails_safely() {
         // §17.4 safe failure: a too-small metadata region makes install return
-        // OutOfMetadata rather than panicking, and the pagemap stays consistent
-        // (the pages it could not map remain non-owned).
-        let m = meta(8 * 1024); // smaller than even one interior node (16 KiB)
+        // OutOfMetadata rather than panicking, and the pagemap stays consistent.
+        let m = meta(4 * 1024); // smaller than even one interior node (8 KiB)
         let pm = PageMap::new();
-        let s = small_span(1, 0x4000_0000, 1, 64);
+        let big = meta(64 * 1024); // build the descriptor (and its bitmap) elsewhere
+        let s = small_span(1, 0x4000_0000, 1, 64, &big);
         assert_eq!(pm.install_span(&m, &s), Err(PagemapError::OutOfMetadata));
         assert!(pm.lookup(s.base()).is_empty());
     }
 
     #[test]
     fn concurrent_install_and_lookup_never_tears() {
-        // W3-3c: installer threads race to create the *shared* leaf node (the
-        // lock-free `child_or_create` CAS) and publish distinct entries, while
-        // reader threads classify the same pages. A reader must only ever see
-        // `Empty` (not yet installed) or the fully-formed span — never a half-built
-        // node or a wrong descriptor. After the join, every span resolves to itself
-        // (P-Map-001).
+        // W3-3c: installer threads race to create shared radix nodes (the lock-free
+        // `child_or_create` CAS) and publish distinct entries, while reader threads
+        // classify the same pages. A reader sees only `Empty` or the fully-formed
+        // span — never a half-built node or a wrong descriptor.
         const N: usize = 64;
         let m = meta(2 * 1024 * 1024);
         let pm = PageMap::new();
-        // All N spans live in one leaf (adjacent pages), so installs contend on the
-        // same radix nodes. Descriptors are fixed in place (no realloc) so the raw
-        // pointers the pagemap stores stay valid.
         let spans: Vec<SpanDescriptor> = (0..N)
-            .map(|i| small_span(i as u32, 0x4000_0000 + i * PAGE_SIZE, 1, 64))
+            .map(|i| small_span(i as u32, 0x4000_0000 + i * PAGE_SIZE, 1, 64, &m))
             .collect();
 
         std::thread::scope(|s| {
-            // Installers: each thread installs every span (idempotent races on the
-            // same entries and nodes — the worst case for the publish protocol).
             for _ in 0..4 {
                 s.spawn(|| {
                     for span in &spans {
-                        // An install may transiently fail only on OOM; the arena is
-                        // sized generously, so it succeeds.
                         pm.install_span(&m, span).unwrap();
                     }
                 });
             }
-            // Readers: classify the pages concurrently; any non-empty result must be
-            // the correct span for that page.
             for _ in 0..4 {
                 s.spawn(|| {
                     for _ in 0..50 {
@@ -718,7 +731,6 @@ mod tests {
             }
         });
 
-        // After all installs, every span is mapped to exactly itself.
         for (i, span) in spans.iter().enumerate() {
             assert_eq!(
                 pm.lookup(span.base()).span_ptr().unwrap(),
