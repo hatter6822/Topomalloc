@@ -30,6 +30,26 @@ Formal: Lean model + seLe4n bridge                           lean/
 | `topo-control` | configuration + control namespace | MIT |
 | `topo-test-support` | trace parser, deterministic PRNG, executable model | MIT |
 
+## Request classification (plan 03 W2)
+
+`classify(size, align, flags)` (§A.1) is the first step on every allocation path.
+It is total and overflow-safe (§9.7): it returns a `Request` or `None` (→ null /
+`bad_alloc`), never panicking or wrapping. The decision is three-way (§9.2):
+
+- **Small** — a size-class slab (`size_class`, a branch-light direct-mapped
+  granule lookup). Over-aligned requests route to a sufficiently-aligned class or
+  out to medium/large — never widening a shared slab's stride (§9.3 / §25.5).
+- **Medium** — a page-rounded extent above the small path.
+- **Large** — at/above the hugepage threshold (`HUGE_THRESHOLD`), hugepage-backed
+  (plan 04). The medium/large split is decided on `max(size, align)`.
+
+Advisory flags (§10.4) are decoded and **validated** by `RequestFlags` into a
+structured `Hints` (zero, cache-bypass, guard, hugepage preference, lifetime,
+hotness) plus arena routing; reserved bits and contradictory combinations fail
+deterministically. The public C `TOPO_*` values map onto this internal layout at
+the plan-06 API boundary. The Lean model mirrors the classifier and proves the
+size-coverage and over-alignment-sufficiency invariants (plan 02 W1-4).
+
 ## Single source of truth (DD-1)
 
 `tools/size-class-gen` reads the committed golden

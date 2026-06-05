@@ -136,8 +136,15 @@ Four W2 implementation choices are ratified here; the module docs
   the granule LUT is 2 KiB (`u8 × 2048`), L1-resident and constant-time, so the
   shipped lookup is a single direct map for the whole small range — no second code
   path, no arithmetic class derivation. Ratified over the hybrid. The over-aligned
-  escape is factored into `align_walk`, unit-tested against synthetic tables that
-  contain over-aligned classes (the shipped table is uniformly 16-aligned).
+  escape is factored into `align_walk` (table-parametric, so the integrated path is
+  unit-tested against synthetic tables with over-aligned classes — the shipped
+  table is uniformly 16-aligned) and **proved** in Lean: `alignWalk_sufficient`
+  shows the walk only ever returns a class whose natural alignment covers the
+  request (the W2-3b "never share a less-aligned slab" rule). The Lean `lake exe
+  check` gate also runs a model-vs-emitted lookup differential (`lookupMatchesModelB`:
+  the emitted `sizeToClass` equals the lookup the model recomputes from the row
+  sizes), and lifts each evaluated gate to a theorem (`size_class_lookup_minimal`,
+  `maxAlign_is_upper_bound`, `huge_threshold_wellformed`).
 * **Internal flag/hints model, validated (§10.4).** `RequestFlags` is the
   allocator's internal, validated representation of the advisory flags (zero,
   cache-bypass, guard, hugepage preference, lifetime, hotness, arena routing). It

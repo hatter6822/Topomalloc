@@ -194,12 +194,22 @@ impl RequestFlags {
     // Each sets exactly one field, so a value built through them is always valid
     // (no reserved bits, and the hugepage policy is single-valued by construction).
 
-    /// Set a boolean flag (`ZERO`, `CACHE_BYPASS`, or `GUARDED`). Bits outside
-    /// those three are ignored, so a builder can never set a reserved bit.
+    /// Request zeroed memory (`TOPO_ZERO`).
     #[inline]
-    pub const fn with(self, bool_flag: u32) -> RequestFlags {
-        let allowed = Self::ZERO | Self::CACHE_BYPASS | Self::GUARDED;
-        RequestFlags(self.0 | (bool_flag & allowed))
+    pub const fn with_zero(self) -> RequestFlags {
+        RequestFlags(self.0 | Self::ZERO)
+    }
+
+    /// Bypass the front-end cache for this request (`TOPO_TCACHE_NONE`).
+    #[inline]
+    pub const fn with_cache_bypass(self) -> RequestFlags {
+        RequestFlags(self.0 | Self::CACHE_BYPASS)
+    }
+
+    /// Request a guard allocation (`TOPO_GUARDED`).
+    #[inline]
+    pub const fn with_guarded(self) -> RequestFlags {
+        RequestFlags(self.0 | Self::GUARDED)
     }
 
     /// Set the hugepage policy (clears whichever hugepage bit was set first, so
@@ -366,7 +376,8 @@ mod tests {
     fn fields_are_independent() {
         // Setting every field at once decodes each back without cross-talk.
         let f = RequestFlags::NONE
-            .with(RequestFlags::ZERO | RequestFlags::GUARDED)
+            .with_zero()
+            .with_guarded()
             .with_hugepage(HugepagePolicy::Prefer)
             .with_lifetime(Lifetime::Long)
             .with_hotness(200)

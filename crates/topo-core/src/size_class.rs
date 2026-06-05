@@ -49,18 +49,46 @@ pub struct SizeClassRow {
 /// requires — never sharing a *less*-aligned class's slab.
 #[inline]
 pub fn size_class(size: usize, align: usize) -> Option<SizeClassId> {
-    // `align > MAX_ALIGN` short-circuits the common over-aligned reject (no class
-    // can ever satisfy it); the walk below still returns `None` correctly for an
-    // `align <= MAX_ALIGN` that no *size-sufficient* class happens to provide.
-    if size == 0 || size > SMALL_MAX || align > MAX_ALIGN {
+    size_class_in(
+        size,
+        align,
+        QUANTUM,
+        SMALL_MAX,
+        MAX_ALIGN,
+        SIZE_TO_CLASS,
+        SIZE_CLASSES,
+    )
+    .map(SizeClassId::new)
+}
+
+/// Table-parametric core of [`size_class`] (W2-2a/W2-3b). Extracting it lets the
+/// full granule-lookup → over-alignment-walk composition be unit-tested against
+/// synthetic tables that actually contain over-aligned classes — the shipped
+/// table is uniformly 16-aligned, so the public `size_class` never advances the
+/// walk at runtime. The parameters mirror the generated constants exactly.
+///
+/// `align > max_align` short-circuits the common over-aligned reject in O(1) (no
+/// class can satisfy it); the walk still returns `None` correctly for an
+/// `align <= max_align` that no *size-sufficient* class happens to provide.
+#[inline]
+fn size_class_in(
+    size: usize,
+    align: usize,
+    quantum: usize,
+    small_max: usize,
+    max_align: usize,
+    size_to_class: &[u8],
+    classes: &[SizeClassRow],
+) -> Option<usize> {
+    if size == 0 || size > small_max || align > max_align {
         return None;
     }
-    let granule = (size - 1) / QUANTUM;
-    // Indexing soundness: `1 <= size <= SMALL_MAX` and `SIZE_TO_CLASS` has
-    // `SMALL_MAX / QUANTUM` entries, so `granule` is in bounds (the generator
+    // Indexing soundness: `1 <= size <= small_max` and `size_to_class` has
+    // `small_max / quantum` entries, so `granule` is in bounds (the generator
     // proves this). We still use a checked `get` to keep the runtime total.
-    let start = *SIZE_TO_CLASS.get(granule)? as usize;
-    align_walk(start, align, SIZE_CLASSES).map(SizeClassId::new)
+    let granule = (size - 1) / quantum;
+    let start = *size_to_class.get(granule)? as usize;
+    align_walk(start, align, classes)
 }
 
 /// The over-alignment escape (§9.3 / §25.5, W2-3b), factored out so it can be
@@ -281,6 +309,56 @@ mod tests {
         assert_eq!(align_walk(3, 32, &table), None);
         // start past the end → None (defensive).
         assert_eq!(align_walk(table.len(), 1, &table), None);
+    }
+
+    #[test]
+    fn size_class_in_routes_over_aligned_to_a_distinct_aligned_class() {
+        // The integrated granule-lookup → align-walk path on a synthetic table
+        // with an over-aligned class (class 2 is 32-aligned; the rest 16). This is
+        // the end-to-end W2-3b routing the shipped table can't exercise.
+        fn r(size: u32, align: u32) -> SizeClassRow {
+            SizeClassRow {
+                size,
+                align,
+                slab_pages: 1,
+                objects_per_slab: 1,
+                batch: 1,
+                max_local_capacity: 1,
+            }
+        }
+        // Sizes 16,32,96,160,256 (each a multiple of its align, §9.3).
+        let classes = [r(16, 16), r(32, 16), r(96, 32), r(160, 16), r(256, 16)];
+        // Granule g (request g*16+1..(g+1)*16) → smallest class whose size fits.
+        let size_to_class: [u8; 16] = [0, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4];
+        let q = 16usize;
+        let small_max = 256usize;
+        let max_align = 32usize;
+        let lookup = |size, align| {
+            size_class_in(
+                size,
+                align,
+                q,
+                small_max,
+                max_align,
+                &size_to_class,
+                &classes,
+            )
+        };
+
+        // The crux of W2-3b: size 20 naturally maps to the less-aligned class 1
+        // (16-aligned), but the over-aligned (32) request is routed FORWARD to the
+        // distinct 32-aligned class 2 — never served from class 1's shared slab.
+        assert_eq!(lookup(20, 16), Some(1));
+        assert_eq!(lookup(20, 32), Some(2));
+        // The chosen class genuinely provides the alignment (no offset hack).
+        assert!(classes[lookup(20, 32).unwrap()].align as usize >= 32);
+        // A request already mapping to the aligned class stays put.
+        assert_eq!(lookup(40, 32), Some(2));
+        // Alignment beyond the table maximum routes out (caller → medium/large).
+        assert_eq!(lookup(20, 64), None);
+        // Oversize and zero still reject.
+        assert_eq!(lookup(small_max + 1, 16), None);
+        assert_eq!(lookup(0, 16), None);
     }
 
     #[test]

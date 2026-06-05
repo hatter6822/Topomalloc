@@ -27,7 +27,7 @@ boundary). These discharge — by evaluation on the generated tuned table — th
 consume (the kernel cannot `decide` the 2048-granule lookup / the spacing products). -/
 def tableGate : Bool :=
   tableOk pageSize quantum smallMax sizeClasses && coversAllB && spacingOkB
-    && minimalLookupB && maxAlignOkB && hugeThresholdOkB
+    && minimalLookupB && lookupMatchesModelB && maxAlignOkB && hugeThresholdOkB
 
 /-- The executable model (W1-10) replays a good trace cleanly and flags the injected
 violation in the bad trace at the expected line — both for the structured event list and

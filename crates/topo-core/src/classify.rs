@@ -254,7 +254,7 @@ mod tests {
         use crate::flags::HugepagePolicy;
         // zero + prefer-hugepage + explicit arena 3.
         let raw = RequestFlags::NONE
-            .with(RequestFlags::ZERO)
+            .with_zero()
             .with_hugepage(HugepagePolicy::Prefer)
             .with_arena(3)
             .unwrap()

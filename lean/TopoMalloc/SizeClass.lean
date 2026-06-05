@@ -326,4 +326,91 @@ theorem buildTable_covers (p : Params) (hp : p.Valid) (req : Nat)
     unfold uniformClassOf at hle
     omega
 
+/- ------------------------------------------------------------------------- -/
+/- W2-3b — over-alignment routing (`align_walk`), modeled and proved.         -/
+/- ------------------------------------------------------------------------- -/
+
+/-- Class `i` exists and is naturally aligned enough for `align` (the walk's
+per-index predicate). -/
+def alignSatAt (classes : List SizeClassRow) (align i : Nat) : Bool :=
+  match classes[i]? with
+  | some r => Nat.ble align r.align
+  | none => false
+
+/-- Mirror of the runtime `align_walk`: the first class index `≥ start` that is
+naturally aligned enough for `align`, or `none`. The over-alignment escape
+(§9.3/§25.5) advances to a sufficiently-aligned class — it never offset-adjusts an
+object inside a shared slab. -/
+def alignWalk (classes : List SizeClassRow) (start align : Nat) : Option Nat :=
+  (List.range classes.length).find? (fun i => Nat.ble start i && alignSatAt classes align i)
+
+/-- **Over-alignment sufficiency (W2-3b).** Whatever class `alignWalk` selects is
+at or after `start` and is naturally aligned enough for the request — so the
+request is served without widening any slab's stride (the load-bearing §9.3/§25.5
+rule, proved rather than only tested). -/
+theorem alignWalk_sufficient {classes : List SizeClassRow} {start align ci : Nat}
+    (h : alignWalk classes start align = some ci) :
+    start ≤ ci ∧ ∃ r, classes[ci]? = some r ∧ align ≤ r.align := by
+  unfold alignWalk at h
+  have hpred := List.find?_some h
+  simp only [Bool.and_eq_true] at hpred
+  obtain ⟨hstart, hsat⟩ := hpred
+  refine ⟨Nat.le_of_ble_eq_true hstart, ?_⟩
+  unfold alignSatAt at hsat
+  split at hsat
+  · next r hr => exact ⟨r, hr, Nat.le_of_ble_eq_true hsat⟩
+  · next => simp at hsat
+
+/-- The size→class mapping, modeled: granule-lookup then the over-alignment walk
+(mirrors the runtime `size_class_in`). -/
+def sizeClassOf (classes : List SizeClassRow) (sizeToClass : List Nat)
+    (quantum size align : Nat) : Option Nat :=
+  match sizeToClass[(size - 1) / quantum]? with
+  | some start => alignWalk classes start align
+  | none => none
+
+/-- End-to-end: the classified size class is naturally aligned enough for the
+request — the W2-3b guarantee on the full modeled lookup. -/
+theorem sizeClassOf_sufficient {classes : List SizeClassRow} {sizeToClass : List Nat}
+    {quantum size align ci : Nat}
+    (h : sizeClassOf classes sizeToClass quantum size align = some ci) :
+    ∃ r, classes[ci]? = some r ∧ align ≤ r.align := by
+  unfold sizeClassOf at h
+  split at h
+  · next start _ => exact (alignWalk_sufficient h).2
+  · next => simp at h
+
+/- ------------------------------------------------------------------------- -/
+/- W2-1 — `maxAlign` upper-bound machinery (the `max`-fold over the table).    -/
+/- ------------------------------------------------------------------------- -/
+
+/-- The maximum alignment over a class list. -/
+def maxAlignOf (classes : List SizeClassRow) : Nat :=
+  classes.foldl (fun acc r => max acc r.align) 0
+
+theorem foldl_maxAlign_ge_init (l : List SizeClassRow) (init : Nat) :
+    init ≤ l.foldl (fun acc r => max acc r.align) init := by
+  induction l generalizing init with
+  | nil => simp
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    exact Nat.le_trans (Nat.le_max_left init hd.align) (ih (max init hd.align))
+
+theorem mem_align_le_foldl (l : List SizeClassRow) (init : Nat) {r : SizeClassRow}
+    (hr : r ∈ l) : r.align ≤ l.foldl (fun acc r => max acc r.align) init := by
+  induction l generalizing init with
+  | nil => simp at hr
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    rcases List.mem_cons.mp hr with rfl | hmem
+    · exact Nat.le_trans (Nat.le_max_right init r.align)
+        (foldl_maxAlign_ge_init tl (max init r.align))
+    · exact ih (max init hd.align) hmem
+
+/-- Every class's alignment is bounded by `maxAlignOf` — the fact behind the
+runtime `align > MAX_ALIGN` fast-reject being sound. -/
+theorem mem_align_le_maxAlignOf {classes : List SizeClassRow} {r : SizeClassRow}
+    (hr : r ∈ classes) : r.align ≤ maxAlignOf classes :=
+  mem_align_le_foldl classes 0 hr
+
 end TopoMalloc
