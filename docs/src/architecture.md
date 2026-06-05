@@ -117,7 +117,10 @@ while spans are concurrently created and recycled. Four modules in `topo-core`:
   the pagemap and the metadata ranges and returns the §17.5 class — `Null`, `Small`
   (with the object index, by the §16.3 slab-layout inverse, read through the seqlock
   so a recycle race never yields a torn result), `Large`, `Interior`, `Metadata`,
-  `Released`, `Quarantined`, or `External`. `free` requires a **base pointer** (§17.5);
+  `Released`, `Quarantined`, or `External`. It is **total over every address**: a
+  recycle that re-bases a span *above* the queried address yields `External` rather
+  than an `addr − base` underflow, so the slab-layout arithmetic can never panic or
+  wrap on any input. `free` requires a **base pointer** (§17.5);
   `validate_free` enforces exactly that, mapping a base pointer or `Null` to a
   `FreeTarget` and an interior/foreign/released/metadata/quarantined pointer to an
   `InvalidFree` that debug/hardened builds *detect and report* — never act on (W3-4b,

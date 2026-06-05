@@ -154,6 +154,17 @@ fn classify_in_span(span_ptr: *const SpanDescriptor, addr: usize) -> PointerClas
         return PointerClass::Quarantined;
     }
 
+    // Totality guard (W3-4). Under a recycle race the seqlock yields a *consistent*
+    // new incarnation, but the stale pagemap entry can point `addr` (from the old,
+    // lower page range) at a span now re-based *above* it. An `addr` below the
+    // current base does not belong to this incarnation — classify it foreign rather
+    // than underflow `addr - base`. With this guard every subtraction below is total
+    // (`addr >= base`, and the `< object0` / `index >= object_count` checks bound the
+    // rest), so classification never panics or wraps on any input.
+    if addr < geom.base {
+        return PointerClass::External;
+    }
+
     // Below object 0 ⇒ in the slab header region (interior to the span).
     if addr < geom.object0 {
         return PointerClass::Interior {
@@ -200,13 +211,18 @@ fn classify_in_large(desc_ptr: *const LargeDescriptor, addr: usize) -> PointerCl
     if desc.state() == LargeState::Released {
         return PointerClass::Released;
     }
-    if addr == desc.base() {
+    // Read the base once so the base-match and the interior offset are computed
+    // against the same value even under a (rare) large-recycle race.
+    let base = desc.base();
+    if addr == base {
         PointerClass::Large { desc: desc_ptr }
     } else {
-        // Any non-base address in the large allocation's pages is interior.
+        // Any non-base address in the large allocation's pages is interior. A
+        // recycle race could re-base above `addr`; `wrapping_sub` keeps the offset
+        // total (a diagnostic only — the free is rejected as non-base regardless).
         PointerClass::Interior {
-            base: desc.base(),
-            offset: addr.wrapping_sub(desc.base()),
+            base,
+            offset: addr.wrapping_sub(base),
         }
     }
 }
@@ -560,16 +576,45 @@ mod tests {
     }
 
     #[test]
-    fn classify_is_consistent_under_concurrent_recycle() {
-        // W3-4 seqlock stress: one thread repeatedly recycles the span (changing its
-        // object_count) while classifier threads resolve object 0's base. The
-        // seqlock guarantees each classification reads a *single* incarnation, so the
-        // result is always the consistent `Small { object_index: 0 }` (or, only if a
-        // recycle is persistently in flight, the conservative `External`) — never a
-        // torn read, a wrong index, a panic, or a crash.
+    fn classify_under_recycle_to_higher_base_is_total() {
+        // W3-4 totality (deterministic): the seqlock yields a consistent NEW
+        // geometry, but a stale pagemap entry can point a low addr at a span recycled
+        // to a HIGHER base. `classify_ptr` must stay total — no `addr - base`
+        // underflow / panic — and report the stale low addr as foreign.
         let m = meta_arena(256 * 1024);
-        // Leak the descriptor and arena so the spawned threads can borrow them for
-        // the scope without lifetime gymnastics; `meta_arena` already leaks.
+        let pm = PageMap::new();
+        let s = span(0x4000_0000, 0, 64);
+        pm.install_span(&m, &s).unwrap();
+        let low = s.object0_base().unwrap();
+        // Recycle to a higher base WITHOUT retiring the entry (exactly the race the
+        // seqlock defends): the entry at `low` still resolves to `s`.
+        assert!(s.recycle(
+            ArenaId::DEFAULT,
+            SizeClassId::new(0),
+            0x9000_0000,
+            1,
+            64,
+            0,
+            &m
+        ));
+        assert!(
+            pm.lookup(low).span_ptr().is_some(),
+            "stale entry still owns the page"
+        );
+        assert!(matches!(classify_ptr(&pm, &m, low), PointerClass::External));
+    }
+
+    #[test]
+    fn classify_is_consistent_under_concurrent_recycle() {
+        // W3-4 seqlock stress: one thread repeatedly recycles the span — varying both
+        // the object_count AND the base (low/high) — while classifier threads resolve
+        // a fixed low address. The seqlock guarantees each classification reads a
+        // *single* incarnation, and the totality guard keeps a low addr against a
+        // high base from underflowing: the result is always the consistent
+        // `Small { object_index: 0 }` (base low), the conservative `External` (base
+        // high, or a persistently in-flight recycle) — never a torn read, a wrong
+        // index, an underflow, a panic, or a crash.
+        let m = meta_arena(256 * 1024);
         let pm = PageMap::new();
         let s = span(0x4000_0000, 0, 64);
         pm.install_span(&m, &s).unwrap();
@@ -579,20 +624,14 @@ mod tests {
         let m = &m;
 
         std::thread::scope(|sc| {
-            // Recycler: same base/class (so object 0 stays valid), object_count
-            // cycling in 1..=64 — all inline bitmaps, so no growth/allocation.
+            // Recycler: alternate the base between the original (object 0 == obj0) and
+            // a higher one (obj0 < base, exercising the totality guard), and cycle the
+            // object_count — all inline bitmaps, so no growth/allocation.
             sc.spawn(move || {
                 for n in 0..20_000u32 {
                     let oc = 1 + (n % 64);
-                    assert!(s.recycle(
-                        ArenaId::DEFAULT,
-                        SizeClassId::new(0),
-                        0x4000_0000,
-                        1,
-                        oc,
-                        0,
-                        m
-                    ));
+                    let base = if n % 2 == 0 { 0x4000_0000 } else { 0x9000_0000 };
+                    assert!(s.recycle(ArenaId::DEFAULT, SizeClassId::new(0), base, 1, oc, 0, m));
                 }
             });
             for _ in 0..3 {

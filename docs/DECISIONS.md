@@ -171,8 +171,11 @@ makes six implementation choices; the module docs carry the detail.
   idempotent-init/hand-off state machine (`Bootstrap`, W3-1b), so the carving logic is
   unit-tested over a caller buffer with no global state. The hand-off is **real**:
   `hand_off_to(successor)` routes new metadata to the normal allocator (§17.4) while
-  already-vended bytes stay valid; `Bootstrap::global()` binds a `BOOTSTRAP_REGION_BYTES`
-  static reserve lazily (DD-2's "static reservation"). A debug **re-entrancy guard**
+  already-vended bytes stay valid; the `MetadataAlloc: Sync` supertrait makes the
+  "safe to call concurrently" contract a type fact (the successor lives behind the
+  `Sync` `Bootstrap` and is called from every thread). `Bootstrap::global()` binds a
+  `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"). A debug
+  **re-entrancy guard**
   (`is_in_alloc()`, a thread-local under `std`/tests, a no-op leaf otherwise) traps the
   S-007 bug of the metadata path re-entering the allocator. The arena is **never** freed
   — metadata a classifier may reach must outlive it (§27.5) — so logical reuse is caught
@@ -207,9 +210,14 @@ makes six implementation choices; the module docs carry the detail.
   pointer stays valid. Separately, a **seqlock** version brackets a recycle's geometry
   writes, and `classify_ptr` reads the geometry through it — so a classification racing
   a recycle (a use-after-free signal) is never composed from two incarnations; a
-  persistently racing recycle resolves conservatively to `External`. An integrity tag
-  (§17.3, FNV-1a over the read-mostly header) lets debug/hardened detect a corrupted
-  descriptor.
+  persistently racing recycle resolves conservatively to `External`. Classification is
+  also **total**: because a stale pagemap entry can point a low address at a span the
+  seqlock reports re-based *above* it, `classify_in_span` first rejects `addr < base`
+  as `External`, so every slab-layout subtraction is underflow-free and the function
+  never panics on any address (the recycle holds the span lock across the whole
+  geometry update, so a lock-holder never sees the bitmap and `object_count`
+  disagree). An integrity tag (§17.3, FNV-1a over the read-mostly header) lets
+  debug/hardened detect a corrupted descriptor.
 
 * **§8.5 in one critical section via a per-span lock.** `central_free ==
   popcount(free_bitmap)` is the authoritative central count; the bitmap edit and the

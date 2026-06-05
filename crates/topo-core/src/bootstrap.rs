@@ -42,8 +42,11 @@ use crate::overflow::align_up;
 ///
 /// Implementations MUST return memory that stays valid for the lifetime of the
 /// allocator (metadata is never freed back across this seam — recycled in place
-/// with a generation bump instead, §27.5) and MUST be safe to call concurrently.
-pub trait MetadataAlloc {
+/// with a generation bump instead, §27.5). The `Sync` bound makes the "MUST be
+/// safe to call concurrently" contract a type-system fact: a source handed to
+/// [`Bootstrap::hand_off_to`] is stored behind the `Sync` `Bootstrap` and called
+/// from every thread, so it must itself be `Sync`.
+pub trait MetadataAlloc: Sync {
     /// Allocate `size` bytes aligned to `align` (a power of two) for metadata, or
     /// `None` on exhaustion / overflow. Never wraps, never panics (§9.7).
     fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>>;

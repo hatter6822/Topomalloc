@@ -698,18 +698,21 @@ impl SpanDescriptor {
         slab_header: u32,
         meta: &dyn MetadataAlloc,
     ) -> bool {
-        // Resize/clear the bitmap first under the span lock; if it cannot grow, fail
-        // before mutating any geometry so the slot stays consistent.
-        self.lock.acquire();
-        let ok = self.free_bitmap.recycle_to(object_count, meta);
-        if ok {
-            self.live_count.store(0, Ordering::Relaxed);
-            self.central_free_count.store(0, Ordering::Relaxed);
-        }
-        self.lock.release();
-        if !ok {
+        // Hold the span lock across the *entire* recycle (RAII, released on every
+        // exit incl. a panic), so the bitmap resize and the geometry update are one
+        // critical section: a lock-holder (a `SpanGuard` doing central accounting)
+        // never observes a window where the bitmap is the new size but `object_count`
+        // is still the old value (§8.5). Classifiers, which do not take the lock, are
+        // kept consistent by the seqlock below.
+        let _span_lock = self.lock();
+        // Resize/clear the bitmap; if it cannot grow, fail before touching any
+        // geometry so the slot stays usable for its old class (safe failure). The
+        // guard releases the lock on this early return.
+        if !self.free_bitmap.recycle_to(object_count, meta) {
             return false;
         }
+        self.live_count.store(0, Ordering::Relaxed);
+        self.central_free_count.store(0, Ordering::Relaxed);
 
         // Open the seqlock (odd ⇒ geometry update in progress): a classifier that
         // observes an odd version, or a version change across its read, retries
@@ -729,7 +732,7 @@ impl SpanDescriptor {
         self.state.store(SpanState::Active as u8, Ordering::Release);
         self.refresh_integrity();
         // Close the seqlock (even ⇒ stable): publishes every geometry store to a
-        // classifier's acquire-load of the version.
+        // classifier's acquire-load of the version. `_span_lock` then releases.
         self.seq.fetch_add(1, Ordering::AcqRel);
         true
     }
