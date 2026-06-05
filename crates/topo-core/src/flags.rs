@@ -333,11 +333,11 @@ mod tests {
 
     #[test]
     fn lifetime_and_hotness_round_trip() {
-        for (lt, _) in [
-            (Lifetime::Unspecified, 0u32),
-            (Lifetime::Short, 1),
-            (Lifetime::Medium, 2),
-            (Lifetime::Long, 3),
+        for lt in [
+            Lifetime::Unspecified,
+            Lifetime::Short,
+            Lifetime::Medium,
+            Lifetime::Long,
         ] {
             assert_eq!(RequestFlags::NONE.with_lifetime(lt).hints().lifetime, lt);
         }

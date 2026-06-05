@@ -47,8 +47,10 @@ Advisory flags (§10.4) are decoded and **validated** by `RequestFlags` into a
 structured `Hints` (zero, cache-bypass, guard, hugepage preference, lifetime,
 hotness) plus arena routing; reserved bits and contradictory combinations fail
 deterministically. The public C `TOPO_*` values map onto this internal layout at
-the plan-06 API boundary. The Lean model mirrors the classifier and proves the
-size-coverage and over-alignment-sufficiency invariants (plan 02 W1-4).
+the plan-06 API boundary. The Lean model mirrors the classifier and proves both
+the size-coverage invariant (plan 02 W1-4) and the over-alignment-sufficiency
+invariant (plan 03 W2-3b: the lookup only ever returns a class whose natural
+alignment covers the request).
 
 ## Single source of truth (DD-1)
 
