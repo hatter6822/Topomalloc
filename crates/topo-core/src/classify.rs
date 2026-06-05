@@ -18,6 +18,7 @@
 //! and are routed to the medium/large path — **never** by widening a shared
 //! slab's stride (§9.3 / §25.5, W2-3b).
 
+use crate::flags::RequestFlags;
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
 use crate::ids::{ArenaId, Label, SizeClassId};
 use crate::overflow::align_up;
@@ -50,7 +51,7 @@ pub enum RequestKind {
 }
 
 /// A fully classified request (§A.1). Carries the routing decision plus the
-/// arena, information-flow label, validated alignment, and the raw advisory
+/// arena, information-flow label, validated alignment, and the validated advisory
 /// flags so the front/middle/back ends can act on placement hints (§10.4)
 /// without re-parsing the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,34 +64,37 @@ pub struct Request {
     pub label: Label,
     /// The required alignment (a validated power of two, `>= 1`).
     pub align: usize,
-    /// The raw advisory flags (§10.4), threaded through for downstream hints
-    /// (cache bypass, hugepage preference, hotness/lifetime). Interpretation of
-    /// the placement hints lands with plans 04/06; the classifier carries them.
-    pub flags: u32,
+    /// The validated advisory flags (§10.4). Decode placement hints with
+    /// [`RequestFlags::hints`]; the arena routed from them is already in
+    /// [`arena`](Self::arena). Acting on the placement hints (zeroing, cache
+    /// bypass, hugepage preference, hotness/lifetime) lands with plans 04/05/06.
+    pub flags: RequestFlags,
     /// How the request is served.
     pub kind: RequestKind,
 }
 
-/// Select the arena for a request (§A.1 `choose_arena`). On the POSIX
-/// single-authority backend there is exactly one arena; explicit arena routing
-/// via flags (§10.4 `TOPO_ARENA`) is a seam filled in with the public API
-/// (plan 06) and multi-authority caches (plan 05, D6).
+/// Select the arena for a request (§A.1 `choose_arena`): decode the explicit
+/// arena from the flag word (§10.4 `TOPO_ARENA`), defaulting to the always-present
+/// default arena. Arena ids beyond [`RequestFlags::MAX_ARENA_ID`] cannot be
+/// flag-encoded and reach the allocator through the explicit-arena handle of the
+/// public API (plan 06); multi-authority cache routing follows at M2 (D6).
 #[inline]
-fn choose_arena(_flags: u32) -> ArenaId {
-    ArenaId::DEFAULT
+fn choose_arena(flags: RequestFlags) -> ArenaId {
+    flags.arena()
 }
 
 /// Select the information-flow label for a request (§36.12). POSIX is a single
 /// authority domain, so every request is `PUBLIC`; seLe4n derives the label from
 /// the arena's authority at integration (plan 09).
 #[inline]
-fn choose_label(_arena: ArenaId, _flags: u32) -> Label {
+fn choose_label(_arena: ArenaId, _flags: RequestFlags) -> Label {
     Label::PUBLIC
 }
 
 /// Classify a request (§A.1). Returns `None` if the alignment is not a power of
-/// two or the size/alignment rounding would overflow (§9.7); the caller turns
-/// `None` into a null return / `bad_alloc`. Never panics, never wraps.
+/// two, the flag word is invalid (§10.4), or the size/alignment rounding would
+/// overflow (§9.7); the caller turns `None` into a null return / `bad_alloc`.
+/// Never panics, never wraps.
 ///
 /// Zero-size requests follow the `zero_unique` policy (§9.6): they are treated
 /// as a 1-byte request, so `malloc(0)` yields a unique freeable pointer from the
@@ -108,6 +112,9 @@ pub fn classify(size: usize, align: usize, flags: u32) -> Option<Request> {
     if !align.is_power_of_two() {
         return None;
     }
+    // flags_invalid (§10.4): reject reserved bits / contradictory combinations
+    // deterministically, so an invalid flag word never silently degrades.
+    let flags = RequestFlags::from_raw(flags)?;
     // §9.6 zero_unique: a zero-size request behaves like a 1-byte request.
     let effective = if size == 0 { 1 } else { size };
 
@@ -243,9 +250,36 @@ mod tests {
     }
 
     #[test]
-    fn flags_are_threaded_through() {
-        let r = classify(32, 16, 0xABCD).unwrap();
-        assert_eq!(r.flags, 0xABCD);
+    fn valid_flags_are_decoded_and_threaded() {
+        use crate::flags::HugepagePolicy;
+        // zero + prefer-hugepage + explicit arena 3.
+        let raw = RequestFlags::NONE
+            .with(RequestFlags::ZERO)
+            .with_hugepage(HugepagePolicy::Prefer)
+            .with_arena(3)
+            .unwrap()
+            .raw();
+        let r = classify(32, 16, raw).unwrap();
+        assert_eq!(r.flags.raw(), raw);
+        assert_eq!(r.arena, ArenaId(3)); // §A.1 choose_arena decoded the flag
+        let h = r.flags.hints();
+        assert!(h.zero);
+        assert_eq!(h.hugepage, HugepagePolicy::Prefer);
+    }
+
+    #[test]
+    fn invalid_flags_are_rejected_deterministically() {
+        // §10.4: a reserved bit fails deterministically (not silently dropped).
+        assert_eq!(classify(32, 16, 1 << 23), None);
+        // Contradictory hugepage preference is rejected.
+        assert_eq!(
+            classify(
+                32,
+                16,
+                RequestFlags::NO_HUGEPAGE | RequestFlags::PREFER_HUGEPAGE
+            ),
+            None
+        );
     }
 
     #[test]

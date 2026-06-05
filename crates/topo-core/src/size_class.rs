@@ -59,14 +59,32 @@ pub fn size_class(size: usize, align: usize) -> Option<SizeClassId> {
     // Indexing soundness: `1 <= size <= SMALL_MAX` and `SIZE_TO_CLASS` has
     // `SMALL_MAX / QUANTUM` entries, so `granule` is in bounds (the generator
     // proves this). We still use a checked `get` to keep the runtime total.
-    let mut idx = *SIZE_TO_CLASS.get(granule)? as usize;
-    while idx < SIZE_CLASSES.len() && (SIZE_CLASSES[idx].align as usize) < align {
+    let start = *SIZE_TO_CLASS.get(granule)? as usize;
+    align_walk(start, align, SIZE_CLASSES).map(SizeClassId::new)
+}
+
+/// The over-alignment escape (§9.3 / §25.5, W2-3b), factored out so it can be
+/// exercised against tables that actually contain over-aligned classes (the
+/// shipped table is uniformly 16-aligned, so `size_class` short-circuits before
+/// reaching the walk).
+///
+/// From `start` — the smallest class whose *size* already covers the request —
+/// advance to the smallest class at or after it whose *natural* alignment is
+/// `>= align`, returning its index, or `None` if no such class exists (the
+/// caller then routes to medium/large). Advancing to a more-aligned class,
+/// rather than offset-adjusting an object inside a shared slab, is what preserves
+/// the `base0 + i*size` layout for every neighbour.
+#[inline]
+fn align_walk(start: usize, align: usize, classes: &[SizeClassRow]) -> Option<usize> {
+    let mut idx = start;
+    while idx < classes.len() && (classes[idx].align as usize) < align {
         idx += 1;
     }
-    if idx >= SIZE_CLASSES.len() {
-        return None;
+    if idx < classes.len() {
+        Some(idx)
+    } else {
+        None
     }
-    Some(SizeClassId::new(idx))
 }
 
 /// The usable size (allocated bytes) for a size class.
@@ -227,6 +245,42 @@ mod tests {
             assert_eq!(slab_bytes(sc), r.slab_pages as usize * tables::PAGE_SIZE);
             assert_eq!(row(sc), r);
         }
+    }
+
+    #[test]
+    fn align_walk_routes_over_aligned_to_a_more_aligned_class() {
+        // A synthetic table WITH an over-aligned class (the shipped table is
+        // uniformly 16-aligned, so this is the only way to exercise the
+        // walk-forward branch, W2-3b). Class 2 is the lone 32-aligned class; it
+        // is deliberately in the *middle* so "the only aligned class is behind
+        // the size-start" is reachable. Sizes ascend; each size is a multiple of
+        // its align (§9.3), so the rows are well-formed.
+        fn r(size: u32, align: u32) -> SizeClassRow {
+            SizeClassRow {
+                size,
+                align,
+                slab_pages: 1,
+                objects_per_slab: 1,
+                batch: 1,
+                max_local_capacity: 1,
+            }
+        }
+        let table = [r(16, 16), r(32, 16), r(96, 32), r(160, 16), r(256, 16)];
+
+        // align <= the start class's alignment: no advance.
+        assert_eq!(align_walk(0, 16, &table), Some(0));
+        assert_eq!(align_walk(1, 1, &table), Some(1));
+        // Over-aligned: skip both 16-aligned classes 0,1 to reach the 32-aligned 2.
+        assert_eq!(align_walk(0, 32, &table), Some(2));
+        // Already at/inside a sufficiently-aligned class: stay.
+        assert_eq!(align_walk(2, 32, &table), Some(2));
+        // No class is 64-aligned (table max is 32): route out (None).
+        assert_eq!(align_walk(0, 64, &table), None);
+        // The 32-aligned class (2) exists but is *behind* the size-start (3): the
+        // request can't be served small → None, so the caller routes to med/large.
+        assert_eq!(align_walk(3, 32, &table), None);
+        // start past the end → None (defensive).
+        assert_eq!(align_walk(table.len(), 1, &table), None);
     }
 
     #[test]

@@ -6,6 +6,23 @@
 //! safely and MUST NOT wrap around and allocate too little memory. These helpers
 //! are the single place that arithmetic is allowed to round, so the property is
 //! provable by inspection and is covered by exhaustive-ish unit tests below.
+//!
+//! **§9.7 overflow-check map.** Every rounding the SPEC requires be checked is
+//! discharged by a helper here, used at exactly one site:
+//!
+//! | §9.7 rounding to check | Checked helper | Used at |
+//! |---|---|---|
+//! | `n * size` (calloc) | [`array_bytes`] | `topomalloc_calloc` (topo-abi) |
+//! | alignment rounding | [`align_up`] | `classify` span, skeleton address align |
+//! | size-class rounding | — (table-bounded) | `size_class` rejects `> SMALL_MAX`, no arithmetic |
+//! | span / page count | [`pages_for`] | backend page accounting (plan 04) |
+//! | hugepage rounding | [`hugepage_round`] | hugepage backend (plan 04) |
+//! | metadata indexing | — | pagemap (plan 03 W3) |
+//!
+//! The hugepage backend is plan 04, so [`hugepage_round`] is not yet on a live
+//! path; it is the checked primitive that backend will use, verified
+//! overflow-safe here now (so the §9.7 "hugepage rounding overflow" obligation is
+//! discharged at the primitive even before the backend lands).
 
 /// Returns `true` iff `value` is a multiple of `align`.
 ///
@@ -50,6 +67,23 @@ pub fn pages_for(bytes: usize, page_size: usize) -> Option<usize> {
         "page size must be a power of two"
     );
     Some(align_up(bytes, page_size)? / page_size)
+}
+
+/// Round `bytes` up to a whole number of hugepages (`hugepage_size` bytes),
+/// checked (§9.7 "hugepage rounding overflow MUST be checked"). `hugepage_size`
+/// must be a power of two and nonzero.
+///
+/// The hugepage backend lands with plan 04; this is the checked rounding
+/// primitive it will use. Sharing [`align_up`] keeps every rounding kind on the
+/// one overflow-safe code path (§9.7 map in the module docs), so "round up to a
+/// hugepage" can never wrap to a smaller region.
+#[inline]
+pub fn hugepage_round(bytes: usize, hugepage_size: usize) -> Option<usize> {
+    debug_assert!(
+        hugepage_size.is_power_of_two(),
+        "hugepage size must be a power of two"
+    );
+    align_up(bytes, hugepage_size)
 }
 
 #[cfg(test)]
@@ -102,5 +136,18 @@ mod tests {
         assert_eq!(pages_for(4097, 4096), Some(2));
         assert_eq!(pages_for(0, 4096), Some(0));
         assert_eq!(pages_for(usize::MAX, 4096), None);
+    }
+
+    #[test]
+    fn hugepage_round_rounds_and_overflows() {
+        // §9.7: rounding up to a hugepage is checked and never wraps.
+        const HUGE: usize = 2 * 1024 * 1024; // 2 MiB
+        assert_eq!(hugepage_round(1, HUGE), Some(HUGE));
+        assert_eq!(hugepage_round(HUGE, HUGE), Some(HUGE));
+        assert_eq!(hugepage_round(HUGE + 1, HUGE), Some(2 * HUGE));
+        assert_eq!(hugepage_round(0, HUGE), Some(0));
+        // Near the top of the address space it must fail, not wrap to a tiny size.
+        assert_eq!(hugepage_round(usize::MAX, HUGE), None);
+        assert_eq!(hugepage_round(usize::MAX - HUGE + 2, HUGE), None);
     }
 }

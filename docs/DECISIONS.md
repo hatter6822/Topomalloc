@@ -118,3 +118,38 @@ which clones the exact pinned SHA into `vendor/sele4n/` (GPL-3.0-or-later, on th
 seLe4n side of the D5 boundary) for hermetic/offline builds. Because the
 simulator mirrors the pinned ABI surface, any upstream drift becomes a compile
 error (risk R13). See [`docs/ABI.md`](ABI.md).
+
+## W2 — classifier design notes (plan 03)
+
+Four W2 implementation choices are ratified here; the module docs
+(`crates/topo-core/src/{classify,size_class,flags,overflow}.rs`) carry the detail.
+
+* **Medium/large bucketing on `max(size, align)`.** The classifier decides the
+  Small/Medium/Large split (§A.1) on the *span* — the smallest region that
+  satisfies both the size and the alignment — rather than §A.1's illustrative
+  `size`-only test. An over-aligned request whose alignment alone reaches the
+  hugepage threshold is thus routed to the Large/hugepage path instead of
+  burdening the medium extent allocator with a hugepage-aligned hole (§9.3 /
+  §25.5 / §18.5).
+* **Full direct-mapped size→class lookup.** The plan sketches a hybrid (direct-map
+  small sizes, compute larger ones from the class array). At `small_max = 32 KiB`
+  the granule LUT is 2 KiB (`u8 × 2048`), L1-resident and constant-time, so the
+  shipped lookup is a single direct map for the whole small range — no second code
+  path, no arithmetic class derivation. Ratified over the hybrid. The over-aligned
+  escape is factored into `align_walk`, unit-tested against synthetic tables that
+  contain over-aligned classes (the shipped table is uniformly 16-aligned).
+* **Internal flag/hints model, validated (§10.4).** `RequestFlags` is the
+  allocator's internal, validated representation of the advisory flags (zero,
+  cache-bypass, guard, hugepage preference, lifetime, hotness, arena routing). It
+  decodes to a structured `Hints`; reserved bits and the contradictory
+  `NO_HUGEPAGE | PREFER_HUGEPAGE` combination are rejected deterministically
+  (`classify` → `None`), satisfying §10.4 without freezing the public C `TOPO_*`
+  ABI — plan 06 maps those macros onto this layout. Alignment is a dedicated
+  `classify` parameter, never a flag bit, so the "mandatory alignment MUST NOT be
+  silently ignored" rule holds trivially. Per-call NUMA-node / explicit-tcache
+  routing are deferred to the placement/cache subsystems (plans 15/05).
+* **Hugepage rounding: a checked primitive now, page-rounded Large for now.**
+  `overflow::hugepage_round` discharges the §9.7 "hugepage rounding overflow"
+  obligation as a verified, overflow-safe primitive; the classifier still
+  page-rounds Large until the hugepage backend (plan 04) sets the §18.6
+  region-cache policy that governs whole-hugepage rounding.

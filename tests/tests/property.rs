@@ -12,7 +12,7 @@ use topo_backend_posix::PosixBackingProvider;
 use topo_core::classify::RequestKind;
 use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
 use topo_core::size_class::row;
-use topo_core::{classify, trace, usable_size, ArenaId, SkeletonAllocator};
+use topo_core::{classify, trace, usable_size, RequestFlags, SkeletonAllocator};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -153,18 +153,30 @@ proptest! {
     /// and every medium/large extent is a whole number of allocator pages.
     #[test]
     fn classify_is_total_deterministic_and_sound(
-        size in 0usize..=(1usize << 48),
+        // Include sizes near usize::MAX so the overflow → None path is exercised,
+        // not just the comfortable range.
+        size in prop_oneof![0usize..=(1usize << 48), (usize::MAX - 65_536)..=usize::MAX],
         align_exp in 0u32..=48,
-        flags in any::<u32>(),
+        // Mostly-valid flag words (no reserved bits) plus some fully-random ones,
+        // so both the accept and the §10.4 reject paths get coverage.
+        flags in prop_oneof![3 => 0u32..(1u32 << 23), 1 => any::<u32>()],
     ) {
         let align = 1usize << align_exp;
         // Determinism: a pure function of its inputs (W2-3a "deterministic").
         prop_assert_eq!(classify(size, align, flags), classify(size, align, flags));
 
-        let Some(req) = classify(size, align, flags) else { return Ok(()); };
+        // §10.4: an invalid flag word is rejected deterministically. `align` is a
+        // valid power of two here, so the only other failure source is overflow.
+        if RequestFlags::from_raw(flags).is_none() {
+            prop_assert!(classify(size, align, flags).is_none());
+            return Ok(());
+        }
+
+        let Some(req) = classify(size, align, flags) else { return Ok(()); }; // remaining None ⇒ overflow
         prop_assert_eq!(req.align, align);
-        prop_assert_eq!(req.flags, flags);
-        prop_assert_eq!(req.arena, ArenaId::DEFAULT);
+        prop_assert_eq!(req.flags.raw(), flags);
+        // The arena is decoded from the flag word (§A.1 choose_arena).
+        prop_assert_eq!(req.arena, RequestFlags::from_raw(flags).unwrap().arena());
 
         let span = size.max(1).max(align); // effective size folded with alignment
         match req.kind {

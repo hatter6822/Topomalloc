@@ -41,6 +41,34 @@ def coversAllB : Bool := (List.range (smallMax / quantum)).all granuleOk
 Bool is *evaluated* by `lake exe check` (the products would strain in-kernel `decide`). -/
 def spacingOkB : Bool := spacingOk sizeClasses
 
+/-- The generated `maxAlign` equals the widest class alignment. The Rust runtime rejects an
+over-aligned request in O(1) when `align > MAX_ALIGN`; that is sound only if `maxAlign` is the
+true maximum, so the `lake exe check` gate re-derives it from the emitted rows (DD-1). -/
+def maxAlignOkB : Bool := maxAlign == sizeClasses.foldl (fun acc r => max acc r.align) (0 : Nat)
+
+/-- The generated `hugeThreshold` (medium/large boundary, §9.2/§A.1) is well-formed: strictly
+above the small path and a whole number of allocator pages, so the medium range is non-empty
+and a page-rounded medium request can never reach the large regime. -/
+def hugeThresholdOkB : Bool :=
+  Nat.blt smallMax hugeThreshold && hugeThreshold % pageSize == 0
+
+/-- Granule `g`'s lookup is *minimal*, not merely covering: the class before the chosen one is
+too small for the granule's smallest request `g*quantum + 1`, so no smaller class fits. With
+`coversAllB` (coverage) this pins the emitted lookup to the unique smallest-fitting class —
+the same property the Rust `lookup_matches_linear_scan` test checks, so both languages agree. -/
+def granuleMinimalB (g : Nat) : Bool :=
+  match sizeToClass[g]? with
+  | none => false
+  | some 0 => true
+  | some (p + 1) =>
+    match sizeClasses[p]? with
+    | none => false
+    | some prev => decide (prev.size < g * quantum + 1)
+
+/-- The whole emitted lookup is minimal: every granule up to `small_max` maps to the smallest
+fitting class. Evaluated by `lake exe check`, like `coversAllB`. -/
+def minimalLookupB : Bool := (List.range (smallMax / quantum)).all granuleMinimalB
+
 /-- A sound granule yields its covering class and row. -/
 theorem granuleOk_elim {g : Nat} (h : granuleOk g = true) :
     ∃ ci row, sizeToClass[g]? = some ci ∧ sizeClasses[ci]? = some row ∧

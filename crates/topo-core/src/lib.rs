@@ -16,6 +16,7 @@
 pub mod backend;
 pub mod classify;
 pub mod error;
+pub mod flags;
 pub mod generated;
 pub mod ids;
 pub mod overflow;
@@ -33,6 +34,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use backend::{Region, Rights, TopoBackingProvider};
 pub use classify::{classify, Request, RequestKind};
 pub use error::BackendError;
+pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use ids::{ArenaId, Label, SizeClassId};
 pub use profile::{active_profile, debug_checks_enabled};
 pub use size_class::{size_class, usable_size, SizeClassRow};
