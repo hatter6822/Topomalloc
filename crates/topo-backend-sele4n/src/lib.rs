@@ -239,22 +239,62 @@ impl Drop for Sele4nSim {
     }
 }
 
-// --- the real seLe4n ABI bridge (plan 09 W22-0; verified against the pin) -------
-//
-// At M1 the `real-abi` feature compiles a `KernelError -> BackendError` mapping (and
-// then `Sele4nBackingProvider`) against the vendored, pinned `sele4n-types`/
-// `sele4n-abi`. That mapping was **verified to compile against the pinned SHA** this
-// session (docs/DECISIONS.md §D8); the exact, reviewed table is recorded there so
-// W22-0 commits it together with the vendored tree and its supply-chain plumbing
-// (deny exceptions, SPDX skip). It is intentionally NOT compiled here, to keep the
-// default build hermetic and free of a committed GPL tree until W22-0:
-//
-//   UntypedRegionExhausted                       -> BackendError::OutOfMemory
-//   InvalidCapability | UntypedTypeMismatch
-//     | UntypedDeviceRestriction
-//     | UntypedAllocSizeTooSmall | AddressOutOfBounds
-//     | MappingConflict | TargetSlotOccupied      -> BackendError::InvalidRequest
-//   _                                            -> BackendError::Unsupported
+/// The bridge to the **real** pinned seLe4n ABI (D8, plan 09 W22-0), compiled only
+/// under `--features real-abi` against the vendored, pinned `sele4n-abi`/
+/// `sele4n-types` (`vendor/sele4n/`, GPL-3.0-or-later). At M0 this proves the seLe4n
+/// side **type-checks against the pinned upstream** (the W4-1 acceptance); the full
+/// `Sele4nBackingProvider` over real frame/untyped capabilities grows here in plan
+/// 09 (W22-0).
+#[cfg(feature = "real-abi")]
+pub mod real_abi {
+    use sele4n_types::KernelError;
+    use topo_core::BackendError;
+
+    /// Map a real seLe4n [`KernelError`] onto the host-visible [`BackendError`]
+    /// taxonomy (§36.6; the `KernelError` mapping `topo_core::error` documents as a
+    /// plan-09 deliverable). Untyped exhaustion is the §36.16 OOM the simulator
+    /// already models; malformed retype/mapping/capability requests become
+    /// `InvalidRequest`; everything else is reported conservatively as `Unsupported`
+    /// until plan 09 refines the full table. This function compiling against the
+    /// pinned `KernelError` is the M0 "seLe4n side type-checks vs pinned upstream"
+    /// witness (W4-1).
+    pub fn map_kernel_error(e: KernelError) -> BackendError {
+        match e {
+            KernelError::UntypedRegionExhausted => BackendError::OutOfMemory,
+            KernelError::InvalidCapability
+            | KernelError::UntypedTypeMismatch
+            | KernelError::UntypedDeviceRestriction
+            | KernelError::UntypedAllocSizeTooSmall
+            | KernelError::AddressOutOfBounds
+            | KernelError::MappingConflict
+            | KernelError::TargetSlotOccupied => BackendError::InvalidRequest,
+            _ => BackendError::Unsupported,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn kernel_errors_map_onto_the_backend_taxonomy() {
+            // Compiles + runs only under `--features real-abi`, against the pinned
+            // upstream `KernelError` — the W4-1 type-check witness, exercised.
+            assert_eq!(
+                map_kernel_error(KernelError::UntypedRegionExhausted),
+                BackendError::OutOfMemory
+            );
+            assert_eq!(
+                map_kernel_error(KernelError::InvalidCapability),
+                BackendError::InvalidRequest
+            );
+            assert_eq!(
+                map_kernel_error(KernelError::PolicyDenied),
+                BackendError::Unsupported
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -28,8 +28,21 @@ confidence-threshold = 0.9
 # The D5 license boundary: GPL-3.0-or-later is permitted ONLY for the seLe4n
 # integration crates — never for an arbitrary dependency. This is the automated
 # counterpart to the per-file SPDX policy and the `xtask` license-boundary check.
+# `topo-backend-sele4n` (a workspace member, always audited) is GPL; the vendored,
+# pinned seLe4n ABI crates it links under `--features real-abi` (`vendor/sele4n/**`,
+# D8) are GPL too. The two `sele4n-*` exceptions are the standing D5 authorization
+# for exactly those crates. They are dormant in the default audit (real-abi is off,
+# so they are not in the resolved graph — cargo-deny notes them as "unmatched",
+# which is non-fatal, like the unmatched permissive allowances above). They are NOT
+# folded into the graph via `[graph] all-features` because cargo-deny's wildcard
+# rule rejects the *vendored crates' own* versionless intra-workspace path deps
+# (upstream's convention, which we keep pristine — see NOTICE §3); the licensing of
+# the vendored tree is instead assured by its `LICENSE`, per-file SPDX, and this
+# policy.
 exceptions = [
     { crate = "topo-backend-sele4n", allow = ["GPL-3.0-or-later"] },
+    { crate = "sele4n-types", allow = ["GPL-3.0-or-later"] },
+    { crate = "sele4n-abi", allow = ["GPL-3.0-or-later"] },
 ]
 
 [bans]

@@ -309,6 +309,19 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
     );
+    // seLe4n `real-abi`: the GPL backend must keep compiling against the pinned,
+    // vendored ABI (D8, W4-1) — guards the `vendor/sele4n` wiring against drift.
+    r.run(
+        "test seLe4n real-abi (vendored pin)",
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "topo-backend-sele4n",
+            "--features",
+            "real-abi",
+        ],
+    );
     global_alloc_smoke_step(&mut r);
 
     // C ABI compile-link-run (§34.1) + rustdoc intra-doc-link check.

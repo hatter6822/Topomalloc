@@ -119,20 +119,35 @@ seLe4n side of the D5 boundary) for hermetic/offline builds. Because the
 simulator mirrors the pinned ABI surface, any upstream drift becomes a compile
 error (risk R13). See [`docs/ABI.md`](ABI.md).
 
-**Vendor + `real-abi` verified (plan 04 W4-1).** The vendor mechanism and the
-`real-abi` wiring were *exercised end-to-end* against the pin during W4:
-`vendor_sele4n.sh` fetched the exact SHA `57c1105…`, the vendored `sele4n-types`/
-`sele4n-abi` compiled cleanly under our toolchain (a nested workspace supplies the
-upstream `*.workspace` fields), and `topo-backend-sele4n --features real-abi`
-type-checked against them — including a `KernelError -> BackendError` bridge
+**Vendor + `real-abi` committed (plan 04 W4-1).** The pinned seLe4n ABI is now
+**vendored into the repository** and `topo-backend-sele4n --features real-abi`
+links it. `vendor_sele4n.sh` fetched the exact SHA `57c1105…`; the minimal pristine
+closed set — `sele4n-types`, `sele4n-abi`, and `sele4n-sys` (a dev-dependency of
+`sele4n-abi`, so its manifest must resolve) — lives under `vendor/sele4n/`, GPL-3.0
+-or-later, with the full `LICENSE` and the `PINNED_SHA`. A nested workspace
+(`vendor/sele4n/Cargo.toml`, excluded from the MIT root) supplies the upstream
+`*.workspace` fields. `real-abi` (off by default) pulls `sele4n-types`/`sele4n-abi`
+as optional path deps and compiles the `KernelError -> BackendError` bridge
 (`UntypedRegionExhausted -> OutOfMemory`; `InvalidCapability`/`UntypedTypeMismatch`/
 `UntypedDeviceRestriction`/`UntypedAllocSizeTooSmall`/`AddressOutOfBounds`/
-`MappingConflict`/`TargetSlotOccupied -> InvalidRequest`; else `Unsupported`). This
-is the W4-1 "seLe4n side type-checks vs pinned upstream" evidence. The vendored tree
-is **gitignored** and the deps stay **uncommitted** so the default build remains
-hermetic and the MIT repo carries no GPL tree; committing the mirror, the path deps,
-and the supply-chain plumbing (cargo-deny exceptions, the vendor SPDX skip) is the
-plan 09 W22-0 deliverable, where the verified bridge above is committed verbatim.
+`MappingConflict`/`TargetSlotOccupied -> InvalidRequest`; else `Unsupported`) — the
+W4-1 "seLe4n side type-checks vs pinned upstream" evidence, now exercised by a unit
+test under that feature.
+
+Supply-chain plumbing (the D5/D8 invariants, all kept):
+
+* **Default build stays hermetic + MIT.** The seLe4n deps are *optional* (off by
+  default), so a default `cargo build`/`metadata` resolves nothing from the mirror;
+  the MIT default artifact links no GPL (the `xtask` license-boundary check confirms
+  `topo-abi` pulls no seLe4n crate). `topo-backend-sele4n` is marked `publish = false`
+  (it cannot be published — it links path-only GPL crates).
+* **Licenses.** `cargo-deny` allows GPL-3.0-or-later only for `topo-backend-sele4n`
+  and the `sele4n-*` exceptions (the standing D5 authorization). The vendored tree's
+  own files keep their upstream SPDX + `LICENSE` and are exempt from the per-file
+  SPDX gate (the `xtask` scan skips `vendor/`); NOTICE §2/§4 attributes them.
+* **No build artifacts committed.** Only the vendored source + manifests are
+  committed; `vendor/sele4n/target` and the standalone `vendor/sele4n/Cargo.lock`
+  are gitignored (the root lock governs the real-abi build).
 
 ## W2 — classifier design notes (plan 03)
 

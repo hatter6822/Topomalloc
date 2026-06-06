@@ -26,7 +26,10 @@ members = [
 ]
 # `fuzz/` is intentionally excluded: cargo-fuzz requires a nightly toolchain and
 # its own workspace (W0-7). It is built on demand by `xtask test --kind fuzz`.
-exclude = ["fuzz"]
+# `vendor/sele4n` is the pinned, GPL-3.0-or-later seLe4n ABI mirror (D8): its own
+# workspace, so its upstream `*.workspace` inheritance resolves there (not against
+# this MIT root). It is linked only by `topo-backend-sele4n --features real-abi`.
+exclude = ["fuzz", "vendor/sele4n"]
 
 [workspace.package]
 version = "0.1.0"
