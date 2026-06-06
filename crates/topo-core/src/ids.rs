@@ -63,14 +63,41 @@ impl Generation {
     /// The generation of a freshly created (never-recycled) span.
     pub const FIRST: Generation = Generation(0);
 
-    /// The next generation, saturating at `u32::MAX` so a recycle can never wrap a
-    /// generation back onto a value a live stale reference might still hold (a
-    /// wrap would defeat the ABA guard, §27.5). Saturation is safe: `2^32`
-    /// recycles of one descriptor slot without the address space being reused is
-    /// not reachable, and pinning at the top only makes the guard *more*
-    /// conservative (every further compare reports "stale").
+    /// The next generation. **Wraps** rather than saturates: saturating at
+    /// `u32::MAX` would pin every recycle past the `2^32`-th at the same value, so a
+    /// [`GenGuard`](crate::span::GenGuard) captured *at* the saturated value would
+    /// then match every later incarnation of that slot — silently defeating the ABA
+    /// guard exactly when the counter is exhausted (§27.5). Wrapping keeps
+    /// consecutive incarnations distinct; an ABA collision then needs an exact
+    /// `2^32`-recycle alignment of one slot, the irreducible limit of a 32-bit tag.
+    /// `0` is skipped on wrap so it stays the sentinel for a never-recycled span
+    /// ([`FIRST`](Self::FIRST)).
     #[inline]
     pub const fn next(self) -> Generation {
-        Generation(self.0.saturating_add(1))
+        match self.0.wrapping_add(1) {
+            0 => Generation(1),
+            n => Generation(n),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_next_increments_then_wraps_skipping_zero() {
+        // Normal increments (the overwhelmingly common case) are unchanged.
+        assert_eq!(Generation::FIRST.next(), Generation(1));
+        assert_eq!(Generation(41).next(), Generation(42));
+        assert_eq!(Generation(u32::MAX - 1).next(), Generation(u32::MAX));
+
+        // At the boundary it *wraps* rather than saturating, so a slot's incarnations
+        // stay distinct — saturating would pin every later recycle at MAX and let a
+        // `GenGuard` captured there match forever (the ABA hole this guards against).
+        // 0 is skipped so it stays the never-recycled sentinel (`FIRST`).
+        assert_eq!(Generation(u32::MAX).next(), Generation(1));
+        assert_ne!(Generation(u32::MAX).next(), Generation(u32::MAX));
+        assert_ne!(Generation(u32::MAX).next(), Generation::FIRST);
     }
 }

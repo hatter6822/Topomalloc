@@ -485,6 +485,15 @@ impl Bootstrap {
             unsafe {
                 GLOBAL.init(REGION.0.get().cast::<u8>(), BOOTSTRAP_REGION_BYTES);
             }
+            // If we *lost* the init race, the winner may still be mid-init (state
+            // `Initializing`): returning now would let a first `alloc` observe the
+            // arena as not-yet-published and spuriously fail with `None`. Wait until
+            // the winner publishes `Active`/`HandedOff` so concurrent lazy first-use is
+            // never starved. The winner itself already passes this (it set the state),
+            // and `init` always completes promptly, so the spin cannot deadlock.
+            while !GLOBAL.is_initialized() {
+                core::hint::spin_loop();
+            }
         }
         &GLOBAL
     }
