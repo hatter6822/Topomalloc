@@ -180,8 +180,11 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("fuzz") => {
             fuzz_steps(&mut r);
         }
+        Some("loom") => {
+            loom_steps(&mut r);
+        }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz)");
+            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom)");
             r.record("unknown test kind", false);
         }
         None => {
@@ -292,6 +295,14 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
 
     // Tests, including the seLe4n simulator vertical slice (G-sim).
     r.run("test host", "cargo", &["test", "--workspace"]);
+    // Hardened pass (G-core): the `debug-checks` profile compiles in the §17.3 /
+    // Appendix-B invariant checks, so the corruption-resistant classification and
+    // descriptor-integrity tests actually run.
+    r.run(
+        "test hardened (debug-checks)",
+        "cargo",
+        &["test", "-p", "topo-core", "--features", "debug-checks"],
+    );
     r.run(
         "test dual-backend (G-sim)",
         "cargo",
@@ -406,6 +417,21 @@ fn fuzz_steps(r: &mut Runner<'_>) {
     } else {
         r.note("cargo-fuzz not found; skipping fuzz build. Install: cargo install cargo-fuzz (nightly).");
     }
+}
+
+/// `loom` model-check of the W3 lock-free protocols (the seqlock and the pagemap
+/// publish/read, W3-3c/W3-4). Run under `--cfg loom` so loom and its heavy
+/// transitive deps stay out of the normal build/audit. Slower than unit tests
+/// (exhaustive interleaving), so it is opt-in (`xtask test --kind loom`), not part
+/// of the default `ci` sweep.
+fn loom_steps(r: &mut Runner<'_>) {
+    std::env::set_var("RUSTFLAGS", "--cfg loom");
+    r.run(
+        "loom protocols (seqlock + publish/read)",
+        "cargo",
+        &["test", "-p", "topo-core", "--test", "loom_protocols"],
+    );
+    std::env::remove_var("RUSTFLAGS");
 }
 
 /// Run the `#[global_allocator]` bootstrap smoke example (the re-entrancy guard,

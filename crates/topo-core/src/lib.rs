@@ -43,7 +43,10 @@ pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use ids::{ArenaId, Generation, Label, LargeId, SizeClassId, SpanId};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
-pub use ptr_class::{classify_ptr, validate_free, InvalidFree, PointerClass};
+pub use ptr_class::{
+    classify_ptr, validate_free, AnyMetadataRegion, FreeTarget, InvalidFree, MetadataRegion,
+    NoMetadata, PointerClass,
+};
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
 pub use span::{

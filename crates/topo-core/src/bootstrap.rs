@@ -458,9 +458,16 @@ impl Bootstrap {
 }
 
 /// Bytes reserved for the process-wide bootstrap metadata region (the §17.4 floor
-/// before hand-off). Sized for early span descriptors and pagemap nodes; tunable.
-/// Reserved in BSS (zero-filled), so it costs virtual address space, not binary
-/// size, and faults in lazily.
+/// before hand-off). Sized for early span descriptors and pagemap nodes, and
+/// **profile-aware**: the `low-rss` profile (§30.1) trades a smaller floor (earlier
+/// hand-off pressure) for a smaller resident reservation. Reserved in BSS
+/// (zero-filled), so it costs virtual address space — not binary size — and faults
+/// in lazily; exhaustion before hand-off fails the metadata allocation safely
+/// (`None`), never faults.
+#[cfg(feature = "low-rss")]
+pub const BOOTSTRAP_REGION_BYTES: usize = 256 * 1024; // 256 KiB
+/// See the `low-rss` variant above.
+#[cfg(not(feature = "low-rss"))]
 pub const BOOTSTRAP_REGION_BYTES: usize = 1 << 20; // 1 MiB
 
 /// The static reserve backing [`Bootstrap::global`].
@@ -721,24 +728,25 @@ mod tests {
         assert!(!boot.is_in_alloc());
     }
 
-    /// A pathological successor that re-enters the bootstrap path — the S-007 bug
-    /// the DD-2 guard exists to trap.
-    struct ReentrantSuccessor {
-        boot: *const Bootstrap,
-    }
-    // SAFETY: the raw pointer is only dereferenced to call the (thread-safe)
-    // `Bootstrap::alloc`; it points at a leaked, `'static` `Bootstrap`.
-    unsafe impl Sync for ReentrantSuccessor {}
-    impl MetadataAlloc for ReentrantSuccessor {
-        fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-            // SAFETY: `boot` points at a live, leaked `Bootstrap`.
-            unsafe { (*self.boot).alloc(size, align) }
-        }
-    }
-
     #[test]
     #[cfg(debug_assertions)] // the guard is a debug_assert; in release it is compiled out
     fn bootstrap_reentrancy_guard_traps_reentry() {
+        // A pathological successor that re-enters the bootstrap path — the S-007 bug
+        // the DD-2 guard exists to trap. Defined here so it is scoped to (and only
+        // compiled with) the debug-only test that uses it.
+        struct ReentrantSuccessor {
+            boot: *const Bootstrap,
+        }
+        // SAFETY: the raw pointer is only dereferenced to call the (thread-safe)
+        // `Bootstrap::alloc`; it points at a leaked, `'static` `Bootstrap`.
+        unsafe impl Sync for ReentrantSuccessor {}
+        impl MetadataAlloc for ReentrantSuccessor {
+            fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+                // SAFETY: `boot` points at a live, leaked `Bootstrap`.
+                unsafe { (*self.boot).alloc(size, align) }
+            }
+        }
+
         let (base, len) = region(64 * 1024);
         let boot: &'static Bootstrap = Box::leak(Box::new(Bootstrap::new()));
         // SAFETY: `region` leaks a live 64 KiB buffer.

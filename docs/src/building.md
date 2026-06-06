@@ -16,7 +16,7 @@ cargo xtask ci        # the exact sequence CI runs
 | `xtask setup [--verify]` | install/verify toolchains + cross targets (idempotent) |
 | `xtask build [--target T] [--profile debug\|performance]` | build all crates (+ Lean via `lake`) |
 | `xtask gen [--check]` | regenerate / verify the generated tables (G-table) |
-| `xtask test [--kind unit\|prop\|diff\|fuzz]` | run the test suites |
+| `xtask test [--kind unit\|prop\|diff\|fuzz\|loom]` | run the test suites |
 | `xtask fmt [--check]` | rustfmt |
 | `xtask lint` | clippy `-D warnings` + SPDX + markdownlint + Lean style |
 | `xtask lean [--check]` | `lake build` + `lake exe check` |

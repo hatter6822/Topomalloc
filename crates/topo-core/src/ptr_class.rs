@@ -44,6 +44,22 @@ impl MetadataRegion for NoMetadata {
     }
 }
 
+/// A composite metadata set: an address is metadata if **any** underlying region
+/// claims it. The allocator composes its metadata sources here — the bootstrap
+/// region plus, after [`hand_off_to`](crate::bootstrap::Bootstrap::hand_off_to),
+/// the normal allocator's region(s) — so `classify_ptr` recognizes a metadata
+/// pointer regardless of which source vended it. Without this, a pointer into the
+/// successor's metadata would mis-classify as `External` once hand-off has happened
+/// (the §17.4/§17.5 post-hand-off gap).
+pub struct AnyMetadataRegion<'a>(pub &'a [&'a dyn MetadataRegion]);
+
+impl MetadataRegion for AnyMetadataRegion<'_> {
+    #[inline]
+    fn contains(&self, addr: usize) -> bool {
+        self.0.iter().any(|r| r.contains(addr))
+    }
+}
+
 impl MetadataRegion for crate::bootstrap::Bootstrap {
     #[inline]
     fn contains(&self, addr: usize) -> bool {
@@ -206,14 +222,19 @@ fn classify_in_large(desc_ptr: *const LargeDescriptor, addr: usize) -> PointerCl
     // SAFETY: as in `classify_in_span` — a pagemap `Large` entry names a live,
     // never-freed descriptor in monotonic metadata.
     let desc = unsafe { &*desc_ptr };
+    // A consistent `(base, state)` snapshot under the large seqlock (W3-4): a recycle
+    // race never composes the base-match and state from two incarnations, and a
+    // persistently racing recycle (or a hardened integrity failure) resolves to
+    // `External` rather than a torn result.
+    let (base, state) = match desc.read_consistent() {
+        Some(v) => v,
+        None => return PointerClass::External,
+    };
     // As in `classify_in_span`: a `Released` descriptor classifies as `Released`
     // even if its pagemap entry has not yet been overwritten (W3-6 release window).
-    if desc.state() == LargeState::Released {
+    if state == LargeState::Released {
         return PointerClass::Released;
     }
-    // Read the base once so the base-match and the interior offset are computed
-    // against the same value even under a (rare) large-recycle race.
-    let base = desc.base();
     if addr == base {
         PointerClass::Large { desc: desc_ptr }
     } else {
@@ -491,6 +512,35 @@ mod tests {
     }
 
     #[test]
+    fn composite_metadata_region_recognizes_all_sources() {
+        // Post-hand-off (§17.4): metadata is vended from both the bootstrap region
+        // and the successor. A single region knows only its own — so a pointer from
+        // the other mis-classifies as foreign — but `AnyMetadataRegion` recognizes
+        // a metadata pointer from EITHER source.
+        let pm = PageMap::new();
+        let boot = meta_arena(64 * 1024);
+        let succ = meta_arena(64 * 1024);
+        let from_boot = boot.alloc(64, 16).unwrap().as_ptr() as usize;
+        let from_succ = succ.alloc(64, 16).unwrap().as_ptr() as usize;
+
+        // A single region mis-reports the *other* source as foreign.
+        assert!(matches!(
+            classify_ptr(&pm, &boot, from_succ),
+            PointerClass::External
+        ));
+        // The composite recognizes both.
+        let all = AnyMetadataRegion(&[&boot, &succ]);
+        assert!(matches!(
+            classify_ptr(&pm, &all, from_boot),
+            PointerClass::Metadata
+        ));
+        assert!(matches!(
+            classify_ptr(&pm, &all, from_succ),
+            PointerClass::Metadata
+        ));
+    }
+
+    #[test]
     fn metadata_pointers_are_distinguished_from_foreign() {
         // A pointer into the metadata arena classifies Metadata; an unrelated
         // address classifies External. Both are invalid frees, but distinguished
@@ -572,6 +622,41 @@ mod tests {
         assert!(matches!(
             classify_ptr(&pm, &m, in_second_page + 3),
             PointerClass::Interior { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_is_total_over_a_corrupted_size_class() {
+        // W3-4 totality (every profile, incl. performance): a span whose `sc` was
+        // corrupted to an out-of-range value classifies foreign — never an
+        // out-of-bounds panic on the size-class table.
+        let m = meta_arena(256 * 1024);
+        let pm = PageMap::new();
+        let s = span(0x4000_0000, 0, 64);
+        pm.install_span(&m, &s).unwrap();
+        let addr = s.object0_base().unwrap(); // a valid base, computed before corruption
+        s.corrupt_sc_for_test(40_000); // wild write past the 72-class table
+        assert!(matches!(
+            classify_ptr(&pm, &m, addr),
+            PointerClass::External
+        ));
+    }
+
+    #[cfg(feature = "debug-checks")]
+    #[test]
+    fn classify_detects_header_corruption_in_hardened() {
+        // §17.3 hardened: the integrity tag is consulted on classification, so a wild
+        // write to a valid-range header field (which the bounds check alone misses)
+        // makes the pointer classify foreign instead of being trusted.
+        let m = meta_arena(256 * 1024);
+        let pm = PageMap::new();
+        let s = span(0x4000_0000, 0, 64);
+        pm.install_span(&m, &s).unwrap();
+        let addr = s.object0_base().unwrap();
+        s.corrupt_object_count_for_test(12_345);
+        assert!(matches!(
+            classify_ptr(&pm, &m, addr),
+            PointerClass::External
         ));
     }
 

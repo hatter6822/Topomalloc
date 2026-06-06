@@ -127,6 +127,18 @@ pub fn row(sc: SizeClassId) -> SizeClassRow {
     SIZE_CLASSES[sc.index()]
 }
 
+/// The full row for a size class, or `None` if `sc` is out of the table's range.
+///
+/// The bounds-checked counterpart of [`row`]: callers that may hold an *untrusted*
+/// or possibly-corrupted `SizeClassId` (e.g. pointer classification reading a size
+/// class out of a span descriptor that a hardened build must survive being
+/// corrupted, §17.3/W3-4) use this to stay total — a bad index resolves to `None`
+/// instead of an out-of-bounds panic.
+#[inline]
+pub fn checked_row(sc: SizeClassId) -> Option<SizeClassRow> {
+    SIZE_CLASSES.get(sc.index()).copied()
+}
+
 /// Number of size classes in the table.
 #[inline]
 pub fn count() -> usize {

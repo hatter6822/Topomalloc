@@ -174,7 +174,8 @@ makes six implementation choices; the module docs carry the detail.
   already-vended bytes stay valid; the `MetadataAlloc: Sync` supertrait makes the
   "safe to call concurrently" contract a type fact (the successor lives behind the
   `Sync` `Bootstrap` and is called from every thread). `Bootstrap::global()` binds a
-  `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"). A debug
+  `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"),
+  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS. A debug
   **re-entrancy guard**
   (`is_in_alloc()`, a thread-local under `std`/tests, a no-op leaf otherwise) traps the
   S-007 bug of the metadata path re-entering the allocator. The arena is **never** freed
@@ -216,8 +217,15 @@ makes six implementation choices; the module docs carry the detail.
   as `External`, so every slab-layout subtraction is underflow-free and the function
   never panics on any address (the recycle holds the span lock across the whole
   geometry update, so a lock-holder never sees the bitmap and `object_count`
-  disagree). An integrity tag (§17.3, FNV-1a over the read-mostly header) lets
-  debug/hardened detect a corrupted descriptor.
+  disagree). Totality extends to corrupted metadata: the size-class lookup is
+  bounds-checked (`size_class::checked_row`), so an out-of-range `sc` resolves to
+  `External` instead of an out-of-bounds panic. The §17.3 integrity tag (FNV-1a over
+  the read-mostly header) is **consumed**, not merely computed: in a hardened build
+  (`debug-checks`) the classification path validates it within the consistent window,
+  so a wild write to a header field makes the pointer classify foreign — closing the
+  gap where the tag was a tested capability with no consumer. The `large` path is
+  seqlock-read too (symmetric with the span). The two lock-free protocols (the seqlock
+  and the W3-3c publish/read) are `loom`-model-checked under `--cfg loom`.
 
 * **§8.5 in one critical section via a per-span lock.** `central_free ==
   popcount(free_bitmap)` is the authoritative central count; the bitmap edit and the

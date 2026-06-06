@@ -550,6 +550,45 @@ mod tests {
     }
 
     #[test]
+    fn radix_index_decomposition_is_lossless() {
+        // The radix's correctness rests on the per-level index extraction being a
+        // *bijection* over `[0, 2^PAGENO_BITS)`: distinct page numbers must take
+        // distinct paths, or two pages would alias one leaf entry. Reconstruct each
+        // page number from its level indices and check equality — for every
+        // single-bit value (covering each bit position) plus representative
+        // multi-bit values. (Exhaustive over 2^50 is infeasible; single-bit coverage
+        // proves no bit is dropped or duplicated by the shifts/masks.)
+        let level_index = |p: usize, k: u32| (p >> (k * RADIX_BITS)) & SLOT_MASK;
+        let reconstruct = |p: usize| -> usize {
+            (0..LEVELS).fold(0usize, |acc, k| {
+                acc | (level_index(p, k) << (k * RADIX_BITS))
+            })
+        };
+        let max_p = (1u128 << PAGENO_BITS) - 1;
+        let mut probes: Vec<usize> = (0..PAGENO_BITS).map(|s| 1usize << s).collect();
+        probes.extend([
+            0,
+            1,
+            (max_p) as usize,
+            (max_p / 2) as usize,
+            (max_p / 3) as usize,
+            0xa5a5_a5a5 & max_p as usize,
+        ]);
+        for p in probes {
+            assert!(p as u128 <= max_p);
+            assert_eq!(
+                reconstruct(p),
+                p,
+                "radix decomposition lost bits for p={p:#x}"
+            );
+            // Each level index is in bounds (no out-of-range node access).
+            for k in 0..LEVELS {
+                assert!(level_index(p, k) < SLOTS);
+            }
+        }
+    }
+
+    #[test]
     fn empty_pagemap_classifies_everything_external() {
         // P-Map-002: with nothing installed (no root), every address is non-owned —
         // including the very top of the address space (no VA cap).

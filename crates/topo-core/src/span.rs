@@ -545,11 +545,11 @@ impl SpanDescriptor {
     }
 
     /// Base address of object 0 (§16.3): `align_up(base + slab_header, sc.align)`.
-    /// `None` only if the rounding overflows `usize` (impossible for a real span;
-    /// kept total per §9.7).
+    /// `None` if the size class is out of range (a corrupted descriptor) or the
+    /// rounding overflows `usize` — total on any input (§9.7), never a panic.
     #[inline]
     pub fn object0_base(&self) -> Option<usize> {
-        let align = size_class::align(self.size_class());
+        let align = size_class::checked_row(self.size_class())?.align as usize;
         let header = self
             .base()
             .checked_add(self.slab_header.load(Ordering::Acquire) as usize)?;
@@ -558,10 +558,20 @@ impl SpanDescriptor {
 
     /// A **consistent** snapshot of the geometry a classifier needs (W3-4), read
     /// under the `seq` seqlock so it never mixes two incarnations. A recycle racing
-    /// the read is retried; `None` only if the recycle is persistently in flight (the
-    /// retry budget is exhausted — a pathological racing free) or the §16.3 geometry
-    /// overflows. For a correct program (no concurrent recycle of a span being freed
+    /// the read is retried; `None` if the recycle is persistently in flight (the
+    /// retry budget is exhausted — a pathological racing free), the §16.3 geometry
+    /// overflows, the size class is out of range, or (hardened) the integrity tag
+    /// fails. For a correct program (no concurrent recycle of a span being freed
     /// into) the first read is always consistent.
+    ///
+    /// **Total on any input and corruption-resistant.** The size-class lookup is
+    /// bounds-checked, so a corrupted/invalid `sc` resolves to `None` instead of an
+    /// out-of-bounds panic — classification stays total even over a corrupted
+    /// descriptor. In a hardened build (`debug-checks`) the §17.3 integrity tag is
+    /// validated within the consistent window, so a wild write to the read-mostly
+    /// header makes the pointer classify foreign rather than be trusted; under a
+    /// concurrent recycle the same check may conservatively report `None`, which is
+    /// the correct outcome (a racing free is rejected) regardless.
     pub fn read_consistent_geometry(&self) -> Option<ClassifyGeometry> {
         for _ in 0..SEQLOCK_RETRIES {
             let s0 = self.seq.load(Ordering::Acquire);
@@ -580,12 +590,22 @@ impl SpanDescriptor {
             if self.seq.load(Ordering::Acquire) != s0 {
                 continue; // recycled during the read; retry
             }
-            let align = size_class::align(sc);
-            let object0 = align_up(base.checked_add(slab_header)?, align)?;
+            // Hardened (§17.3): reject a corrupted read-mostly header. Within the
+            // consistent window, a tag mismatch means a wild write (or, harmlessly,
+            // a recycle that just started) — either way the pointer is not trusted.
+            #[cfg(feature = "debug-checks")]
+            if !self.validate_integrity() {
+                return None;
+            }
+            // Bounds-checked size-class lookup: an out-of-range `sc` (a corrupted
+            // descriptor) resolves to `None` (→ foreign) rather than panicking, so
+            // classification is total on every input and in every profile.
+            let row = size_class::checked_row(sc)?;
+            let object0 = align_up(base.checked_add(slab_header)?, row.align as usize)?;
             return Some(ClassifyGeometry {
                 base,
                 object0,
-                object_size: size_class::usable_size(sc),
+                object_size: row.size as usize,
                 object_count,
                 sc,
                 arena,
@@ -982,6 +1002,9 @@ pub struct LargeDescriptor {
     arena: AtomicU32,
     /// Generation (§27.5).
     generation: AtomicU32,
+    /// Seqlock version for consistent classification reads (W3-4, mirroring the span
+    /// seqlock): even when stable, odd while a recycle is mid-update.
+    seq: AtomicU32,
     /// [`LargeState`] as a `u8`.
     state: AtomicU8,
 }
@@ -998,10 +1021,36 @@ impl LargeDescriptor {
             id,
             arena: AtomicU32::new(arena.0),
             generation: AtomicU32::new(Generation::FIRST.0),
+            seq: AtomicU32::new(0),
             state: AtomicU8::new(LargeState::Active as u8),
         };
         desc.refresh_integrity();
         desc
+    }
+
+    /// A **consistent** `(base, state)` snapshot for classification (W3-4), read
+    /// under the seqlock so a recycle race never composes the two from different
+    /// incarnations. `None` if a recycle is persistently in flight or (hardened) the
+    /// integrity tag fails. Mirrors [`SpanDescriptor::read_consistent_geometry`].
+    pub fn read_consistent(&self) -> Option<(usize, LargeState)> {
+        for _ in 0..SEQLOCK_RETRIES {
+            let s0 = self.seq.load(Ordering::Acquire);
+            if s0 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let base = self.base.load(Ordering::Acquire);
+            let state = LargeState::from_u8(self.state.load(Ordering::Acquire));
+            if self.seq.load(Ordering::Acquire) != s0 {
+                continue;
+            }
+            #[cfg(feature = "debug-checks")]
+            if !self.validate_integrity() {
+                return None;
+            }
+            return Some((base, state));
+        }
+        None
     }
 
     /// Slot identity.
@@ -1066,6 +1115,9 @@ impl LargeDescriptor {
     /// SPEC-transition: large descriptor recycled (§27.5)
     pub fn recycle(&self, arena: ArenaId, base: usize, usable_size: usize, align: usize) {
         debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        // Open the seqlock (odd): a classifier reading through `read_consistent`
+        // retries rather than mixing incarnations (W3-4).
+        self.seq.fetch_add(1, Ordering::AcqRel);
         let next = self.generation().next();
         self.generation.store(next.0, Ordering::Release);
         self.arena.store(arena.0, Ordering::Release);
@@ -1075,6 +1127,8 @@ impl LargeDescriptor {
         self.state
             .store(LargeState::Active as u8, Ordering::Release);
         self.refresh_integrity();
+        // Close the seqlock (even): publish the new incarnation.
+        self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
     #[inline]
@@ -1121,6 +1175,25 @@ unsafe impl Send for SpanDescriptor {}
 unsafe impl Sync for LargeDescriptor {}
 // SAFETY: as the `Sync` impl above.
 unsafe impl Send for LargeDescriptor {}
+
+/// Test-only fault injection: simulate a wild write to a read-mostly header field
+/// *without* refreshing the integrity tag, to exercise the total/hardened
+/// classification paths (W3-4 / §17.3).
+#[cfg(test)]
+impl SpanDescriptor {
+    /// Corrupt the size-class field to an arbitrary (possibly out-of-range) value.
+    pub(crate) fn corrupt_sc_for_test(&self, raw: u16) {
+        self.sc.store(raw, Ordering::Relaxed);
+    }
+
+    /// Corrupt the object-count field (a valid-range value the integrity tag, but
+    /// not the bounds check, will catch). Only the hardened profile validates the
+    /// tag on classification, so this helper is exercised there.
+    #[cfg(feature = "debug-checks")]
+    pub(crate) fn corrupt_object_count_for_test(&self, raw: u32) {
+        self.object_count.store(raw, Ordering::Relaxed);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1373,6 +1446,35 @@ mod tests {
         assert!(
             !s.validate_integrity(),
             "corruption must be detected (§17.3)"
+        );
+    }
+
+    #[test]
+    fn geometry_read_is_total_over_a_corrupted_size_class() {
+        // W3-4 totality (every profile): a wild write setting `sc` out of the table's
+        // range makes the geometry read resolve to `None` (→ a foreign pointer)
+        // rather than indexing the size-class table out of bounds and panicking.
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        assert!(s.read_consistent_geometry().is_some());
+        s.corrupt_sc_for_test(40_000); // far beyond the 72-class table
+        assert!(s.read_consistent_geometry().is_none());
+        assert!(s.object0_base().is_none());
+    }
+
+    #[cfg(feature = "debug-checks")]
+    #[test]
+    fn hardened_geometry_read_rejects_a_corrupted_header() {
+        // §17.3 hardened: the integrity tag is validated on the classification path,
+        // so a wild write to a (valid-range) header field — which the bounds check
+        // alone would miss — makes the geometry read resolve to `None`.
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        assert!(s.read_consistent_geometry().is_some());
+        s.corrupt_object_count_for_test(12_345);
+        assert!(
+            s.read_consistent_geometry().is_none(),
+            "hardened classification must reject a corrupted header (§17.3)"
         );
     }
 

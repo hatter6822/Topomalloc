@@ -117,15 +117,22 @@ while spans are concurrently created and recycled. Four modules in `topo-core`:
   the pagemap and the metadata ranges and returns the §17.5 class — `Null`, `Small`
   (with the object index, by the §16.3 slab-layout inverse, read through the seqlock
   so a recycle race never yields a torn result), `Large`, `Interior`, `Metadata`,
-  `Released`, `Quarantined`, or `External`. It is **total over every address**: a
-  recycle that re-bases a span *above* the queried address yields `External` rather
-  than an `addr − base` underflow, so the slab-layout arithmetic can never panic or
-  wrap on any input. `free` requires a **base pointer** (§17.5);
-  `validate_free` enforces exactly that, mapping a base pointer or `Null` to a
-  `FreeTarget` and an interior/foreign/released/metadata/quarantined pointer to an
-  `InvalidFree` that debug/hardened builds *detect and report* — never act on (W3-4b,
-  ties plan 08 W18-2). A fuzz target (`fuzz/fuzz_targets/ptr_class.rs`) hardens the
-  total/never-panics guarantee over adversarial addresses and pagemap layouts.
+  `Released`, `Quarantined`, or `External`. It is **total and corruption-resistant**:
+  a recycle that re-bases a span *above* the queried address yields `External` rather
+  than an `addr − base` underflow; the size-class lookup is bounds-checked, so a
+  corrupted/out-of-range `sc` yields `External` rather than an out-of-bounds panic;
+  and a hardened build (`debug-checks`) validates the §17.3 integrity tag on the
+  classification path, so a wild write to a descriptor's read-mostly header makes the
+  pointer classify foreign rather than be trusted — classification never panics or
+  wraps on any input, valid metadata or not. Metadata is recognized across **all**
+  sources via `AnyMetadataRegion` (the bootstrap region plus the post-hand-off
+  successor). `free` requires a **base pointer** (§17.5); `validate_free` enforces
+  exactly that, mapping a base pointer or `Null` to a `FreeTarget` and an
+  interior/foreign/released/metadata/quarantined pointer to an `InvalidFree` that
+  debug/hardened builds *detect and report* — never act on (W3-4b, ties plan 08
+  W18-2). A fuzz target (`fuzz/fuzz_targets/ptr_class.rs`) hardens the total guarantee
+  over adversarial addresses and pagemap layouts; the `large` path is seqlock-read,
+  symmetric with the span path.
 
 The runtime pagemap is held to the **same soundness property the Lean model proves**.
 Beyond the property test (`tests/tests/pagemap.rs`) that discharges
@@ -135,7 +142,15 @@ Beyond the property test (`tests/tests/pagemap.rs`) that discharges
 evaluates; the Rust `pagemap_matches_lean_replay_differential` test replays the
 *identical* trace against the radix and asserts the same `addr → span` results — so a
 divergence on either side fails CI (the W3-3d differential, the pagemap analogue of
-the live-set oracle's trace-replay loop).
+the live-set oracle's trace-replay loop). The radix's index decomposition is tested
+lossless (distinct pages never collide), and the two subtle lock-free protocols — the
+W3-4 seqlock and the W3-3c publish/read — are **model-checked by `loom`**
+(`tests/loom_protocols.rs`, `cargo xtask test --kind loom`, gated to `--cfg loom` so
+its deps stay out of the normal build), an exhaustive-interleaving complement to the
+std-thread stress tests. Criterion benchmarks (`benches/metadata.rs`,
+`cargo xtask bench`) measure the lookup/classify/install latency and report the
+node-byte overhead, so the W3-3a "bounded + documented" claim is measured, not
+asserted.
 
 ## Single source of truth (DD-1)
 
