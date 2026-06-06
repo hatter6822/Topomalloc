@@ -29,17 +29,28 @@ backend) is built **without** any GPL component and is therefore MIT-licensed.
 -------------------------------------------------------------------------------
 
 The seLe4n-integration components are licensed GPL-3.0-or-later (see
-`sele4n/LICENSE`), because they link or model the GPLv3 seLe4n microkernel ABI
-(`hatter6822/seLe4n`, pinned per decision D8). They are:
+`sele4n/LICENSE` and `vendor/sele4n/LICENSE`), because they link or model the
+GPLv3 seLe4n microkernel ABI (`hatter6822/seLe4n`, pinned per decision D8). They
+are:
 
   * crates/topo-backend-sele4n  — Sele4nSim and (from M1) the Sele4nBackingProvider
   * lean/TopoMalloc/SeLe4n/**   — the Lean bridge model
   * sele4n/**                   — the resource-server component and adapters
+  * vendor/sele4n/**            — the VENDORED, pinned seLe4n Rust ABI crates
+                                  (`sele4n-types`, `sele4n-abi`, `sele4n-sys`),
+                                  upstream GPL-3.0-or-later, copyright their
+                                  authors; see `vendor/sele4n/LICENSE` (the full
+                                  GPLv3 text) and `vendor/sele4n/PINNED_SHA`. They
+                                  are an unmodified mirror produced by
+                                  `scripts/vendor_sele4n.sh`, linked only by
+                                  `topo-backend-sele4n --features real-abi`.
 
 Building TopoMalloc with the `sele4n-sim` Cargo feature (e.g.
-`libtopomalloc-sele4n`) links these GPL components; the resulting combined
-binary is therefore GPL-3.0-or-later. The MIT crates' own source files are
-unchanged and remain MIT; only the combined work is GPL.
+`libtopomalloc-sele4n`), or `topo-backend-sele4n` with `--features real-abi`
+(which links the vendored ABI above), links these GPL components; the resulting
+combined binary is therefore GPL-3.0-or-later. The MIT crates' own source files
+are unchanged and remain MIT; only the combined work is GPL. The default,
+distributable artifact enables neither feature and links no GPL code.
 
 -------------------------------------------------------------------------------
 3. SPDX policy (W0-12)
@@ -53,6 +64,12 @@ Every source file carries an `SPDX-License-Identifier` header:
 CI enforces this (`cargo xtask lint`). When adding a file under
 `crates/topo-backend-sele4n`, `lean/TopoMalloc/SeLe4n`, or `sele4n/`, use the
 `GPL-3.0-or-later` identifier; everywhere else use `MIT`.
+
+Vendored upstream code under `vendor/` is **exempt** from this per-file policy
+(the `xtask` SPDX gate skips `vendor/`): it carries its own upstream
+`SPDX-License-Identifier` headers and a complete license text
+(`vendor/sele4n/LICENSE`), and its provenance is pinned in
+`vendor/sele4n/PINNED_SHA`. We do not re-license or re-header third-party code.
 
 -------------------------------------------------------------------------------
 4. Upstream

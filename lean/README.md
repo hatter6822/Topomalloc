@@ -28,10 +28,11 @@ single-source check is fully constructive. Verify with `#print axioms <thm>`.
 | `TopoMalloc/State.lean` | abstract `State`, ownership map, the `setOwner` frame primitive | W1-5 |
 | `TopoMalloc/WellFormed.lean` | the **14** named `WellFormed` clauses (§33.3 + §9.5/§16 backbones) + preservation | W1-3 |
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions | W1-5 |
+| `TopoMalloc/ExtentState.lean` | the §20.1 extent physical-backing state machine + `canTransition` (pinned 1:1 to Rust) | W4-2d |
 | `TopoMalloc/Rseq.lean` | the RSEQ contract — trusted primitive + frame condition (§33.5) | W1-7 |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family, incl. `Demo.lean` (a concrete non-empty witness) | W1-4e/6/8/9 |
 | `TopoMalloc/Exec.lean` | executable model + §33.7 **text-grammar** trace replay; flags injected violations | W1-10 |
-| `Check.lean` | `lake exe check`: the G-table gate, coverage, and the (structured + text) trace-oracle gate | — |
+| `Check.lean` | `lake exe check`: the G-table gate, the trace-oracle gate, and the pagemap (W3-3d), §36.6 provider (`providerChainGate`) and §20.1 extent-state (`extentStateGate`, W4-2d) differentials | — |
 
 ### The §33.4 theorem set (`Theorems/`)
 

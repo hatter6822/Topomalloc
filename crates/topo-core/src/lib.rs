@@ -17,9 +17,11 @@ pub mod backend;
 pub mod bootstrap;
 pub mod classify;
 pub mod error;
+pub mod extent;
 pub mod flags;
 pub mod generated;
 pub mod ids;
+pub mod large;
 pub mod overflow;
 pub mod pagemap;
 pub mod profile;
@@ -35,12 +37,20 @@ pub mod trace;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Convenience re-exports for the common surface.
-pub use backend::{Region, Rights, TopoBackingProvider};
+pub use backend::{
+    CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,
+    TopoBackingProvider, VWindow,
+};
 pub use bootstrap::{Bootstrap, BumpArena, MetadataAlloc};
 pub use classify::{classify, Request, RequestKind};
 pub use error::BackendError;
+pub use extent::{
+    Extent, ExtentError, ExtentFlags, ExtentId, ExtentManager, ExtentMap, ExtentRef, ExtentState,
+    Fit, HugeRange, NoRegionCache, RegionCacheHook, RetainPolicy, StateBytes,
+};
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use ids::{ArenaId, Generation, Label, LargeId, SizeClassId, SpanId};
+pub use large::{LargeAllocator, LargeConfig};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{

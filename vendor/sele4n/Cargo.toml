@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Nested workspace for the vendored seLe4n ABI crates (D8). Vendored from
+# github.com/hatter6822/seLe4n @ the PINNED_SHA by scripts/vendor_sele4n.sh; this is
+# upstream GPL-3.0-or-later code on the seLe4n side of the D5 license boundary (see
+# the LICENSE here and the repo NOTICE §2/§4). It is a SEPARATE workspace, excluded
+# from the MIT root (root Cargo.toml `exclude`), so the vendored crates'
+# `*.workspace = true` inheritance resolves against THIS manifest, not the root.
+#
+# Only the crates the `real-abi` build needs are vendored: `sele4n-abi` (+ its dep
+# `sele4n-types`), and `sele4n-sys` (a dev-dependency of `sele4n-abi`, so its
+# manifest must resolve). `sele4n-hal` is not referenced and is omitted (D8:
+# "sele4n-sys/sele4n-hal as needed").
+[workspace]
+resolver = "2"
+members = ["sele4n-types", "sele4n-abi", "sele4n-sys"]
+
+# The upstream workspace package fields the vendored crates inherit (D8: upstream
+# workspace version 0.31.50, MSRV 1.82).
+[workspace.package]
+version = "0.31.50"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/hatter6822/seLe4n"

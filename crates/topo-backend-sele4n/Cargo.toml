@@ -13,21 +13,33 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 license = "GPL-3.0-or-later"
+# Not a crates.io publish target: under `real-abi` it links vendored, path-only GPL
+# crates (`vendor/sele4n/**`) that are not on crates.io, so publishing is impossible
+# by construction. Marking it private also lets cargo-deny's `allow-wildcard-paths`
+# accept the versionless intra-workspace path deps on it (D8 supply-chain plumbing).
+publish = false
 
 [dependencies]
 topo-core = { path = "../topo-core", version = "0.1.0" }
 
-# D8 — the real seLe4n ABI is pinned to a reviewed SHA and wired at M1 (W22-0).
-# It is declared here as documentation of the pin; it is brought in as an
-# optional dependency under `--features real-abi` so the M0 host simulator stays
-# hermetic and the pin is recorded now (W0-1).
-#   sele4n-abi   = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-abi" }
-#   sele4n-types = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-types" }
+# D8 — the real seLe4n ABI, pinned to the reviewed SHA (vendor/sele4n/PINNED_SHA) and
+# vendored under `vendor/sele4n/` by `scripts/vendor_sele4n.sh` (GPL-3.0-or-later, on
+# the seLe4n side of the D5 boundary). These are **optional** path deps, pulled in
+# ONLY under `--features real-abi` — so the default build resolves nothing from the
+# mirror, stays hermetic (no git fetch, no crates.io), and the MIT default artifact
+# links no GPL. `topo-backend-sele4n` is itself GPL, so these GPL deps sit on the
+# correct side of the boundary. Path (not git) deps keep the real-abi build offline
+# and reproducible against the committed pin.
+sele4n-types = { path = "../../vendor/sele4n/sele4n-types", version = "0.31.50", optional = true }
+sele4n-abi = { path = "../../vendor/sele4n/sele4n-abi", version = "0.31.50", optional = true }
 
 [features]
 default = []
-# Reserved for M1: compile the provider against the pinned real seLe4n ABI.
-real-abi = []
+# Compile the provider against the pinned, vendored real seLe4n ABI (D8, plan 09
+# W22-0). At M0 this links the `KernelError -> BackendError` bridge (the seam that
+# type-checks vs the pinned upstream, W4-1); the full `Sele4nBackingProvider` over
+# real frame/untyped capabilities grows here in plan 09.
+real-abi = ["dep:sele4n-types", "dep:sele4n-abi"]
 
 [lints]
 workspace = true

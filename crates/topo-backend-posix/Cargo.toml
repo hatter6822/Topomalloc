@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 [package]
 name = "topo-backend-posix"
-description = "PosixBackingProvider: the degenerate single-authority, single-label backend (the M0 skeleton; real mmap/madvise land in plan 04)."
+description = "PosixBackingProvider: the degenerate single-authority, single-label backend — real mmap/madvise/mprotect on unix (plan 04 W4-3)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,11 @@ license = "MIT"
 
 [dependencies]
 topo-core = { path = "../topo-core", version = "0.1.0" }
+
+# Real `mmap`/`madvise`/`mprotect`/`munmap` on unix (plan 04 W4-3). MIT/Apache-2.0,
+# within the deny.toml license allow-list; from crates.io (a known registry).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

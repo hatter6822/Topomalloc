@@ -620,6 +620,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
+name = "sele4n-abi"
+version = "0.31.50"
+dependencies = [
+ "sele4n-types",
+]
+
+[[package]]
+name = "sele4n-types"
+version = "0.31.50"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -758,6 +769,7 @@ version = "0.1.0"
 name = "topo-backend-posix"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "topo-core",
 ]
 
@@ -765,6 +777,8 @@ dependencies = [
 name = "topo-backend-sele4n"
 version = "0.1.0"
 dependencies = [
+ "sele4n-abi",
+ "sele4n-types",
  "topo-core",
 ]
 

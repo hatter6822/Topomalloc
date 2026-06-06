@@ -83,6 +83,11 @@ jobs:
           else
             attempt
           fi
+      # Guard the Darwin (Apple) `madvise` cfg branch (`MADV_FREE_REUSABLE`, §20.4):
+      # metadata-only cross-`cargo check` so it cannot bit-rot. Once per workflow.
+      - name: Check Darwin (Apple madvise cfg branch)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && matrix.profile == 'debug'
+        run: rustup target add x86_64-apple-darwin && cargo check -p topo-backend-posix --target x86_64-apple-darwin
 
   # G-core: tests on both arches; AArch64 runs under qemu-user (the asm/RSEQ
   # battery lands here from plan 05). The host run also exercises the seLe4n

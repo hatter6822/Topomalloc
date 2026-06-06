@@ -4,7 +4,8 @@
 #  * licenses — every dependency is permissively licensed, EXCEPT the seLe4n
 #    integration crate which is allowed to be GPL-3.0-or-later (D5);
 #  * advisories — no known-vulnerable or yanked dependencies;
-#  * sources — crates come from crates.io or the pinned seLe4n git repo (D8).
+#  * sources — crates come from crates.io (the seLe4n ABI is vendored under
+#    `vendor/`, D8 — a path dependency, not a git source).
 # Run via `cargo xtask deny` (and the CI `deny` job).
 
 [advisories]
@@ -12,9 +13,10 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# Permissive licenses allowed for all dependencies. Kept to the set the current
-# dependency tree actually uses plus the most common permissive licenses, so a
-# routine dependency update does not trip the gate.
+# Permissive licenses allowed for all dependencies. A deliberate superset of what the
+# current tree uses (plus the most common permissive licenses) so a routine dependency
+# update does not trip the gate; `unused-allowed-license = "allow"` keeps an as-yet
+# unused entry from warning.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -25,9 +27,20 @@ allow = [
     "Unlicense",
 ]
 confidence-threshold = 0.9
+unused-allowed-license = "allow"
 # The D5 license boundary: GPL-3.0-or-later is permitted ONLY for the seLe4n
-# integration crates — never for an arbitrary dependency. This is the automated
+# integration crate — never for an arbitrary dependency. This is the automated
 # counterpart to the per-file SPDX policy and the `xtask` license-boundary check.
+# `topo-backend-sele4n` (a workspace member, always in the resolved graph) is the GPL
+# boundary crate and carries the standing D5 exception. The vendored, pinned seLe4n ABI
+# crates it links under `--features real-abi` (`vendor/sele4n/**`, D8) are GPL too, but
+# they are absent from this default audit's graph (real-abi off) — so they need no
+# exception here — and they cannot be folded in via `[graph] all-features`: cargo-deny
+# treats those *public* vendored crates' versionless intra-workspace `path` deps as
+# wildcards, and `allow-wildcard-paths` does not apply to public crates, so it would
+# trip the `[bans]` wildcard rule (we keep the mirror pristine — NOTICE §3). Their GPL
+# licensing is instead assured by `vendor/sele4n/LICENSE`, per-file SPDX, and the
+# license-boundary check.
 exceptions = [
     { crate = "topo-backend-sele4n", allow = ["GPL-3.0-or-later"] },
 ]
@@ -42,6 +55,6 @@ allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
+# The seLe4n ABI is vendored under `vendor/sele4n/` as a path dependency (D8), never
+# pulled from git, so no git source is allowed — an accidental git dependency is denied.
 unknown-git = "deny"
-# The pinned seLe4n ABI repo (D8); wired behind the `real-abi` feature at M1.
-allow-git = ["https://github.com/hatter6822/seLe4n"]

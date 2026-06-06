@@ -39,6 +39,19 @@ pub struct Stats {
     pub central_free_bytes: u64,
     /// Bytes of allocator metadata.
     pub metadata_bytes: u64,
+
+    // --- back-end physical state (§20.1/§21.2, plan 04 W4-3a) ---------------
+    /// Free, physically-backed bytes that may hold old data (§20.1 *dirty*).
+    pub dirty_bytes: u64,
+    /// Free, lazily-purged/scrubbed bytes (§20.1 *muzzy*).
+    pub muzzy_bytes: u64,
+    /// Free bytes returned to the OS, needing recommit (§20.1 *released*).
+    pub released_bytes: u64,
+    /// All free back-end bytes (§21.2 `pageheap_free_bytes`): reserved + dirty +
+    /// muzzy + released.
+    pub pageheap_free_bytes: u64,
+    /// Total virtual bytes the back-end manages (§21.2 `virtual_bytes`).
+    pub virtual_bytes: u64,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -87,6 +100,21 @@ impl Profile {
 }
 
 impl Stats {
+    /// Record the back-end physical-state byte breakdown (§20.1/§21.2) from the
+    /// extent manager's [`StateBytes`](topo_core::StateBytes) — the W4-3a "states
+    /// reconcile in stats" path. `dirty`/`muzzy`/`released` map directly;
+    /// `pageheap_free_bytes` is all free back-end bytes and `virtual_bytes` the
+    /// total the back-end manages. The invariant
+    /// `virtual_bytes == live + dirty + muzzy + released + (reserved/active backing)`
+    /// is the extent manager's `StateBytes::total()`.
+    pub fn record_backend(&mut self, sb: topo_core::StateBytes) {
+        self.dirty_bytes = sb.dirty as u64;
+        self.muzzy_bytes = sb.muzzy as u64;
+        self.released_bytes = sb.released as u64;
+        self.pageheap_free_bytes = sb.free() as u64;
+        self.virtual_bytes = sb.total() as u64;
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -111,6 +139,13 @@ impl Stats {
                 "  \"central\": {{\n",
                 "    \"free_bytes\": {central}\n",
                 "  }},\n",
+                "  \"backend\": {{\n",
+                "    \"dirty_bytes\": {dirty},\n",
+                "    \"muzzy_bytes\": {muzzy},\n",
+                "    \"released_bytes\": {released},\n",
+                "    \"pageheap_free_bytes\": {pageheap},\n",
+                "    \"virtual_bytes\": {virtual_b}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -126,6 +161,11 @@ impl Stats {
             thread = self.thread_cache_bytes,
             transfer = self.transfer_bytes,
             central = self.central_free_bytes,
+            dirty = self.dirty_bytes,
+            muzzy = self.muzzy_bytes,
+            released = self.released_bytes,
+            pageheap = self.pageheap_free_bytes,
+            virtual_b = self.virtual_bytes,
             metadata = self.metadata_bytes,
         )
     }
@@ -153,6 +193,30 @@ mod tests {
         assert_eq!(v["profile"], "performance");
         assert_eq!(v["application"]["live_bytes"], 3493224448u64);
         assert_eq!(v["cache"]["per_cpu_bytes"], 268435456u64);
+    }
+
+    #[test]
+    fn backend_state_reconciles_into_stats() {
+        // W4-3a: the extent manager's StateBytes feeds the §21.2 backend fields, and
+        // the JSON carries them. The reconciliation identities hold by construction.
+        let sb = topo_core::StateBytes {
+            reserved: 4096,
+            active: 8192,
+            dirty: 2048,
+            muzzy: 1024,
+            released: 512,
+        };
+        let mut s = Stats::default();
+        s.record_backend(sb);
+        assert_eq!(s.dirty_bytes, 2048);
+        assert_eq!(s.muzzy_bytes, 1024);
+        assert_eq!(s.released_bytes, 512);
+        assert_eq!(s.pageheap_free_bytes, (4096 + 2048 + 1024 + 512) as u64);
+        assert_eq!(s.virtual_bytes, (4096 + 8192 + 2048 + 1024 + 512) as u64);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["backend"]["dirty_bytes"], 2048);
+        assert_eq!(v["backend"]["released_bytes"], 512);
+        assert_eq!(v["backend"]["virtual_bytes"], 15872);
     }
 
     #[test]

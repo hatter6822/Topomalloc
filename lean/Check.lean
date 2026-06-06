@@ -14,9 +14,11 @@ single-core bridge families) are checked by `lake build` proof-checking every mo
 this executable adds the two *evaluated* gates on top.
 -/
 import TopoMalloc
+import TopoMalloc.SeLe4n.UntypedProvider
 
 open TopoMalloc
 open TopoMalloc.Generated
+open TopoMalloc.SeLe4n
 
 /-- The generated table passes the Lean §9.3/§9.5 predicate, its emitted lookup is sound
 (`coversAllB`) and minimal (`minimalLookupB`) for every small request, it satisfies the §9.4
@@ -46,6 +48,31 @@ Rust test `pagemap_matches_lean_replay_differential` checks the identical trace 
 the runtime radix, so a divergence on either side fails CI. -/
 def pagemapDiffGate : Bool := TopoMalloc.pagemapGate
 
+/-- The full §36.6 backing-provider lifecycle, in order. The single source of truth
+the Rust `ProviderState` chain is pinned to (plan 04 W4-1, A1). -/
+def providerChain : List BackingState :=
+  [.authorizedUntyped, .reservedUntyped, .frameCapMinted, .mappedToServer,
+   .mappedToClient, .allocatorCommitted, .allocatorDirty, .allocatorMuzzyOrScrubbed,
+   .unmapped, .revoked, .recyclableUntyped]
+
+/-- The provider-state-machine differential (W4-1, A1): `BackingState.next` is exactly
+the linear §36.6 chain `providerChain[i] -> providerChain[i+1]`, terminating at
+`recyclableUntyped`. The Rust test `provider_next_matches_the_36_6_chain_exactly` pins
+the runtime `ProviderState::can_transition` to the *same* chain, so the runtime checker
+and this proof cannot drift (the analogue of the pagemap differential for §36.6). -/
+def providerChainGate : Bool :=
+  (providerChain.zip providerChain.tail).all (fun p => decide (BackingState.next p.1 = some p.2))
+    && decide (BackingState.next BackingState.recyclableUntyped = none)
+
+/-- The §20.1 extent-state-machine differential (W4-2d): `ExtentState.canTransition` is
+exactly reflexivity ∪ the canonical `extentEdges`, over all 25 ordered pairs. The Rust
+test `extent_state_transition_matches_lean` pins the runtime
+`ExtentState::can_transition` to the *same* edge set, so the runtime physical-state
+machine and this model cannot drift (the §20.1 analogue of `providerChainGate`). -/
+def extentStateGate : Bool :=
+  ExtentState.all.all (fun s => ExtentState.all.all (fun t =>
+    ExtentState.canTransition s t == (s == t || ExtentState.hasEdge s t)))
+
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
@@ -62,5 +89,15 @@ def main : IO UInt32 := do
     IO.println "lake check: pagemap differential OK (install/lookup trace replays; matches Rust radix, W3-3d)"
   else
     IO.eprintln "lake check: pagemap differential FAILED (W3-3d replay)"
+    ok := false
+  if providerChainGate then
+    IO.println "lake check: provider state machine OK (§36.6 chain matches BackingState.next; pins Rust ProviderState, W4-1)"
+  else
+    IO.eprintln "lake check: provider state machine FAILED (§36.6 chain drift, W4-1)"
+    ok := false
+  if extentStateGate then
+    IO.println "lake check: extent state machine OK (§20.1 transitions match ExtentState.canTransition; pins Rust ExtentState, W4-2d)"
+  else
+    IO.eprintln "lake check: extent state machine FAILED (§20.1 transition drift, W4-2d)"
     ok := false
   return if ok then 0 else 1

@@ -33,6 +33,22 @@ pub fn have(bin: &str) -> bool {
         .is_ok()
 }
 
+/// Whether a rustup `target` is installed, so a cross-`cargo check` can run. Gates the
+/// optional Apple-`cfg` compile check in `ci` without failing where the target std is
+/// absent (most hosts/CI are Linux).
+pub fn target_installed(triple: &str) -> bool {
+    Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == triple)
+        })
+        .unwrap_or(false)
+}
+
 /// Accumulates step results for a command, printing a header per step and a
 /// summary at the end.
 pub struct Runner<'a> {
