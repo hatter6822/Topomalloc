@@ -139,6 +139,24 @@ pub fn checked_row(sc: SizeClassId) -> Option<SizeClassRow> {
     SIZE_CLASSES.get(sc.index()).copied()
 }
 
+// Every size class has a nonzero object size, so the `delta / object_size` /
+// `delta % object_size` on the classification path (`ptr_class::classify_in_span`)
+// can never divide by zero — the divisor `row.size` is always `>= 1`. Proven *here*
+// with a `const` scan of the shipped table, so that totality property is local and
+// self-contained rather than resting on an unstated table invariant (DD-1 keeps the
+// generated table itself honest, but the divide-by-zero freedom is pinned right next
+// to the lookup the classifier uses).
+const _: () = {
+    let mut i = 0;
+    while i < SIZE_CLASSES.len() {
+        assert!(
+            SIZE_CLASSES[i].size > 0,
+            "a size class has object size 0 — pointer classification would divide by zero"
+        );
+        i += 1;
+    }
+};
+
 /// Number of size classes in the table.
 #[inline]
 pub fn count() -> usize {

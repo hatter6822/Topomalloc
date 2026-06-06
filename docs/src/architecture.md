@@ -67,8 +67,10 @@ while spans are concurrently created and recycled. Four modules in `topo-core`:
   init, and a **real hand-off** — `hand_off_to(successor)` routes new metadata to the
   normal allocator once it exists, while bytes already vended stay valid. The
   process-wide `Bootstrap::global()` binds a `BOOTSTRAP_REGION_BYTES` static reserve
-  lazily (the DD-2 "static reservation"). A **debug re-entrancy guard** traps any
-  re-entry of the metadata path on a thread (`is_in_alloc()`), the concrete form of
+  lazily (the DD-2 "static reservation"). A **re-entrancy guard** *refuses* any
+  same-thread re-entry of the metadata path — `alloc` returns `None` rather than
+  recursing, in **every** profile, and additionally debug-aborts under
+  `debug-assertions` (`is_in_alloc()` exposes the state) — the concrete form of
   S-007's "must never re-enter the public allocator." Span descriptors, their
   out-of-line bitmaps, and the pagemap's radix nodes all come from this seam
   (`MetadataAlloc`), so the source can change at hand-off without callers caring.
@@ -123,8 +125,11 @@ while spans are concurrently created and recycled. Four modules in `topo-core`:
   corrupted/out-of-range `sc` yields `External` rather than an out-of-bounds panic;
   and a hardened build (`debug-checks`) validates the §17.3 integrity tag on the
   classification path, so a wild write to a descriptor's read-mostly header makes the
-  pointer classify foreign rather than be trusted — classification never panics or
-  wraps on any input, valid metadata or not. Metadata is recognized across **all**
+  pointer classify foreign rather than be trusted. A tag mismatch is *disambiguated*
+  by re-reading the seqlock version — it is genuine corruption only when the version
+  is unchanged; a mismatch from a recycle that merely raced the check is retried, not
+  misreported — so a benign concurrent recycle is never spuriously classified foreign.
+  Classification never panics or wraps on any input, valid metadata or not. Metadata is recognized across **all**
   sources via `AnyMetadataRegion` (the bootstrap region plus the post-hand-off
   successor). `free` requires a **base pointer** (§17.5); `validate_free` enforces
   exactly that, mapping a base pointer or `Null` to a `FreeTarget` and an
@@ -143,8 +148,9 @@ evaluates; the Rust `pagemap_matches_lean_replay_differential` test replays the
 *identical* trace against the radix and asserts the same `addr → span` results — so a
 divergence on either side fails CI (the W3-3d differential, the pagemap analogue of
 the live-set oracle's trace-replay loop). The radix's index decomposition is tested
-lossless (distinct pages never collide), and the two subtle lock-free protocols — the
-W3-4 seqlock and the W3-3c publish/read — are **model-checked by `loom`**
+lossless (distinct pages never collide), and the subtle lock-free protocols — the
+W3-4 seqlock (with its hardened integrity-vs-race disambiguation), the W3-3c
+publish/read, and the lazy-node CAS race — are **model-checked by `loom`**
 (`tests/loom_protocols.rs`, `cargo xtask test --kind loom`, gated to `--cfg loom` so
 its deps stay out of the normal build), an exhaustive-interleaving complement to the
 std-thread stress tests. Criterion benchmarks (`benches/metadata.rs`,

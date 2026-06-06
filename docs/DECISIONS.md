@@ -175,10 +175,11 @@ makes six implementation choices; the module docs carry the detail.
   "safe to call concurrently" contract a type fact (the successor lives behind the
   `Sync` `Bootstrap` and is called from every thread). `Bootstrap::global()` binds a
   `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"),
-  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS. A debug
-  **re-entrancy guard**
-  (`is_in_alloc()`, a thread-local under `std`/tests, a no-op leaf otherwise) traps the
-  S-007 bug of the metadata path re-entering the allocator. The arena is **never** freed
+  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS. A
+  **re-entrancy guard** (`is_in_alloc()`, a thread-local under `std`/tests, a no-op
+  leaf otherwise) *refuses* the S-007 re-entry of the metadata path: `alloc` returns
+  `None` rather than recurse — in **every** profile, not only debug — and additionally
+  debug-aborts under `debug-assertions`. The arena is **never** freed
   — metadata a classifier may reach must outlive it (§27.5) — so logical reuse is caught
   by a generation, not by reclaiming memory.
 
@@ -190,7 +191,9 @@ makes six implementation choices; the module docs carry the detail.
   mis-mapped owned memory on such hosts). Uniform 1024-slot (8 KiB) nodes keep the
   resident footprint low (lazy population, the `low-rss` interest); the cost is a
   couple more dependent loads on the *slow* path only. Leaf entries are tagged pointers
-  (low 3 bits; descriptors are ≥ 8-aligned): `Empty` = 0 (a zeroed leaf is valid),
+  (low 3 bits; both `SpanDescriptor` and `LargeDescriptor` are ≥ 8-aligned, each pinned
+  by a compile-time `const` assert so a field reorder can never collide the tag with a
+  real address bit): `Empty` = 0 (a zeroed leaf is valid),
   `Small`/`Large`, `ReleasedRetained` (P-Map-005). Chosen over a flat array (wastes
   virtual space) and a hash map (worst-case/resize hazards), DD-1. `metadata_bytes()`
   reports the bounded overhead.
@@ -219,12 +222,17 @@ makes six implementation choices; the module docs carry the detail.
   geometry update, so a lock-holder never sees the bitmap and `object_count`
   disagree). Totality extends to corrupted metadata: the size-class lookup is
   bounds-checked (`size_class::checked_row`), so an out-of-range `sc` resolves to
-  `External` instead of an out-of-bounds panic. The §17.3 integrity tag (FNV-1a over
-  the read-mostly header) is **consumed**, not merely computed: in a hardened build
-  (`debug-checks`) the classification path validates it within the consistent window,
-  so a wild write to a header field makes the pointer classify foreign — closing the
-  gap where the tag was a tested capability with no consumer. The `large` path is
-  seqlock-read too (symmetric with the span). The two lock-free protocols (the seqlock
+  `External` instead of an out-of-bounds panic, and a `const` scan pins every class's
+  object size `> 0` so the `delta / object_size` on that path can never divide by zero.
+  The §17.3 integrity tag (FNV-1a over the read-mostly header, hashed with **acquire**
+  loads) is **consumed**, not merely computed: in a hardened build (`debug-checks`) the
+  classification path validates it, and a tag mismatch is *disambiguated* by re-reading
+  the seqlock version — genuine corruption only when the version is unchanged, otherwise
+  a recycle merely raced the check and the read is retried. So a wild write to a header
+  field makes the pointer classify foreign, while a benign concurrent recycle is
+  **never** misreported as corruption — closing the gap where the tag was a tested
+  capability with no consumer. The `large` path is seqlock-read too (symmetric with the
+  span). The two lock-free protocols (the seqlock
   and the W3-3c publish/read) are `loom`-model-checked under `--cfg loom`.
 
 * **§8.5 in one critical section via a per-span lock.** `central_free ==

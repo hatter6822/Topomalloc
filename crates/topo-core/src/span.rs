@@ -568,10 +568,10 @@ impl SpanDescriptor {
     /// bounds-checked, so a corrupted/invalid `sc` resolves to `None` instead of an
     /// out-of-bounds panic — classification stays total even over a corrupted
     /// descriptor. In a hardened build (`debug-checks`) the §17.3 integrity tag is
-    /// validated within the consistent window, so a wild write to the read-mostly
-    /// header makes the pointer classify foreign rather than be trusted; under a
-    /// concurrent recycle the same check may conservatively report `None`, which is
-    /// the correct outcome (a racing free is rejected) regardless.
+    /// validated, and a mismatch is disambiguated by re-reading the seqlock: an
+    /// *unchanged* version means a genuine wild write (→ classify foreign), a changed
+    /// one means a recycle merely raced the check (→ retry), so a benign recycle is
+    /// never misreported as corruption.
     pub fn read_consistent_geometry(&self) -> Option<ClassifyGeometry> {
         for _ in 0..SEQLOCK_RETRIES {
             let s0 = self.seq.load(Ordering::Acquire);
@@ -590,12 +590,15 @@ impl SpanDescriptor {
             if self.seq.load(Ordering::Acquire) != s0 {
                 continue; // recycled during the read; retry
             }
-            // Hardened (§17.3): reject a corrupted read-mostly header. Within the
-            // consistent window, a tag mismatch means a wild write (or, harmlessly,
-            // a recycle that just started) — either way the pointer is not trusted.
+            // Hardened (§17.3): reject a corrupted read-mostly header. A tag mismatch
+            // with an *unchanged* version (re-read) is genuine corruption; a changed
+            // version means a recycle raced the check — retry rather than misreport.
             #[cfg(feature = "debug-checks")]
             if !self.validate_integrity() {
-                return None;
+                if self.seq.load(Ordering::Acquire) == s0 {
+                    return None; // genuine corruption
+                }
+                continue; // a recycle raced the integrity check; retry
             }
             // Bounds-checked size-class lookup: an out-of-range `sc` (a corrupted
             // descriptor) resolves to `None` (→ foreign) rather than panicking, so
@@ -676,18 +679,21 @@ impl SpanDescriptor {
             .store(self.compute_integrity(), Ordering::Release);
     }
 
-    /// The checksum the geometry fields currently imply.
+    /// The checksum the geometry fields currently imply. Reads with `Acquire` so a
+    /// cross-thread [`validate_integrity`](Self::validate_integrity) that observes a
+    /// recycled field also observes the recycle's seqlock bump (letting the caller
+    /// distinguish corruption from a racing recycle).
     #[inline]
     fn compute_integrity(&self) -> u64 {
         header_checksum(&[
             self.id.0 as u64,
-            self.base.load(Ordering::Relaxed) as u64,
-            self.arena.load(Ordering::Relaxed) as u64,
-            self.page_count.load(Ordering::Relaxed) as u64,
-            self.object_count.load(Ordering::Relaxed) as u64,
-            self.slab_header.load(Ordering::Relaxed) as u64,
-            self.sc.load(Ordering::Relaxed) as u64,
-            self.generation.load(Ordering::Relaxed) as u64,
+            self.base.load(Ordering::Acquire) as u64,
+            self.arena.load(Ordering::Acquire) as u64,
+            self.page_count.load(Ordering::Acquire) as u64,
+            self.object_count.load(Ordering::Acquire) as u64,
+            self.slab_header.load(Ordering::Acquire) as u64,
+            self.sc.load(Ordering::Acquire) as u64,
+            self.generation.load(Ordering::Acquire) as u64,
         ])
     }
 
@@ -1009,6 +1015,15 @@ pub struct LargeDescriptor {
     state: AtomicU8,
 }
 
+// Like `SpanDescriptor`, a `LargeDescriptor` is reached through a 3-bit-tagged
+// pagemap entry (W3-3b `TAG_LARGE`), so it must be at least 8-aligned for the tag
+// bits and the pointer to coexist in one word. Pin it at compile time — mirroring
+// the `SpanDescriptor` guard above — so a future field reorder, `repr` change, or
+// narrow-`usize` target can never silently drop the alignment below 8 and make a
+// tag bit collide with a real address bit (which `decode` would then mask off,
+// corrupting the descriptor pointer `lookup` returns).
+const _: () = assert!(core::mem::align_of::<LargeDescriptor>() >= 8);
+
 impl LargeDescriptor {
     /// Create a descriptor for a live large allocation.
     pub fn new(id: LargeId, arena: ArenaId, base: usize, usable_size: usize, align: usize) -> Self {
@@ -1044,9 +1059,14 @@ impl LargeDescriptor {
             if self.seq.load(Ordering::Acquire) != s0 {
                 continue;
             }
+            // Hardened (§17.3): as in `read_consistent_geometry`, disambiguate a tag
+            // mismatch by re-reading the version — corruption iff it is unchanged.
             #[cfg(feature = "debug-checks")]
             if !self.validate_integrity() {
-                return None;
+                if self.seq.load(Ordering::Acquire) == s0 {
+                    return None;
+                }
+                continue;
             }
             return Some((base, state));
         }
@@ -1137,15 +1157,17 @@ impl LargeDescriptor {
             .store(self.compute_integrity(), Ordering::Release);
     }
 
+    /// The checksum the header fields currently imply (reads `Acquire`; see
+    /// [`SpanDescriptor::compute_integrity`] for the ordering rationale).
     #[inline]
     fn compute_integrity(&self) -> u64 {
         header_checksum(&[
             self.id.0 as u64,
-            self.base.load(Ordering::Relaxed) as u64,
-            self.usable_size.load(Ordering::Relaxed) as u64,
-            self.align.load(Ordering::Relaxed) as u64,
-            self.arena.load(Ordering::Relaxed) as u64,
-            self.generation.load(Ordering::Relaxed) as u64,
+            self.base.load(Ordering::Acquire) as u64,
+            self.usable_size.load(Ordering::Acquire) as u64,
+            self.align.load(Ordering::Acquire) as u64,
+            self.arena.load(Ordering::Acquire) as u64,
+            self.generation.load(Ordering::Acquire) as u64,
         ])
     }
 

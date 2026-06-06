@@ -76,8 +76,16 @@ impl BumpArena {
     /// `base` must point to the start of a single writable allocation of at least
     /// `capacity` bytes that stays valid and is not accessed through any other
     /// path for as long as this arena — and every pointer it vends — is in use.
+    /// `capacity` must not exceed `isize::MAX`: every in-range offset is then a valid
+    /// argument to `<*mut u8>::add` (Rust's pointer-offset rule forbids offsets past
+    /// `isize::MAX`), which [`alloc`](Self::alloc) relies on. Any allocation a real
+    /// allocator can return already satisfies this.
     #[inline]
     pub const unsafe fn new(base: *mut u8, capacity: usize) -> Self {
+        debug_assert!(
+            capacity <= isize::MAX as usize,
+            "BumpArena capacity must not exceed isize::MAX (pointer-offset soundness)"
+        );
         Self {
             base,
             capacity,
@@ -119,6 +127,13 @@ impl BumpArena {
         let size = size.max(1);
         let base_addr = self.base as usize;
 
+        // The cursor is `Relaxed` throughout: disjointness of vended ranges follows
+        // purely from the atomicity + monotonicity of the RMW (each successful CAS is
+        // a unique point in the cursor's modification order, with `end` strictly
+        // increasing), not from any happens-before on the *bytes*. The arena vends
+        // uninitialized bytes and never reuses one, so it owes callers no ordering on
+        // contents — each caller synchronizes its own writes to the region it got. (A
+        // future byte-reuse feature would have to upgrade this to Release/Acquire.)
         loop {
             let cur = self.cursor.load(Ordering::Relaxed);
             // Align the *absolute* address so the returned pointer — not merely
@@ -169,12 +184,14 @@ unsafe impl Send for BumpArena {}
 // atomic cursor and receive disjoint ranges.
 unsafe impl Sync for BumpArena {}
 
-/// A debug **re-entrancy guard** (DD-2): the bootstrap metadata path must never
-/// re-enter a metadata allocation on the same thread (S-007). Under `std`/tests a
-/// thread-local flag makes a re-entry a debug abort and lets the public allocator
-/// query [`is_in_alloc`](Bootstrap::is_in_alloc) to refuse re-entering; in pure
-/// `no_std` it is a no-op (the bump core is a proven leaf — it only touches its
-/// atomic cursor, calling nothing).
+/// A **re-entrancy guard** (DD-2): the bootstrap metadata path must never re-enter a
+/// metadata allocation on the same thread (S-007). Under `std`/tests a thread-local
+/// flag both lets [`enter`](imp::Guard::enter) *refuse* a re-entry (return `None`, so
+/// [`Bootstrap::alloc`] fails safe rather than recursing — in every profile) and a
+/// `debug_assert!` make it a loud abort under `debug-assertions`; the public
+/// allocator can also query [`is_in_alloc`](Bootstrap::is_in_alloc). In pure `no_std`
+/// the flag is absent, so the guard is a no-op (the bump core is a proven leaf — it
+/// only touches its atomic cursor, calling nothing).
 mod reentry {
     #[cfg(any(test, feature = "std"))]
     mod imp {
@@ -190,15 +207,23 @@ mod reentry {
         pub(crate) struct Guard(());
         impl Guard {
             #[inline]
-            pub(crate) fn enter() -> Guard {
+            pub(crate) fn enter() -> Option<Guard> {
                 // Re-entry is the S-007 bug: the metadata path called back into a
-                // metadata allocation (or the public allocator) on this thread.
+                // metadata allocation (or the public allocator) on this thread. The
+                // `debug_assert!` makes it a loud abort under test/debug; returning
+                // `None` is the structural backstop that refuses the re-entry in
+                // *every* profile (incl. release+`std`, where the assert is compiled
+                // out) and stops a nested guard from clearing the in-alloc flag out
+                // from under the still-active outer call.
                 debug_assert!(
                     !active(),
                     "bootstrap metadata allocator re-entered (S-007 violation)"
                 );
+                if active() {
+                    return None;
+                }
                 IN_ALLOC.with(|f| f.set(true));
-                Guard(())
+                Some(Guard(()))
             }
         }
         impl Drop for Guard {
@@ -218,8 +243,11 @@ mod reentry {
         pub(crate) struct Guard(());
         impl Guard {
             #[inline]
-            pub(crate) fn enter() -> Guard {
-                Guard(())
+            pub(crate) fn enter() -> Option<Guard> {
+                // `active()` is always `false` here (no thread-local without `std`),
+                // so a re-entry is never observed and the bump core's leaf property is
+                // the guarantee; this never refuses.
+                Some(Guard(()))
             }
         }
     }
@@ -254,9 +282,10 @@ enum State {
 /// once with a region — or take the process-wide [`global`](Self::global), which
 /// lazily binds a static reserve. `init` is idempotent (a second call or a lost
 /// race is a no-op), and exhaustion is reported as `None`, never a panic (safe
-/// failure). The path provably never re-enters the public allocator (S-007): an
+/// failure). The path never re-enters the public allocator (S-007): an
 /// [`alloc`](Self::alloc) only touches the bound arena (or the registered
-/// successor), under a debug re-entrancy guard.
+/// successor), and a re-entrancy guard refuses any same-thread re-entry — returning
+/// `None` in every profile, and debug-aborting under `debug-assertions`.
 pub struct Bootstrap {
     state: AtomicU8,
     /// The guarded arena. Written exactly once, by the `Uninit -> Initializing`
@@ -407,13 +436,17 @@ impl Bootstrap {
     }
 
     /// Allocate `size` bytes aligned to `align` for metadata, or `None` if the
-    /// allocator is uninitialized or exhausted (safe failure, never a panic). After
-    /// a [`hand_off_to`](Self::hand_off_to) the request routes to the successor; else
-    /// it bumps the bound arena's cursor. A debug re-entrancy guard (DD-2) traps any
-    /// re-entry of the metadata path on this thread (S-007).
+    /// allocator is uninitialized, exhausted, or this thread is already inside a
+    /// metadata allocation (safe failure, never a panic). After a
+    /// [`hand_off_to`](Self::hand_off_to) the request routes to the successor; else it
+    /// bumps the bound arena's cursor. The re-entrancy guard (DD-2) refuses any
+    /// same-thread re-entry of the metadata path (S-007): `None` in every profile,
+    /// and additionally a debug abort under `debug-assertions`.
     #[inline]
     pub fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-        let _guard = reentry::Guard::enter();
+        // S-007 backstop: refuse (return `None`) rather than recurse if this thread is
+        // already inside a metadata allocation — enforced in every profile.
+        let _guard = reentry::Guard::enter()?;
         if self.is_handed_off() {
             // SAFETY: `is_handed_off()` observed `HandedOff` with an acquire load,
             // which synchronizes-with the release store in `hand_off_to` that
@@ -728,25 +761,25 @@ mod tests {
         assert!(!boot.is_in_alloc());
     }
 
-    #[test]
-    #[cfg(debug_assertions)] // the guard is a debug_assert; in release it is compiled out
-    fn bootstrap_reentrancy_guard_traps_reentry() {
-        // A pathological successor that re-enters the bootstrap path — the S-007 bug
-        // the DD-2 guard exists to trap. Defined here so it is scoped to (and only
-        // compiled with) the debug-only test that uses it.
-        struct ReentrantSuccessor {
-            boot: *const Bootstrap,
+    /// A pathological successor that re-enters the bootstrap path on every `alloc` —
+    /// the S-007 bug the DD-2 guard exists to refuse/trap. Shared by the two
+    /// re-entrancy tests (one per profile), so it has a user in every test build.
+    struct ReentrantSuccessor {
+        boot: *const Bootstrap,
+    }
+    // SAFETY: the raw pointer is only dereferenced to call the (thread-safe)
+    // `Bootstrap::alloc`; it points at a leaked, `'static` `Bootstrap`.
+    unsafe impl Sync for ReentrantSuccessor {}
+    impl MetadataAlloc for ReentrantSuccessor {
+        fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+            // SAFETY: `boot` points at a live, leaked `Bootstrap`.
+            unsafe { (*self.boot).alloc(size, align) }
         }
-        // SAFETY: the raw pointer is only dereferenced to call the (thread-safe)
-        // `Bootstrap::alloc`; it points at a leaked, `'static` `Bootstrap`.
-        unsafe impl Sync for ReentrantSuccessor {}
-        impl MetadataAlloc for ReentrantSuccessor {
-            fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-                // SAFETY: `boot` points at a live, leaked `Bootstrap`.
-                unsafe { (*self.boot).alloc(size, align) }
-            }
-        }
+    }
 
+    /// A fresh, leaked `'static` `Bootstrap` handed off to a [`ReentrantSuccessor`],
+    /// so the next `boot.alloc(..)` re-enters the metadata path on this thread.
+    fn armed_reentrant_bootstrap() -> &'static Bootstrap {
         let (base, len) = region(64 * 1024);
         let boot: &'static Bootstrap = Box::leak(Box::new(Bootstrap::new()));
         // SAFETY: `region` leaks a live 64 KiB buffer.
@@ -754,7 +787,13 @@ mod tests {
         let reentrant: &'static ReentrantSuccessor =
             Box::leak(Box::new(ReentrantSuccessor { boot }));
         assert!(boot.hand_off_to(reentrant));
+        boot
+    }
 
+    #[test]
+    #[cfg(debug_assertions)] // under debug-assertions the guard additionally debug-aborts
+    fn bootstrap_reentrancy_guard_traps_reentry_in_debug() {
+        let boot = armed_reentrant_bootstrap();
         // Suppress the expected panic's default message, then confirm the re-entry
         // trips the S-007 guard (a debug abort caught here).
         let prev = std::panic::take_hook();
@@ -766,6 +805,23 @@ mod tests {
             "re-entering the bootstrap path must trip the S-007 guard"
         );
         // The guard was released on unwind, so the thread is clean again.
+        assert!(!boot.is_in_alloc());
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))] // in release the debug_assert is gone; only the backstop remains
+    fn bootstrap_reentrancy_guard_refuses_reentry_in_release() {
+        let boot = armed_reentrant_bootstrap();
+        // No debug abort in release: the guard's `enter()` returns `None` on the
+        // re-entry, so the inner `alloc` fails safe and the whole call resolves to
+        // `None` — never recursing into the metadata path (no stack overflow, no
+        // double-vend). This is the S-007 structural backstop the debug test cannot
+        // exercise (its `debug_assert!` aborts first).
+        assert!(
+            boot.alloc(16, 8).is_none(),
+            "re-entry must be refused (None), not serviced, in release too"
+        );
+        // The outer guard released normally, so the thread is clean again.
         assert!(!boot.is_in_alloc());
     }
 }

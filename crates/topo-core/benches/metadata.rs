@@ -12,12 +12,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use topo_core::bootstrap::BumpArena;
+use topo_core::generated::tables::PAGE_SIZE;
 use topo_core::ids::{ArenaId, SizeClassId, SpanId};
 use topo_core::pagemap::PageMap;
 use topo_core::ptr_class::{classify_ptr, NoMetadata};
 use topo_core::span::SpanDescriptor;
-
-const PAGE_SIZE: usize = 16384;
 
 /// Leak a metadata arena live for the whole process (benches never tear down).
 fn leak_arena(bytes: usize) -> &'static BumpArena {

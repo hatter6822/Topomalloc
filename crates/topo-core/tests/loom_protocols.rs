@@ -62,6 +62,58 @@ fn seqlock_consistent_read_is_never_torn() {
     });
 }
 
+/// The integrity-vs-race disambiguation (W3-4, hardened path): after a consistent
+/// read, `read_consistent_geometry` validates the §17.3 integrity tag; on a
+/// mismatch it **re-reads the version** and treats the mismatch as genuine
+/// corruption *only if the version is unchanged*, otherwise a recycle merely raced
+/// the check and it retries. Soundness rests on one ordering fact: if the validating
+/// read observes any field (or the tag) from a recycle's bracketed write, a later
+/// Acquire-load of the version must observe `seq != s0`. So a benign recycle is
+/// never misreported as corruption. We model the tag as a value that equals the
+/// field in any consistent incarnation (here `base == ck`); a recycle moves both
+/// (Release) within an odd/even bracket. A reader that sees them *disagree* (a torn,
+/// mid-recycle validate) must then observe an advanced version.
+#[test]
+fn integrity_mismatch_under_recycle_is_seen_as_a_version_change() {
+    loom::model(|| {
+        let base = Arc::new(AtomicUsize::new(0));
+        let ck = Arc::new(AtomicUsize::new(0)); // the §17.3 tag; consistent ⟺ ck == base
+        let seq = Arc::new(AtomicU32::new(0));
+
+        // Writer = one recycle, exactly `SpanDescriptor::recycle`: open the seqlock
+        // (odd), store the field then the recomputed tag (Release), close it (even).
+        let writer = {
+            let (base, ck, seq) = (base.clone(), ck.clone(), seq.clone());
+            thread::spawn(move || {
+                seq.fetch_add(1, Ordering::AcqRel); // odd: update in progress
+                base.store(0x4000, Ordering::Release);
+                ck.store(0x4000, Ordering::Release); // refresh_integrity
+                seq.fetch_add(1, Ordering::AcqRel); // even: published
+            })
+        };
+
+        // Reader = the hardened validate + re-check. It reads the version, then the
+        // fields the way `validate_integrity` does (Acquire), and if the tag and field
+        // disagree (a mismatch a racing recycle could cause) it must NOT conclude
+        // "corruption": re-reading the version has to show it advanced past `s0`.
+        let s0 = seq.load(Ordering::Acquire);
+        if s0 & 1 == 0 {
+            let b = base.load(Ordering::Acquire);
+            let c = ck.load(Ordering::Acquire);
+            if b != c {
+                assert_ne!(
+                    seq.load(Ordering::Acquire),
+                    s0,
+                    "a racing recycle's torn validate was misread as corruption \
+                     (base={b:#x}, ck={c:#x}, s0={s0})"
+                );
+            }
+        }
+
+        writer.join().unwrap();
+    });
+}
+
 /// The publish/read invariant (W3-3c): a reader that observes a published radix
 /// node (a non-null child pointer / a non-`Empty` leaf entry) never reads the
 /// node's contents before they were initialized. We model a node's contents
