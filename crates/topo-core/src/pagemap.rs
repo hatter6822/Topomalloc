@@ -247,9 +247,10 @@ impl PageMap {
     /// caller MUST have finished initializing `span` before calling — the descriptor
     /// is the publish payload (W3-6).
     ///
-    /// Returns [`PagemapError::OutOfMetadata`] if a radix node cannot be allocated;
-    /// no partial install is observable as a wrong owner (each page is published
-    /// atomically, and a page not yet reached stays `Empty`).
+    /// Returns [`PagemapError::OutOfMetadata`] if a radix node cannot be allocated.
+    /// **Atomic on failure:** `publish_range` creates every node before publishing any
+    /// entry, so an exhausted install leaves every page `Empty` — no page is ever left
+    /// mapped to a descriptor whose allocation failed (W3-6).
     ///
     /// SPEC-transition: pagemap publish for span activation (§17.2 P-Map-006)
     pub fn install_span(
@@ -312,29 +313,48 @@ impl PageMap {
 
     /// Publish `entry` to every page in `[base, stop)`, creating radix nodes as
     /// needed. The single allocating mutator; all installs funnel through here.
+    ///
+    /// **Two-phase, so it is atomic on metadata exhaustion (W3-6).** Phase 1 creates
+    /// every radix node the range needs — the only fallible step — but publishes
+    /// nothing, so an `OutOfMetadata` here leaves every page still `Empty`; a failed
+    /// install can never leave a page mapped to the descriptor. Phase 2 then publishes
+    /// the entries and cannot fail (the nodes exist from phase 1 and are never freed).
     fn publish_range(
         &self,
         meta: &dyn MetadataAlloc,
         (base, stop): (usize, usize),
         entry: usize,
     ) -> Result<(), PagemapError> {
+        // Phase 1 — create all nodes (fallible, publishes nothing). On OOM nothing has
+        // been stored, so the install is all-or-nothing for the caller.
         for p in page_range(base, stop) {
-            let leaf = self.leaf_or_create(meta, p)?;
-            // SAFETY: `leaf_or_create` returned a valid, published `Leaf`.
+            self.leaf_or_create(meta, p)?;
+        }
+        // Phase 2 — publish every entry. Infallible: phase 1 created the leaf for each
+        // page and radix nodes are monotonic (never freed), so `find_leaf` is `Some`.
+        for p in page_range(base, stop) {
+            let leaf = self
+                .find_leaf(p)
+                .expect("phase 1 created the leaf for every page in the range");
+            // SAFETY: `find_leaf` returned a valid, published `Leaf`.
             let slot = unsafe { &(*leaf).entries[p & SLOT_MASK] };
-            // P-Map-001: a page maps to exactly one descriptor. An install over a
-            // page already owned by a *different* descriptor is a bug (a fresh page
-            // is `Empty`; a re-install of the same span publishes the same word).
+            // P-Map-001: a page maps to exactly one descriptor. An install over a page
+            // already owned by a *different* descriptor is a caller bug (a fresh page
+            // is `Empty`; a re-install of the same span publishes the same word). Debug
+            // builds abort to surface it; release builds **preserve the existing owner**
+            // (skip the store) rather than silently retarget a page that live pointers
+            // may still resolve through — defense-in-depth for the single-mutator
+            // invariant (W3-6).
+            let prior = slot.load(Ordering::Acquire);
             debug_assert!(
-                {
-                    let prior = slot.load(Ordering::Acquire);
-                    prior == TAG_EMPTY || prior == entry
-                },
+                prior == TAG_EMPTY || prior == entry,
                 "P-Map-001: page already owned by a different descriptor"
             );
-            // The release store publishes `entry` so an acquire-loading reader sees
-            // the descriptor it encodes fully initialized (W3-3c).
-            slot.store(entry, Ordering::Release);
+            if prior == TAG_EMPTY || prior == entry {
+                // The release store publishes `entry` so an acquire-loading reader sees
+                // the descriptor it encodes fully initialized (W3-3c).
+                slot.store(entry, Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -734,6 +754,46 @@ mod tests {
         let s = small_span(1, 0x4000_0000, 1, 64, &big);
         assert_eq!(pm.install_span(&m, &s), Err(PagemapError::OutOfMetadata));
         assert!(pm.lookup(s.base()).is_empty());
+    }
+
+    #[test]
+    fn install_out_of_metadata_is_atomic_across_leaves() {
+        // W3-6 two-phase install: a *multi-leaf* install that exhausts metadata
+        // partway must publish NOTHING — every page in the range stays `Empty`, so a
+        // failed allocation's pages can never later classify/free as owned. (An
+        // interleaved one-pass install would leave the first leaf's pages mapped.)
+        // A large allocation that spills one page past a leaf boundary spans two
+        // leaves, so the install must create a second leaf node mid-range.
+        let base = 0x4000_0000usize;
+        assert_eq!(page_of(base) % SLOTS, 0, "test base must be leaf-aligned");
+        let usable = SLOTS * PAGE_SIZE + PAGE_SIZE; // one leaf + one page into the next
+        let d = LargeDescriptor::new(LargeId(1), ArenaId::DEFAULT, base, usable, PAGE_SIZE);
+
+        // Measure the full node cost in a generous arena (node bytes are 8-aligned, so
+        // this equals the arena bytes consumed — no padding slack to account for).
+        let full_pm = PageMap::new();
+        full_pm
+            .install_large(&meta(1 << 20), &d)
+            .expect("generous install succeeds");
+        let full = full_pm.metadata_bytes();
+
+        // One byte short of the full path: the final leaf node cannot be allocated, so
+        // the install fails in phase 1 — after earlier leaves' nodes exist but before
+        // any entry is published.
+        let tight = meta(full - 1);
+        let pm = PageMap::new();
+        assert_eq!(
+            pm.install_large(&tight, &d),
+            Err(PagemapError::OutOfMetadata)
+        );
+
+        // Atomicity: not a single page of the range is mapped.
+        for p in page_range(base, base + usable) {
+            assert!(
+                pm.lookup(p << PAGE_SHIFT).is_empty(),
+                "page {p:#x} left mapped after a failed install (non-atomic)"
+            );
+        }
     }
 
     #[test]

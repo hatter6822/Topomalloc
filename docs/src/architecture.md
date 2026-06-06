@@ -110,7 +110,9 @@ while spans are concurrently created and recycled. Four modules in `topo-core`:
   classifier sees `Empty` or a fully-formed entry, never a half-built node. Because
   descriptors live in monotonic metadata and are recycled with a generation bump, a
   stale pointer is always dereferenceable and the generation flags the reuse (the
-  §27.5 use-after-free the SPEC warns of). **This module is the single mutator**
+  §27.5 use-after-free the SPEC warns of). An install is **two-phase, so it is atomic
+  on metadata exhaustion** — every radix node is created before any entry is published,
+  so a failed install leaves no page mapped. **This module is the single mutator**
   (W3-6): split/merge (plan 04 W4-2b) and span lifecycle (W5-5) route every change
   through `install_span`/`release_span`/`retire_span`/`install_large`, never poking a
   leaf; `metadata_bytes()` reports the bounded node overhead.

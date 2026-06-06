@@ -175,7 +175,10 @@ makes six implementation choices; the module docs carry the detail.
   "safe to call concurrently" contract a type fact (the successor lives behind the
   `Sync` `Bootstrap` and is called from every thread). `Bootstrap::global()` binds a
   `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"),
-  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS. A
+  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS; on a
+  concurrent first-use race `global()` waits for the init winner to publish `Active`
+  before returning, so a loser of the init CAS never hands back an
+  apparently-uninitialized allocator (no spurious metadata `None`). A
   **re-entrancy guard** (`is_in_alloc()`, a thread-local under `std`/tests, a no-op
   leaf otherwise) *refuses* the S-007 re-entry of the metadata path: `alloc` returns
   `None` rather than recurse — in **every** profile, not only debug — and additionally
@@ -201,15 +204,22 @@ makes six implementation choices; the module docs carry the detail.
 * **Publish/read with release/acquire + a single lock-free mutator (W3-6).** Leaf
   entries are release-stored *after* the descriptor is initialized; readers
   acquire-load; new nodes are zeroed before a release-CAS links them — so a classifier
-  sees `Empty` or a fully-formed entry, never a torn node (F1). The pagemap is the
-  **only** mutator (F3): W4-2b and W5-5 route through
-  `install_span`/`release_span`/`retire_span`/`install_large` (guarded in debug against
-  a double-install over a different descriptor and a non-page-aligned span base). Its
+  sees `Empty` or a fully-formed entry, never a torn node (F1). Installs are
+  **two-phase, hence atomic on metadata exhaustion**: `publish_range` creates every
+  radix node the range needs (the only fallible step) *before* publishing any entry, so
+  an `OutOfMetadata` leaves every page `Empty` — a failed allocation never leaves a
+  page mapped to its descriptor. The pagemap is the **only** mutator (F3): W4-2b and
+  W5-5 route through `install_span`/`release_span`/`retire_span`/`install_large`. A
+  page maps to exactly one descriptor (P-Map-001): a double-install over a *different*
+  descriptor is a caller bug a `debug_assert` aborts on, and release builds **preserve
+  the existing owner** (skip the store) rather than silently retarget a live page. Its
   operations are lock-free (atomic publish), so they acquire no lock and cannot violate
   the §27.2 hierarchy; they run inside the caller's span critical section (P-Map-006).
 
 * **Generation for identity + a seqlock for read-consistency (W3-5/W3-4).** Span/large
-  descriptors carry a `generation` bumped on recycle (§16.6/§27.5); `GenGuard` lets a
+  descriptors carry a `generation` bumped on recycle (§16.6/§27.5; it **wraps**,
+  skipping 0, rather than saturating — saturating would pin the counter at its ceiling
+  and let a `GenGuard` captured there match every later incarnation); `GenGuard` lets a
   stashed reference detect a recycle (ABA), and descriptors are never freed, so the
   pointer stays valid. Separately, a **seqlock** version brackets a recycle's geometry
   writes, and `classify_ptr` reads the geometry through it — so a classification racing
