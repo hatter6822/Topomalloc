@@ -78,10 +78,17 @@ impl Sele4nSim {
         self.pool_total
     }
 
-    /// Validate that `[offset, offset+len)` lies within `region` and return the
-    /// sub-range pointer (the §36.6 "map only into an authorized window" check, in
-    /// the degenerate host form).
+    /// Validate that `region` is a frame this simulator reserved **and** that
+    /// `[offset, offset+len)` lies within it, returning the sub-range pointer (the
+    /// §36.6 "map only into an authorized window" check, in the degenerate host form).
+    ///
+    /// These are *safe* trait calls and [`Region`] has public fields, so a foreign or
+    /// forged `Region` must be rejected with `InvalidRequest` — never offset into or
+    /// written through — or the safe API could derive/zero an unowned pointer. We
+    /// therefore confirm the region matches a live frame (base + length) before
+    /// computing `region.base.add(offset)`.
     fn checked_subrange(
+        &self,
         region: Region,
         offset: usize,
         len: usize,
@@ -92,7 +99,20 @@ impl Sele4nSim {
         if end > region.len {
             return Err(BackendError::InvalidRequest);
         }
-        // SAFETY: `offset <= region.len` within a single `region.len`-byte allocation.
+        // The region must be one we reserved (base + length match a live frame); only
+        // then is `region.base` a valid allocation to offset into.
+        let owned = self
+            .state
+            .lock()
+            .expect("sim mutex poisoned")
+            .frames
+            .iter()
+            .any(|fr| fr.base == region.base as usize && fr.charged == region.len);
+        if !owned {
+            return Err(BackendError::InvalidRequest);
+        }
+        // SAFETY: `region` matches a live frame we own, so `region.base` is a valid
+        // allocation of `region.len` bytes and `offset <= region.len`.
         Ok(unsafe { region.base.add(offset) })
     }
 }
@@ -150,14 +170,14 @@ impl TopoBackingProvider for Sele4nSim {
     fn commit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 commit / recommit (M-005). Host memory is already backed; validate
         // the window. (The frame is already AllocatorCommitted from `reserve`.)
-        Self::checked_subrange(region, offset, len)?;
+        self.checked_subrange(region, offset, len)?;
         Ok(())
     }
 
     fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 decommit ≈ MADV_DONTNEED: discard contents now (mirrors POSIX). The
         // pool charge is unchanged — this is a sub-frame backing op, not a recycle.
-        let p = Self::checked_subrange(region, offset, len)?;
+        let p = self.checked_subrange(region, offset, len)?;
         // SAFETY: `checked_subrange` confirmed the sub-range is in bounds.
         unsafe { std::ptr::write_bytes(p, 0, len) };
         Ok(())
@@ -165,13 +185,13 @@ impl TopoBackingProvider for Sele4nSim {
 
     fn purge_lazy(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_lazy ≈ MADV_FREE: lazy discard; contents may persist on host.
-        Self::checked_subrange(region, offset, len)?;
+        self.checked_subrange(region, offset, len)?;
         Ok(())
     }
 
     fn purge_forced(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_forced ≈ MADV_DONTNEED: discard contents now.
-        let p = Self::checked_subrange(region, offset, len)?;
+        let p = self.checked_subrange(region, offset, len)?;
         // SAFETY: as in `decommit`.
         unsafe { std::ptr::write_bytes(p, 0, len) };
         Ok(())
@@ -416,6 +436,39 @@ mod tests {
             Err(BackendError::InvalidRequest)
         ));
         assert_eq!(sim.pool_remaining(), sim.pool_total());
+    }
+
+    #[test]
+    fn physical_ops_reject_foreign_regions_without_dereferencing() {
+        // Audit (P1): the physical-state ops are *safe* trait calls and `Region` has
+        // public fields, so a foreign/forged region must be rejected (InvalidRequest)
+        // — never offset into or zeroed (`write_bytes`). A genuine reservation works.
+        let sim = Sele4nSim::new(1 << 16);
+        let foreign = Region {
+            base: 0x1000 as *mut u8,
+            len: 4096,
+        };
+        assert!(matches!(
+            sim.commit(foreign, 0, 4096),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert!(matches!(
+            sim.decommit(foreign, 0, 4096),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert!(matches!(
+            sim.purge_lazy(foreign, 0, 4096),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert!(matches!(
+            sim.purge_forced(foreign, 0, 4096),
+            Err(BackendError::InvalidRequest)
+        ));
+        // A genuine reservation still commits / decommits / releases end to end.
+        let r = sim.reserve(ArenaId::DEFAULT, 4096, 16).expect("reserve");
+        sim.commit(r, 0, r.len).expect("commit");
+        sim.decommit(r, 0, r.len).expect("decommit");
+        sim.release(ArenaId::DEFAULT, r).expect("release");
     }
 
     #[test]

@@ -438,8 +438,10 @@ pub trait TopoBackingProvider {
 
     /// Map `frame` into `window` with `rights`/`cache`, returning the usable
     /// [`MappedRange`] (§36.6 `map_frame`). Default (POSIX): the window's own pages
-    /// back it, so "mapping" commits the frame's bytes (capped at the window length)
-    /// and hands back the range.
+    /// back it, so "mapping" commits the window and hands the range back. The frame
+    /// must fill the window **exactly** — the collapsed seam maps a window 1:1 to a
+    /// frame (a partial map is rejected; see the body). Plan 09 overrides this to map
+    /// sub-window frames against real frame capabilities.
     ///
     /// SPEC-transition: provider `FrameCapMinted -> MappedToServer -> MappedToClient -> AllocatorCommitted` (§36.6)
     fn map_frame(
@@ -451,12 +453,16 @@ pub trait TopoBackingProvider {
         cache: CachePolicy,
     ) -> Result<MappedRange, BackendError> {
         let _ = (arena, cache);
-        let len = frame.size.min(window.region.len);
-        let region = Region {
-            base: window.region.base,
-            len,
-        };
-        self.commit(region, 0, len)?;
+        // The collapsed POSIX seam backs a window with a single mapping, and
+        // `recycle` → `release` reclaims the whole reservation (matched by base). So a
+        // frame must fill its window exactly: a partial map would make the returned
+        // `MappedRange` describe fewer bytes than `recycle` actually unmaps and leave
+        // the remainder untracked. Reject it rather than silently truncating.
+        if frame.size != window.region.len {
+            return Err(BackendError::InvalidRequest);
+        }
+        let region = window.region;
+        self.commit(region, 0, region.len)?;
         Ok(MappedRange { region, rights })
     }
 

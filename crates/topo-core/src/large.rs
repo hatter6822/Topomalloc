@@ -355,6 +355,16 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             }
         };
         let slot = pool.slot_ptr(idx);
+        // §17.5: `free` requires the allocation's *base* pointer. Every page the large
+        // allocation covers maps to the same descriptor in the pagemap, so an interior
+        // pointer (`base + k`) also resolves here — but it is NOT a valid free. Reject
+        // it (returning `false`, like `ptr_class::classify_in_large`'s `Interior`)
+        // rather than retiring/releasing the whole allocation out from under live use.
+        // SAFETY: `slot` is a live pool slot (it is in the pagemap).
+        if ptr as usize != unsafe { (*slot).desc.base() } {
+            self.lock.release();
+            return false;
+        }
         // Capture the backing and the region before retiring/recycling.
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
         let (backing, region) = unsafe {
@@ -634,6 +644,30 @@ mod tests {
         assert!(la.free(p));
         // Double free: the pointer no longer classifies as large.
         assert!(!la.free(p), "double free is rejected");
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn free_of_interior_pointer_is_rejected() {
+        // §17.5 / audit: `free` requires the *base* pointer. An interior pointer into
+        // a large allocation (which resolves to the same descriptor via the pagemap)
+        // must NOT free it — that would retire/release the whole allocation out from
+        // under live use. It returns `false` and leaves the allocation intact.
+        let la = large(64, 16);
+        let p = la.allocate(3 * PAGE, PAGE);
+        assert!(!p.is_null());
+        // SAFETY: `p .. p + 3*PAGE` is the live allocation; `p + PAGE` is interior.
+        let interior = unsafe { p.add(PAGE) };
+        assert!(!la.free(interior), "interior free is rejected");
+        assert_eq!(
+            la.live_count(),
+            1,
+            "allocation still live after interior free"
+        );
+        assert_eq!(la.usable_size(p), Some(3 * PAGE), "allocation intact");
+        // The base pointer still frees correctly.
+        assert!(la.free(p), "base free succeeds");
+        assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
     }
 

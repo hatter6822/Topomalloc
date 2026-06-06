@@ -835,6 +835,41 @@ mod tests {
     }
 
     #[test]
+    fn map_frame_rejects_a_frame_smaller_than_its_window() {
+        // Audit: the collapsed seam maps a window 1:1 to a frame. A sub-window frame
+        // is rejected (otherwise `recycle` → `release` would unmap the *whole*
+        // reservation while the `MappedRange` describes only the frame, leaving the
+        // remainder untracked). A frame that fills the window maps fine.
+        use topo_core::Rights;
+        let p = PosixBackingProvider::new();
+        let win = p
+            .reserve_window(ArenaId::DEFAULT, 4 * PAGE, PAGE, Rights::READ_WRITE)
+            .expect("reserve_window");
+        let small = p
+            .create_frame(
+                ArenaId::DEFAULT,
+                PAGE.trailing_zeros(),
+                topo_core::Label::PUBLIC,
+            )
+            .expect("create_frame");
+        assert_eq!(small.size, PAGE);
+        assert!(
+            matches!(
+                p.map_frame(
+                    ArenaId::DEFAULT,
+                    small,
+                    win,
+                    Rights::READ_WRITE,
+                    Default::default()
+                ),
+                Err(BackendError::InvalidRequest)
+            ),
+            "a frame smaller than its window is rejected"
+        );
+        // The reserved window is released by the provider's Drop.
+    }
+
+    #[test]
     fn name_is_posix() {
         assert_eq!(PosixBackingProvider::new().name(), "posix");
     }
