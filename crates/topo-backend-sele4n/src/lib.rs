@@ -279,19 +279,37 @@ pub mod real_abi {
         #[test]
         fn kernel_errors_map_onto_the_backend_taxonomy() {
             // Compiles + runs only under `--features real-abi`, against the pinned
-            // upstream `KernelError` — the W4-1 type-check witness, exercised.
-            assert_eq!(
-                map_kernel_error(KernelError::UntypedRegionExhausted),
-                BackendError::OutOfMemory
-            );
-            assert_eq!(
-                map_kernel_error(KernelError::InvalidCapability),
-                BackendError::InvalidRequest
-            );
-            assert_eq!(
-                map_kernel_error(KernelError::PolicyDenied),
-                BackendError::Unsupported
-            );
+            // upstream `KernelError` — the W4-1 type-check witness, exercised. Locks
+            // the whole mapping table so a future edit (or an upstream variant
+            // rename/removal) is caught here, not at M1.
+            use BackendError::*;
+            use KernelError as K;
+            // Untyped exhaustion is the §36.16 out-of-memory.
+            assert_eq!(map_kernel_error(K::UntypedRegionExhausted), OutOfMemory);
+            // Malformed retype / mapping / capability requests → InvalidRequest.
+            for e in [
+                K::InvalidCapability,
+                K::UntypedTypeMismatch,
+                K::UntypedDeviceRestriction,
+                K::UntypedAllocSizeTooSmall,
+                K::AddressOutOfBounds,
+                K::MappingConflict,
+                K::TargetSlotOccupied,
+            ] {
+                assert_eq!(map_kernel_error(e), InvalidRequest, "{e:?}");
+            }
+            // Everything else is reported conservatively as Unsupported until plan 09
+            // refines the table (the `#[non_exhaustive]` `KernelError`'s wildcard arm);
+            // spot-check representative variants from across the enum.
+            for e in [
+                K::PolicyDenied,
+                K::NotImplemented,
+                K::TranslationFault,
+                K::ObjectNotFound,
+                K::BackingObjectMissing,
+            ] {
+                assert_eq!(map_kernel_error(e), Unsupported, "{e:?}");
+            }
         }
     }
 }

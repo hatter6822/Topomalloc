@@ -332,6 +332,20 @@ module docs carry the detail.
   machine, so the cardinal §36.6 bug (recycling untyped that still has a live client
   mapping — the illegal jump that skips unmap→revoke) trips the checker.
 
+* **The `ExtentState` machine is pinned to Lean too (W4-2d).** The §20.1
+  physical-backing lifecycle (`Reserved`/`Active`/`Dirty`/`Muzzy`/`Released`) that
+  enforces M-004/M-005 at runtime has its legal transition relation
+  (`ExtentState::can_transition`) `debug_assert`ed at every physical-state write and
+  pinned 1:1 to the Lean `ExtentState.canTransition` model by the
+  `extent_state_transition_matches_lean` test and the `lake exe check`
+  `extentStateGate` — the §20.1 analogue of `providerChainGate`. So the machine the
+  allocator actually runs cannot drift from the model the `recommit_*`/`release_*`
+  theorems reason about. (`split`/`merge` are *structural* geometry ops that derive a
+  result state from combined backing, not lifecycle transitions, so they are
+  deliberately outside the relation. A forbidden edge carries meaning: nothing
+  returns to `Reserved`, and `Active` may not step straight to `Muzzy` — a live
+  extent must be freed before it can be purged.)
+
 * **Real `mmap`/`madvise`/`mprotect` on unix; host fallback elsewhere (W4-3).** The
   POSIX provider issues the **real syscalls** on `cfg(unix)`: `mmap` reserves,
   `madvise(MADV_DONTNEED)` decommits / forcibly purges, `madvise(MADV_FREE)` lazily

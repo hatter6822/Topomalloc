@@ -64,6 +64,15 @@ def providerChainGate : Bool :=
   (providerChain.zip providerChain.tail).all (fun p => decide (BackingState.next p.1 = some p.2))
     && decide (BackingState.next BackingState.recyclableUntyped = none)
 
+/-- The §20.1 extent-state-machine differential (W4-2d): `ExtentState.canTransition` is
+exactly reflexivity ∪ the canonical `extentEdges`, over all 25 ordered pairs. The Rust
+test `extent_state_transition_matches_lean` pins the runtime
+`ExtentState::can_transition` to the *same* edge set, so the runtime physical-state
+machine and this model cannot drift (the §20.1 analogue of `providerChainGate`). -/
+def extentStateGate : Bool :=
+  ExtentState.all.all (fun s => ExtentState.all.all (fun t =>
+    ExtentState.canTransition s t == (s == t || ExtentState.hasEdge s t)))
+
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
@@ -85,5 +94,10 @@ def main : IO UInt32 := do
     IO.println "lake check: provider state machine OK (§36.6 chain matches BackingState.next; pins Rust ProviderState, W4-1)"
   else
     IO.eprintln "lake check: provider state machine FAILED (§36.6 chain drift, W4-1)"
+    ok := false
+  if extentStateGate then
+    IO.println "lake check: extent state machine OK (§20.1 transitions match ExtentState.canTransition; pins Rust ExtentState, W4-2d)"
+  else
+    IO.eprintln "lake check: extent state machine FAILED (§20.1 transition drift, W4-2d)"
     ok := false
   return if ok then 0 else 1

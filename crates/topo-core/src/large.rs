@@ -547,6 +547,62 @@ mod tests {
         }
     }
 
+    // A region-cache hook (§18.6, C13) that serves exactly its first matching request
+    // from one owned region and declines the rest, counting how many freed regions it
+    // accepts back. Shared by the cache-routing tests.
+    use std::alloc::{alloc, dealloc, Layout};
+    use std::cell::Cell;
+
+    struct OneShotCache {
+        base: *mut u8,
+        len: usize,
+        layout: Layout,
+        served: Cell<bool>,
+        returns: Cell<usize>,
+    }
+    impl OneShotCache {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, PAGE).unwrap();
+            // SAFETY: nonzero, page-aligned layout.
+            let base = unsafe { alloc(layout) };
+            assert!(!base.is_null());
+            Self {
+                base,
+                len,
+                layout,
+                served: Cell::new(false),
+                returns: Cell::new(0),
+            }
+        }
+    }
+    impl RegionCacheHook for OneShotCache {
+        fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
+            if !self.served.get() && bytes <= self.len && align <= PAGE {
+                self.served.set(true);
+                Some(Region {
+                    base: self.base,
+                    len: self.len,
+                })
+            } else {
+                None
+            }
+        }
+        fn try_cache(&self, region: Region) -> bool {
+            assert_eq!(
+                region.base, self.base,
+                "only the cache-served region returns here"
+            );
+            self.returns.set(self.returns.get() + 1);
+            true // the cache takes ownership
+        }
+    }
+    impl Drop for OneShotCache {
+        fn drop(&mut self) {
+            // SAFETY: exactly the pointer/layout from `new`.
+            unsafe { dealloc(self.base, self.layout) };
+        }
+    }
+
     #[test]
     fn allocate_is_classifiable_and_freeable() {
         let la = large(64, 16);
@@ -593,6 +649,26 @@ mod tests {
         }
         assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn new_fails_cleanly_on_metadata_exhaustion() {
+        // W4-5 safe failure: a metadata arena too small for the slot pools makes `new`
+        // return an error rather than panicking or half-initialising. (The extent
+        // manager releases its reservation on this path, so nothing leaks.)
+        let r = LargeAllocator::new(
+            PosixBackingProvider::new(),
+            meta(64), // far too small for the 4096-slot extent pool below
+            pagemap(),
+            ArenaId::DEFAULT,
+            LargeConfig {
+                region_bytes: 64 * PAGE,
+                region_align: PAGE,
+                extent_slots: 4096,
+                large_slots: 16,
+            },
+        );
+        assert!(r.is_err(), "construction over an exhausted arena must fail");
     }
 
     #[test]
@@ -726,56 +802,6 @@ mod tests {
         // and on free be offered back to the cache via `try_cache` — never routed to
         // the extent manager. This is the cache-served path no other test exercises
         // (all others use `NoRegionCache`, whose defaults decline both calls).
-        use std::alloc::{alloc, dealloc, Layout};
-        use std::cell::Cell;
-
-        struct OneShotCache {
-            base: *mut u8,
-            len: usize,
-            layout: Layout,
-            served: Cell<bool>,
-            returned: Cell<bool>,
-        }
-        impl OneShotCache {
-            fn new(len: usize) -> Self {
-                let layout = Layout::from_size_align(len, PAGE).unwrap();
-                // SAFETY: nonzero, page-aligned layout.
-                let base = unsafe { alloc(layout) };
-                assert!(!base.is_null());
-                Self {
-                    base,
-                    len,
-                    layout,
-                    served: Cell::new(false),
-                    returned: Cell::new(false),
-                }
-            }
-        }
-        impl RegionCacheHook for OneShotCache {
-            fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
-                if !self.served.get() && bytes <= self.len && align <= PAGE {
-                    self.served.set(true);
-                    Some(Region {
-                        base: self.base,
-                        len: self.len,
-                    })
-                } else {
-                    None
-                }
-            }
-            fn try_cache(&self, region: Region) -> bool {
-                assert_eq!(region.base, self.base, "freed region offered back to cache");
-                self.returned.set(true);
-                true // the cache takes ownership
-            }
-        }
-        impl Drop for OneShotCache {
-            fn drop(&mut self) {
-                // SAFETY: exactly the pointer/layout from `new`.
-                unsafe { dealloc(self.base, self.layout) };
-            }
-        }
-
         let la = large(64, 16);
         let cache = OneShotCache::new(3 * PAGE);
         // Alloc: the cache serves it (`backing == None`), bypassing the extent manager.
@@ -793,12 +819,53 @@ mod tests {
         }
         // Free: offered back to the cache (`try_cache`), not freed through the extents.
         assert!(la.free_with(p, &cache));
-        assert!(
-            cache.returned.get(),
+        assert_eq!(
+            cache.returns.get(),
+            1,
             "freed cache-served region returned to the cache"
         );
         assert_eq!(la.live_count(), 0);
         assert_eq!(la.usable_size(p), None);
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn mixed_cache_served_and_extent_backed_route_correctly_on_free() {
+        // §18.6: within one allocator a hook may serve SOME allocations
+        // (`backing == None`) and decline others (extent-backed). On free each must go
+        // back to its own owner — the cache-served one to `try_cache`, the
+        // extent-backed one to the extent manager — driven by the descriptor's
+        // `has_extent` flag. Covers the mixed routing the single-allocation test does
+        // not.
+        let la = large(64, 16);
+        let cache = OneShotCache::new(3 * PAGE); // serves exactly the first request
+
+        let served = la.allocate_with(3 * PAGE, PAGE, &cache);
+        assert!(!served.is_null());
+        assert_eq!(served, cache.base, "first alloc served from the cache");
+        let backed = la.allocate_with(3 * PAGE, PAGE, &cache); // cache now declines
+        assert!(!backed.is_null());
+        assert_ne!(
+            backed, cache.base,
+            "second alloc came from the extent manager"
+        );
+        assert_eq!(la.live_count(), 2);
+
+        // Free the extent-backed one first: routed to the extents, never to the cache.
+        assert!(la.free_with(backed, &cache));
+        assert_eq!(
+            cache.returns.get(),
+            0,
+            "an extent-backed free must not touch the cache"
+        );
+        // Free the cache-served one: routed back to the cache exactly once.
+        assert!(la.free_with(served, &cache));
+        assert_eq!(
+            cache.returns.get(),
+            1,
+            "cache-served free returns to the cache"
+        );
+        assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
     }
 }

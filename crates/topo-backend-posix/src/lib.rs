@@ -14,7 +14,7 @@
 //! TopoMalloc's memory states (§20.1) map to OS primitives as follows. On unix the
 //! provider issues the real syscall; the table is the contract:
 //!
-//! | TopoMalloc op (§20.4) | TopoMalloc state | Linux / unix here | macOS / BSD |
+//! | TopoMalloc op (§20.4) | TopoMalloc state | Linux / other unix | Darwin (macOS/iOS) |
 //! |---|---|---|---|
 //! | `reserve` | reserved | `mmap(PROT_READ\|WRITE)` (or `PROT_NONE` in guard mode) | `mmap` |
 //! | `commit` | committed | no-op (already mapped RW); `mprotect(PROT_READ\|WRITE)` in guard mode | `mprotect` |
@@ -27,7 +27,11 @@
 //! On Linux `MADV_DONTNEED` drops the pages immediately (RSS falls now; a later
 //! read faults a fresh **zero** page), whereas `MADV_FREE` is lazy (the kernel
 //! reclaims under pressure and the old contents survive until then) — exactly the
-//! §20.1 dirty-vs-muzzy distinction.
+//! §20.1 dirty-vs-muzzy distinction. On Darwin the discard-now ops (`decommit`,
+//! `purge_forced`) use `MADV_FREE_REUSABLE` instead, because Darwin's `MADV_DONTNEED`
+//! is advisory and does not reclaim (the `MADV_DISCARD_NOW` split below). Correctness
+//! does not depend on the post-discard read value: M-005 requires a recommit before
+//! any reuse. The Apple branch is compiled but not exercised by CI (which runs Linux).
 //!
 //! ## Guard mode (§20.5, W4-3b — catch use-after-free)
 //!
@@ -263,6 +267,20 @@ mod sys {
 
     use topo_core::BackendError;
 
+    /// `madvise` advice for **discard the backing now** (RSS drops immediately; reuse
+    /// needs a recommit, M-005). Linux and the other BSDs use `MADV_DONTNEED` — a
+    /// later read then faults a fresh **zero** page. Darwin's `MADV_DONTNEED` is
+    /// advisory and does *not* reclaim, so Apple targets use `MADV_FREE_REUSABLE`,
+    /// the eager-reclaim equivalent there (the §20.4 per-platform table). The
+    /// allocator's contract is unchanged either way: a released range is never read
+    /// without a recommit first (M-005), so whether the discarded page reads back as
+    /// zero is not relied upon. (The Apple branch compiles against `libc` but is not
+    /// exercised by CI, which runs on Linux.)
+    #[cfg(target_vendor = "apple")]
+    const MADV_DISCARD_NOW: libc::c_int = libc::MADV_FREE_REUSABLE;
+    #[cfg(not(target_vendor = "apple"))]
+    const MADV_DISCARD_NOW: libc::c_int = libc::MADV_DONTNEED;
+
     /// The OS page size (`sysconf(_SC_PAGESIZE)`), the granularity `mmap`/`madvise`/
     /// `mprotect` operate at. The allocator's `PAGE_SIZE` (16 KiB) is a multiple of
     /// it, so every extent offset/length passed here is OS-page-aligned.
@@ -377,9 +395,10 @@ mod sys {
         len: usize,
         guard: bool,
     ) -> Result<(), BackendError> {
-        // SAFETY: page-aligned in-bounds range; MADV_DONTNEED on anonymous private
-        // memory drops the pages (zero-fill on next fault).
-        let rc = unsafe { libc::madvise(addr as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+        // SAFETY: page-aligned in-bounds range; the discard-now advice on anonymous
+        // private memory drops the pages (zero-fill on next fault on Linux; eager
+        // reclaim on Darwin — see `MADV_DISCARD_NOW`).
+        let rc = unsafe { libc::madvise(addr as *mut libc::c_void, len, MADV_DISCARD_NOW) };
         if rc != 0 {
             return Err(BackendError::OutOfMemory);
         }
@@ -412,13 +431,14 @@ mod sys {
         }
     }
 
-    /// Forcibly discard `[addr, addr+len)` now (MADV_DONTNEED).
+    /// Forcibly discard `[addr, addr+len)` now (the discard-now advice; see
+    /// [`MADV_DISCARD_NOW`]).
     ///
     /// # Safety
     /// `[addr, addr+len)` is an OS-page-aligned sub-range of a live reservation.
     pub(super) unsafe fn purge_forced(addr: usize, len: usize) -> Result<(), BackendError> {
         // SAFETY: page-aligned in-bounds range.
-        let rc = unsafe { libc::madvise(addr as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+        let rc = unsafe { libc::madvise(addr as *mut libc::c_void, len, MADV_DISCARD_NOW) };
         if rc == 0 {
             Ok(())
         } else {
@@ -756,6 +776,62 @@ mod tests {
             assert_eq!(r.base.read(), 0x22);
         }
         p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn unmap_policy_with_guard_pages_faults_on_use_after_free() {
+        // §20.5 / W4-3b end-to-end: the guard-mode provider *driven by the extent
+        // manager under `RetainPolicy::Unmap`* must trap a use-after-free. Freeing an
+        // extent decommits it AND mprotects the range PROT_NONE, so a later access to
+        // the freed extent faults — the integration the provider-level guard test does
+        // not cover (it calls the provider directly). Verified in a forked child.
+        use topo_core::bootstrap::BumpArena;
+        use topo_core::{ExtentManager, Fit, RetainPolicy};
+
+        // Leaked metadata arena (live for the process), the slot-pool test pattern.
+        let meta: &'static BumpArena = {
+            let buf = vec![0u8; 1 << 20].into_boxed_slice();
+            let len = buf.len();
+            let ptr = Box::into_raw(buf).cast::<u8>();
+            // SAFETY: the leaked buffer is valid for the process.
+            Box::leak(Box::new(unsafe { BumpArena::new(ptr, len) }))
+        };
+        let mut mgr = ExtentManager::new(
+            PosixBackingProvider::with_guard_pages(),
+            meta,
+            ArenaId::DEFAULT,
+            4 * PAGE,
+            PAGE,
+            4096,
+        )
+        .expect("manager");
+        mgr.set_retain_policy(RetainPolicy::Unmap);
+
+        let r = mgr.alloc(2 * PAGE, PAGE, Fit::First).expect("alloc");
+        let region = mgr.region_of(r).expect("region");
+        // SAFETY: guard mode mprotect'd the extent RW on the commit `alloc` performed.
+        unsafe { region.base.write(0x11) };
+        mgr.free(r).expect("free"); // Unmap: decommit + mprotect(PROT_NONE)
+
+        // SAFETY: `fork` in a test with no other threads touching shared state; the
+        // child only reads one address and never returns normally. The parent must
+        // NOT touch `region.base` (it is PROT_NONE in this process too).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: the freed extent's range is PROT_NONE — this read must fault.
+            // SAFETY: deliberate faulting access; the child never returns normally.
+            let v = unsafe { core::ptr::read_volatile(region.base) };
+            std::process::exit(v as i32 & 1); // exit 0 would signal a *missing* trap
+        }
+        let mut status: libc::c_int = 0;
+        // SAFETY: valid pid and status pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFSIGNALED(status),
+            "use-after-free of an Unmap-freed extent did not fault under guard pages"
+        );
     }
 
     #[test]

@@ -257,8 +257,13 @@ failure-injection, and **fuzz** (`fuzz/fuzz_targets/extent.rs`) tests. The **Lea
 theorems certify the geometric core: `span_split`/`span_merge_preserves_disjointness`
 (`Theorems/Span.lean`, W1-8a — the Rust `split` is Lean's `splitLeft`/`splitRight`,
 `merge` their union), `release_to_os_preserves_live_objects` (`Theorems/Release.lean`,
-W1-8c — decommit/M-004), and the new `recommit_*` theorems (`Theorems/Extent.lean`,
+W1-8c — decommit/M-004), and the `recommit_*` theorems (`Theorems/Extent.lean`,
 W4-2d — commit/M-005); so the implementation discharges the obligations they state.
+The §20.1 physical-state machine *itself* is pinned to the Lean `ExtentState.canTransition`
+model by a Rust differential test (`extent_state_transition_matches_lean`) and the
+`lake exe check` `extentStateGate` — the §20.1 analogue of `providerChainGate` — and
+`can_transition` is `debug_assert`ed at every physical-state write, so the extent-state
+transitions the allocator actually runs cannot drift from the model.
 
 ## Single source of truth (DD-1)
 

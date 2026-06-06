@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::util::{have, Outcome, Runner};
+use crate::util::{have, target_installed, Outcome, Runner};
 
 /// Directories never scanned by the built-in file checks (build outputs, VCS, and
 /// the gitignored, separately-licensed seLe4n ABI mirror under `vendor/`, D8).
@@ -195,6 +195,14 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
                 "cargo",
                 &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
             );
+            // W4-3b: exercise the low-rss profile so `RetainPolicy::from_profile`
+            // actually resolves to `Unmap` (the aggressive-unmap default), not just
+            // the manually-set policy the lifecycle tests use.
+            r.run(
+                "low-rss profile (retain policy)",
+                "cargo",
+                &["test", "-p", "topo-core", "--features", "low-rss"],
+            );
             global_alloc_smoke_step(&mut r);
         }
     }
@@ -293,6 +301,29 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
             "aarch64-unknown-linux-gnu",
         ],
     );
+    // The Darwin (Apple) `madvise` cfg branch (`MADV_FREE_REUSABLE`, §20.4) is
+    // metadata-checked here when its target std is installed, so it cannot bit-rot
+    // unnoticed; skipped with a note where the target is absent (the GitHub `build`
+    // job installs it and runs this check once — CI is otherwise Linux).
+    const APPLE_TARGET: &str = "x86_64-apple-darwin";
+    if target_installed(APPLE_TARGET) {
+        r.run(
+            "check Darwin (apple madvise cfg)",
+            "cargo",
+            &[
+                "check",
+                "-p",
+                "topo-backend-posix",
+                "--target",
+                APPLE_TARGET,
+            ],
+        );
+    } else {
+        r.note(
+            "x86_64-apple-darwin not installed; skipping the Apple madvise cfg check \
+             (`rustup target add x86_64-apple-darwin` to enable).",
+        );
+    }
 
     // Tests, including the seLe4n simulator vertical slice (G-sim).
     r.run("test host", "cargo", &["test", "--workspace"]);
@@ -308,6 +339,13 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "test dual-backend (G-sim)",
         "cargo",
         &["test", "-p", "topo-tests", "--features", "sele4n-sim"],
+    );
+    // W4-3b: the low-rss profile selects `RetainPolicy::Unmap` via `from_profile`;
+    // run the core suite under it so that aggressive-unmap default is exercised.
+    r.run(
+        "test low-rss profile (W4-3b retain policy)",
+        "cargo",
+        &["test", "-p", "topo-core", "--features", "low-rss"],
     );
     // seLe4n `real-abi`: the GPL backend must keep compiling against the pinned,
     // vendored ABI (D8, W4-1) — guards the `vendor/sele4n` wiring against drift.

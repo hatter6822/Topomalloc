@@ -137,6 +137,45 @@ impl ExtentState {
             ExtentState::Active | ExtentState::Dirty | ExtentState::Muzzy
         )
     }
+
+    /// Whether `self -> to` is a legal §20.1 physical-backing transition of a single
+    /// extent's lifecycle. Reflexive (an idempotent op — e.g. re-purging a muzzy
+    /// extent — and a state-preserving split are always legal). The directed edges
+    /// are exactly those the physical-state operations produce:
+    ///
+    ///  * **allocate** (`carve`): any free extent → `Active` (backing is then ensured
+    ///    by the commit `alloc` performs, M-005);
+    ///  * **free**: `Active` → `Dirty` (retain) or `Released` (eager unmap);
+    ///  * **recommit** (`mark_committed`, M-005): an unbacked free `Reserved`/`Released`
+    ///    → `Dirty`;
+    ///  * **purge**: `Dirty` → `Muzzy`;
+    ///  * **decommit/release**: a free `Reserved`/`Dirty`/`Muzzy` → `Released`.
+    ///
+    /// The forbidden edges carry real meaning: nothing returns to `Reserved` (the
+    /// initial, never-backed state — once an extent is touched it never goes back),
+    /// and `Active` may not step straight to `Muzzy` (a live extent must be *freed*
+    /// before it can be purged — the M-004 "no purge of a live range" guard). The
+    /// *structural* `split`/`merge` (§18.4) are **not** lifecycle transitions — they
+    /// derive the result extent's state from the combined backing — so they are not
+    /// modeled by this relation. This predicate is pinned 1:1 to the Lean
+    /// `ExtentState.canTransition` model by the `extent_state_transition_matches_lean`
+    /// test and the `lake exe check` `extentStateGate` (W4-2d), so the runtime
+    /// machine and the proof cannot drift (the §20.1 analogue of the §36.6
+    /// `ProviderState` differential).
+    pub const fn can_transition(self, to: ExtentState) -> bool {
+        use ExtentState::*;
+        if self as u8 == to as u8 {
+            return true; // reflexive: idempotent op / state-preserving structural rewrite
+        }
+        matches!(
+            (self, to),
+            (Reserved | Dirty | Muzzy | Released, Active) // allocate (carve)
+                | (Active, Dirty | Released)              // free (retain | unmap)
+                | (Reserved | Released, Dirty)            // recommit (M-005)
+                | (Dirty, Muzzy)                          // purge
+                | (Reserved | Dirty | Muzzy, Released) // decommit / release
+        )
+    }
 }
 
 /// A hugepage backing range for an extent (§18.2 `HugePageRange`). For M1 (no
@@ -963,6 +1002,10 @@ impl ExtentMap {
         self.bin_remove(active.0);
         let mut s = self.get(active.0);
         let was_free_bytes = s.len;
+        debug_assert!(
+            ExtentState::from_u8(s.state).can_transition(ExtentState::Active),
+            "carve: illegal §20.1 transition to Active"
+        );
         s.state = ExtentState::Active as u8;
         self.put(active.0, s);
         self.free_bytes -= was_free_bytes;
@@ -983,6 +1026,10 @@ impl ExtentMap {
     pub fn free(&mut self, id: ExtentId, new_state: ExtentState) -> Option<ExtentId> {
         let e = self.view(id)?;
         debug_assert_eq!(e.state, ExtentState::Active, "freeing a non-Active extent");
+        debug_assert!(
+            e.state.can_transition(new_state),
+            "free: illegal §20.1 transition"
+        );
         let mut s = self.get(id.0);
         s.state = new_state as u8;
         self.put(id.0, s);
@@ -1001,7 +1048,12 @@ impl ExtentMap {
         let newly = s.len - s.committed_len;
         s.committed_len = s.len;
         // A free extent that was Released/Reserved becomes Dirty once backed again.
-        if ExtentState::from_u8(s.state).is_free() && !ExtentState::from_u8(s.state).is_backed() {
+        let prev = ExtentState::from_u8(s.state);
+        if prev.is_free() && !prev.is_backed() {
+            debug_assert!(
+                prev.can_transition(ExtentState::Dirty),
+                "recommit: illegal §20.1 transition to Dirty"
+            );
             s.state = ExtentState::Dirty as u8;
         }
         self.put(id.0, s);
@@ -1016,6 +1068,10 @@ impl ExtentMap {
         let mut s = self.get(id.0);
         let was = s.committed_len;
         s.committed_len = 0;
+        debug_assert!(
+            ExtentState::from_u8(s.state).can_transition(new_state),
+            "decommit: illegal §20.1 transition"
+        );
         s.state = new_state as u8;
         self.put(id.0, s);
         self.committed_bytes -= was;
@@ -1030,6 +1086,10 @@ impl ExtentMap {
             return false;
         }
         let mut s = self.get(id.0);
+        debug_assert!(
+            ExtentState::from_u8(s.state).can_transition(new_state),
+            "set_state: illegal §20.1 transition"
+        );
         s.state = new_state as u8;
         self.put(id.0, s);
         true
@@ -1633,9 +1693,13 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         Ok(())
     }
 
-    /// Forcibly purge a **free** extent's contents now (§20.4): RSS drops
+    /// Forcibly purge a **free, backed** extent's contents now (§20.4): RSS drops
     /// immediately and the extent becomes [`Muzzy`](ExtentState::Muzzy) (still
-    /// mapped; a later read faults a fresh page). M-004: free extents only.
+    /// mapped; a later read faults a fresh page). A **no-op on an unbacked** free
+    /// extent ([`Released`](ExtentState::Released)/[`Reserved`](ExtentState::Reserved),
+    /// `committed_len == 0`) — nothing is resident to drop, and forcing it to `Muzzy`
+    /// would break the state↔backing coupling (mirrors [`purge_lazy`](Self::purge_lazy)'s
+    /// no-op off non-`Dirty`). M-004: free extents only.
     ///
     /// SPEC-transition: `purge_forced` (provider `Allocator* -> AllocatorMuzzyOrScrubbed`, §20.4)
     pub fn purge_forced(&self, r: ExtentRef) -> Result<(), ExtentError> {
@@ -1644,11 +1708,17 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         if !e.state.is_free() {
             return Err(ExtentError::NotFree);
         }
-        let offset = self.sub_offset(e.base);
-        self.provider
-            .purge_forced(self.region, offset, e.len)
-            .map_err(ExtentError::Backend)?;
-        g.map.set_state(r.id, ExtentState::Muzzy);
+        // Only a *backed* free extent has resident pages to drop; an unbacked one
+        // (Released/Reserved, `committed_len == 0`) is already purged, so forcing it
+        // to Muzzy would be a no-op that violates the state↔backing coupling (Muzzy
+        // must be backed). Mirror `purge_lazy`, which already no-ops off `Dirty`.
+        if e.committed_len > 0 {
+            let offset = self.sub_offset(e.base);
+            self.provider
+                .purge_forced(self.region, offset, e.len)
+                .map_err(ExtentError::Backend)?;
+            g.map.set_state(r.id, ExtentState::Muzzy);
+        }
         debug_assert!(g.map.check_invariants());
         Ok(())
     }
@@ -1843,7 +1913,7 @@ mod tests {
     }
 
     fn manager(pages: usize) -> ExtentManager<HostProvider> {
-        ExtentManager::new(
+        let mut m = ExtentManager::new(
             HostProvider::new(),
             meta(1 << 20),
             ArenaId::DEFAULT,
@@ -1851,7 +1921,13 @@ mod tests {
             PAGE,
             4096,
         )
-        .expect("manager")
+        .expect("manager");
+        // Pin the retain policy so the lifecycle tests are deterministic regardless of
+        // the build profile (under `--features low-rss`/`debug`, `from_profile` would
+        // otherwise default to Unmap and flip `free` semantics). Profile *selection*
+        // is covered separately by `retain_policy_follows_the_build_profile`.
+        m.set_retain_policy(RetainPolicy::Retain);
+        m
     }
 
     // === ExtentMap (pure bookkeeping) ====================================
@@ -2091,6 +2167,125 @@ mod tests {
         assert_eq!(mgr.decommit(r), Err(ExtentError::NotFree));
         assert_eq!(mgr.release(r), Err(ExtentError::NotFree));
         assert_eq!(mgr.purge_lazy(r), Err(ExtentError::NotFree));
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn purge_forced_on_unbacked_released_extent_is_a_safe_noop() {
+        // Regression: `purge_forced` on an *unbacked* free extent (Released,
+        // `committed_len == 0`) must be a no-op. Forcing it to Muzzy would claim it is
+        // backed (Muzzy ⇒ backed) while `committed_len == 0`, violating the
+        // state↔backing coupling and tripping `check_invariants` — and it has no
+        // resident pages to drop anyway. Mirrors `purge_lazy`'s no-op off non-Dirty.
+        let mgr = manager(8);
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(b).unwrap();
+        mgr.release(b).unwrap(); // b: Released, committed_len 0
+        assert_eq!(mgr.view(b).unwrap().state, ExtentState::Released);
+        mgr.purge_forced(b).unwrap(); // no-op: unbacked
+        assert_eq!(mgr.view(b).unwrap().state, ExtentState::Released);
+        assert_eq!(mgr.view(b).unwrap().committed_len, 0);
+        assert!(mgr.check_invariants());
+        let _ = a;
+    }
+
+    #[test]
+    fn extent_state_transition_matches_lean() {
+        use ExtentState::*;
+        const STATES: [ExtentState; 5] = [Reserved, Active, Dirty, Muzzy, Released];
+        // The canonical legal §20.1 directed edges (non-reflexive) — the SAME list the
+        // Lean `ExtentState.extentEdges` source of truth encodes
+        // (lean/TopoMalloc/ExtentState.lean), pinned by the `lake exe check`
+        // `extentStateGate`. `can_transition` must be exactly reflexivity ∪ these
+        // edges; if the runtime relation and the Lean model drift, one side fails (the
+        // §20.1 analogue of `provider_next_matches_the_36_6_chain_exactly`, W4-2d).
+        const EDGES: &[(ExtentState, ExtentState)] = &[
+            (Reserved, Active),
+            (Dirty, Active),
+            (Muzzy, Active),
+            (Released, Active),
+            (Active, Dirty),
+            (Active, Released),
+            (Reserved, Dirty),
+            (Released, Dirty),
+            (Dirty, Muzzy),
+            (Reserved, Released),
+            (Dirty, Released),
+            (Muzzy, Released),
+        ];
+        for &from in &STATES {
+            for &to in &STATES {
+                let expected = from == to || EDGES.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition(to),
+                    expected,
+                    "transition {from:?} -> {to:?} disagrees with the canonical §20.1 relation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retain_policy_follows_the_build_profile() {
+        // W4-3b: retain by default on a 64-bit performance build; unmap more
+        // aggressively under the `debug`/`low-rss` profiles or on a 32-bit
+        // (address-space-scarce) target. CI runs this both with and without
+        // `--features low-rss`, so the `from_profile` *selection* is exercised — not
+        // just the manually-set policy the lifecycle tests use.
+        let p = RetainPolicy::from_profile();
+        if cfg!(any(feature = "debug", feature = "low-rss")) || cfg!(target_pointer_width = "32") {
+            assert_eq!(p, RetainPolicy::Unmap, "aggressive-unmap profile");
+        } else {
+            assert_eq!(p, RetainPolicy::Retain, "64-bit performance default");
+        }
+        // `ExtentManager::new` adopts the profile policy by default. (The `manager`
+        // helper overrides it to Retain for determinism, so build one directly here.)
+        let mgr_default = ExtentManager::new(
+            HostProvider::new(),
+            meta(1 << 20),
+            ArenaId::DEFAULT,
+            8 * PAGE,
+            PAGE,
+            4096,
+        )
+        .expect("manager");
+        assert_eq!(mgr_default.retain_policy(), p);
+    }
+
+    #[test]
+    fn new_rejects_a_region_size_that_would_overflow() {
+        // §9.7: the managed region is page-rounded; a size whose page-rounded length
+        // would wrap `usize` is rejected (Overflow), never silently truncated to a
+        // smaller region. No reservation happens before the check, so nothing leaks.
+        let r = ExtentManager::new(
+            HostProvider::new(),
+            meta(1 << 16),
+            ArenaId::DEFAULT,
+            usize::MAX,
+            PAGE,
+            4096,
+        );
+        assert!(matches!(r, Err(ExtentError::Overflow)));
+    }
+
+    #[test]
+    fn set_extent_flags_on_a_stale_ref_is_rejected() {
+        let mgr = manager(8);
+        let r = mgr.alloc(2 * PAGE, PAGE, Fit::First).unwrap();
+        // A ref with a mismatched generation is stale by construction (DD-1 F2): the
+        // flag write must be refused and have no effect.
+        let stale = ExtentRef {
+            id: r.id,
+            generation: r.generation.wrapping_add(1),
+        };
+        assert_eq!(
+            mgr.set_extent_flags(stale, ExtentFlags(0b1)),
+            Err(ExtentError::Stale)
+        );
+        // The live ref still works; the stale attempt left the flags untouched.
+        mgr.set_extent_flags(r, ExtentFlags(0b1)).expect("live ref");
+        assert_eq!(mgr.extent_flags(r), Some(ExtentFlags(0b1)));
         assert!(mgr.check_invariants());
     }
 

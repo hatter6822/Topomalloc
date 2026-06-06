@@ -34,22 +34,31 @@ pub const fn debug_checks_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Calls are `super::`-qualified rather than `use super::*` so the module carries
+    // no unused import when every test below is `cfg`-gated out (e.g. under
+    // `--features low-rss`, where neither applies).
 
     #[test]
-    #[cfg(not(feature = "debug-checks"))]
+    #[cfg(not(any(
+        feature = "debug-checks",
+        feature = "low-rss",
+        feature = "deterministic-test",
+        feature = "hugepage-optimized"
+    )))]
     fn default_build_is_performance() {
         // With no profile feature the build is `performance` and pays no debug
-        // checks. (Gated off when `debug-checks` is enabled — e.g. the hardened
-        // test pass — where the assertion deliberately would not hold.)
-        assert_eq!(active_profile(), "performance");
-        assert!(!debug_checks_enabled());
+        // checks. Gated off whenever *any* profile feature is active (debug-checks
+        // covers the `hardened`/`debug` passes; the other profiles are listed
+        // explicitly), where the assertion deliberately would not hold — so the suite
+        // stays green under, e.g., `--features low-rss` (W4-3b).
+        assert_eq!(super::active_profile(), "performance");
+        assert!(!super::debug_checks_enabled());
     }
 
     #[test]
     #[cfg(feature = "debug-checks")]
     fn debug_checks_feature_enables_the_checks() {
         // The hardened/debug pass: the §17.3/Appendix-B checks are compiled in.
-        assert!(debug_checks_enabled());
+        assert!(super::debug_checks_enabled());
     }
 }
