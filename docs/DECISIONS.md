@@ -265,3 +265,96 @@ makes six implementation choices; the module docs carry the detail.
   recorded install/lookup trace is replayed by `lake exe check` and by the Rust
   `pagemap_matches_lean_replay_differential` test against the radix — the W3-3d
   differential loop.
+
+## W4 — back-end extents, physical state & the provider seam (plan 04)
+
+The W4 back-end (`crates/topo-core/src/{extent,backend}.rs` plus the
+`topo-backend-{posix,sele4n}` physical-state ops) makes six implementation choices;
+the module docs carry the detail.
+
+* **Extend the §36.6 seam in place; POSIX stays the degenerate case.** The M0 seam
+  (`reserve`/`commit`/`release`) is *extended*, not replaced (the M0 contract is
+  forward-compatible): the trait gains `decommit`/`purge_lazy`/`purge_forced` (the
+  §20.4 physical-state ops) and `revoke_descendants` (a default no-op — POSIX has a
+  single ambient authority, so there is nothing to revoke). New ops have default
+  no-op bodies, so any minimal provider still compiles, while POSIX/Sim override
+  them with real state tracking. `reserve` is documented as the POSIX **collapse**
+  of §36.6 `reserve_window ∘ create_frame ∘ map_frame` (with `READ_WRITE` rights and
+  a `Cached` mapping), so plan 09's capability provider drops in behind the
+  identical interface (D2). A `ProviderState` enum + `can_transition` checker models
+  the §36.6 machine and is **asserted at runtime** — the seLe4n simulator walks every
+  reservation through `AuthorizedUntyped → … → AllocatorCommitted` and every release
+  through `Unmapped → Revoked → RecyclableUntyped`, so the cardinal §36.6 bug
+  (recycling untyped that still has a live client mapping) trips the checker on the
+  backend where capability semantics are real.
+
+* **Extent index = a metadata-backed, index-based slot pool (no global allocator).**
+  An allocator-internal structure must never re-enter the global allocator (the
+  metadata analogue of S-007), so the free-extent index is **not** an
+  `alloc::BTreeMap`; it is a fixed-capacity slot pool allocated once from the
+  `MetadataAlloc` seam (zeroed → a valid all-unoccupied pool) with intrusive links
+  by **slot index** (not raw pointers). Index links keep the whole bookkeeping core
+  (`ExtentMap`) *safe* Rust — the only `unsafe` is one `get`/`put` accessor pair
+  over the pool, justified by a bounds check plus `&self`/`&mut self` exclusivity —
+  so the split/merge/coalesce logic is directly unit- and property-tested. Slots are
+  `Copy` POD read/written by value, so the index manipulation never holds two slot
+  borrows at once (borrow-check-clean). Exhaustion returns `None`/`Exhausted`, never
+  a wrap (§9.7).
+
+* **Boundary-tag + dual index; split and merge kept separate (DD-1).** Every extent
+  (free *and* allocated) is on one **address-ordered** intrusive list, so a freed
+  extent's physical neighbours are its list neighbours and coalescing is O(1) (the
+  boundary-tag role). Free extents are *additionally* on a **size-segregated**
+  free-list binned by `floor(log2(pages))`; because the bins are size-segregated the
+  smallest fit is in the lowest non-empty adequate bin, so **best-fit is exact** and
+  **first-fit** stops at the first hit. Split and merge are separate operations
+  (different preconditions, different hazards): `split` installs both halves'
+  metadata before publishing (F1), and is atomic on slot exhaustion (the descriptor
+  pop is the only fallible step, done first); `merge` retires the absorbed
+  descriptor **behind a generation bump** so a captured `ExtentRef` resolves to
+  `None` after the slot recycles (F2, "no stale descriptor visible to
+  classification"). `carve` pre-checks it has exactly the slots its (≤ 2) splits
+  need, so a carve never half-mutates. The geometric core is certified by the
+  existing Lean theorems (`span_split`/`span_merge_preserves_disjointness`,
+  `release_to_os_preserves_live_objects`): the Rust `split` is Lean's
+  `splitLeft`/`splitRight`, `merge` their union.
+
+* **Physical state coupled to backing; M-004/M-005 enforced structurally.** An
+  extent's `committed_len ∈ {0, len}` and its state are coupled — `Dirty`/`Muzzy`
+  are backed, `Reserved`/`Released` are not — for *free* extents; an `Active` extent
+  may be transiently uncommitted while the manager commits it (M-005 guarantees
+  backing before the range is *used*, not while it is carved), so the invariant
+  relaxes for `Active` only. **M-004** ("decommit/release require evidence the range
+  holds no live object") is enforced structurally: only a *free* extent may be
+  decommitted/released/purged — a free extent holds no live object by construction —
+  and an op on an `Active` extent is refused (`NotFree`). **M-005** is enforced by
+  `alloc`, which recommits a `Released` source extent before handing it out. The
+  merge state-compatibility gate (§18.4) is conservative — only same-backing free
+  extents merge — so `committed_len` adds cleanly and the invariant is preserved.
+
+* **POSIX physical-state mapping: documented, host-modeled, hermetic (W4-3).** The
+  POSIX provider stays host-backed (the dual-backend co-equality test, D2, and the
+  CI/QEMU runs require deterministic, syscall-free backends), and the §20.4 ops
+  perform the **observable equivalent** of the documented `madvise`/`mprotect`
+  mapping: `decommit`/`purge_forced` ≈ `MADV_DONTNEED` (discard now — a later read
+  sees zeros), `purge_lazy` ≈ `MADV_FREE` (lazy — contents may persist, a valid
+  outcome), `commit` ≈ `mprotect`/first-touch (no-op on already-backed host memory).
+  The full per-platform table is the module-doc contract the real-syscall provider
+  implements behind the same trait — a localized substitution, nothing above the
+  seam changes. The dirty/muzzy/released **byte accounting** lives in the extent
+  manager (`committed_bytes`) and reconciles in stats (plan 07). The
+  **retain-vs-unmap** policy (§20.5) is profile-keyed: `Retain` (keep backing on
+  free) on 64-bit performance builds, `Unmap` (eager decommit) under
+  `debug`/`low-rss`/32-bit.
+
+* **Large path bypasses the small caches; region-cache is a hook point (W4-4).**
+  `alloc_large` rounds to whole pages overflow-safely (§9.7) and allocates a
+  best-fit extent **without touching the size-class/slab path** (§18.5), after
+  offering the request to a `RegionCacheHook` (the §18.6 hook for sizes awkwardly
+  larger than a hugepage). The hook's default is no-op; the concrete `RegionCache`
+  and the hugepage filler land with W11 (M5), reusing the same extent machinery over
+  contiguous normal-frame runs (§36.9), so the placement model stays
+  backend-agnostic. Every back-end op is fallible and leaves the state well-formed
+  on failure (W4-5): `ExtentMap::check_invariants` (the executable §18 tiling/index
+  predicate) is `debug_assert`ed after every mutation and held green by the
+  failure-injection property test under random provider failures.

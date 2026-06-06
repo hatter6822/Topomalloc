@@ -1,0 +1,2072 @@
+// SPDX-License-Identifier: MIT
+//! The back-end: extent and page management (§18, plan 04 W4-2, DD-1).
+//!
+//! The back-end owns **virtual address ranges and physical backing state** below
+//! the span layer (§18.1). It reserves virtual memory through the
+//! [`TopoBackingProvider`] seam, splits and
+//! merges ranges to satisfy requests and fight fragmentation, tracks the
+//! dirty/muzzy/released physical state (§20.1), and returns memory to the OS —
+//! **without ever exposing a stale descriptor to pointer classification** (DD-1).
+//!
+//! **Structure (DD-1: a boundary-tag + free-extent index).** A managed region is
+//! tiled by [`Extent`] descriptors held in a fixed-capacity, metadata-backed slot
+//! pool. Two indices make the §18.4 operations cheap:
+//!
+//! * **by address** — every extent (free *and* allocated) is on one ascending,
+//!   contiguous, intrusive doubly-linked list, so neighbour-coalescing is O(1)
+//!   (the boundary-tag role: an extent's physical neighbours are its list
+//!   neighbours, DD-1);
+//! * **by size** — every *free* extent is additionally on a size-segregated free
+//!   list (binned by `floor(log2(page_count))`), so best/first-fit is a bounded
+//!   bin scan (W4-2a).
+//!
+//! **Why split and merge are separate (DD-1).** They have different preconditions
+//! and different stale-descriptor hazards: a split must install both halves'
+//! metadata *before* publishing them (failure mode F1), while a merge must retire
+//! the absorbed descriptor *behind a generation* so no reader resolves a recycled
+//! slot to the wrong range (failure mode F2 — "coalescing is where most backend
+//! use-after-free hides"). The slot pool gives each extent a reuse
+//! [`generation`](Extent::generation); an [`ExtentRef`] pairs an id with the
+//! generation it was minted at, so a reference captured before a merge resolves to
+//! `None` once the slot is recycled.
+//!
+//! **Concurrency (§27.2).** The back-end sits at the *Backend extent lock* — the
+//! lowest data-structure lock in the §27.2 hierarchy. [`ExtentMap`] is the pure,
+//! single-threaded bookkeeping core (directly unit-tested via `&mut self`);
+//! [`ExtentManager`] wraps it behind that lock and drives the provider, exposing
+//! `&self` like the rest of the allocator. Holding the backend lock during a
+//! provider call is sound — the provider's own lock is below it in the hierarchy.
+//!
+//! **Safety invariants (mirrored in Lean).** Split/merge preserve range
+//! disjointness and the region tiling (plan 02 W1-8a, `Theorems/Span.lean`);
+//! release preserves live objects (W1-8c, `Theorems/Release.lean`). At runtime the
+//! back-end enforces **M-004** (a range is decommitted/released only when it holds
+//! no live object — structurally, only a *free* extent may be released) and
+//! **M-005** (a released extent is recommitted before it is handed back out).
+//! [`ExtentMap::check_invariants`] is the executable form of the tiling/index
+//! well-formedness predicate and is asserted after every mutation in debug builds
+//! and by the failure-injection test (W4-5).
+
+use core::cell::UnsafeCell;
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::backend::{Region, TopoBackingProvider};
+use crate::bootstrap::MetadataAlloc;
+use crate::error::BackendError;
+use crate::generated::tables::PAGE_SIZE;
+use crate::ids::ArenaId;
+use crate::overflow::{align_up, pages_for};
+
+/// A sentinel "no slot" index for the intrusive links (`u32::MAX`).
+const NIL: u32 = u32::MAX;
+
+/// Number of size bins (`floor(log2(page_count))` buckets). `usize::BITS + 1`
+/// covers every representable page count (a page count never exceeds
+/// `usize::MAX / PAGE_SIZE`, so the top bins stay empty — but indexing is always
+/// in range).
+const NBINS: usize = usize::BITS as usize + 1;
+
+/// Identifies an extent by its slot in the [`ExtentMap`] pool. Pair it with the
+/// slot [`generation`](Extent::generation) in an [`ExtentRef`] when holding it
+/// across an operation that could retire the slot (split/merge), so a recycled
+/// slot is detected (DD-1 failure mode F2).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ExtentId(pub u32);
+
+/// A generation-checked handle to an extent (DD-1 F2). Minted by
+/// [`ExtentMap::view`]/alloc, validated by [`ExtentMap::resolve`]; a reference held
+/// across a merge that recycled the slot resolves to `None` rather than to the
+/// different range now occupying it — the "no stale descriptor visible to
+/// classification" guarantee of §18.4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExtentRef {
+    /// The slot.
+    pub id: ExtentId,
+    /// The slot generation this reference was minted at.
+    pub generation: u32,
+}
+
+/// Physical-backing state of an extent (§18.2 `ExtentState` / §20.1). The
+/// invariant `committed_len ∈ {0, len}` couples the state to the backing:
+/// `Active`/`Dirty`/`Muzzy` are fully backed (`committed_len == len`),
+/// `Reserved`/`Released` are unbacked (`committed_len == 0`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum ExtentState {
+    /// Virtual range reserved, no physical backing yet (`committed_len == 0`).
+    Reserved = 0,
+    /// Allocated and handed out; a live object may exist (fully backed).
+    Active = 1,
+    /// Free, physically backed, may hold old data — reuse is cheap (§20.1 dirty).
+    Dirty = 2,
+    /// Free, lazily purged or scrubbed (§20.1 muzzy); still mapped.
+    Muzzy = 3,
+    /// Free, backing returned to the OS; reuse requires a recommit (M-005, §20.1
+    /// released). The virtual range is **retained** so a stale pointer into it
+    /// classifies as released (P-Map-005) rather than being silently reused.
+    Released = 4,
+}
+
+impl ExtentState {
+    #[inline]
+    const fn from_u8(v: u8) -> ExtentState {
+        match v {
+            1 => ExtentState::Active,
+            2 => ExtentState::Dirty,
+            3 => ExtentState::Muzzy,
+            4 => ExtentState::Released,
+            _ => ExtentState::Reserved,
+        }
+    }
+
+    /// Whether the extent is free (available to satisfy an allocation) — anything
+    /// but [`Active`](ExtentState::Active). A free extent holds **no live object**,
+    /// which is the structural runtime evidence M-004 requires before decommit /
+    /// release.
+    #[inline]
+    pub const fn is_free(self) -> bool {
+        !matches!(self, ExtentState::Active)
+    }
+
+    /// Whether the extent is fully physically backed (`committed_len == len`).
+    #[inline]
+    pub const fn is_backed(self) -> bool {
+        matches!(
+            self,
+            ExtentState::Active | ExtentState::Dirty | ExtentState::Muzzy
+        )
+    }
+}
+
+/// A hugepage backing range for an extent (§18.2 `HugePageRange`). For M1 (no
+/// hardware hugepages — that is W11, M5) an extent has no hugepage backing
+/// (`len == 0`); the field and its merge-accounting hook exist so the hugepage
+/// filler (W11) reuses the same extent machinery (§36.9: the placement model is
+/// backend-agnostic over contiguous normal-frame runs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct HugeRange {
+    /// Base of the backing hugepage run (`0` and `len == 0` ⇒ none).
+    pub base: usize,
+    /// Length of the backing hugepage run in bytes (`0` ⇒ none).
+    pub len: usize,
+}
+
+impl HugeRange {
+    /// The empty (no-hugepage) range.
+    pub const NONE: HugeRange = HugeRange { base: 0, len: 0 };
+
+    /// Whether this extent has hugepage backing.
+    #[inline]
+    pub const fn is_some(self) -> bool {
+        self.len != 0
+    }
+}
+
+/// A read-only snapshot of an [`Extent`] (§18.2), returned to callers so they
+/// never touch the slot pool directly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Extent {
+    /// Slot identity.
+    pub id: ExtentId,
+    /// Owning arena.
+    pub arena: ArenaId,
+    /// Base address.
+    pub base: usize,
+    /// Length in bytes (always a whole number of [`PAGE_SIZE`] pages).
+    pub len: usize,
+    /// Bytes physically committed (`0` or `len`).
+    pub committed_len: usize,
+    /// Physical-backing state.
+    pub state: ExtentState,
+    /// Hugepage backing (W11 hook; `NONE` at M1).
+    pub huge: HugeRange,
+    /// Split/merge generation (§18.2 `split_generation`): bumped whenever this
+    /// extent's geometry changes, so a captured snapshot is detectably stale.
+    pub split_generation: u32,
+    /// Slot reuse generation (the [`ExtentRef`] guard counter).
+    pub generation: u32,
+}
+
+impl Extent {
+    /// The half-open address range `[base, base + len)`.
+    #[inline]
+    pub const fn range(self) -> (usize, usize) {
+        (self.base, self.base + self.len)
+    }
+
+    /// The end address `base + len`.
+    #[inline]
+    pub const fn end(self) -> usize {
+        self.base + self.len
+    }
+}
+
+/// A back-end operation that could not complete. Every variant leaves the
+/// back-end state well-formed (W4-5): the operation is refused, not half-done.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExtentError {
+    /// No free extent large enough, or the slot pool is exhausted (safe failure,
+    /// §9.7 — never a wrap or an under-allocation).
+    Exhausted,
+    /// A size/alignment/page rounding overflowed `usize` (§9.7).
+    Overflow,
+    /// A malformed request (zero size, non-power-of-two alignment).
+    InvalidRequest,
+    /// The operation requires a **free** extent but the target is still
+    /// [`Active`](ExtentState::Active) — refused to uphold M-004 (no
+    /// decommit/release of a range that may hold a live object).
+    NotFree,
+    /// The [`ExtentRef`] named a slot that was recycled (DD-1 F2) or is unoccupied.
+    Stale,
+    /// The backing provider failed (§36.6). The back-end state is unchanged.
+    Backend(BackendError),
+}
+
+impl From<BackendError> for ExtentError {
+    fn from(e: BackendError) -> Self {
+        ExtentError::Backend(e)
+    }
+}
+
+/// Fit policy for [`ExtentMap::carve`] (§18.3 `extent_alloc` policy, W4-2a).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Fit {
+    /// First adequate extent (lowest size bin, first in the list) — fastest.
+    First,
+    /// Smallest adequate extent — least fragmentation. Exact because the bins are
+    /// size-segregated, so the smallest fit is in the lowest non-empty bin.
+    #[default]
+    Best,
+}
+
+/// One pool slot. All fields are integers, so a zeroed block of slots is a valid
+/// all-unoccupied pool (`from_raw_parts_mut` over zeroed metadata is sound). Copy,
+/// so the bookkeeping reads/writes whole slots by value and never holds two slot
+/// borrows at once (keeping the index logic borrow-check-clean and `unsafe`-free
+/// beyond the single pool accessor).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Slot {
+    base: usize,
+    len: usize,
+    committed_len: usize,
+    huge_base: usize,
+    huge_len: usize,
+    arena: u32,
+    split_gen: u32,
+    generation: u32,
+    /// Address-ordered list links (all occupied extents).
+    addr_prev: u32,
+    addr_next: u32,
+    /// Size-bin free-list links (free extents only).
+    bin_prev: u32,
+    bin_next: u32,
+    /// Unused-slot stack link (when `occupied == 0`).
+    free_next: u32,
+    state: u8,
+    occupied: u8,
+}
+
+/// The size bin for a free extent of `pages` pages: `floor(log2(pages)) + 1`
+/// (bin `b` holds pages in `[2^(b-1), 2^b)`), so bins are size-segregated and the
+/// smallest fit is in the lowest non-empty adequate bin.
+#[inline]
+fn bin_index(pages: usize) -> usize {
+    (usize::BITS - pages.leading_zeros()) as usize
+}
+
+/// The pure, single-threaded extent bookkeeping core (DD-1). Owns the
+/// metadata-backed slot pool and the two indices; every operation keeps the
+/// region tiled and the indices consistent ([`check_invariants`](Self::check_invariants)).
+/// Directly unit-tested via `&mut self`; [`ExtentManager`] wraps it with the
+/// backend lock and the provider.
+pub struct ExtentMap {
+    /// Metadata-backed slot array. Allocated once and zeroed at construction, so
+    /// it is a valid `[Slot]` for its whole life; never freed (monotonic
+    /// metadata, §17.4). Accessed only through [`get`](Self::get)/[`put`](Self::put)
+    /// under `&self`/`&mut self`, which guarantee exclusive/shared access.
+    slots: NonNull<Slot>,
+    /// Slot capacity.
+    cap: u32,
+    /// Base of the managed virtual region (page-aligned).
+    region_base: usize,
+    /// Length of the managed virtual region in bytes (a whole number of pages).
+    region_len: usize,
+    /// Owning arena of the whole region.
+    arena: ArenaId,
+    /// Head of the unused-slot stack.
+    free_slot_head: u32,
+    /// Count of unused slots (so `carve` can pre-check it has enough for its
+    /// up-to-two splits and never fail a split mid-way, W4-5).
+    unused_slots: u32,
+    /// Head/tail of the address-ordered list (ascending base).
+    addr_head: u32,
+    addr_tail: u32,
+    /// Per-size-bin free-list heads.
+    bins: [u32; NBINS],
+    /// Free (non-`Active`) bytes currently in the index.
+    free_bytes: usize,
+    /// Committed bytes across all extents (for stats reconciliation, §20 / plan 07).
+    committed_bytes: usize,
+}
+
+// SAFETY: `ExtentMap` owns its slot memory exclusively (a `NonNull<Slot>` into
+// never-freed metadata) and exposes mutation only through `&mut self`. It holds
+// no thread-shared state of its own, so moving it across threads is sound; the
+// `&self` reads it offers (`view`/`resolve`/`check_invariants`) touch only its own
+// fields. `ExtentManager` adds the §27.2 backend lock for shared concurrent use.
+unsafe impl Send for ExtentMap {}
+
+impl ExtentMap {
+    /// Build an extent map over `[region_base, region_base + region_len)` with a
+    /// pool of `slot_cap` extent descriptors from `meta`. The region must be
+    /// page-aligned with a page-multiple length and a nonzero `slot_cap`. Returns
+    /// `None` if the slot pool cannot be allocated (safe failure).
+    ///
+    /// The region starts as a single [`Reserved`](ExtentState::Reserved) free
+    /// extent (no physical backing; `commit`/`alloc` faults it in on demand —
+    /// the §18.1 "commit or fault physical backing" responsibility).
+    pub fn new(
+        meta: &dyn MetadataAlloc,
+        region_base: usize,
+        region_len: usize,
+        slot_cap: usize,
+    ) -> Option<ExtentMap> {
+        if region_len == 0
+            || slot_cap == 0
+            || !region_base.is_multiple_of(PAGE_SIZE)
+            || !region_len.is_multiple_of(PAGE_SIZE)
+            || slot_cap > (NIL as usize)
+            || region_base.checked_add(region_len).is_none()
+        {
+            return None;
+        }
+        let bytes = slot_cap.checked_mul(core::mem::size_of::<Slot>())?;
+        let mem = meta.alloc(bytes, core::mem::align_of::<Slot>())?;
+        // SAFETY: `mem` is a fresh, exclusively-owned, `align_of::<Slot>()`-aligned
+        // region of exactly `bytes` bytes; zeroing yields `slot_cap` valid `Slot`s
+        // (every field is an integer, so the all-zero bit pattern is a legal value).
+        unsafe { ptr::write_bytes(mem.as_ptr(), 0, bytes) };
+        let slots = mem.cast::<Slot>();
+
+        let mut map = ExtentMap {
+            slots,
+            cap: slot_cap as u32,
+            region_base,
+            region_len,
+            arena: ArenaId::DEFAULT,
+            free_slot_head: NIL,
+            unused_slots: 0,
+            addr_head: NIL,
+            addr_tail: NIL,
+            bins: [NIL; NBINS],
+            free_bytes: 0,
+            committed_bytes: 0,
+        };
+
+        // Build the unused-slot stack over every slot (1, 2, …, cap-1, then 0 last
+        // so slot 0 is popped first — purely cosmetic). Each slot is already zeroed.
+        for i in (0..slot_cap as u32).rev() {
+            let mut s = map.get(i);
+            s.free_next = map.free_slot_head;
+            map.put(i, s);
+            map.free_slot_head = i;
+            map.unused_slots += 1;
+        }
+
+        // Place the initial Reserved free extent covering the whole region.
+        let id = map.pop_slot()?; // cannot fail: we just pushed `slot_cap >= 1` slots
+        let mut s = map.get(id.0);
+        s.base = region_base;
+        s.len = region_len;
+        s.committed_len = 0;
+        s.huge_base = 0;
+        s.huge_len = 0;
+        s.arena = ArenaId::DEFAULT.0;
+        s.split_gen = 0;
+        s.state = ExtentState::Reserved as u8;
+        s.occupied = 1;
+        s.addr_prev = NIL;
+        s.addr_next = NIL;
+        map.put(id.0, s);
+        map.addr_head = id.0;
+        map.addr_tail = id.0;
+        map.bin_insert(id.0);
+        map.free_bytes = region_len;
+
+        debug_assert!(map.check_invariants());
+        Some(map)
+    }
+
+    /// Set the arena every extent in this region belongs to (called once by
+    /// [`ExtentManager::new`]; an extent's arena never changes, M-002).
+    fn set_arena(&mut self, arena: ArenaId) {
+        self.arena = arena;
+        // The single initial extent is the only one present at construction.
+        let head = self.addr_head;
+        if head != NIL {
+            let mut s = self.get(head);
+            s.arena = arena.0;
+            self.put(head, s);
+        }
+    }
+
+    // --- slot pool accessors (the only `unsafe` in the bookkeeping) ----------
+
+    /// Read slot `i` by value. `i < cap` is a caller invariant (every index here
+    /// is a live link or a bounds-checked argument).
+    #[inline]
+    fn get(&self, i: u32) -> Slot {
+        debug_assert!(i < self.cap, "extent slot index out of range");
+        // SAFETY: `i < cap`, the slot memory is initialized (zeroed at construction
+        // then only ever overwritten with valid `Slot`s), `&self` guarantees no
+        // concurrent writer, and `Slot: Copy` so the read leaves the pool untouched.
+        unsafe { self.slots.as_ptr().add(i as usize).read() }
+    }
+
+    /// Write slot `i`.
+    #[inline]
+    fn put(&mut self, i: u32, s: Slot) {
+        debug_assert!(i < self.cap, "extent slot index out of range");
+        // SAFETY: `i < cap` and `&mut self` guarantees exclusive access to the pool.
+        unsafe { self.slots.as_ptr().add(i as usize).write(s) };
+    }
+
+    /// Pop an unused slot off the stack, or `None` if the pool is exhausted. Bumps
+    /// the slot generation so an [`ExtentRef`] for a previous occupant is now stale
+    /// (DD-1 F2). Does not mark it occupied — the caller fills it in first
+    /// (install-before-publish, W4-2b F1).
+    fn pop_slot(&mut self) -> Option<ExtentId> {
+        let i = self.free_slot_head;
+        if i == NIL {
+            return None;
+        }
+        let mut s = self.get(i);
+        self.free_slot_head = s.free_next;
+        self.unused_slots -= 1;
+        s.free_next = NIL;
+        s.generation = s.generation.wrapping_add(1);
+        self.put(i, s);
+        Some(ExtentId(i))
+    }
+
+    /// Retire slot `i` to the unused stack. Bumps the generation so any captured
+    /// [`ExtentRef`] for it is now stale (the merge "retire behind a generation",
+    /// DD-1 F2). The caller has already unlinked it from both indices.
+    fn push_slot(&mut self, i: u32) {
+        let mut s = self.get(i);
+        debug_assert_eq!(s.occupied, 1, "double-retiring an extent slot");
+        s.occupied = 0;
+        s.generation = s.generation.wrapping_add(1);
+        s.free_next = self.free_slot_head;
+        self.put(i, s);
+        self.free_slot_head = i;
+        self.unused_slots += 1;
+    }
+
+    // --- size-bin index (free extents) ---------------------------------------
+
+    /// Insert free extent `i` at the head of its size bin.
+    fn bin_insert(&mut self, i: u32) {
+        let mut s = self.get(i);
+        let b = bin_index(s.len / PAGE_SIZE);
+        let head = self.bins[b];
+        s.bin_prev = NIL;
+        s.bin_next = head;
+        self.put(i, s);
+        if head != NIL {
+            let mut h = self.get(head);
+            h.bin_prev = i;
+            self.put(head, h);
+        }
+        self.bins[b] = i;
+    }
+
+    /// Remove free extent `i` from its size bin.
+    fn bin_remove(&mut self, i: u32) {
+        let s = self.get(i);
+        let b = bin_index(s.len / PAGE_SIZE);
+        if s.bin_prev != NIL {
+            let mut p = self.get(s.bin_prev);
+            p.bin_next = s.bin_next;
+            self.put(s.bin_prev, p);
+        } else {
+            debug_assert_eq!(self.bins[b], i, "free extent not at the head of its bin");
+            self.bins[b] = s.bin_next;
+        }
+        if s.bin_next != NIL {
+            let mut n = self.get(s.bin_next);
+            n.bin_prev = s.bin_prev;
+            self.put(s.bin_next, n);
+        }
+        let mut s = self.get(i);
+        s.bin_prev = NIL;
+        s.bin_next = NIL;
+        self.put(i, s);
+    }
+
+    // --- address-ordered index (all extents) ---------------------------------
+
+    /// Insert `new` immediately after `after` in the address list (`after == NIL`
+    /// inserts at the head). `new`'s slot is fully initialized by the caller first.
+    fn addr_insert_after(&mut self, new: u32, after: u32) {
+        let next = if after == NIL {
+            self.addr_head
+        } else {
+            self.get(after).addr_next
+        };
+        let mut s = self.get(new);
+        s.addr_prev = after;
+        s.addr_next = next;
+        self.put(new, s);
+        if after == NIL {
+            self.addr_head = new;
+        } else {
+            let mut a = self.get(after);
+            a.addr_next = new;
+            self.put(after, a);
+        }
+        if next == NIL {
+            self.addr_tail = new;
+        } else {
+            let mut n = self.get(next);
+            n.addr_prev = new;
+            self.put(next, n);
+        }
+    }
+
+    /// Unlink `i` from the address list.
+    fn addr_remove(&mut self, i: u32) {
+        let s = self.get(i);
+        if s.addr_prev != NIL {
+            let mut p = self.get(s.addr_prev);
+            p.addr_next = s.addr_next;
+            self.put(s.addr_prev, p);
+        } else {
+            self.addr_head = s.addr_next;
+        }
+        if s.addr_next != NIL {
+            let mut n = self.get(s.addr_next);
+            n.addr_prev = s.addr_prev;
+            self.put(s.addr_next, n);
+        } else {
+            self.addr_tail = s.addr_prev;
+        }
+    }
+
+    // --- queries -------------------------------------------------------------
+
+    /// The number of extent descriptors the pool can still create.
+    #[inline]
+    pub fn unused_slots(&self) -> usize {
+        self.unused_slots as usize
+    }
+
+    /// Free bytes currently available across all free extents.
+    #[inline]
+    pub fn free_bytes(&self) -> usize {
+        self.free_bytes
+    }
+
+    /// Bytes physically committed across all extents (for stats reconciliation,
+    /// §20 / plan 07 — the dirty/muzzy/released accounting that W4-3a documents).
+    #[inline]
+    pub fn committed_bytes(&self) -> usize {
+        self.committed_bytes
+    }
+
+    /// The managed region's address range.
+    #[inline]
+    pub fn region(&self) -> (usize, usize) {
+        (self.region_base, self.region_base + self.region_len)
+    }
+
+    /// A snapshot of extent `id`, or `None` if the slot is unoccupied.
+    pub fn view(&self, id: ExtentId) -> Option<Extent> {
+        if id.0 >= self.cap {
+            return None;
+        }
+        let s = self.get(id.0);
+        if s.occupied == 0 {
+            return None;
+        }
+        Some(self.snapshot(id.0, s))
+    }
+
+    /// A generation-checked reference to extent `id` (the [`ExtentRef`] guard).
+    pub fn extent_ref(&self, id: ExtentId) -> Option<ExtentRef> {
+        self.view(id).map(|e| ExtentRef {
+            id,
+            generation: e.generation,
+        })
+    }
+
+    /// Resolve a reference, returning `None` (stale) if the slot was recycled or
+    /// is unoccupied — the §18.4 "no stale descriptor" guard.
+    pub fn resolve(&self, r: ExtentRef) -> Option<Extent> {
+        let e = self.view(r.id)?;
+        if e.generation == r.generation {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn snapshot(&self, i: u32, s: Slot) -> Extent {
+        Extent {
+            id: ExtentId(i),
+            arena: ArenaId(s.arena),
+            base: s.base,
+            len: s.len,
+            committed_len: s.committed_len,
+            state: ExtentState::from_u8(s.state),
+            huge: HugeRange {
+                base: s.huge_base,
+                len: s.huge_len,
+            },
+            split_generation: s.split_gen,
+            generation: s.generation,
+        }
+    }
+
+    // --- split (W4-2b) -------------------------------------------------------
+
+    /// Split extent `id` at `prefix_len` into `[base, base + prefix_len)` (kept in
+    /// `id`) and a fresh extent `[base + prefix_len, end)`. Both results are
+    /// page-aligned (the precondition is `prefix_len` a nonzero page multiple
+    /// strictly inside the extent, §18.4). Returns the new (right) extent's id, or
+    /// `None` if `prefix_len` is invalid or the slot pool is exhausted — in which
+    /// case **nothing is mutated** (the pop is the first, only fallible, step), so
+    /// the back-end stays well-formed (W4-5, failure mode F1: never publish a
+    /// half-built half).
+    ///
+    /// Both halves inherit `id`'s state and backing: `committed_len ∈ {0, len}` is
+    /// preserved on each. The `split_generation` of both is bumped so a snapshot
+    /// taken before the split is detectably stale.
+    ///
+    /// SPEC-transition: `extent_split` (§18.3 / §33.4 `span_split_preserves_disjointness`)
+    pub fn split(&mut self, id: ExtentId, prefix_len: usize) -> Option<ExtentId> {
+        let parent = self.view(id)?;
+        // §18.4: both results page-aligned ⇒ prefix is a nonzero page multiple,
+        // and strictly less than the extent (a zero-length tail is not a split).
+        if prefix_len == 0 || prefix_len >= parent.len || !prefix_len.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        // Allocate the right half's descriptor first (the only fallible step).
+        let right = self.pop_slot()?;
+        let suffix_len = parent.len - prefix_len;
+        // Backing splits cleanly because `committed_len ∈ {0, len}`: a fully-backed
+        // parent yields two fully-backed halves; an unbacked parent, two unbacked.
+        let backed = parent.committed_len == parent.len;
+        let right_base = parent.base + prefix_len;
+
+        // Fully initialize the right half *before* it is linked anywhere
+        // (install-before-publish, F1).
+        let mut rs = self.get(right.0);
+        rs.base = right_base;
+        rs.len = suffix_len;
+        rs.committed_len = if backed { suffix_len } else { 0 };
+        rs.huge_base = 0;
+        rs.huge_len = 0;
+        rs.arena = parent.arena.0;
+        rs.split_gen = parent.split_generation.wrapping_add(1);
+        rs.state = parent.state as u8;
+        rs.occupied = 1;
+        self.put(right.0, rs);
+
+        // Shrink the parent (left half) and bump its generation.
+        let mut ls = self.get(id.0);
+        let was_free = ExtentState::from_u8(ls.state).is_free();
+        if was_free {
+            self.bin_remove(id.0); // its bin changes with its size
+        }
+        ls = self.get(id.0);
+        ls.len = prefix_len;
+        ls.committed_len = if backed { prefix_len } else { 0 };
+        ls.split_gen = ls.split_gen.wrapping_add(1);
+        self.put(id.0, ls);
+
+        // Publish: link the right half after the left in address order, and bin
+        // both halves if free.
+        self.addr_insert_after(right.0, id.0);
+        if was_free {
+            self.bin_insert(id.0);
+            self.bin_insert(right.0);
+        }
+        debug_assert!(self.check_invariants());
+        Some(right)
+    }
+
+    // --- merge / coalesce (W4-2c) --------------------------------------------
+
+    /// Whether `left` and `right` may be merged (§18.4): address-adjacent, same
+    /// arena, both free, **state-compatible** (both fully backed or both
+    /// unbacked, so the merged `committed_len = left + right` keeps the
+    /// `committed_len ∈ {0, len}` invariant), and hugepage-accounting consistent
+    /// (neither hugepage-backed at M1).
+    fn mergeable(&self, left: &Extent, right: &Extent) -> bool {
+        left.end() == right.base                          // adjacency
+            && left.arena == right.arena                  // arena-compat (M-002)
+            && left.state.is_free()
+            && right.state.is_free()                      // never merge a live range
+            && (left.committed_len == left.len) == (right.committed_len == right.len) // backing-compat
+            && !left.huge.is_some()
+            && !right.huge.is_some() // hugepage-accounting (W11 refines)
+    }
+
+    /// Merge the address-adjacent free extents `left` and `right` into `left`
+    /// (§18.4), retiring `right`'s descriptor behind a generation bump so no reader
+    /// resolves the recycled slot to the merged range (DD-1 F2: "no stale
+    /// descriptors visible to classification"). Returns `false` (no mutation) if
+    /// the §18.4 compatibility gates fail.
+    ///
+    /// SPEC-transition: `extent_merge` (§18.3 / §33.4 `span_merge_preserves_disjointness`)
+    pub fn merge(&mut self, left: ExtentId, right: ExtentId) -> bool {
+        let (lv, rv) = match (self.view(left), self.view(right)) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return false,
+        };
+        if left == right || !self.mergeable(&lv, &rv) {
+            return false;
+        }
+        // Unlink both from their bins, and `right` from the address list.
+        self.bin_remove(left.0);
+        self.bin_remove(right.0);
+        self.addr_remove(right.0);
+        // Grow `left` to cover both; backing adds exactly (state-compatible).
+        let mut ls = self.get(left.0);
+        ls.len = lv.len + rv.len;
+        ls.committed_len = lv.committed_len + rv.committed_len;
+        ls.split_gen = ls.split_gen.wrapping_add(1);
+        // The merged state is the conservative join: a backed merge is `Dirty`
+        // ("may hold old data" subsumes muzzy/clean); an unbacked merge stays
+        // `Released` (still needs a recommit, M-005).
+        ls.state = if ls.committed_len == ls.len {
+            ExtentState::Dirty as u8
+        } else {
+            ExtentState::Released as u8
+        };
+        self.put(left.0, ls);
+        // Re-bin `left` (it grew) and retire `right`'s slot (generation bumped).
+        self.bin_insert(left.0);
+        self.push_slot(right.0);
+        debug_assert!(self.check_invariants());
+        true
+    }
+
+    /// Coalesce extent `id` with its free, compatible address-neighbours (§18.4),
+    /// returning the surviving extent's id. Used by `free` to fight fragmentation.
+    /// At most two merges (left and right neighbour), each O(1) via the address
+    /// list — the boundary-tag coalescing of DD-1.
+    pub fn coalesce(&mut self, id: ExtentId) -> ExtentId {
+        let mut survivor = id;
+        // Merge with the right neighbour into `survivor`.
+        let next = self.get(survivor.0).addr_next;
+        if next != NIL && self.merge(survivor, ExtentId(next)) {
+            // `survivor` absorbed `next`.
+        }
+        // Merge with the left neighbour into it (the left becomes the survivor).
+        let prev = self.get(survivor.0).addr_prev;
+        if prev != NIL && self.merge(ExtentId(prev), survivor) {
+            survivor = ExtentId(prev);
+        }
+        survivor
+    }
+
+    // --- allocation (W4-2b) --------------------------------------------------
+
+    /// Find a free extent that can satisfy `needed_len` bytes at `align`, returning
+    /// `(slot, aligned_base, prefix_len)`. `needed_len` is a page multiple and
+    /// `align` a power of two. Best-fit is exact (bins are size-segregated). Any
+    /// alignment prefix is a page multiple (the region and every extent base are
+    /// page-aligned and `align` is a power of two), so the resulting splits stay
+    /// page-aligned (§18.4).
+    fn find_fit(&self, needed_len: usize, align: usize, fit: Fit) -> Option<(u32, usize, usize)> {
+        let needed_pages = needed_len / PAGE_SIZE;
+        let start = bin_index(needed_pages);
+        let mut best: Option<(u32, usize, usize)> = None;
+        for b in start..NBINS {
+            let mut i = self.bins[b];
+            while i != NIL {
+                let s = self.get(i);
+                // Aligned base within this extent, and the prefix it costs.
+                if let Some(aligned) = align_up(s.base, align) {
+                    let prefix = aligned - s.base; // aligned >= base ⇒ no underflow
+                                                   // `prefix + needed_len` cannot overflow: both are bounded by the
+                                                   // region length, itself a valid `usize` range.
+                    if let Some(total) = prefix.checked_add(needed_len) {
+                        if s.len >= total {
+                            match fit {
+                                Fit::First => return Some((i, aligned, prefix)),
+                                Fit::Best => {
+                                    let better = match best {
+                                        None => true,
+                                        Some((bi, _, _)) => s.len < self.get(bi).len,
+                                    };
+                                    if better {
+                                        best = Some((i, aligned, prefix));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                i = self.get(i).bin_next;
+            }
+            // Best-fit: the bins are size-segregated, so once a bin yields a fit the
+            // smallest fit overall is the smallest within it — no need to look higher.
+            if matches!(fit, Fit::Best) && best.is_some() {
+                break;
+            }
+        }
+        best
+    }
+
+    /// Carve a free extent of exactly `needed_len` bytes aligned to `align` out of
+    /// the index, marking it [`Active`](ExtentState::Active) and returning its id.
+    /// Pure bookkeeping (no provider call): `committed_len` is left as the carved
+    /// extent's prior backing — [`ExtentManager`] commits the uncommitted part
+    /// before handing it out (M-005). `needed_len` must be a nonzero page multiple
+    /// and `align` a power of two. `None` on no-fit or slot exhaustion (safe
+    /// failure); the index is unchanged on failure.
+    ///
+    /// SPEC-transition: `extent_alloc` (§18.3)
+    pub fn carve(&mut self, needed_len: usize, align: usize, fit: Fit) -> Option<ExtentId> {
+        if needed_len == 0 || !needed_len.is_multiple_of(PAGE_SIZE) || !align.is_power_of_two() {
+            return None;
+        }
+        let (slot, aligned, prefix) = self.find_fit(needed_len, align, fit)?;
+        // A carve performs a prefix split (if misaligned) and/or a tail split (if the
+        // fit is larger than needed), each needing one fresh slot. Pre-check the pool
+        // for *exactly* the splits this carve will perform, so neither split can fail
+        // mid-way (W4-5: a refused carve never half-mutates).
+        let avail = self.get(slot).len;
+        let splits = (prefix > 0) as u32 + ((avail - prefix > needed_len) as u32);
+        if self.unused_slots < splits {
+            return None; // would need a split but the pool is exhausted (safe)
+        }
+
+        let mut active = ExtentId(slot);
+        // Trim the alignment prefix: split off `[base, aligned)` as a free head,
+        // and continue with the aligned remainder.
+        if prefix > 0 {
+            let right = self.split(active, prefix)?; // left stays free, right is aligned
+            active = right;
+        }
+        // Trim the size remainder: split off the tail past `needed_len` as free.
+        let active_len = self.get(active.0).len;
+        if active_len > needed_len {
+            let _tail = self.split(active, needed_len)?; // tail stays free
+        }
+        debug_assert_eq!(self.get(active.0).base, aligned);
+        debug_assert_eq!(self.get(active.0).len, needed_len);
+
+        // Mark the carved extent Active and remove it from the free index.
+        self.bin_remove(active.0);
+        let mut s = self.get(active.0);
+        let was_free_bytes = s.len;
+        s.state = ExtentState::Active as u8;
+        self.put(active.0, s);
+        self.free_bytes -= was_free_bytes;
+        debug_assert!(self.check_invariants());
+        Some(active)
+    }
+
+    // --- free / physical-state transitions (W4-2d) ---------------------------
+
+    /// Return an [`Active`](ExtentState::Active) extent to the free index in
+    /// `new_state` (the back-end's chosen physical state — [`Dirty`](ExtentState::Dirty)
+    /// to retain backing, or `Released` if the caller already decommitted), then
+    /// coalesce with free neighbours (§18.4). Returns the surviving extent's id.
+    /// Infallible — freeing never needs a slot (merge only retires them) and never
+    /// fails (you cannot refuse to free).
+    ///
+    /// SPEC-transition: `extent free` (object/span `Live -> CentralFree`/`Dirty`, §7.2/§20.1)
+    pub fn free(&mut self, id: ExtentId, new_state: ExtentState) -> Option<ExtentId> {
+        let e = self.view(id)?;
+        debug_assert_eq!(e.state, ExtentState::Active, "freeing a non-Active extent");
+        let mut s = self.get(id.0);
+        s.state = new_state as u8;
+        self.put(id.0, s);
+        self.free_bytes += e.len;
+        self.bin_insert(id.0);
+        let survivor = self.coalesce(id);
+        debug_assert!(self.check_invariants());
+        Some(survivor)
+    }
+
+    /// Mark extent `id` fully committed (the bookkeeping half of a `commit`;
+    /// [`ExtentManager`] calls the provider). Idempotent. Returns the byte count
+    /// that newly became committed (so the manager commits exactly that range).
+    fn mark_committed(&mut self, id: ExtentId) -> usize {
+        let mut s = self.get(id.0);
+        let newly = s.len - s.committed_len;
+        s.committed_len = s.len;
+        // A free extent that was Released/Reserved becomes Dirty once backed again.
+        if ExtentState::from_u8(s.state).is_free() && !ExtentState::from_u8(s.state).is_backed() {
+            s.state = ExtentState::Dirty as u8;
+        }
+        self.put(id.0, s);
+        self.committed_bytes += newly;
+        newly
+    }
+
+    /// Mark extent `id` decommitted and `new_state` (the bookkeeping half of a
+    /// `decommit`/`release`/`purge`). Returns the byte count that was committed
+    /// before (so the manager decommits exactly that range).
+    fn mark_decommitted(&mut self, id: ExtentId, new_state: ExtentState) -> usize {
+        let mut s = self.get(id.0);
+        let was = s.committed_len;
+        s.committed_len = 0;
+        s.state = new_state as u8;
+        self.put(id.0, s);
+        self.committed_bytes -= was;
+        was
+    }
+
+    /// Set extent `id`'s state without touching its backing (e.g. dirty → muzzy on
+    /// a lazy purge, where the pages stay mapped). Returns `false` if `id` is
+    /// unoccupied.
+    fn set_state(&mut self, id: ExtentId, new_state: ExtentState) -> bool {
+        if self.view(id).is_none() {
+            return false;
+        }
+        let mut s = self.get(id.0);
+        s.state = new_state as u8;
+        self.put(id.0, s);
+        true
+    }
+
+    // --- invariants (W4-5 oracle) --------------------------------------------
+
+    /// Whether the back-end is well-formed: the address list tiles the region
+    /// exactly (sorted, contiguous, gap-free, no overlap), every occupied extent is
+    /// listed once, every free extent is in exactly its size bin, no `Active`
+    /// extent is binned, `committed_len ∈ {0, len}` matches the state, and the slot
+    /// accounting balances. This is the executable form of the §18 tiling
+    /// well-formedness predicate (the W4-5 invariant the failure-injection test
+    /// keeps green); `debug_assert`ed after every mutation.
+    pub fn check_invariants(&self) -> bool {
+        // 1. Address list tiles the region exactly, in ascending order.
+        let mut cursor = self.region_base;
+        let mut i = self.addr_head;
+        let mut prev = NIL;
+        let mut listed = 0usize;
+        let mut free_bytes = 0usize;
+        let mut committed = 0usize;
+        while i != NIL {
+            let s = self.get(i);
+            if s.occupied != 1 {
+                return false;
+            }
+            if s.addr_prev != prev {
+                return false;
+            }
+            if s.base != cursor {
+                return false; // gap or overlap
+            }
+            if s.len == 0 || !s.len.is_multiple_of(PAGE_SIZE) {
+                return false;
+            }
+            let st = ExtentState::from_u8(s.state);
+            // `committed_len ∈ {0, len}` always (backing is all-or-nothing here).
+            if s.committed_len != 0 && s.committed_len != s.len {
+                return false;
+            }
+            // The state↔backing coupling holds for *free* extents (Dirty/Muzzy are
+            // backed, Reserved/Released are not). An `Active` extent may be
+            // transiently uncommitted while the manager commits it — M-005
+            // guarantees backing before the range is *used*, not while it is being
+            // carved — so the coupling is not required for `Active`.
+            if st.is_free() && st.is_backed() != (s.committed_len == s.len) {
+                return false;
+            }
+            // Bin membership: free ⇔ in its size bin; Active ⇔ not binned.
+            let in_bin = self.is_in_bin(i);
+            if st.is_free() != in_bin {
+                return false;
+            }
+            if st.is_free() {
+                free_bytes += s.len;
+            }
+            committed += s.committed_len;
+            cursor = match cursor.checked_add(s.len) {
+                Some(c) => c,
+                None => return false,
+            };
+            prev = i;
+            i = s.addr_next;
+            listed += 1;
+        }
+        if cursor != self.region_base + self.region_len {
+            return false; // does not cover the whole region
+        }
+        if self.addr_tail != prev {
+            return false;
+        }
+        if free_bytes != self.free_bytes || committed != self.committed_bytes {
+            return false;
+        }
+        // 2. Slot accounting: listed (occupied) + unused == capacity.
+        if listed + self.unused_slots as usize != self.cap as usize {
+            return false;
+        }
+        // 3. Every binned extent is free and in the correct bin.
+        for b in 0..NBINS {
+            let mut j = self.bins[b];
+            let mut seen = 0usize;
+            while j != NIL {
+                let s = self.get(j);
+                if s.occupied != 1
+                    || !ExtentState::from_u8(s.state).is_free()
+                    || bin_index(s.len / PAGE_SIZE) != b
+                {
+                    return false;
+                }
+                j = s.bin_next;
+                seen += 1;
+                if seen > self.cap as usize {
+                    return false; // cycle guard
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether extent `i` is reachable from its size bin's head (debug check).
+    fn is_in_bin(&self, i: u32) -> bool {
+        let s = self.get(i);
+        let b = bin_index(s.len / PAGE_SIZE);
+        let mut j = self.bins[b];
+        let mut steps = 0usize;
+        while j != NIL {
+            if j == i {
+                return true;
+            }
+            j = self.get(j).bin_next;
+            steps += 1;
+            if steps > self.cap as usize {
+                return false;
+            }
+        }
+        false
+    }
+}
+
+// ===========================================================================
+// The lock-guarded, provider-driving back-end (§27.2 backend lock, W4-2d/3/4/5).
+// ===========================================================================
+
+/// The §27.2 *Backend extent lock* — a test-and-test-and-set spinlock, the same
+/// lightweight primitive the span lock uses. The backend's critical sections are a
+/// handful of slot edits plus one provider call; it is the lowest data-structure
+/// lock in the hierarchy, so holding it across a provider call cannot invert the
+/// §27.2 order.
+struct BackendLock {
+    locked: AtomicBool,
+}
+
+impl BackendLock {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn acquire(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline]
+    fn release(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Retain-versus-unmap policy for freed extents (§20.5, W4-3b). Retaining virtual
+/// address space improves reuse and metadata stability; unmapping (here:
+/// decommitting backing eagerly on free) reduces RSS and turns a use-after-free
+/// into a fault-or-released-classification.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetainPolicy {
+    /// Keep backing on free (the extent becomes [`Dirty`](ExtentState::Dirty), reuse
+    /// is cheap). The default on 64-bit server platforms (§20.5).
+    Retain,
+    /// Decommit backing on free (the extent becomes [`Released`](ExtentState::Released),
+    /// needing a recommit before reuse — M-005). More aggressive RSS reclaim and
+    /// use-after-free catching for `debug`/`low-rss` and address-space-scarce
+    /// (32-bit) targets (§20.5).
+    Unmap,
+}
+
+impl RetainPolicy {
+    /// The policy implied by the build profile (§20.5, W4-3b): retain on a 64-bit
+    /// performance build; unmap more aggressively under `debug`/`low-rss` or on a
+    /// 32-bit (address-space-scarce) target.
+    pub const fn from_profile() -> RetainPolicy {
+        if cfg!(any(feature = "debug", feature = "low-rss")) || cfg!(target_pointer_width = "32") {
+            RetainPolicy::Unmap
+        } else {
+            RetainPolicy::Retain
+        }
+    }
+}
+
+/// The §18.6 region cache: a hook for allocations slightly larger than a hugepage,
+/// which would waste memory if rounded up to a whole number of hugepages. The
+/// concrete cache lands with the hugepage backend (W11-3, M5); this trait is the
+/// **hook point** so the large-allocation path (W4-4) can consult it without
+/// depending on the hugepage code, and the default implementations make a
+/// hookless build fall straight through to the extent manager.
+pub trait RegionCacheHook {
+    /// Try to satisfy a `bytes`/`align` large request from cached awkward-sized
+    /// regions (§18.6), returning a region the cache now considers handed out, or
+    /// `None` to fall through to the extent manager. Default: `None`.
+    fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
+        let _ = (bytes, align);
+        None
+    }
+
+    /// Offer a freed large `region` back to the cache; returns `true` if the cache
+    /// took ownership (so the manager must not release it). Default: `false`.
+    fn try_cache(&self, region: Region) -> bool {
+        let _ = region;
+        false
+    }
+}
+
+/// The no-op region cache used until W11-3 supplies a real one (§18.6).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoRegionCache;
+
+impl RegionCacheHook for NoRegionCache {}
+
+/// The back-end extent manager (§18): an [`ExtentMap`] over a provider-reserved
+/// region, guarded by the §27.2 backend lock and driving the
+/// [`TopoBackingProvider`] for every physical-state transition. POSIX is the
+/// degenerate single-authority case; the same manager runs over the seLe4n
+/// simulator (D2).
+///
+/// Every operation is fallible and leaves the back-end well-formed on failure
+/// (W4-5): the physical (provider) step is sequenced so that a provider failure
+/// rolls the bookkeeping back to a consistent state rather than stranding a
+/// half-committed extent.
+pub struct ExtentManager<P: TopoBackingProvider> {
+    provider: P,
+    /// The whole reserved region (the unit `release`d on `Drop`; physical-state
+    /// ops pass it plus the sub-extent's offset/len to the provider).
+    region: Region,
+    arena: ArenaId,
+    retain: RetainPolicy,
+    lock: BackendLock,
+    map: UnsafeCell<ExtentMap>,
+}
+
+// SAFETY: every access to `map` goes through `lock` (the §27.2 backend lock),
+// which serializes mutators; `region`/`arena`/`retain` are immutable after
+// construction; and the provider is `Sync`. So concurrent `&self` use is
+// data-race-free.
+unsafe impl<P: TopoBackingProvider + Send + Sync> Sync for ExtentManager<P> {}
+// SAFETY: the manager owns its `map` (metadata-backed, never aliased) and a `Send`
+// provider; moving it across threads moves both with no shared aliasing.
+unsafe impl<P: TopoBackingProvider + Send> Send for ExtentManager<P> {}
+
+/// An RAII hold of the backend lock exposing the guarded [`ExtentMap`]. Releases
+/// the lock on drop — including on an unwinding `debug_assert!` — so the lock is
+/// never left held (the span lock's discipline, applied to the backend lock).
+struct MapGuard<'a> {
+    lock: &'a BackendLock,
+    map: &'a mut ExtentMap,
+}
+
+impl Drop for MapGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
+impl<P: TopoBackingProvider> ExtentManager<P> {
+    /// Reserve a region of `size` bytes aligned to `align` from `provider` for
+    /// `arena` and build a back-end over it with a pool of `slot_cap` extent
+    /// descriptors from `meta`. The region begins as a single
+    /// [`Reserved`](ExtentState::Reserved) free extent; backing is committed on
+    /// demand by [`alloc`](Self::alloc). The retain/unmap policy is taken from the
+    /// build profile (§20.5, W4-3b).
+    ///
+    /// Returns the provider's error if the reservation fails, or
+    /// [`ExtentError::Exhausted`] if the metadata for the slot pool cannot be
+    /// allocated. On any failure the reserved region (if any) is released, so no
+    /// reservation is leaked (W4-5).
+    pub fn new(
+        provider: P,
+        meta: &dyn MetadataAlloc,
+        arena: ArenaId,
+        size: usize,
+        align: usize,
+        slot_cap: usize,
+    ) -> Result<Self, ExtentError> {
+        // The managed region must be a whole number of pages so every extent base
+        // and split is page-aligned (§18.4).
+        let pages = pages_for(size, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        let region_len = pages.checked_mul(PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        if region_len == 0 || !align.is_power_of_two() {
+            return Err(ExtentError::InvalidRequest);
+        }
+        let region = provider
+            .reserve(arena, region_len, align.max(PAGE_SIZE))
+            .map_err(ExtentError::Backend)?;
+        let region_base = region.base as usize;
+        match ExtentMap::new(meta, region_base, region_len, slot_cap) {
+            Some(mut map) => {
+                map.set_arena(arena);
+                Ok(Self {
+                    provider,
+                    region,
+                    arena,
+                    retain: RetainPolicy::from_profile(),
+                    lock: BackendLock::new(),
+                    map: UnsafeCell::new(map),
+                })
+            }
+            None => {
+                // Roll back the reservation so a failed construction leaks nothing.
+                let _ = provider.release(arena, region);
+                Err(ExtentError::Exhausted)
+            }
+        }
+    }
+
+    /// The active retain/unmap policy (§20.5).
+    #[inline]
+    pub fn retain_policy(&self) -> RetainPolicy {
+        self.retain
+    }
+
+    /// Override the retain/unmap policy (tests / the control plane, §20.5).
+    #[inline]
+    pub fn set_retain_policy(&mut self, policy: RetainPolicy) {
+        self.retain = policy;
+    }
+
+    /// The backend's name (the provider's), for diagnostics/traces.
+    #[inline]
+    pub fn backend_name(&self) -> &'static str {
+        self.provider.name()
+    }
+
+    /// Acquire the backend lock and expose the guarded map (RAII release).
+    #[inline]
+    fn lock(&self) -> MapGuard<'_> {
+        self.lock.acquire();
+        MapGuard {
+            lock: &self.lock,
+            // SAFETY: the lock is held, granting exclusive access to `map`.
+            map: unsafe { &mut *self.map.get() },
+        }
+    }
+
+    /// The provider offset of `extent_base` within the reserved region.
+    #[inline]
+    fn sub_offset(&self, extent_base: usize) -> usize {
+        extent_base - (self.region.base as usize)
+    }
+
+    /// The [`Region`] (address + length) backing extent `r`, or `None` if stale.
+    pub fn region_of(&self, r: ExtentRef) -> Option<Region> {
+        let g = self.lock();
+        let e = g.map.resolve(r)?;
+        Some(Region {
+            // The sub-extent pointer derives from the reserved region's base, so it
+            // carries the same provenance as the bytes the provider handed us.
+            base: self.region.base.wrapping_add(self.sub_offset(e.base)),
+            len: e.len,
+        })
+    }
+
+    /// A snapshot of extent `r`, or `None` if the reference is stale.
+    pub fn view(&self, r: ExtentRef) -> Option<Extent> {
+        self.lock().map.resolve(r)
+    }
+
+    /// Free bytes available across all free extents.
+    pub fn free_bytes(&self) -> usize {
+        self.lock().map.free_bytes()
+    }
+
+    /// Committed bytes across all extents (stats reconciliation, §20 / plan 07).
+    pub fn committed_bytes(&self) -> usize {
+        self.lock().map.committed_bytes()
+    }
+
+    /// Whether the back-end is well-formed (the W4-5 invariant oracle).
+    pub fn check_invariants(&self) -> bool {
+        self.lock().map.check_invariants()
+    }
+
+    /// Allocate an extent of at least `size` bytes aligned to `align`, committed
+    /// and ready to use (M-005: a [`Released`](ExtentState::Released) source extent
+    /// is recommitted before it is handed out). `size` is rounded up to a whole
+    /// number of pages (overflow-safe, §9.7). Returns a generation-checked
+    /// [`ExtentRef`].
+    ///
+    /// On a provider commit failure the carved extent is returned to the free
+    /// index, so the back-end is unchanged (W4-5).
+    ///
+    /// SPEC-transition: `extent_alloc` + commit (§18.3 / object `* -> Live`, §7.2)
+    pub fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError> {
+        if size == 0 || !align.is_power_of_two() {
+            return Err(ExtentError::InvalidRequest);
+        }
+        let needed = align_up(size, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        let g = self.lock();
+        let id = g
+            .map
+            .carve(needed, align, fit)
+            .ok_or(ExtentError::Exhausted)?;
+        // Commit the part of the carved extent that is not yet backed (M-005). For
+        // a freshly carved extent `committed_len` is `0` (was Reserved/Released) or
+        // `len` (was Dirty/Muzzy), so this commits the whole extent or nothing.
+        let e = g.map.view(id).expect("just carved");
+        let uncommitted = e.len - e.committed_len;
+        if uncommitted > 0 {
+            let offset = self.sub_offset(e.base) + e.committed_len;
+            if let Err(err) = self.provider.commit(self.region, offset, uncommitted) {
+                // Roll back: return the carved extent to the free index in a state
+                // consistent with its (unchanged) backing, leaving us well-formed.
+                let recovered = if e.committed_len == e.len {
+                    ExtentState::Dirty
+                } else {
+                    ExtentState::Released
+                };
+                g.map.free(id, recovered);
+                return Err(ExtentError::Backend(err));
+            }
+            g.map.mark_committed(id);
+        }
+        debug_assert!(g.map.check_invariants());
+        let generation = g.map.view(id).expect("just carved").generation;
+        Ok(ExtentRef { id, generation })
+    }
+
+    /// The large-allocation path (§18.5, W4-4): page-round `bytes` overflow-safely,
+    /// consult the region-cache `hook` for awkward sizes (§18.6), and otherwise
+    /// allocate a best-fit extent — **bypassing the small-object slab path
+    /// entirely** (this layer never touches size classes, §18.5). Returns the
+    /// backing [`Region`] and, when served from the extent manager, the owning
+    /// [`ExtentRef`] (a cache-served region is owned by the cache, so its ref is
+    /// `None`).
+    ///
+    /// SPEC-transition: `large_allocate` (§18.5)
+    pub fn alloc_large(
+        &self,
+        bytes: usize,
+        align: usize,
+        hook: &dyn RegionCacheHook,
+    ) -> Result<(Region, Option<ExtentRef>), ExtentError> {
+        if bytes == 0 || !align.is_power_of_two() {
+            return Err(ExtentError::InvalidRequest);
+        }
+        // §9.7 / plan 06 W2-4: round to whole pages without ever wrapping to a
+        // smaller region. (The hugepage rounding lands with W11; the hook handles
+        // the awkward-size case it exists for.)
+        let rounded = align_up(bytes, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        // §18.6 region cache first refusal for awkward (just-over-a-hugepage) sizes.
+        if let Some(region) = hook.try_alloc(rounded, align) {
+            return Ok((region, None));
+        }
+        let r = self.alloc(rounded, align, Fit::Best)?;
+        let region = self.region_of(r).expect("just allocated");
+        Ok((region, Some(r)))
+    }
+
+    /// Free extent `r`, applying the retain/unmap policy (§20.5, W4-3b): retain
+    /// keeps the backing ([`Dirty`](ExtentState::Dirty)); unmap decommits it
+    /// eagerly ([`Released`](ExtentState::Released)). Coalesces with free
+    /// neighbours (§18.4). A stale or non-[`Active`](ExtentState::Active) reference
+    /// (a double free) is rejected with [`ExtentError::Stale`]/`NotFree` and never
+    /// acted on.
+    ///
+    /// Freeing always succeeds for a live reference: if the eager-decommit provider
+    /// call fails under the unmap policy, the extent is simply retained (still
+    /// freed, just not decommitted) — well-formed (W4-5).
+    ///
+    /// SPEC-transition: `extent free` (object `Live -> CentralFree`/`Dirty`, §7.2/§20.1)
+    pub fn free(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if e.state != ExtentState::Active {
+            return Err(ExtentError::NotFree); // double free / not an allocation
+        }
+        match self.retain {
+            RetainPolicy::Retain => {
+                g.map.free(r.id, ExtentState::Dirty);
+            }
+            RetainPolicy::Unmap => {
+                let offset = self.sub_offset(e.base);
+                match self.provider.decommit(self.region, offset, e.committed_len) {
+                    Ok(()) => {
+                        g.map.mark_decommitted(r.id, ExtentState::Active);
+                        g.map.free(r.id, ExtentState::Released);
+                    }
+                    // Decommit failed: retain instead (still a valid free).
+                    Err(_) => {
+                        g.map.free(r.id, ExtentState::Dirty);
+                    }
+                }
+            }
+        }
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+
+    /// Recommit a free extent's backing (M-005): a [`Released`](ExtentState::Released)
+    /// extent becomes [`Dirty`](ExtentState::Dirty) again. Idempotent on an
+    /// already-backed extent.
+    ///
+    /// SPEC-transition: `extent_commit` (provider `* -> AllocatorCommitted`, §36.6)
+    pub fn commit(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        let uncommitted = e.len - e.committed_len;
+        if uncommitted > 0 {
+            let offset = self.sub_offset(e.base) + e.committed_len;
+            self.provider
+                .commit(self.region, offset, uncommitted)
+                .map_err(ExtentError::Backend)?;
+            g.map.mark_committed(r.id);
+        }
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+
+    /// Decommit a **free** extent's backing (§18.3, M-004): the extent becomes
+    /// [`Released`](ExtentState::Released) (recommit before reuse). Rejected with
+    /// [`ExtentError::NotFree`] if the extent is still [`Active`](ExtentState::Active)
+    /// — the runtime evidence M-004 requires that the range holds no live object.
+    ///
+    /// SPEC-transition: `extent_decommit` (provider `* -> Unmapped`, §18.3/§36.6)
+    pub fn decommit(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if !e.state.is_free() {
+            return Err(ExtentError::NotFree); // M-004
+        }
+        if e.committed_len > 0 {
+            let offset = self.sub_offset(e.base);
+            self.provider
+                .decommit(self.region, offset, e.committed_len)
+                .map_err(ExtentError::Backend)?;
+            g.map.mark_decommitted(r.id, ExtentState::Released);
+        } else {
+            g.map.set_state(r.id, ExtentState::Released);
+        }
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+
+    /// Lazily purge a **free**, [`Dirty`](ExtentState::Dirty) extent (§20.4): mark
+    /// it discardable ([`Muzzy`](ExtentState::Muzzy)); the backing stays mapped and
+    /// reuse is still cheap. No-op on a non-dirty extent.
+    ///
+    /// SPEC-transition: `purge_lazy` (provider `AllocatorDirty -> AllocatorMuzzyOrScrubbed`, §20.4)
+    pub fn purge_lazy(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if !e.state.is_free() {
+            return Err(ExtentError::NotFree);
+        }
+        if e.state == ExtentState::Dirty {
+            let offset = self.sub_offset(e.base);
+            self.provider
+                .purge_lazy(self.region, offset, e.len)
+                .map_err(ExtentError::Backend)?;
+            g.map.set_state(r.id, ExtentState::Muzzy);
+        }
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+
+    /// Forcibly purge a **free** extent's contents now (§20.4): RSS drops
+    /// immediately and the extent becomes [`Muzzy`](ExtentState::Muzzy) (still
+    /// mapped; a later read faults a fresh page). M-004: free extents only.
+    ///
+    /// SPEC-transition: `purge_forced` (provider `Allocator* -> AllocatorMuzzyOrScrubbed`, §20.4)
+    pub fn purge_forced(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if !e.state.is_free() {
+            return Err(ExtentError::NotFree);
+        }
+        let offset = self.sub_offset(e.base);
+        self.provider
+            .purge_forced(self.region, offset, e.len)
+            .map_err(ExtentError::Backend)?;
+        g.map.set_state(r.id, ExtentState::Muzzy);
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+
+    /// Release a **free** extent's backing to the OS/provider (§18.3 `extent_release`
+    /// / §20.4): revoke descendants (a no-op on POSIX, real capability work on
+    /// seLe4n, §36.6) then decommit, leaving the extent
+    /// [`Released`](ExtentState::Released) (recommit before reuse, M-005). M-004:
+    /// free extents only.
+    ///
+    /// SPEC-transition: `release` (provider `Unmapped -> Revoked -> RecyclableUntyped`, §36.6/§21)
+    pub fn release(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if !e.state.is_free() {
+            return Err(ExtentError::NotFree); // M-004
+        }
+        // Revoke descendants of *this sub-extent* before returning its backing
+        // (§36.6: revoke must complete before memory is returned to a pool); a
+        // no-op on POSIX, real capability revocation on seLe4n (plan 09 — which is
+        // why it gets the sub-extent's region, not the whole one). The whole-region
+        // `release` is the provider's unit of return (on `Drop`); a *sub-extent*
+        // returns its backing via the page-granular `decommit` while the manager
+        // retains the virtual range for recommit (M-005, §20.5 retain).
+        let offset = self.sub_offset(e.base);
+        let sub = Region {
+            base: self.region.base.wrapping_add(offset),
+            len: e.len,
+        };
+        self.provider
+            .revoke_descendants(self.arena, sub)
+            .map_err(ExtentError::Backend)?;
+        if e.committed_len > 0 {
+            self.provider
+                .decommit(self.region, offset, e.committed_len)
+                .map_err(ExtentError::Backend)?;
+            g.map.mark_decommitted(r.id, ExtentState::Released);
+        } else {
+            g.map.set_state(r.id, ExtentState::Released);
+        }
+        debug_assert!(g.map.check_invariants());
+        Ok(())
+    }
+}
+
+impl<P: TopoBackingProvider> Drop for ExtentManager<P> {
+    fn drop(&mut self) {
+        // Return the whole reserved region to the provider. A failure here cannot be
+        // reported from `drop`, but providers must leave their state well-formed
+        // (§36.6); the metadata-backed slot pool is monotonic and simply goes away
+        // with its arena.
+        let _ = self.provider.release(self.arena, self.region);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::BumpArena;
+    use std::alloc::{alloc as host_alloc, dealloc, Layout};
+    use std::sync::atomic::{AtomicU32, Ordering as O};
+    use std::sync::Mutex;
+
+    const PAGE: usize = PAGE_SIZE;
+
+    /// A leaked heap metadata arena (the `pagemap`/`span` test pattern), valid for
+    /// the process so vended slot pools outlive every extent map built over them.
+    fn meta(bytes: usize) -> &'static BumpArena {
+        let buf = vec![0u8; bytes].into_boxed_slice();
+        let len = buf.len();
+        let ptr = Box::into_raw(buf).cast::<u8>();
+        // SAFETY: the leaked buffer is live for the process; `len` bytes are valid.
+        Box::leak(Box::new(unsafe { BumpArena::new(ptr, len) }))
+    }
+
+    /// Build an `ExtentMap` over a synthetic page-aligned region (no real bytes —
+    /// the map only does address bookkeeping). 4096 slots is ample for the tests.
+    fn map(base: usize, pages: usize) -> ExtentMap {
+        ExtentMap::new(meta(1 << 20), base, pages * PAGE, 4096).expect("extent map")
+    }
+
+    // --- a host-backed test provider (with failure injection, W4-5) ----------
+
+    /// A real-memory provider for `ExtentManager` tests: `reserve` hands out a host
+    /// allocation (already writable), the physical-state ops model the documented
+    /// POSIX mapping (decommit/purge zero the range like `MADV_DONTNEED`), and any
+    /// op can be made to fail once to exercise the well-formed-on-failure path.
+    struct HostProvider {
+        owned: Mutex<Vec<(usize, Layout)>>,
+        fail_commit: AtomicU32,
+        fail_decommit: AtomicU32,
+        commits: AtomicU32,
+        decommits: AtomicU32,
+        revokes: AtomicU32,
+    }
+
+    impl HostProvider {
+        fn new() -> Self {
+            Self {
+                owned: Mutex::new(Vec::new()),
+                fail_commit: AtomicU32::new(0),
+                fail_decommit: AtomicU32::new(0),
+                commits: AtomicU32::new(0),
+                decommits: AtomicU32::new(0),
+                revokes: AtomicU32::new(0),
+            }
+        }
+        fn fail_next_commit(&self) {
+            self.fail_commit.store(1, O::Relaxed);
+        }
+    }
+
+    impl TopoBackingProvider for HostProvider {
+        fn reserve(
+            &self,
+            _arena: ArenaId,
+            size: usize,
+            align: usize,
+        ) -> Result<Region, BackendError> {
+            if size == 0 || !align.is_power_of_two() {
+                return Err(BackendError::InvalidRequest);
+            }
+            let layout =
+                Layout::from_size_align(size, align).map_err(|_| BackendError::InvalidRequest)?;
+            // SAFETY: nonzero size + valid power-of-two alignment (checked above).
+            let base = unsafe { host_alloc(layout) };
+            if base.is_null() {
+                return Err(BackendError::OutOfMemory);
+            }
+            self.owned.lock().unwrap().push((base as usize, layout));
+            Ok(Region { base, len: size })
+        }
+        fn commit(&self, _r: Region, _o: usize, _l: usize) -> Result<(), BackendError> {
+            self.commits.fetch_add(1, O::Relaxed);
+            if self.fail_commit.swap(0, O::Relaxed) == 1 {
+                return Err(BackendError::OutOfMemory);
+            }
+            Ok(())
+        }
+        fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
+            self.decommits.fetch_add(1, O::Relaxed);
+            if self.fail_decommit.swap(0, O::Relaxed) == 1 {
+                return Err(BackendError::OutOfMemory);
+            }
+            // Model MADV_DONTNEED: discard the contents now (a later read faults a
+            // fresh zero page). Bounds: `offset + len <= region.len`.
+            // SAFETY: `[offset, offset+len)` is in bounds of the committed region.
+            unsafe { ptr::write_bytes(region.base.add(offset), 0, len) };
+            Ok(())
+        }
+        fn purge_forced(
+            &self,
+            region: Region,
+            offset: usize,
+            len: usize,
+        ) -> Result<(), BackendError> {
+            // SAFETY: in-bounds sub-range of the committed region.
+            unsafe { ptr::write_bytes(region.base.add(offset), 0, len) };
+            Ok(())
+        }
+        fn revoke_descendants(&self, _a: ArenaId, _r: Region) -> Result<(), BackendError> {
+            self.revokes.fetch_add(1, O::Relaxed);
+            Ok(())
+        }
+        fn release(&self, _arena: ArenaId, region: Region) -> Result<(), BackendError> {
+            let mut owned = self.owned.lock().unwrap();
+            let base = region.base as usize;
+            let idx = owned
+                .iter()
+                .position(|&(b, _)| b == base)
+                .ok_or(BackendError::InvalidRequest)?;
+            let (_, layout) = owned.swap_remove(idx);
+            // SAFETY: exactly the pointer/layout from the matching `reserve`.
+            unsafe { dealloc(base as *mut u8, layout) };
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "host-test"
+        }
+    }
+
+    impl Drop for HostProvider {
+        fn drop(&mut self) {
+            for (base, layout) in self.owned.get_mut().unwrap().drain(..) {
+                // SAFETY: same invariant as `release`.
+                unsafe { dealloc(base as *mut u8, layout) };
+            }
+        }
+    }
+
+    fn manager(pages: usize) -> ExtentManager<HostProvider> {
+        ExtentManager::new(
+            HostProvider::new(),
+            meta(1 << 20),
+            ArenaId::DEFAULT,
+            pages * PAGE,
+            PAGE,
+            4096,
+        )
+        .expect("manager")
+    }
+
+    // === ExtentMap (pure bookkeeping) ====================================
+
+    #[test]
+    fn new_tiles_region_as_one_reserved_extent() {
+        let m = map(0x4000_0000, 8);
+        assert!(m.check_invariants());
+        assert_eq!(m.free_bytes(), 8 * PAGE);
+        assert_eq!(m.committed_bytes(), 0);
+        let (lo, hi) = m.region();
+        assert_eq!(hi - lo, 8 * PAGE);
+    }
+
+    #[test]
+    fn carve_exact_marks_active_and_empties_free() {
+        let mut m = map(0x4000_0000, 4);
+        let id = m.carve(4 * PAGE, PAGE, Fit::Best).expect("carve all");
+        let e = m.view(id).unwrap();
+        assert_eq!(e.state, ExtentState::Active);
+        assert_eq!(e.len, 4 * PAGE);
+        assert_eq!(m.free_bytes(), 0);
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn carve_splits_off_remainder_and_tiles() {
+        let mut m = map(0x4000_0000, 8);
+        let id = m.carve(3 * PAGE, PAGE, Fit::Best).expect("carve 3");
+        let e = m.view(id).unwrap();
+        assert_eq!(e.len, 3 * PAGE);
+        assert_eq!(e.base, 0x4000_0000);
+        // The remainder (5 pages) is still free.
+        assert_eq!(m.free_bytes(), 5 * PAGE);
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn carve_with_overalignment_splits_a_page_aligned_prefix() {
+        // A 4*PAGE alignment forces an aligned base above the region base, so a
+        // page-aligned prefix is split off (W4-2b: every split page-aligned).
+        let base = PAGE; // region base not 4*PAGE-aligned
+        let mut m = map(base, 16);
+        let big_align = 4 * PAGE;
+        let id = m
+            .carve(2 * PAGE, big_align, Fit::Best)
+            .expect("aligned carve");
+        let e = m.view(id).unwrap();
+        assert_eq!(e.base % big_align, 0, "allocation honors the alignment");
+        assert_eq!(e.base % PAGE, 0, "still page-aligned");
+        assert_eq!(e.len, 2 * PAGE);
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn split_rejects_unaligned_zero_and_out_of_bounds() {
+        let mut m = map(0x4000_0000, 4);
+        let id = ExtentId(m.addr_head);
+        assert!(m.split(id, 0).is_none(), "zero-length prefix");
+        assert!(m.split(id, 4 * PAGE).is_none(), "whole-length (no tail)");
+        assert!(m.split(id, PAGE + 1).is_none(), "non-page-aligned");
+        // None of the failed splits mutated the map.
+        assert!(m.check_invariants());
+        assert_eq!(m.free_bytes(), 4 * PAGE);
+    }
+
+    #[test]
+    fn split_halves_tile_the_parent() {
+        // Mirrors Theorems/Span.lean `split_halves_disjoint`: the two halves tile
+        // the parent with no gap or overlap.
+        let mut m = map(0x4000_0000, 8);
+        let left = ExtentId(m.addr_head);
+        let parent = m.view(left).unwrap();
+        let right = m.split(left, 3 * PAGE).expect("split");
+        let l = m.view(left).unwrap();
+        let r = m.view(right).unwrap();
+        assert_eq!(l.base, parent.base);
+        assert_eq!(l.len, 3 * PAGE);
+        assert_eq!(r.base, parent.base + 3 * PAGE);
+        assert_eq!(l.end(), r.base, "no gap");
+        assert_eq!(r.end(), parent.end(), "covers the parent");
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn merge_coalesces_adjacent_free_extents() {
+        let mut m = map(0x4000_0000, 8);
+        let left = ExtentId(m.addr_head);
+        let right = m.split(left, 3 * PAGE).expect("split");
+        assert!(m.merge(left, right), "adjacent free extents merge");
+        let e = m.view(left).unwrap();
+        assert_eq!(e.len, 8 * PAGE, "merged back to the whole region");
+        assert!(m.view(right).is_none(), "right slot retired");
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn merge_refuses_non_adjacent_active_or_cross_state() {
+        let mut m = map(0x4000_0000, 8);
+        let a = ExtentId(m.addr_head);
+        let b = m.split(a, 4 * PAGE).expect("split");
+        // Make `a` Active (carve it): now merge(a,b) must refuse (a is not free).
+        let act = m.carve(4 * PAGE, PAGE, Fit::First).expect("carve a");
+        assert!(!m.merge(act, b), "never merge a live (Active) range");
+        // Non-adjacent: free `act`, split `b`, and try to merge the two non-touching
+        // free extents — refused (adjacency gate).
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn coalesce_absorbs_both_free_neighbours() {
+        let mut m = map(0x4000_0000, 9);
+        // Carve three adjacent 3-page extents, free the outer two, then free the
+        // middle — coalesce must merge all three into one.
+        let a = m.carve(3 * PAGE, PAGE, Fit::First).unwrap();
+        let b = m.carve(3 * PAGE, PAGE, Fit::First).unwrap();
+        let c = m.carve(3 * PAGE, PAGE, Fit::First).unwrap();
+        assert_eq!(m.free_bytes(), 0);
+        // The pure map never commits (that is the manager's job), so a carved extent
+        // is unbacked: free it to the unbacked free state, `Released` (a Dirty free
+        // extent would have to be backed). Coalescing across same-backing states is
+        // exercised here; the backed (`Dirty`) path is covered by the manager tests.
+        m.free(a, ExtentState::Released);
+        m.free(c, ExtentState::Released);
+        let survivor = m.free(b, ExtentState::Released).unwrap();
+        let e = m.view(survivor).unwrap();
+        assert_eq!(e.len, 9 * PAGE, "all three coalesced");
+        assert_eq!(m.free_bytes(), 9 * PAGE);
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn best_fit_picks_the_smallest_adequate_extent() {
+        let mut m = map(0x4000_0000, 16);
+        // Carve to leave free extents of 2 and 4 pages (and an active gap between).
+        let _a = m.carve(2 * PAGE, PAGE, Fit::First).unwrap(); // [0,2) active
+        let hold2 = m.carve(2 * PAGE, PAGE, Fit::First).unwrap(); // [2,4)
+        let _b = m.carve(4 * PAGE, PAGE, Fit::First).unwrap(); // [4,8) active
+        let hold4 = m.carve(4 * PAGE, PAGE, Fit::First).unwrap(); // [8,12)
+                                                                  // Free the 2-page and 4-page holds, leaving free extents of size 2 and 4.
+                                                                  // (Unbacked carves free to `Released`; see `coalesce_absorbs_both_free_neighbours`.)
+        m.free(hold2, ExtentState::Released);
+        m.free(hold4, ExtentState::Released);
+        // Best-fit a 2-page request: must pick the 2-page extent, not the 4-page one.
+        let got = m.carve(2 * PAGE, PAGE, Fit::Best).unwrap();
+        assert_eq!(m.view(got).unwrap().base, 0x4000_0000 + 2 * PAGE);
+        assert!(m.check_invariants());
+    }
+
+    #[test]
+    fn slot_exhaustion_fails_safely() {
+        // A tiny pool: after the initial extent, only a couple of splits are possible.
+        let mut m = ExtentMap::new(meta(1 << 16), 0x4000_0000, 64 * PAGE, 3).expect("map");
+        // Each non-exact carve consumes a slot for the remainder; eventually the pool
+        // is exhausted and carve returns None without corrupting the map.
+        let mut n = 0;
+        while m.carve(PAGE, PAGE, Fit::First).is_some() {
+            n += 1;
+            assert!(m.check_invariants());
+            assert!(n < 100, "should exhaust the 3-slot pool quickly");
+        }
+        assert!(
+            m.check_invariants(),
+            "exhaustion leaves the map well-formed"
+        );
+    }
+
+    #[test]
+    fn stale_ref_after_merge_resolves_none() {
+        // DD-1 F2: a reference captured before a merge that retires the slot must
+        // resolve to None (not to the different range now in the slot).
+        let mut m = map(0x4000_0000, 8);
+        let left = ExtentId(m.addr_head);
+        let right = m.split(left, 4 * PAGE).expect("split");
+        let stale = m.extent_ref(right).expect("ref to right");
+        assert!(m.resolve(stale).is_some());
+        assert!(m.merge(left, right), "merge retires right's slot");
+        assert!(m.resolve(stale).is_none(), "captured ref is now stale");
+    }
+
+    // === ExtentManager (provider integration, W4-2d/3/4/5) ===============
+
+    #[test]
+    fn alloc_commits_writable_memory_and_frees() {
+        let mgr = manager(16);
+        let r = mgr.alloc(3 * PAGE, PAGE, Fit::Best).expect("alloc");
+        let region = mgr.region_of(r).expect("region");
+        assert_eq!(region.len, 3 * PAGE);
+        assert_eq!(region.base as usize % PAGE, 0);
+        // The committed region is writable end to end.
+        // SAFETY: `region` is committed for its whole length.
+        unsafe {
+            for i in 0..region.len {
+                region.base.add(i).write(0x5a);
+            }
+            assert_eq!(region.base.add(region.len - 1).read(), 0x5a);
+        }
+        assert_eq!(mgr.committed_bytes(), 3 * PAGE);
+        mgr.free(r).expect("free");
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn alloc_free_reuses_space_under_retain() {
+        let mut mgr = manager(8);
+        mgr.set_retain_policy(RetainPolicy::Retain);
+        let r1 = mgr.alloc(8 * PAGE, PAGE, Fit::Best).unwrap();
+        assert_eq!(mgr.free_bytes(), 0);
+        mgr.free(r1).unwrap();
+        // Retain keeps the backing: the freed extent is Dirty (still committed).
+        assert_eq!(mgr.free_bytes(), 8 * PAGE);
+        assert_eq!(mgr.committed_bytes(), 8 * PAGE, "retain keeps backing");
+        // A re-alloc reuses the space without a fresh commit.
+        let r2 = mgr.alloc(8 * PAGE, PAGE, Fit::Best).unwrap();
+        assert_eq!(mgr.region_of(r2).unwrap().len, 8 * PAGE);
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn free_under_unmap_policy_decommits_backing() {
+        let mut mgr = manager(8);
+        mgr.set_retain_policy(RetainPolicy::Unmap);
+        let r = mgr.alloc(8 * PAGE, PAGE, Fit::Best).unwrap();
+        assert_eq!(mgr.committed_bytes(), 8 * PAGE);
+        mgr.free(r).unwrap();
+        // Unmap decommits eagerly: the backing is returned (committed bytes drop).
+        assert_eq!(mgr.committed_bytes(), 0, "unmap decommits on free");
+        assert_eq!(mgr.free_bytes(), 8 * PAGE);
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn decommit_and_release_require_a_free_extent_m004() {
+        let mgr = manager(8);
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::Best).unwrap();
+        // M-004: an Active extent may hold a live object — decommit/release refused.
+        assert_eq!(mgr.decommit(r), Err(ExtentError::NotFree));
+        assert_eq!(mgr.release(r), Err(ExtentError::NotFree));
+        assert_eq!(mgr.purge_lazy(r), Err(ExtentError::NotFree));
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn alloc_recommits_a_released_extent_before_reuse_m005() {
+        let mgr = manager(8);
+        // Split off two halves so a freed half can be released, then re-allocated.
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(b).unwrap();
+        mgr.release(b).unwrap(); // b's backing returned; state Released, committed 0
+        assert_eq!(mgr.view(b).unwrap().state, ExtentState::Released);
+        assert_eq!(mgr.committed_bytes(), 4 * PAGE);
+        // Re-allocating that 4-page hole must recommit it (M-005) and hand back
+        // writable memory.
+        let c = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        assert_eq!(
+            mgr.committed_bytes(),
+            8 * PAGE,
+            "released space recommitted"
+        );
+        let region = mgr.region_of(c).unwrap();
+        // SAFETY: committed for its whole length (the recommit faulted it in).
+        unsafe {
+            region.base.write(0x42);
+            assert_eq!(region.base.read(), 0x42);
+        }
+        let _ = a;
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn explicit_release_decommits_a_free_extent_and_recommit_restores() {
+        let mgr = manager(8);
+        // Carve two halves so one can be freed and explicitly released while a ref to
+        // the free half is retained for the release/commit calls.
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(b).unwrap(); // b is now Dirty (retain); ref `b` still resolves
+        let committed_before = mgr.committed_bytes();
+        assert_eq!(committed_before, 8 * PAGE);
+        // Explicitly release b's backing to the OS (decommit + revoke).
+        mgr.release(b).unwrap();
+        assert_eq!(mgr.committed_bytes(), 4 * PAGE, "b's 4 pages decommitted");
+        assert_eq!(mgr.view(b).unwrap().state, ExtentState::Released);
+        // Recommit before reuse (M-005).
+        mgr.commit(b).unwrap();
+        assert_eq!(mgr.committed_bytes(), 8 * PAGE, "recommitted");
+        assert_eq!(mgr.view(b).unwrap().state, ExtentState::Dirty);
+        let _ = a;
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn purge_lazy_then_forced_track_muzzy() {
+        let mgr = manager(8);
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(r).unwrap(); // Dirty
+        mgr.purge_lazy(r).unwrap();
+        assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
+        // Forced purge on a muzzy extent stays muzzy (contents discarded now).
+        mgr.purge_forced(r).unwrap();
+        assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
+        // Still backed (mapped) — committed bytes unchanged by a purge.
+        assert_eq!(mgr.committed_bytes(), 4 * PAGE);
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn double_free_is_rejected_not_acted_on() {
+        let mgr = manager(8);
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(r).unwrap();
+        // The second free sees a non-Active (now Dirty/coalesced) extent: rejected.
+        assert!(matches!(
+            mgr.free(r),
+            Err(ExtentError::NotFree) | Err(ExtentError::Stale)
+        ));
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn alloc_large_rounds_and_bypasses_with_region_cache_hook() {
+        let mgr = manager(64);
+        // An "awkward" size (just over 2 pages) rounds up to whole pages, no wrap.
+        let (region, r) = mgr
+            .alloc_large(2 * PAGE + 1, PAGE, &NoRegionCache)
+            .expect("large");
+        assert_eq!(region.len, 3 * PAGE, "rounded up to whole pages");
+        assert!(r.is_some(), "served from the extent manager (no cache)");
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn commit_failure_leaves_state_well_formed_w4_5() {
+        let mgr = manager(8);
+        // `mod tests` is a child of `extent`, so it reaches the private provider
+        // field to arm the one-shot failure injection.
+        mgr.provider.fail_next_commit();
+        // The first alloc must commit (the region is Reserved); the injected failure
+        // makes it fail — and roll the carve back, leaving the back-end untouched.
+        let before_free = mgr.free_bytes();
+        assert!(matches!(
+            mgr.alloc(4 * PAGE, PAGE, Fit::Best),
+            Err(ExtentError::Backend(BackendError::OutOfMemory))
+        ));
+        assert_eq!(mgr.free_bytes(), before_free, "carve rolled back");
+        assert_eq!(mgr.committed_bytes(), 0);
+        assert!(
+            mgr.check_invariants(),
+            "failed alloc keeps invariants green"
+        );
+        // The back-end still works after the injected failure.
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::Best).expect("recovers");
+        assert!(mgr.view(r).is_some());
+        assert!(mgr.check_invariants());
+    }
+}

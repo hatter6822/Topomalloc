@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 [package]
 name = "topo-core"
-description = "TopoMalloc core: classifier, size classes, the backing-provider seam, and the M0 skeleton allocator. no_std-capable."
+description = "TopoMalloc core: classifier, size classes, the backing-provider seam, the back-end extent manager, and the M0 skeleton allocator. no_std-capable."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
