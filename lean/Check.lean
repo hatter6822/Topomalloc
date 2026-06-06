@@ -40,6 +40,12 @@ def oracleGate : Bool :=
     | .ok ⟨[]⟩, .error (3, .freeOfUnknown 0x1000) => true
     | _, _ => false)
 
+/-- The pagemap differential (W3-3d): the recorded install/lookup trace replays
+through the executable pagemap model with every `addr -> span` lookup as expected. The
+Rust test `pagemap_matches_lean_replay_differential` checks the identical trace against
+the runtime radix, so a divergence on either side fails CI. -/
+def pagemapDiffGate : Bool := TopoMalloc.pagemapGate
+
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
@@ -51,5 +57,10 @@ def main : IO UInt32 := do
     IO.println s!"lake check: trace oracle OK (good trace replays; injected violation flagged, §33.7)"
   else
     IO.eprintln "lake check: trace oracle FAILED (W1-10 replay)"
+    ok := false
+  if pagemapDiffGate then
+    IO.println "lake check: pagemap differential OK (install/lookup trace replays; matches Rust radix, W3-3d)"
+  else
+    IO.eprintln "lake check: pagemap differential FAILED (W3-3d replay)"
     ok := false
   return if ok then 0 else 1

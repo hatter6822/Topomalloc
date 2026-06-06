@@ -26,5 +26,25 @@ hugepage-optimized = []
 
 [dependencies]
 
+[dev-dependencies]
+# Micro-benchmark harness (W0-8, §34.6) for the W3 metadata paths. Default features
+# (rayon, plotters, and their wasm/web transitive deps) are dropped to shrink the
+# supply-chain surface; `cargo_bench_support` is kept for `cargo bench`.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# `loom` exhaustively model-checks the lock-free concurrency protocols (W3-3c
+# publish/read and the W3-4 seqlock). Gated to `--cfg loom` so it — and its heavy
+# transitive deps — are invisible to the normal build, test, and supply-chain audit;
+# run with `RUSTFLAGS="--cfg loom" cargo test -p topo-core --test loom_protocols`.
+[target.'cfg(loom)'.dev-dependencies]
+# Default features (the `tracing-subscriber` checkpoint UI and its transitive deps)
+# are dropped to keep the supply-chain surface minimal; the model checker itself
+# needs none of them.
+loom = { version = "0.7", default-features = false }
+
+[[bench]]
+name = "metadata"
+harness = false
+
 [lints]
 workspace = true

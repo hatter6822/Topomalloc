@@ -9,7 +9,7 @@ supports it (arch, stats, control, test-support).
 
 | Crate | Role | License | Plan |
 |-------|------|---------|------|
-| `topo-core` | classifier, size classes, the seam, the M0 skeleton allocator | MIT | 03, 05 |
+| `topo-core` | classifier, size classes, the seam, metadata/pagemap/bootstrap + pointer classification, the M0 skeleton allocator | MIT | 03, 05 |
 | `topo-abi` | C ABI exports + Rust `GlobalAlloc` adapter | MIT | 06 |
 | `topo-backend-posix` | `PosixBackingProvider` (single-authority case) | MIT | 04 |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later | 09 |

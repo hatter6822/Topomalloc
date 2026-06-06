@@ -6,10 +6,13 @@
 # cross targets are present (via `cargo xtask setup`, the same entry point devs
 # use) and prints a one-line readiness summary. Fast, idempotent, non-interactive.
 #
-# Lean is intentionally *not* installed here: the upstream Lean release host is
-# often unreachable from sandboxed sessions, and the Lean steps are optional
-# locally (CI installs Lean via the official action). `xtask` skips Lean cleanly
-# when `lake` is absent, so the session is still able to run `cargo xtask ci`.
+# `cargo xtask setup` also provisions the pinned Lean toolchain via
+# `scripts/setup_lean.sh` (best-effort, non-fatal): it downloads from the
+# reachable GitHub releases — not elan's release host — self-installs `zstd` if
+# missing, and puts `lake`/`lean` on PATH (persisting via $CLAUDE_ENV_FILE /
+# $GITHUB_PATH) so the formal-model gates run in-session. If Lean cannot be
+# provisioned (no network/privileges), `xtask` skips the Lean steps cleanly and
+# the session can still run the rest of `cargo xtask ci`.
 set -uo pipefail
 
 # Only provision in the remote (web / CI-agent) environment; a local checkout

@@ -37,10 +37,19 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "debug-checks"))]
     fn default_build_is_performance() {
-        // The test harness builds with default features, so this is the
-        // performance profile with no debug checks.
+        // With no profile feature the build is `performance` and pays no debug
+        // checks. (Gated off when `debug-checks` is enabled — e.g. the hardened
+        // test pass — where the assertion deliberately would not hold.)
         assert_eq!(active_profile(), "performance");
         assert!(!debug_checks_enabled());
+    }
+
+    #[test]
+    #[cfg(feature = "debug-checks")]
+    fn debug_checks_feature_enables_the_checks() {
+        // The hardened/debug pass: the §17.3/Appendix-B checks are compiled in.
+        assert!(debug_checks_enabled());
     }
 }

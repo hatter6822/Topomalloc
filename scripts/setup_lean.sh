@@ -54,8 +54,28 @@ esac
 if [ -x "${TOOLCHAIN_DIR}/bin/lean" ] && [ -f "${TOOLCHAIN_DIR}/lib/crti.o" ]; then
   log "Lean ${TOOLCHAIN} already installed (fast path)."
 else
-  command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
-  command -v zstd >/dev/null 2>&1 || { echo "error: zstd is required (apt-get install zstd)" >&2; exit 1; }
+  # Best-effort install of a required tool via the system package manager. The
+  # ephemeral remote/CI container image may ship without `zstd` (the Lean
+  # tarballs are `.tar.zst`), so provision it unattended rather than failing the
+  # whole setup. Non-fatal: the hard check below still errors if a tool is
+  # genuinely unobtainable (e.g. no package manager / no privileges / no network).
+  ensure_tool() {
+    local tool="$1" pkg="${2:-$1}"
+    command -v "${tool}" >/dev/null 2>&1 && return 0
+    log "installing ${pkg} (required by setup_lean.sh) ..."
+    local apt=""
+    if command -v apt-get >/dev/null 2>&1; then
+      if [ "$(id -u)" -eq 0 ]; then apt="apt-get"; elif command -v sudo >/dev/null 2>&1; then apt="sudo apt-get"; fi
+    fi
+    if [ -n "${apt}" ]; then
+      ${apt} install -y "${pkg}" >/dev/null 2>&1 \
+        || { ${apt} update >/dev/null 2>&1 && ${apt} install -y "${pkg}" >/dev/null 2>&1; } \
+        || true
+    fi
+    command -v "${tool}" >/dev/null 2>&1
+  }
+  ensure_tool curl || { echo "error: curl is required" >&2; exit 1; }
+  ensure_tool zstd || { echo "error: zstd is required (apt-get install zstd)" >&2; exit 1; }
 
   ARCHIVE="lean-${VERSION_NUMBER}-linux${ARCH_SUFFIX}.tar.zst"
   URL="https://github.com/${TOOLCHAIN_ORG}/${TOOLCHAIN_REPO}/releases/download/${TOOLCHAIN_TAG}/${ARCHIVE}"

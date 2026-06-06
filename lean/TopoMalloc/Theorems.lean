@@ -11,6 +11,7 @@ import TopoMalloc.Theorems.Cache
 import TopoMalloc.Theorems.Central
 import TopoMalloc.Theorems.Span
 import TopoMalloc.Theorems.Pagemap
+import TopoMalloc.Theorems.PagemapExec
 import TopoMalloc.Theorems.Release
 import TopoMalloc.Theorems.Arena
 import TopoMalloc.Theorems.Allocate

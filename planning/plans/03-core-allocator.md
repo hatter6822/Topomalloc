@@ -301,9 +301,20 @@ generator, never a literal.
 - [x] Over-aligned requests never share a slab (W2-3b) — `size_class` routes them to
       a sufficiently-aligned class or out to medium/large; the runtime `MAX_ALIGN`
       fast-reject and the `over_alignment_never_widens_a_shared_slab` test enforce it.
-- [ ] One critical section updates bitmap **and** count together (W5-2); no torn accounting.
+- [x] One critical section updates bitmap **and** count together (W5-2); no torn
+      accounting — `SpanDescriptor` owns a per-span lock (§27.2/§8.5); the bitmap edit
+      and the cached `central_free_count` move together through the `SpanGuard`
+      (`central_insert`/`central_remove`), the only mutation path, so the
+      `central_free == popcount` invariant is never observed torn. W5 wires the central
+      list around this lock.
 - [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
       the hot path.
 - [ ] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for.
-- [ ] Pagemap and span state never move in separate critical sections (W3-6).
+- [x] Pagemap and span state never move in separate critical sections (W3-6) — the
+      pagemap (`crates/topo-core/src/pagemap.rs`) is the **single** mutator: every
+      change goes through `install_span`/`release_span`/`retire_span`/`install_large`,
+      which pair the descriptor's state change with the entry publish (e.g.
+      `release_span` debug-asserts the span is marked `Released` first) under
+      release/acquire ordering. W4-2b (split/merge) and W5-5 (span lifecycle) route
+      through these and never poke a leaf directly.
 - [ ] Span creation stays out of the locked central critical section (W5-4b returns `empty`).

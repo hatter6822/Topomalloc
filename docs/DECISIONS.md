@@ -160,3 +160,108 @@ Four W2 implementation choices are ratified here; the module docs
   obligation as a verified, overflow-safe primitive; the classifier still
   page-rounds Large until the hugepage backend (plan 04) sets the §18.6
   region-cache policy that governs whole-hugepage rounding.
+
+## W3 — metadata, pagemap & classification design notes (plan 03)
+
+The W3 metadata substrate (`crates/topo-core/src/{bootstrap,span,pagemap,ptr_class}.rs`)
+makes six implementation choices; the module docs carry the detail.
+
+* **Bootstrap = bump core + lifecycle, with a real hand-off, a static global, and a
+  re-entrancy guard.** The monotonic bump arena (`BumpArena`, W3-1a) is split from the
+  idempotent-init/hand-off state machine (`Bootstrap`, W3-1b), so the carving logic is
+  unit-tested over a caller buffer with no global state. The hand-off is **real**:
+  `hand_off_to(successor)` routes new metadata to the normal allocator (§17.4) while
+  already-vended bytes stay valid; the `MetadataAlloc: Sync` supertrait makes the
+  "safe to call concurrently" contract a type fact (the successor lives behind the
+  `Sync` `Bootstrap` and is called from every thread). `Bootstrap::global()` binds a
+  `BOOTSTRAP_REGION_BYTES` static reserve lazily (DD-2's "static reservation"),
+  profile-aware (smaller under `low-rss`) and faulting in lazily from BSS; on a
+  concurrent first-use race `global()` waits for the init winner to publish `Active`
+  before returning, so a loser of the init CAS never hands back an
+  apparently-uninitialized allocator (no spurious metadata `None`). A
+  **re-entrancy guard** (`is_in_alloc()`, a thread-local under `std`/tests, a no-op
+  leaf otherwise) *refuses* the S-007 re-entry of the metadata path: `alloc` returns
+  `None` rather than recurse — in **every** profile, not only debug — and additionally
+  debug-aborts under `debug-assertions`. The arena is **never** freed
+  — metadata a classifier may reach must outlive it (§27.5) — so logical reuse is caught
+  by a generation, not by reclaiming memory.
+
+* **Pagemap radix: derived depth over the full `usize` range, uniform 8 KiB nodes.**
+  The depth is `ceil((usize::BITS − PAGE_SHIFT) / RADIX_BITS)` with `RADIX_BITS = 10`
+  (5 levels on a 64-bit / 16 KiB-page target, 2 on 32-bit), so the radix covers the
+  **entire address space with no virtual-address-width assumption** — an address from
+  5-level paging / a 57-bit VA maps as readily as a 48-bit one (the earlier 48-bit cap
+  mis-mapped owned memory on such hosts). Uniform 1024-slot (8 KiB) nodes keep the
+  resident footprint low (lazy population, the `low-rss` interest); the cost is a
+  couple more dependent loads on the *slow* path only. Leaf entries are tagged pointers
+  (low 3 bits; both `SpanDescriptor` and `LargeDescriptor` are ≥ 8-aligned, each pinned
+  by a compile-time `const` assert so a field reorder can never collide the tag with a
+  real address bit): `Empty` = 0 (a zeroed leaf is valid),
+  `Small`/`Large`, `ReleasedRetained` (P-Map-005). Chosen over a flat array (wastes
+  virtual space) and a hash map (worst-case/resize hazards), DD-1. `metadata_bytes()`
+  reports the bounded overhead.
+
+* **Publish/read with release/acquire + a single lock-free mutator (W3-6).** Leaf
+  entries are release-stored *after* the descriptor is initialized; readers
+  acquire-load; new nodes are zeroed before a release-CAS links them — so a classifier
+  sees `Empty` or a fully-formed entry, never a torn node (F1). Installs are
+  **two-phase, hence atomic on metadata exhaustion**: `publish_range` creates every
+  radix node the range needs (the only fallible step) *before* publishing any entry, so
+  an `OutOfMetadata` leaves every page `Empty` — a failed allocation never leaves a
+  page mapped to its descriptor. The pagemap is the **only** mutator (F3): W4-2b and
+  W5-5 route through `install_span`/`release_span`/`retire_span`/`install_large`. A
+  page maps to exactly one descriptor (P-Map-001): a double-install over a *different*
+  descriptor is a caller bug a `debug_assert` aborts on, and release builds **preserve
+  the existing owner** (skip the store) rather than silently retarget a live page. Its
+  operations are lock-free (atomic publish), so they acquire no lock and cannot violate
+  the §27.2 hierarchy; they run inside the caller's span critical section (P-Map-006).
+
+* **Generation for identity + a seqlock for read-consistency (W3-5/W3-4).** Span/large
+  descriptors carry a `generation` bumped on recycle (§16.6/§27.5; it **wraps**,
+  skipping 0, rather than saturating — saturating would pin the counter at its ceiling
+  and let a `GenGuard` captured there match every later incarnation); `GenGuard` lets a
+  stashed reference detect a recycle (ABA), and descriptors are never freed, so the
+  pointer stays valid. Separately, a **seqlock** version brackets a recycle's geometry
+  writes, and `classify_ptr` reads the geometry through it — so a classification racing
+  a recycle (a use-after-free signal) is never composed from two incarnations; a
+  persistently racing recycle resolves conservatively to `External`. Classification is
+  also **total**: because a stale pagemap entry can point a low address at a span the
+  seqlock reports re-based *above* it, `classify_in_span` first rejects `addr < base`
+  as `External`, so every slab-layout subtraction is underflow-free and the function
+  never panics on any address (the recycle holds the span lock across the whole
+  geometry update, so a lock-holder never sees the bitmap and `object_count`
+  disagree). Totality extends to corrupted metadata: the size-class lookup is
+  bounds-checked (`size_class::checked_row`), so an out-of-range `sc` resolves to
+  `External` instead of an out-of-bounds panic, and a `const` scan pins every class's
+  object size `> 0` so the `delta / object_size` on that path can never divide by zero.
+  The §17.3 integrity tag (FNV-1a over the read-mostly header, hashed with **acquire**
+  loads) is **consumed**, not merely computed: in a hardened build (`debug-checks`) the
+  classification path validates it, and a tag mismatch is *disambiguated* by re-reading
+  the seqlock version — genuine corruption only when the version is unchanged, otherwise
+  a recycle merely raced the check and the read is retried. So a wild write to a header
+  field makes the pointer classify foreign, while a benign concurrent recycle is
+  **never** misreported as corruption — closing the gap where the tag was a tested
+  capability with no consumer. The `large` path is seqlock-read too (symmetric with the
+  span). The two lock-free protocols (the seqlock
+  and the W3-3c publish/read) are `loom`-model-checked under `--cfg loom`.
+
+* **§8.5 in one critical section via a per-span lock.** `central_free ==
+  popcount(free_bitmap)` is the authoritative central count; the bitmap edit and the
+  count update move together under a lightweight per-span spinlock (§27.2's span lock,
+  which W5 adopts), reachable only through a `SpanGuard` — so the invariant is updated
+  atomically and never observed torn. The cached `local`/`transfer`/`quarantined` terms
+  are logical (reconstructed in debug W5-3c, zero before caches), so `is_empty` (§16.5)
+  takes them as explicit inputs and never infers liveness from the bitmap (the DD-3
+  catastrophe guard).
+
+* **Hybrid bitmap: inline-small, out-of-line-large.** A slab of ≤ `INLINE_BITS` (128)
+  objects keeps its bitmap inline; the few high-count classes allocate a class-sized
+  bitmap from the metadata seam. The descriptor stays a fixed, compact 96 bytes for
+  every class (the earlier all-inline design carried a 128-byte bitmap in *every*
+  descriptor), and recycle grows the out-of-line block only when a larger class needs
+  it. The descriptor footprint is asserted (W3-2). The pagemap's runtime soundness is
+  tied to the proof by an **executable Lean pagemap model** (`PagemapExec.lean`):
+  `install_lookup_sound` is kernel-checked (mirroring `pagemap_lookup_sound`), and a
+  recorded install/lookup trace is replayed by `lake exe check` and by the Rust
+  `pagemap_matches_lean_replay_differential` test against the radix — the W3-3d
+  differential loop.
