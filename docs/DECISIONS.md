@@ -272,8 +272,10 @@ makes six implementation choices; the module docs carry the detail.
   field makes the pointer classify foreign, while a benign concurrent recycle is
   **never** misreported as corruption — closing the gap where the tag was a tested
   capability with no consumer. The `large` path is seqlock-read too (symmetric with the
-  span). The two lock-free protocols (the seqlock
-  and the W3-3c publish/read) are `loom`-model-checked under `--cfg loom`.
+  span). The two lock-free protocols (the seqlock and the W3-3c publish/read), plus
+  the W4 large-free critical section (whose lookup-under-the-pool-lock makes a
+  concurrent double-free of one pointer settle on exactly one winner), are
+  `loom`-model-checked under `--cfg loom`.
 
 * **§8.5 in one critical section via a per-span lock.** `central_free ==
   popcount(free_bitmap)` is the authoritative central count; the bitmap edit and the

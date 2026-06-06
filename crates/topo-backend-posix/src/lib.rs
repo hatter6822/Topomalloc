@@ -576,6 +576,38 @@ mod tests {
     }
 
     #[test]
+    fn decommit_then_recommit_restores_writable_memory_m005() {
+        // §20.4 / M-005 on the production path: after a decommit (MADV_DONTNEED) the
+        // range must be recommittable and writable again — a fresh, zeroed mapping —
+        // so a reused released extent is sound. (The guard-mode test cycles this with
+        // PROT_NONE; this covers the default performance path, which nothing else did.)
+        let p = PosixBackingProvider::new();
+        let r = p
+            .reserve(ArenaId::DEFAULT, 4 * PAGE, PAGE)
+            .expect("reserve");
+        p.commit(r, 0, r.len).expect("commit");
+        // SAFETY: committed for its full length.
+        unsafe { std::ptr::write_bytes(r.base, 0xaa, r.len) };
+        p.decommit(r, 0, r.len).expect("decommit"); // discards contents now
+        p.commit(r, 0, r.len).expect("recommit"); // M-005 recommit before reuse
+                                                  // SAFETY: recommitted for its full length.
+        unsafe {
+            assert_eq!(
+                r.base.read(),
+                0,
+                "recommitted range faults in zeroed (DONTNEED)"
+            );
+            std::ptr::write_bytes(r.base, 0xbb, r.len);
+            assert_eq!(
+                r.base.add(r.len - 1).read(),
+                0xbb,
+                "writable after recommit"
+            );
+        }
+        p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[test]
     fn decommit_discards_contents_like_madv_dontneed() {
         // §20.4 / W4-3a: decommit ≈ MADV_DONTNEED — a later read sees a fresh zero
         // page. With the real provider this exercises the actual madvise.

@@ -588,6 +588,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "illegal provider-state transition")]
+    fn advance_debug_aborts_on_illegal_skip() {
+        // Companion to the release-only structural check above. Under
+        // `debug-assertions` an illegal §36.6 transition must ABORT (surfacing the
+        // provider bug), not silently return `Err`. CI runs tests in debug, so this
+        // is the profile that actually exercises `advance`'s rejection — and
+        // `starting_at`, which the release-only block above cannot cover here.
+        let mut m = ProviderStateMachine::starting_at(ProviderState::ReservedUntyped);
+        let _ = m.advance(ProviderState::RecyclableUntyped); // skips the chain → abort
+    }
+
+    #[test]
     fn region_addr_range_is_base_and_end() {
         let mut buf = [0u8; 64];
         let r = Region {

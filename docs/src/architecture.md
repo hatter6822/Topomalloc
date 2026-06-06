@@ -154,7 +154,9 @@ divergence on either side fails CI (the W3-3d differential, the pagemap analogue
 the live-set oracle's trace-replay loop). The radix's index decomposition is tested
 lossless (distinct pages never collide), and the subtle lock-free protocols — the
 W3-4 seqlock (with its hardened integrity-vs-race disambiguation), the W3-3c
-publish/read, and the lazy-node CAS race — are **model-checked by `loom`**
+publish/read, the lazy-node CAS race, and the W4 large-free critical section (the
+lookup-under-the-pool-lock that makes a concurrent double-free settle on exactly one
+winner) — are **model-checked by `loom`**
 (`tests/loom_protocols.rs`, `cargo xtask test --kind loom`, gated to `--cfg loom` so
 its deps stay out of the normal build), an exhaustive-interleaving complement to the
 std-thread stress tests. Criterion benchmarks (`benches/metadata.rs`,
@@ -237,7 +239,9 @@ M1) the capability provider drop in behind the *identical* seam (D2).
   best-fit extent, and installs a `LargeDescriptor` through the W3-6 mutator
   (`install_large`) — so the result is **classifiable**: `free`/`usable_size`
   recover it by pagemap lookup, retire the entry *before* the descriptor slot can
-  recycle (no stale-address hazard), and return the extent. A `RegionCacheHook` (the
+  recycle — under the pool lock, so there is no stale-address hazard and two threads
+  racing to free one pointer settle on exactly one winner (never a double free) — and
+  return the extent. A `RegionCacheHook` (the
   §18.6 awkward-size hook) gets first refusal; a cache-served region is freed back to
   the cache, defining the lifecycle W11-3 fills (M5).
 

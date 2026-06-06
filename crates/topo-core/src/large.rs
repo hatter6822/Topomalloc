@@ -25,9 +25,12 @@
 //!
 //! **Concurrency.** The descriptor pool is guarded by a backend-class spinlock
 //! (§27.2); the extent manager and the pagemap carry their own synchronization.
-//! `free` retires the old pagemap entry **before** the descriptor slot can be
-//! recycled, so a classifier never resolves a stale address to a recycled
-//! descriptor.
+//! `free` resolves the descriptor and retires its pagemap entry **under that lock,
+//! before** the slot can be recycled, so (a) a classifier never resolves a stale
+//! address to a recycled descriptor, and (b) two threads racing to free the **same**
+//! pointer resolve to exactly one successful free — the loser re-reads an
+//! already-retired entry and rejects, never double-releasing the slot or
+//! double-freeing the extent (M-004; checked by a `loom` model and a stress test).
 
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
@@ -327,12 +330,21 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         if ptr.is_null() {
             return false;
         }
+        self.lock.acquire();
+        // Resolve the descriptor *under the lock*. The first thread to free `ptr`
+        // retires its pagemap entry (below) before releasing the lock, so a second
+        // thread racing to free the SAME pointer re-reads `None` here and rejects —
+        // it can never reach `index_of`/`release` on an already-retired slot. Doing
+        // the lookup outside the lock would let both threads resolve the same slot
+        // and double-release it (free-stack corruption → later double-vend), the
+        // classic large double-free (§17.5, M-004).
         let desc_ptr = match self.pagemap.lookup(ptr as usize).large_ptr() {
             Some(p) => p,
-            None => return false, // not a large allocation (foreign / small / released)
+            None => {
+                self.lock.release();
+                return false; // not live (foreign / small / released / already freed)
+            }
         };
-
-        self.lock.acquire();
         // SAFETY: lock held ⇒ exclusive access to the pool.
         let pool = unsafe { &mut *self.pool.get() };
         let idx = match pool.index_of(desc_ptr) {
@@ -381,14 +393,27 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// The usable size of the large allocation at base `ptr`, or `None` if `ptr` is
     /// not a live large allocation of this allocator (§25.4 `usable_size`).
     pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
-        let desc_ptr = self.pagemap.lookup(ptr as usize).large_ptr()?;
+        if ptr.is_null() {
+            return None;
+        }
         self.lock.acquire();
-        // SAFETY: lock held ⇒ exclusive pool access.
-        let pool = unsafe { &mut *self.pool.get() };
-        let res = pool.index_of(desc_ptr).map(|idx| {
-            // SAFETY: `idx` is a live slot; reading the usable size is sound.
-            unsafe { (*pool.slot_ptr(idx)).desc.usable_size() }
-        });
+        // Resolve under the lock (as in `free_with`): a concurrent free retires the
+        // pagemap entry and recycles the slot while holding this lock, so reading the
+        // descriptor outside it could race a retire/recycle and observe a stale or
+        // reused slot. Under the lock, `lookup` and the slot read are atomic w.r.t.
+        // the free path.
+        let res = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr).map(|idx| {
+                    // SAFETY: `idx` is a live slot under the lock; reading its
+                    // usable size is sound.
+                    unsafe { (*pool.slot_ptr(idx)).desc.usable_size() }
+                })
+            }
+            None => None,
+        };
         self.lock.release();
         res
     }
@@ -611,6 +636,169 @@ mod tests {
             }
         });
         assert_eq!(la.live_count(), 0);
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn concurrent_double_free_of_same_pointer_is_safe() {
+        // Regression (audit Finding #2): the descriptor lookup must happen *under*
+        // the pool lock. Otherwise two threads racing to free the SAME pointer both
+        // resolve its slot before either retires it, then both `pool.release(idx)` —
+        // double-releasing the slot (free-stack self-cycle → later double-vend) and
+        // double-freeing the extent. With the lookup under the lock, the first freer
+        // retires the pagemap entry before unlocking, so every racing freer re-reads
+        // `None` and rejects. Contract: exactly ONE free wins per pointer, the pool
+        // stays well-formed, and slots are cleanly reusable (no double-vend).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const PTRS: usize = 64;
+        const FREERS: usize = 4;
+
+        let la = Arc::new(large(1024, 256));
+        // A batch of live allocations whose bases are shared across every thread.
+        let ptrs: Vec<usize> = (0..PTRS)
+            .map(|_| {
+                let p = la.allocate(2 * PAGE, PAGE);
+                assert!(!p.is_null());
+                p as usize
+            })
+            .collect();
+        assert_eq!(la.live_count(), PTRS);
+
+        let ptrs = Arc::new(ptrs);
+        let wins = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(FREERS));
+        std::thread::scope(|s| {
+            for _ in 0..FREERS {
+                let la = Arc::clone(&la);
+                let ptrs = Arc::clone(&ptrs);
+                let wins = Arc::clone(&wins);
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || {
+                    barrier.wait(); // release all freers together to widen the race
+                    for &p in ptrs.iter() {
+                        if la.free(p as *mut u8) {
+                            wins.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Never zero (a lost free) and never more than one (a double free) per ptr.
+        assert_eq!(
+            wins.load(Ordering::Relaxed),
+            PTRS,
+            "exactly one free won per pointer"
+        );
+        assert_eq!(la.live_count(), 0);
+        assert!(
+            la.check_invariants(),
+            "pool well-formed after the double-free race"
+        );
+
+        // Slots must be cleanly reusable: a double-vend would corrupt the free stack
+        // and either fail to allocate or hand back an aliasing pointer.
+        let mut reuse = Vec::with_capacity(PTRS);
+        for _ in 0..PTRS {
+            let p = la.allocate(2 * PAGE, PAGE);
+            assert!(
+                !p.is_null(),
+                "slots reusable after the race (no double-vend)"
+            );
+            reuse.push(p as usize);
+        }
+        let mut distinct = reuse.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), PTRS, "no two reused slots alias");
+        for p in reuse {
+            assert!(la.free(p as *mut u8));
+        }
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn cache_served_allocation_bypasses_extents_and_returns_to_the_cache() {
+        // §18.6 region cache (C13): a hook may serve an "awkward"-sized region itself
+        // (`backing == None`). Such an allocation must still classify and be writable,
+        // and on free be offered back to the cache via `try_cache` — never routed to
+        // the extent manager. This is the cache-served path no other test exercises
+        // (all others use `NoRegionCache`, whose defaults decline both calls).
+        use std::alloc::{alloc, dealloc, Layout};
+        use std::cell::Cell;
+
+        struct OneShotCache {
+            base: *mut u8,
+            len: usize,
+            layout: Layout,
+            served: Cell<bool>,
+            returned: Cell<bool>,
+        }
+        impl OneShotCache {
+            fn new(len: usize) -> Self {
+                let layout = Layout::from_size_align(len, PAGE).unwrap();
+                // SAFETY: nonzero, page-aligned layout.
+                let base = unsafe { alloc(layout) };
+                assert!(!base.is_null());
+                Self {
+                    base,
+                    len,
+                    layout,
+                    served: Cell::new(false),
+                    returned: Cell::new(false),
+                }
+            }
+        }
+        impl RegionCacheHook for OneShotCache {
+            fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
+                if !self.served.get() && bytes <= self.len && align <= PAGE {
+                    self.served.set(true);
+                    Some(Region {
+                        base: self.base,
+                        len: self.len,
+                    })
+                } else {
+                    None
+                }
+            }
+            fn try_cache(&self, region: Region) -> bool {
+                assert_eq!(region.base, self.base, "freed region offered back to cache");
+                self.returned.set(true);
+                true // the cache takes ownership
+            }
+        }
+        impl Drop for OneShotCache {
+            fn drop(&mut self) {
+                // SAFETY: exactly the pointer/layout from `new`.
+                unsafe { dealloc(self.base, self.layout) };
+            }
+        }
+
+        let la = large(64, 16);
+        let cache = OneShotCache::new(3 * PAGE);
+        // Alloc: the cache serves it (`backing == None`), bypassing the extent manager.
+        let p = la.allocate_with(3 * PAGE, PAGE, &cache);
+        assert!(!p.is_null());
+        assert_eq!(p, cache.base, "served from the cache region");
+        assert!(cache.served.get());
+        // Classifiable + writable through the normal pagemap path.
+        assert_eq!(la.usable_size(p), Some(3 * PAGE));
+        assert_eq!(la.live_count(), 1);
+        // SAFETY: the cache region is committed host memory of `3 * PAGE` bytes.
+        unsafe {
+            p.write(0x77);
+            assert_eq!(p.read(), 0x77);
+        }
+        // Free: offered back to the cache (`try_cache`), not freed through the extents.
+        assert!(la.free_with(p, &cache));
+        assert!(
+            cache.returned.get(),
+            "freed cache-served region returned to the cache"
+        );
+        assert_eq!(la.live_count(), 0);
+        assert_eq!(la.usable_size(p), None);
         assert!(la.check_invariants());
     }
 }

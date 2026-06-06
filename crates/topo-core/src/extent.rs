@@ -1102,6 +1102,14 @@ impl ExtentMap {
             prev = i;
             i = s.addr_next;
             listed += 1;
+            // Manifest linear bound. The list is already cycle-free by construction
+            // (the `addr_prev == prev` check above rejects any revisited node, and
+            // `cursor` strictly increases), but bounding the walk by capacity keeps
+            // the oracle total even if a future refactor weakens those checks —
+            // matching the bin walks below.
+            if listed > self.cap as usize {
+                return false;
+            }
         }
         if cursor != self.region_base + self.region_len {
             return false; // does not cover the whole region
@@ -2147,6 +2155,25 @@ mod tests {
         mgr.purge_forced(r).unwrap();
         assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
         // Still backed (mapped) — committed bytes unchanged by a purge.
+        assert_eq!(mgr.committed_bytes(), 4 * PAGE);
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn purge_lazy_is_idempotent_on_muzzy_and_rejects_live() {
+        let mgr = manager(8);
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        // M-004: purging a *live* (Active) extent is refused and never acted on.
+        assert!(matches!(mgr.purge_lazy(r), Err(ExtentError::NotFree)));
+        assert!(matches!(mgr.purge_forced(r), Err(ExtentError::NotFree)));
+        assert_eq!(mgr.view(r).unwrap().state, ExtentState::Active);
+        // Free → Dirty → purge_lazy → Muzzy; a second purge_lazy is the documented
+        // idempotent no-op ("No-op on a non-dirty extent"), still Muzzy, still backed.
+        mgr.free(r).unwrap();
+        mgr.purge_lazy(r).unwrap();
+        assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
+        mgr.purge_lazy(r).unwrap();
+        assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
         assert_eq!(mgr.committed_bytes(), 4 * PAGE);
         assert!(mgr.check_invariants());
     }

@@ -361,6 +361,46 @@ mod tests {
     }
 
     #[test]
+    fn reserve_and_release_reject_bad_requests_without_corruption() {
+        let sim = Sele4nSim::new(1 << 16);
+        // reserve rejects zero size and non-power-of-two alignment (§36.6).
+        assert!(matches!(
+            sim.reserve(ArenaId::DEFAULT, 0, 16),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert!(matches!(
+            sim.reserve(ArenaId::DEFAULT, 16, 24),
+            Err(BackendError::InvalidRequest)
+        ));
+        let r = sim.reserve(ArenaId::DEFAULT, 4096, 16).expect("reserve");
+        // Physical-state ops reject out-of-range and overflowing sub-windows.
+        assert!(matches!(
+            sim.commit(r, 1, r.len),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert!(matches!(
+            sim.decommit(r, usize::MAX, 1),
+            Err(BackendError::InvalidRequest)
+        ));
+        // release rejects a foreign base without deallocating it (no double free).
+        let foreign = Region {
+            base: 0x1000 as *mut u8,
+            len: 4096,
+        };
+        assert!(matches!(
+            sim.release(ArenaId::DEFAULT, foreign),
+            Err(BackendError::InvalidRequest)
+        ));
+        sim.release(ArenaId::DEFAULT, r).expect("release");
+        // Double release: the frame is gone, so it is rejected — never dealloc'd twice.
+        assert!(matches!(
+            sim.release(ArenaId::DEFAULT, r),
+            Err(BackendError::InvalidRequest)
+        ));
+        assert_eq!(sim.pool_remaining(), sim.pool_total());
+    }
+
+    #[test]
     fn name_is_sele4n_sim() {
         assert_eq!(Sele4nSim::new(0).name(), "sele4n-sim");
     }

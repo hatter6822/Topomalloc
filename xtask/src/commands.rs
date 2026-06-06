@@ -433,15 +433,16 @@ fn fuzz_steps(r: &mut Runner<'_>) {
     }
 }
 
-/// `loom` model-check of the W3 lock-free protocols (the seqlock and the pagemap
-/// publish/read, W3-3c/W3-4). Run under `--cfg loom` so loom and its heavy
-/// transitive deps stay out of the normal build/audit. Slower than unit tests
-/// (exhaustive interleaving), so it is opt-in (`xtask test --kind loom`), not part
-/// of the default `ci` sweep.
+/// `loom` model-check of the W3/W4 concurrency protocols (the W3-4 seqlock, the
+/// W3-3c pagemap publish/read, and the W4 large-free critical section — the
+/// lookup-under-the-pool-lock discipline that makes a concurrent double-free safe).
+/// Run under `--cfg loom` so loom and its heavy transitive deps stay out of the
+/// normal build/audit. Slower than unit tests (exhaustive interleaving), so it is
+/// opt-in (`xtask test --kind loom`), not part of the default `ci` sweep.
 fn loom_steps(r: &mut Runner<'_>) {
     std::env::set_var("RUSTFLAGS", "--cfg loom");
     r.run(
-        "loom protocols (seqlock + publish/read)",
+        "loom protocols (seqlock + publish/read + large-free)",
         "cargo",
         &["test", "-p", "topo-core", "--test", "loom_protocols"],
     );

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! `loom` model-checks of the two subtle lock-free protocols W3 relies on — the
+//! `loom` model-checks of the subtle concurrency protocols W3/W4 rely on — the
 //! **seqlock** (W3-4, `SpanDescriptor::read_consistent_geometry` /
-//! `LargeDescriptor::read_consistent`) and the **publish/read** of the pagemap
-//! radix (W3-3c, `child_or_create` / leaf-entry store vs. `lookup`). `loom`
-//! exhaustively explores every thread interleaving and memory-ordering outcome
-//! permitted by the C11 model, so these are a machine-checked complement to the
-//! std-thread stress tests (which exercise *some* interleavings on one machine).
+//! `LargeDescriptor::read_consistent`), the **publish/read** of the pagemap radix
+//! (W3-3c, `child_or_create` / leaf-entry store vs. `lookup`), and the
+//! **large-free critical section** (W4, [`crate::large::LargeAllocator::free_with`]:
+//! the lookup-under-the-pool-lock discipline that makes a concurrent double-free of
+//! the same pointer safe). `loom` exhaustively explores every thread interleaving
+//! and memory-ordering outcome permitted by the C11 model, so these are a
+//! machine-checked complement to the std-thread stress tests (which exercise *some*
+//! interleavings on one machine).
 //!
 //! These model the protocols with the **identical orderings** the real code uses
 //! (AcqRel on the seqlock version, Release on the data/publish stores, Acquire on
@@ -17,7 +20,7 @@
 #![cfg(loom)]
 
 use loom::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use loom::sync::Arc;
+use loom::sync::{Arc, Mutex};
 use loom::thread;
 
 /// The seqlock invariant (W3-4): a reader that observes a *consistent* version
@@ -184,5 +187,57 @@ fn lazy_node_creation_cas_race_yields_one_node() {
         let final_slot = slot.load(Ordering::Acquire);
         assert!(final_slot == 1 || final_slot == 2);
         assert_eq!(final_slot, n1, "published node differs from the slot");
+    });
+}
+
+/// The large-free critical-section discipline (W4, `LargeAllocator::free_with`): two
+/// threads racing to free the SAME pointer must result in EXACTLY ONE slot release
+/// (and one winning `free`). Soundness rests on resolving the descriptor (the pagemap
+/// `lookup`) *under* the pool lock: the first freer retires the pagemap entry before
+/// releasing the lock, so the second observes it gone and rejects. Were the lookup
+/// done outside the lock, both freers would resolve the same slot and both
+/// `pool.release(idx)` — a double release (free-stack self-cycle → later double-vend).
+///
+/// We model the whole pool critical section as plain state behind one lock (which is
+/// how the real code holds it — `self.lock` over the pagemap entry, the slot's
+/// presence, and the free stack): `present` is the pagemap entry, `releases` counts
+/// `pool.release`. Reading `present` only *after* `lock()` encodes the fix; `loom`
+/// explores both lock-acquisition orders and asserts the slot is released exactly
+/// once in every one. (Moving the `present` read before `lock()` — the bug — makes
+/// `loom` find the interleaving where both read it live and `releases` reaches 2.)
+#[test]
+fn large_double_free_under_pool_lock_releases_the_slot_once() {
+    loom::model(|| {
+        struct Pool {
+            present: bool, // the pagemap entry for the freed pointer (live ⟺ true)
+            releases: u32, // count of `pool.release(idx)` — must end at exactly 1
+            wins: u32,     // count of `free` calls that returned `true`
+        }
+        let pool = Arc::new(Mutex::new(Pool {
+            present: true,
+            releases: 0,
+            wins: 0,
+        }));
+
+        let freer = |pool: Arc<Mutex<Pool>>| {
+            thread::spawn(move || {
+                // `free_with`: acquire the pool lock, THEN resolve + retire + release.
+                let mut p = pool.lock().unwrap();
+                if p.present {
+                    p.present = false; // retire_large (under the lock)
+                    p.releases += 1; // pool.release(idx)
+                    p.wins += 1; // returns `true`
+                }
+                // a second freer that finds `!present` falls through and returns `false`
+            })
+        };
+        let t1 = freer(pool.clone());
+        let t2 = freer(pool.clone());
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let p = pool.lock().unwrap();
+        assert_eq!(p.releases, 1, "slot released exactly once (no double free)");
+        assert_eq!(p.wins, 1, "exactly one freer won");
     });
 }
