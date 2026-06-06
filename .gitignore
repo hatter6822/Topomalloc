@@ -15,6 +15,11 @@ Cargo.lock.bak
 /fuzz/corpus
 /fuzz/artifacts
 
+# Vendored, pinned seLe4n ABI mirror (D8, GPL-3.0-or-later). Regenerated on demand
+# by scripts/vendor_sele4n.sh; committed together with its supply-chain plumbing at
+# plan 09 W22-0, not before (keeps the default build hermetic and the repo MIT-clean).
+/vendor
+
 # mdbook
 /docs/book
 

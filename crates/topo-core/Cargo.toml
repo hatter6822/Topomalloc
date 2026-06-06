@@ -46,5 +46,9 @@ loom = { version = "0.7", default-features = false }
 name = "metadata"
 harness = false
 
+[[bench]]
+name = "extent"
+harness = false
+
 [lints]
 workspace = true

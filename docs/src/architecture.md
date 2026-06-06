@@ -11,8 +11,8 @@ Request classifier: small/medium/large, size class,         topo-core (classify)
                     align, arena, label, hints
 Metadata substrate: bootstrap bump alloc, pagemap,          topo-core (bootstrap,
   span/large descriptors, pointer classification              pagemap, span, ptr_class)
-Back-end: extents (split/merge/coalesce), physical          topo-core (extent),
-  state (dirty/muzzy/released), large path                    plan 04 W4
+Back-end: extents (split/merge/coalesce), physical          topo-core (extent,
+  state (dirty/muzzy/released), large path + classify         large), plan 04 W4
 Front/middle ends (M2+)                                      topo-core, plan 05
         ─────────────────  S E A M  ─────────────────
 trait TopoBackingProvider (+ §36.6 provider state machine)   topo-core (backend)
@@ -172,18 +172,24 @@ is the **degenerate single ambient-authority case**; the seLe4n simulator and (a
 M1) the capability provider drop in behind the *identical* seam (D2).
 
 - **The seam & the provider state machine** (`backend.rs`, W4-1, §36.6). The trait
-  carries `reserve` (the POSIX collapse of §36.6 `reserve_window ∘ create_frame ∘
-  map_frame`) plus the physical-state ops `commit`/`decommit`/`purge_lazy`/
-  `purge_forced`/`release` and `revoke_descendants` (a no-op on POSIX — there are
-  no descendant capabilities to revoke under a single ambient authority). A
-  `ProviderState` enum models the §36.6 lifecycle `AuthorizedUntyped → … →
-  AllocatorCommitted → … → Unmapped → Revoked → RecyclableUntyped`; its
-  `can_transition` checker enforces the ordering invariants the SPEC mandates —
-  **unmap before revoke before recycle**, so recycled untyped never retains a live
-  client mapping, and **recommit before reuse** (M-005). The seLe4n simulator walks
-  every reservation through the machine and asserts each step (the capability
-  backend is where the ordering matters); the machine is modeled in Lean (plan 02
-  W1-11b) and asserted at runtime here.
+  is offered in **two layers**: the *collapsed* ops the allocator core drives
+  (`reserve`/`commit`/`decommit`/`purge_lazy`/`purge_forced`/`release` and
+  `revoke_descendants`, a no-op on POSIX), and the *full §36.6 typed surface*
+  (`reserve_window`/`create_frame`/`map_frame`/`unmap_frame`/`recycle` over
+  `VWindow`/`FrameCap`/`MappedRange`). On POSIX the capability types collapse to an
+  address range and the granular methods **default-compose** the collapsed ops, so
+  one `reserve` (an `mmap`) realises `reserve_window ∘ create_frame ∘ map_frame`;
+  plan 09 overrides the granular methods with real capabilities. A `ProviderState`
+  enum models the §36.6 lifecycle as the **exact linear chain** `AuthorizedUntyped →
+  … → RecyclableUntyped` — mirroring the Lean `BackingState.next` (W1-11b)
+  one-for-one (allocator *reuse* is the extent manager's `ExtentState`, not a
+  back-edge of this lifecycle). `can_transition` enforces the §36.6 ordering
+  (**unmap before revoke before recycle**), so recycled untyped never retains a live
+  client mapping. The Rust↔Lean agreement is pinned both ways — a Rust test
+  (`provider_next_matches_the_36_6_chain_exactly`) and a `lake exe check` gate
+  (`providerChainGate`) — so the runtime checker and the proof cannot drift. The
+  seLe4n simulator walks every reservation/release through the machine, asserting
+  each step on the backend where capability semantics are real.
 
 - **The extent manager** (`extent.rs`, W4-2, DD-1). A managed region is tiled by
   `Extent` descriptors in a fixed-capacity, metadata-backed slot pool (no global
@@ -211,20 +217,29 @@ M1) the capability provider drop in behind the *identical* seam (D2).
   M-005 guarantees backing before *use*). The physical-state ops enforce **M-004**:
   decommit/purge/release require a *free* extent (a free extent holds no live
   object — the runtime evidence M-004 demands), and an attempt on an `Active`
-  extent is refused (`NotFree`). The POSIX provider documents the per-platform
-  `madvise`/`mprotect` mapping (e.g. Linux `MADV_DONTNEED` ↔ released/forced-purge,
-  `MADV_FREE` ↔ muzzy/lazy-purge, `mprotect` ↔ commit) and, host-backed, performs
-  the *observable* equivalent so the dirty/muzzy/released distinction is testable
-  and the runs stay hermetic; the byte accounting (`committed_bytes`) reconciles in
-  stats (plan 07). The **retain-vs-unmap** policy (§20.5, W4-3b) is profile-keyed:
-  retain backing on free for 64-bit performance builds (cheap reuse), decommit
-  eagerly under `debug`/`low-rss`/32-bit (lower RSS, catches use-after-free).
+  extent is refused (`NotFree`). On **unix the POSIX provider issues the real
+  syscalls** for the per-platform `madvise`/`mprotect` mapping — Linux
+  `MADV_DONTNEED` ↔ decommit/forced-purge, `MADV_FREE` ↔ lazy-purge,
+  `mmap`/`munmap` ↔ reserve/release, `mprotect` ↔ commit (guard mode) — so
+  `release`/`decommit` genuinely return memory to the OS (a `cfg(not(unix))`
+  host-allocator fallback keeps the same observable behaviour everywhere). The
+  §20.1 byte breakdown (`state_bytes()` → `dirty`/`muzzy`/`released`) reconciles into
+  the §21.2 stat fields via `topo_stats::Stats::record_backend`. The
+  **retain-vs-unmap** policy (§20.5, W4-3b) is profile-keyed (retain on 64-bit perf,
+  unmap under `debug`/`low-rss`/32-bit); a **guard-mode** provider
+  (`with_guard_pages`) `mprotect`s released ranges `PROT_NONE` so a use-after-free
+  **faults** (a fork-based test asserts the trap).
 
-- **Large path & region-cache hook** (W4-4, §18.5/§18.6). `alloc_large` rounds the
-  request to whole pages overflow-safely (§9.7) and goes straight to the extent
-  manager — **bypassing the small-object path** (it never touches size classes) —
-  after offering the request to a `RegionCacheHook` first (the §18.6 hook for sizes
-  awkwardly larger than a hugepage; the concrete cache is W11-3, M5).
+- **Large path & classification** (`large.rs`, W4-4, §18.5/§18.6). `LargeAllocator`
+  composes the extent manager, a `PageMap`, and a **recycling `LargeDescriptor`
+  pool** (no per-allocation metadata leak). `allocate` page-rounds overflow-safely,
+  **bypasses the small-object path** (never touches size classes, §18.5), takes a
+  best-fit extent, and installs a `LargeDescriptor` through the W3-6 mutator
+  (`install_large`) — so the result is **classifiable**: `free`/`usable_size`
+  recover it by pagemap lookup, retire the entry *before* the descriptor slot can
+  recycle (no stale-address hazard), and return the extent. A `RegionCacheHook` (the
+  §18.6 awkward-size hook) gets first refusal; a cache-served region is freed back to
+  the cache, defining the lifecycle W11-3 fills (M5).
 
 Every back-end op is **fallible and leaves the state well-formed on failure**
 (W4-5, §36.6): the fallible provider step is sequenced so a failure rolls the
@@ -233,13 +248,13 @@ bookkeeping back rather than stranding a half-committed extent.
 well-formedness predicate — the address list tiles the region exactly, every free
 extent is in its correct bin, no `Active` extent is binned, the slot accounting
 balances — and is `debug_assert`ed after every mutation and exercised by the
-failure-injection property test. The **Lean** theorems
-`span_split_preserves_disjointness` / `span_merge_preserves_disjointness`
-(`Theorems/Span.lean`, W1-8a) and `release_to_os_preserves_live_objects`
-(`Theorems/Release.lean`, W1-8c) certify the geometric core: the Rust `split`
-produces exactly Lean's `splitLeft`/`splitRight`, `merge` their union, and
-`release`/`decommit` touch no live object — so the implementation discharges the
-obligations those theorems state.
+property, **concurrency** (a multi-threaded stress over the §27.2-locked manager),
+failure-injection, and **fuzz** (`fuzz/fuzz_targets/extent.rs`) tests. The **Lean**
+theorems certify the geometric core: `span_split`/`span_merge_preserves_disjointness`
+(`Theorems/Span.lean`, W1-8a — the Rust `split` is Lean's `splitLeft`/`splitRight`,
+`merge` their union), `release_to_os_preserves_live_objects` (`Theorems/Release.lean`,
+W1-8c — decommit/M-004), and the new `recommit_*` theorems (`Theorems/Extent.lean`,
+W4-2d — commit/M-005); so the implementation discharges the obligations they state.
 
 ## Single source of truth (DD-1)
 

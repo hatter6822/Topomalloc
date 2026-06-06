@@ -17,16 +17,22 @@ license = "GPL-3.0-or-later"
 [dependencies]
 topo-core = { path = "../topo-core", version = "0.1.0" }
 
-# D8 — the real seLe4n ABI is pinned to a reviewed SHA and wired at M1 (W22-0).
-# It is declared here as documentation of the pin; it is brought in as an
-# optional dependency under `--features real-abi` so the M0 host simulator stays
-# hermetic and the pin is recorded now (W0-1).
-#   sele4n-abi   = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-abi" }
-#   sele4n-types = { git = "https://github.com/hatter6822/seLe4n", rev = "57c11054d31b819364d8089268ab38927881ab0b", package = "sele4n-types" }
+# D8 — the real seLe4n ABI is pinned to a reviewed SHA and vendored on demand by
+# `scripts/vendor_sele4n.sh` into `vendor/sele4n/` (gitignored, GPL-3.0-or-later).
+# It is NOT a committed dependency at M0: a committed (even optional) path/git dep
+# would make the default build resolve the vendored manifests, eroding the hermetic
+# build and pulling a GPL tree into the MIT-default repo before its time. Wiring
+# `--features real-abi` against the vendored crates is plan 09 W22-0; the seam was
+# *verified* to compile against the pinned ABI (see docs/DECISIONS.md §D8). To wire
+# locally: run the vendor script, add `vendor/sele4n` to the root `exclude`, and:
+#   sele4n-types = { path = "../../vendor/sele4n/sele4n-types", optional = true }
+#   sele4n-abi   = { path = "../../vendor/sele4n/sele4n-abi",   optional = true }
+#   real-abi = ["dep:sele4n-types", "dep:sele4n-abi"]
 
 [features]
 default = []
-# Reserved for M1: compile the provider against the pinned real seLe4n ABI.
+# Reserved for plan 09 W22-0: compile the provider against the pinned, vendored real
+# seLe4n ABI (verified working against the pin this session; see docs/DECISIONS.md).
 real-abi = []
 
 [lints]

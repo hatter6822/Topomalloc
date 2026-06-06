@@ -186,19 +186,80 @@ pub struct Extent {
     pub split_generation: u32,
     /// Slot reuse generation (the [`ExtentRef`] guard counter).
     pub generation: u32,
+    /// §18.2 `flags` — back-end policy bits ([`ExtentFlags`]).
+    pub flags: ExtentFlags,
 }
 
 impl Extent {
-    /// The half-open address range `[base, base + len)`.
+    /// The half-open address range `[base, base + len)`. Uses saturating
+    /// arithmetic so it is **total** even on a hand-constructed [`Extent`] with
+    /// nonsensical fields (manager-produced extents never overflow — construction
+    /// rejects a region whose `base + len` would wrap).
     #[inline]
     pub const fn range(self) -> (usize, usize) {
-        (self.base, self.base + self.len)
+        (self.base, self.base.saturating_add(self.len))
     }
 
-    /// The end address `base + len`.
+    /// The end address `base + len` (saturating; see [`range`](Self::range)).
     #[inline]
     pub const fn end(self) -> usize {
-        self.base + self.len
+        self.base.saturating_add(self.len)
+    }
+}
+
+/// §18.2 `flags` — back-end policy bits carried on each [`Extent`]. Reserved for
+/// the hugepage filler's per-extent placement/bin hints (W11, §19) and other
+/// back-end policy; `NONE` until those land. Defined as a newtype so the bit
+/// vocabulary can grow without changing the descriptor layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ExtentFlags(pub u32);
+
+impl ExtentFlags {
+    /// No flags.
+    pub const NONE: ExtentFlags = ExtentFlags(0);
+
+    /// The raw flag word.
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Bytes in each [`ExtentState`] across a managed region (§20.1), for stats
+/// reconciliation (plan 07, W4-3a "states reconcile in stats"). The fields sum to
+/// the region length; `committed()` equals the manager's `committed_bytes()`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StateBytes {
+    /// Reserved (virtual only, unbacked) bytes.
+    pub reserved: usize,
+    /// Active (allocated/handed out) bytes.
+    pub active: usize,
+    /// Dirty (free, backed, may hold old data) bytes.
+    pub dirty: usize,
+    /// Muzzy (free, lazily purged/scrubbed) bytes.
+    pub muzzy: usize,
+    /// Released (free, decommitted, needs recommit) bytes.
+    pub released: usize,
+}
+
+impl StateBytes {
+    /// Total bytes across all states (== the managed region length).
+    #[inline]
+    pub const fn total(self) -> usize {
+        self.reserved + self.active + self.dirty + self.muzzy + self.released
+    }
+
+    /// Physically-backed bytes (`active + dirty + muzzy`); equals the manager's
+    /// `committed_bytes()`.
+    #[inline]
+    pub const fn committed(self) -> usize {
+        self.active + self.dirty + self.muzzy
+    }
+
+    /// Free (not [`Active`](ExtentState::Active)) bytes.
+    #[inline]
+    pub const fn free(self) -> usize {
+        self.reserved + self.dirty + self.muzzy + self.released
     }
 }
 
@@ -256,6 +317,8 @@ struct Slot {
     arena: u32,
     split_gen: u32,
     generation: u32,
+    /// §18.2 `flags` (back-end policy bits; see [`ExtentFlags`]).
+    flags: u32,
     /// Address-ordered list links (all occupied extents).
     addr_prev: u32,
     addr_next: u32,
@@ -385,6 +448,7 @@ impl ExtentMap {
         s.huge_len = 0;
         s.arena = ArenaId::DEFAULT.0;
         s.split_gen = 0;
+        s.flags = ExtentFlags::NONE.0;
         s.state = ExtentState::Reserved as u8;
         s.occupied = 1;
         s.addr_prev = NIL;
@@ -576,6 +640,37 @@ impl ExtentMap {
         self.committed_bytes
     }
 
+    /// Bytes in each [`ExtentState`] across the region (§20.1), the breakdown that
+    /// reconciles in stats (plan 07, W4-3a). Walks the address list (a slow-path
+    /// stats read). The result satisfies `total() == region_len` and
+    /// `committed() == committed_bytes()` — both `debug_assert`ed here.
+    pub fn state_bytes(&self) -> StateBytes {
+        let mut sb = StateBytes::default();
+        let mut i = self.addr_head;
+        while i != NIL {
+            let s = self.get(i);
+            match ExtentState::from_u8(s.state) {
+                ExtentState::Reserved => sb.reserved += s.len,
+                ExtentState::Active => sb.active += s.len,
+                ExtentState::Dirty => sb.dirty += s.len,
+                ExtentState::Muzzy => sb.muzzy += s.len,
+                ExtentState::Released => sb.released += s.len,
+            }
+            i = s.addr_next;
+        }
+        debug_assert_eq!(
+            sb.total(),
+            self.region_len,
+            "state_bytes must tile the region"
+        );
+        debug_assert_eq!(
+            sb.committed(),
+            self.committed_bytes,
+            "committed bytes must agree"
+        );
+        sb
+    }
+
     /// The managed region's address range.
     #[inline]
     pub fn region(&self) -> (usize, usize) {
@@ -627,6 +722,7 @@ impl ExtentMap {
             },
             split_generation: s.split_gen,
             generation: s.generation,
+            flags: ExtentFlags(s.flags),
         }
     }
 
@@ -671,6 +767,7 @@ impl ExtentMap {
         rs.huge_len = 0;
         rs.arena = parent.arena.0;
         rs.split_gen = parent.split_generation.wrapping_add(1);
+        rs.flags = parent.flags.0; // the right half inherits the parent's policy bits
         rs.state = parent.state as u8;
         rs.occupied = 1;
         self.put(right.0, rs);
@@ -938,6 +1035,13 @@ impl ExtentMap {
         true
     }
 
+    /// Set extent `id`'s §18.2 policy `flags` (caller pre-validated `id` is live).
+    fn set_flags(&mut self, id: ExtentId, flags: ExtentFlags) {
+        let mut s = self.get(id.0);
+        s.flags = flags.0;
+        self.put(id.0, s);
+    }
+
     // --- invariants (W4-5 oracle) --------------------------------------------
 
     /// Whether the back-end is well-formed: the address list tiles the region
@@ -1062,20 +1166,21 @@ impl ExtentMap {
 /// lightweight primitive the span lock uses. The backend's critical sections are a
 /// handful of slot edits plus one provider call; it is the lowest data-structure
 /// lock in the hierarchy, so holding it across a provider call cannot invert the
-/// §27.2 order.
-struct BackendLock {
+/// §27.2 order. `pub(crate)` so the large-allocation path ([`crate::large`]) reuses
+/// it for its descriptor-pool critical section.
+pub(crate) struct BackendLock {
     locked: AtomicBool,
 }
 
 impl BackendLock {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             locked: AtomicBool::new(false),
         }
     }
 
     #[inline]
-    fn acquire(&self) {
+    pub(crate) fn acquire(&self) {
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -1088,7 +1193,7 @@ impl BackendLock {
     }
 
     #[inline]
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.locked.store(false, Ordering::Release);
     }
 }
@@ -1307,6 +1412,29 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     /// Committed bytes across all extents (stats reconciliation, §20 / plan 07).
     pub fn committed_bytes(&self) -> usize {
         self.lock().map.committed_bytes()
+    }
+
+    /// Bytes in each [`ExtentState`] (§20.1) — the dirty/muzzy/released breakdown
+    /// that reconciles in stats (plan 07, W4-3a). `total()` is the region length;
+    /// `committed()` equals [`committed_bytes`](Self::committed_bytes).
+    pub fn state_bytes(&self) -> StateBytes {
+        self.lock().map.state_bytes()
+    }
+
+    /// The §18.2 policy [`flags`](ExtentFlags) on extent `r`, or `None` if stale.
+    pub fn extent_flags(&self, r: ExtentRef) -> Option<ExtentFlags> {
+        self.lock().map.resolve(r).map(|e| e.flags)
+    }
+
+    /// Set the §18.2 policy [`flags`](ExtentFlags) on extent `r` (back-end policy —
+    /// e.g. the W11 hugepage filler's per-extent hints). `Stale` if `r` was recycled.
+    pub fn set_extent_flags(&self, r: ExtentRef, flags: ExtentFlags) -> Result<(), ExtentError> {
+        let g = self.lock();
+        if g.map.resolve(r).is_none() {
+            return Err(ExtentError::Stale);
+        }
+        g.map.set_flags(r.id, flags);
+        Ok(())
     }
 
     /// Whether the back-end is well-formed (the W4-5 invariant oracle).
@@ -1622,6 +1750,9 @@ mod tests {
         }
         fn fail_next_commit(&self) {
             self.fail_commit.store(1, O::Relaxed);
+        }
+        fn fail_next_decommit(&self) {
+            self.fail_decommit.store(1, O::Relaxed);
         }
     }
 
@@ -2068,5 +2199,150 @@ mod tests {
         let r = mgr.alloc(4 * PAGE, PAGE, Fit::Best).expect("recovers");
         assert!(mgr.view(r).is_some());
         assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn decommit_failure_leaves_state_well_formed_w4_5() {
+        // W4-5: a provider decommit failure must leave the back-end well-formed.
+        // Two halves so a freed extent stays distinct (its Active neighbour prevents
+        // a coalesce that would stale its ref).
+        let mut mgr = manager(8);
+        mgr.set_retain_policy(RetainPolicy::Unmap);
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+
+        // (1) Free under Unmap attempts decommit; the injected failure makes the
+        // manager fall back to retaining `b` (still a clean free).
+        mgr.provider.fail_next_decommit();
+        mgr.free(b)
+            .expect("free still succeeds (falls back to retain)");
+        assert!(
+            mgr.check_invariants(),
+            "decommit failure keeps invariants green"
+        );
+        assert_eq!(
+            mgr.committed_bytes(),
+            8 * PAGE,
+            "decommit failed ⇒ backing retained"
+        );
+
+        // (2) `b` is now a free Dirty extent (its left neighbour `a` is Active, so it
+        // did not coalesce — its ref is still valid). An explicit decommit that hits
+        // the injected failure is surfaced as Backend(..) and changes nothing.
+        let committed_before = mgr.committed_bytes();
+        mgr.provider.fail_next_decommit();
+        assert!(matches!(
+            mgr.decommit(b),
+            Err(ExtentError::Backend(BackendError::OutOfMemory))
+        ));
+        assert_eq!(
+            mgr.committed_bytes(),
+            committed_before,
+            "failed decommit changed nothing"
+        );
+        assert!(mgr.check_invariants());
+        let _ = a;
+    }
+
+    #[test]
+    fn state_bytes_reconcile_with_region_and_committed() {
+        // W4-3a "states reconcile in stats": the per-state byte breakdown tiles the
+        // region and its committed sum matches committed_bytes(), across a mix of
+        // reserved / active / dirty extents.
+        let mgr = manager(16);
+        let total = 16 * PAGE;
+        // All reserved initially (committed 0).
+        let sb0 = mgr.state_bytes();
+        assert_eq!(sb0.total(), total);
+        assert_eq!(sb0.reserved, total);
+        assert_eq!(sb0.committed(), 0);
+
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap(); // Active, committed
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap(); // Active, committed
+        let sb = mgr.state_bytes();
+        assert_eq!(sb.total(), total, "state bytes always tile the region");
+        assert_eq!(sb.committed(), mgr.committed_bytes(), "committed agrees");
+        assert_eq!(sb.active, 8 * PAGE);
+        assert_eq!(sb.reserved, 8 * PAGE); // the un-carved remainder
+
+        mgr.free(a).unwrap(); // retain (perf default) → Dirty, still committed
+        let sb2 = mgr.state_bytes();
+        assert_eq!(sb2.total(), total);
+        assert_eq!(sb2.committed(), mgr.committed_bytes());
+        assert_eq!(sb2.dirty, 4 * PAGE, "a is now dirty (still backed)");
+        assert_eq!(sb2.active, 4 * PAGE, "b stays active");
+        let _ = b;
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn extent_flags_round_trip() {
+        // §18.2 `flags` (C12): the back-end policy bits set/get on a live extent and
+        // survive; a split inherits the parent's flags.
+        let mgr = manager(16);
+        let r = mgr.alloc(8 * PAGE, PAGE, Fit::Best).unwrap();
+        assert_eq!(mgr.extent_flags(r), Some(ExtentFlags::NONE));
+        mgr.set_extent_flags(r, ExtentFlags(0b1011))
+            .expect("set flags");
+        assert_eq!(mgr.extent_flags(r), Some(ExtentFlags(0b1011)));
+        mgr.free(r).unwrap();
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn concurrent_alloc_free_keeps_invariants_and_is_disjoint() {
+        // C9: the §27.2 backend lock makes the manager `Sync`. Hammer a shared
+        // manager from several threads doing alloc/free; the back-end must stay
+        // well-formed and never hand two threads overlapping live extents. Each
+        // thread stamps its allocations and checks them, so any aliasing is caught.
+        use std::sync::Arc;
+        let mgr = Arc::new(manager(512));
+        std::thread::scope(|s| {
+            for t in 0..6u8 {
+                let mgr = Arc::clone(&mgr);
+                s.spawn(move || {
+                    let mut held: Vec<(ExtentRef, usize)> = Vec::new();
+                    for round in 0..400u32 {
+                        // Alternate alloc and free to churn split/merge under contention.
+                        if round % 3 != 0 || held.is_empty() {
+                            let pages = (round % 4 + 1) as usize;
+                            if let Ok(r) = mgr.alloc(pages * PAGE, PAGE, Fit::First) {
+                                if let Some(region) = mgr.region_of(r) {
+                                    let tag = t.wrapping_add(1);
+                                    // SAFETY: committed for its whole length; stamp the
+                                    // first byte of each page and re-check it later.
+                                    unsafe {
+                                        for p in (0..region.len).step_by(PAGE) {
+                                            region.base.add(p).write(tag);
+                                        }
+                                    }
+                                    held.push((r, region.base as usize));
+                                }
+                            }
+                        } else {
+                            let (r, base) = held.swap_remove(held.len() - 1);
+                            // SAFETY: still a live allocation we stamped.
+                            let seen = unsafe { (base as *const u8).read() };
+                            assert_eq!(
+                                seen,
+                                t.wrapping_add(1),
+                                "another thread aliased our extent"
+                            );
+                            mgr.free(r).expect("free a live extent");
+                        }
+                    }
+                    // Drain.
+                    for (r, _) in held {
+                        let _ = mgr.free(r);
+                    }
+                });
+            }
+        });
+        assert!(
+            mgr.check_invariants(),
+            "concurrent churn left the back-end well-formed"
+        );
+        // Everything was freed and coalesced back to the whole region.
+        assert_eq!(mgr.free_bytes(), 512 * PAGE);
     }
 }

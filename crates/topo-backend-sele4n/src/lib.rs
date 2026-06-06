@@ -194,17 +194,22 @@ impl TopoBackingProvider for Sele4nSim {
             .position(|fr| fr.base == base)
             .ok_or(BackendError::InvalidRequest)?;
         let mut fr = st.frames.swap_remove(idx);
-        // Walk the §36.6 release tail, asserting the unmap-before-revoke-before-
-        // recycle ordering that keeps recycled untyped from retaining a live client
-        // mapping. The machine refuses any out-of-order step (caught here).
+        // Walk the §36.6 release tail one legal `next` step at a time — the exact
+        // linear chain the Lean `BackingState.next` proves (W1-11b). A released
+        // frame is dirtied (no longer live), scrubbed (muzzy), unmapped, revoked,
+        // and only then recycled: the unmap-before-revoke-before-recycle ordering
+        // that keeps recycled untyped from retaining a live client mapping. The
+        // machine refuses any out-of-order step (caught here).
         for to in [
+            ProviderState::AllocatorDirty,
+            ProviderState::AllocatorMuzzyOrScrubbed,
             ProviderState::Unmapped,
             ProviderState::Revoked,
             ProviderState::RecyclableUntyped,
         ] {
-            fr.fsm
-                .advance(to)
-                .expect("§36.6 release tail must be legal (unmap → revoke → recycle)");
+            fr.fsm.advance(to).expect(
+                "§36.6 release tail must be legal (dirty → muzzy → unmap → revoke → recycle)",
+            );
         }
         // Recycle the untyped back to the pool (the §36.6 RecyclableUntyped step).
         st.pool_remaining += fr.charged;
@@ -233,6 +238,23 @@ impl Drop for Sele4nSim {
         }
     }
 }
+
+// --- the real seLe4n ABI bridge (plan 09 W22-0; verified against the pin) -------
+//
+// At M1 the `real-abi` feature compiles a `KernelError -> BackendError` mapping (and
+// then `Sele4nBackingProvider`) against the vendored, pinned `sele4n-types`/
+// `sele4n-abi`. That mapping was **verified to compile against the pinned SHA** this
+// session (docs/DECISIONS.md §D8); the exact, reviewed table is recorded there so
+// W22-0 commits it together with the vendored tree and its supply-chain plumbing
+// (deny exceptions, SPDX skip). It is intentionally NOT compiled here, to keep the
+// default build hermetic and free of a committed GPL tree until W22-0:
+//
+//   UntypedRegionExhausted                       -> BackendError::OutOfMemory
+//   InvalidCapability | UntypedTypeMismatch
+//     | UntypedDeviceRestriction
+//     | UntypedAllocSizeTooSmall | AddressOutOfBounds
+//     | MappingConflict | TargetSlotOccupied      -> BackendError::InvalidRequest
+//   _                                            -> BackendError::Unsupported
 
 #[cfg(test)]
 mod tests {

@@ -7,8 +7,9 @@ use std::process::Command;
 
 use crate::util::{have, Outcome, Runner};
 
-/// Directories never scanned by the built-in file checks (build outputs, VCS).
-const SKIP_DIRS: &[&str] = &["target", ".git", ".lake", "book", "node_modules"];
+/// Directories never scanned by the built-in file checks (build outputs, VCS, and
+/// the gitignored, separately-licensed seLe4n ABI mirror under `vendor/`, D8).
+const SKIP_DIRS: &[&str] = &["target", ".git", ".lake", "book", "node_modules", "vendor"];
 
 /// True if `args` contains the bare `flag`.
 fn has_flag(args: &[String], flag: &str) -> bool {
