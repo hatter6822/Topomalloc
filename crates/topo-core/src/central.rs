@@ -541,7 +541,12 @@ impl CentralCache {
         batch.len = removed as u16;
 
         let old_live = sg.live_count();
-        sg.set_live_count(old_live + removed as u32);
+        let removed_u32 = removed as u32;
+        debug_assert!(
+            old_live.checked_add(removed_u32).is_some(),
+            "live_count overflow: {old_live} + {removed_u32} exceeds u32"
+        );
+        sg.set_live_count(old_live + removed_u32);
 
         debug_assert!(sg.central_count_matches_bitmap());
 
@@ -675,9 +680,15 @@ impl CentralCache {
 
         // W5-3e trigger: was this span exhausted (not in the partial list)?
         // If it now has central-free objects, add it back.
+        //
+        // `central_free_count() == inserted` means the span had zero central-free
+        // objects before this insert — i.e., it was removed from the partial list
+        // by remove_batch when it was fully drained.  A span with 0 central-free
+        // cannot remain on the partial list (remove_batch pops it on exhaustion),
+        // so the head-pointer check is defence-in-depth, not the primary guard.
         let was_exhausted = {
             let head = bin.partial_head.load(Ordering::Relaxed);
-            sg.central_free_count() == inserted && inserted > 0 && { !core::ptr::eq(head, span) }
+            sg.central_free_count() == inserted && inserted > 0 && !core::ptr::eq(head, span)
         };
 
         // W5-3d/3e: empty detection trigger (M2 action: replace NONE with
@@ -746,7 +757,10 @@ impl CentralCache {
         }
 
         // Step 3: add to partial list under central lock.
-        let bin = &self.bins[sc.index()];
+        let bin = self
+            .bins
+            .get(sc.index())
+            .expect("activate_span: invalid size class");
         let _guard = bin.lock();
         bin.push_partial(span);
         bin.span_count.fetch_add(1, Ordering::Relaxed);
@@ -759,15 +773,18 @@ impl CentralCache {
     /// Deactivate an empty span (W5-5): remove it from the partial or empty
     /// list, transition its pagemap entries to `Released` (W3-6), and decrement
     /// the bin's span count. The caller is responsible for returning the backing
-    /// extent to the backend. Returns `true` if the span was deactivated.
+    /// extent to the backend.
     ///
     /// **C-004/C-005 acceptance:** panics if the span is not empty. Releasing
     /// a non-empty span would recycle live memory — a catastrophic failure mode.
     ///
     /// SPEC-transition: span `Active -> Released` (§7.3, §14.6)
-    pub fn deactivate_span(&self, span: &SpanDescriptor, pagemap: &PageMap) -> bool {
+    pub fn deactivate_span(&self, span: &SpanDescriptor, pagemap: &PageMap) {
         let sc = span.size_class();
-        let bin = &self.bins[sc.index()];
+        let bin = self
+            .bins
+            .get(sc.index())
+            .expect("deactivate_span: invalid size class");
         let _guard = bin.lock();
 
         // C-004/C-005: verify emptiness under both locks. The central lock
@@ -802,8 +819,6 @@ impl CentralCache {
         // W3-6: transition pagemap entries.
         span.set_state(SpanState::Released);
         pagemap.release_span(span);
-
-        true
     }
 }
 
@@ -1037,7 +1052,7 @@ mod tests {
         assert!(span.is_empty_central_only());
 
         // Deactivate removes from whichever list (partial or empty cache).
-        assert!(cache.deactivate_span(&span, &pm));
+        cache.deactivate_span(&span, &pm);
         assert_eq!(cache.bin(sc).unwrap().span_count(), 0);
         assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
         assert_eq!(cache.bin(sc).unwrap().empty_count(), 0);
@@ -1393,7 +1408,7 @@ mod tests {
         assert_eq!(span.central_free_count() as usize, obj_count);
 
         // Step 4: deactivate. All counts zero.
-        assert!(cache.deactivate_span(&span, &pm));
+        cache.deactivate_span(&span, &pm);
         assert_eq!(span.live_count(), 0);
         assert_eq!(span.central_free_count(), 0);
         assert_eq!(cache.bin(sc).unwrap().span_count(), 0);

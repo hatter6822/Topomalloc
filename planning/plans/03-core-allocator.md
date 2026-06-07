@@ -330,3 +330,17 @@ generator, never a literal.
       `CentralCache::remove_batch` returns `RemoveResult::NeedSpan` when no partial span
       exists; the **caller** creates a new span outside the lock, then retries. The central
       lock is never held while allocating metadata or mapping pages.
+- [x] Bitmap bounds are validated before every insert/remove — `central_insert` and
+      `central_remove` reject indices `>= object_count` before touching the bitmap,
+      preventing out-of-bounds access on corrupted or adversarial index values.
+- [x] `central_remove_batch` applies accumulated bitmap clears before exiting —
+      the inner loop `break` ensures the `clear_mask` store runs for every word,
+      even when an out-of-range index terminates the scan mid-word.
+- [x] `deactivate_span` is infallible — it panics on invariant violation (C-004/C-005)
+      rather than returning a meaningless `true`.  The `-> bool` return type was
+      removed to match the unconditional semantics.
+- [x] Compile-time table validation covers section 9.3 invariants — the const assertion
+      in `slab.rs` now verifies `align.is_power_of_two()`, `size.is_multiple_of(align)`,
+      and `slab_pages > 0` alongside the existing capacity and count checks.
+- [x] `is_valid` verifies `object0 >= base` — prevents a manually constructed
+      `SlabLayout` from passing validation with objects that extend before the slab start.

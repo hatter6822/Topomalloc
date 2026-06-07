@@ -122,8 +122,8 @@ impl SlabLayout {
         if self.object_size == 0 || !self.object_size.is_multiple_of(self.align) {
             return false;
         }
-        // object0 is aligned.
-        if !self.object0.is_multiple_of(self.align) {
+        // object0 is aligned and within the slab.
+        if !self.object0.is_multiple_of(self.align) || self.object0 < base {
             return false;
         }
         // Last object ends within the slab.
@@ -177,6 +177,15 @@ const _: () = {
             r.objects_per_slab > 0,
             "a size class has 0 objects per slab"
         );
+        assert!(
+            r.align > 0 && (r.align & (r.align - 1)) == 0,
+            "a size class has non-power-of-two alignment"
+        );
+        assert!(
+            r.size.is_multiple_of(r.align),
+            "a size class has size not a multiple of align (section 9.3)"
+        );
+        assert!(r.slab_pages > 0, "a size class has 0 slab pages");
         i += 1;
     }
 };
@@ -258,15 +267,41 @@ mod tests {
     #[test]
     fn addr_to_index_rejects_interior_and_foreign() {
         let base = 0x4000_0000usize;
-        let sc = SizeClassId::new(0);
-        let layout = SlabLayout::compute(sc, base, 0).unwrap();
-        // Interior of object 0 (not at boundary).
-        assert_eq!(layout.addr_to_index(layout.object0 + 1), None);
-        // Before the slab.
-        assert_eq!(layout.addr_to_index(base - 1), None);
-        // Past the last object.
-        let past = layout.objects_end().unwrap();
-        assert_eq!(layout.addr_to_index(past), None);
+        // Test across several size classes with different object sizes.
+        for idx in [0, 1, 10, 30, SIZE_CLASSES.len() - 1] {
+            let sc = SizeClassId::new(idx);
+            let layout = SlabLayout::compute(sc, base, 0).unwrap();
+            // Interior of object 0 (not at boundary).
+            if layout.object_size > 1 {
+                assert_eq!(
+                    layout.addr_to_index(layout.object0 + 1),
+                    None,
+                    "sc {idx}: interior byte accepted"
+                );
+            }
+            // Mid-object address for last object.
+            if layout.object_count > 1 && layout.object_size > 1 {
+                let mid = layout.object_addr(layout.object_count - 1).unwrap() + 1;
+                assert_eq!(
+                    layout.addr_to_index(mid),
+                    None,
+                    "sc {idx}: mid-last-object accepted"
+                );
+            }
+            // Before the slab.
+            assert_eq!(
+                layout.addr_to_index(base - 1),
+                None,
+                "sc {idx}: before-slab accepted"
+            );
+            // Past the last object.
+            let past = layout.objects_end().unwrap();
+            assert_eq!(
+                layout.addr_to_index(past),
+                None,
+                "sc {idx}: past-end accepted"
+            );
+        }
     }
 
     #[test]

@@ -878,6 +878,9 @@ impl SpanGuard<'_> {
     /// SPEC-transition: object `* -> FreeInCentral` (§7.2)
     #[inline]
     pub fn central_insert(&self, i: usize) -> bool {
+        if i >= self.span.object_count() as usize {
+            return false;
+        }
         if self.span.free_bitmap.insert(i) {
             self.span.central_free_count.fetch_add(1, Ordering::Relaxed);
             true
@@ -892,6 +895,9 @@ impl SpanGuard<'_> {
     /// SPEC-transition: object `FreeInCentral -> *` (§7.2)
     #[inline]
     pub fn central_remove(&self, i: usize) -> bool {
+        if i >= self.span.object_count() as usize {
+            return false;
+        }
         if self.span.free_bitmap.remove(i) {
             // The bit was set, so the count is `>= 1` under the §8.5 invariant; guard
             // the subtraction in debug as defence-in-depth.
@@ -999,7 +1005,7 @@ impl SpanGuard<'_> {
         let words = self.span.free_bitmap.active_words();
         let obj_count = self.span.object_count() as usize;
 
-        'outer: for w in 0..words {
+        for w in 0..words {
             if removed >= max {
                 break;
             }
@@ -1014,7 +1020,7 @@ impl SpanGuard<'_> {
                 }
                 let idx = w * 64 + bit_pos as usize;
                 if idx >= obj_count {
-                    break 'outer;
+                    break;
                 }
                 let bit = 1u64 << bit_pos;
                 clear_mask |= bit;
@@ -1669,5 +1675,45 @@ mod tests {
         let g = span.lock();
         assert_eq!(g.central_free_count(), 256);
         assert!(g.central_count_matches_bitmap());
+    }
+
+    #[test]
+    fn central_insert_and_remove_reject_out_of_range_index() {
+        let m = meta(256 * 1024);
+        let sc = SizeClassId::new(0);
+        let row = size_class::row(sc);
+        let span = SpanDescriptor::new(
+            SpanId(1),
+            ArenaId::DEFAULT,
+            sc,
+            0x4000_0000,
+            row.slab_pages,
+            row.objects_per_slab,
+            0,
+            &m,
+        )
+        .unwrap();
+
+        let g = span.lock();
+        let obj_count = span.object_count() as usize;
+
+        // In-range insert succeeds.
+        assert!(g.central_insert(0));
+        assert_eq!(g.central_free_count(), 1);
+
+        // Out-of-range insert is rejected without UB or count change.
+        assert!(!g.central_insert(obj_count));
+        assert!(!g.central_insert(obj_count + 100));
+        assert!(!g.central_insert(usize::MAX));
+        assert_eq!(g.central_free_count(), 1);
+
+        // In-range remove succeeds.
+        assert!(g.central_remove(0));
+        assert_eq!(g.central_free_count(), 0);
+
+        // Out-of-range remove is rejected.
+        assert!(!g.central_remove(obj_count));
+        assert!(!g.central_remove(usize::MAX));
+        assert_eq!(g.central_free_count(), 0);
     }
 }
