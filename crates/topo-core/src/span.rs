@@ -44,7 +44,7 @@
 
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 
 use crate::bootstrap::MetadataAlloc;
@@ -432,6 +432,11 @@ pub struct SpanDescriptor {
     lock: SpanLock,
     /// Authoritative central-residency bitmap (§16.4), hybrid inline/out-of-line.
     free_bitmap: FreeBitmap,
+    /// Next span in the central free list's partial chain (W5-4a), or null.
+    /// Protected by the owning [`CentralBin`](crate::central::CentralBin)'s
+    /// lock, **not** the span lock — the span lock protects bitmap/counts, the
+    /// central lock protects list membership.
+    central_next: AtomicPtr<SpanDescriptor>,
 }
 
 // W3-2 acceptance: the descriptor footprint is asserted. `repr(C)` makes the
@@ -487,6 +492,7 @@ impl SpanDescriptor {
             state: AtomicU8::new(SpanState::Active as u8),
             lock: SpanLock::new(),
             free_bitmap,
+            central_next: AtomicPtr::new(ptr::null_mut()),
         };
         desc.refresh_integrity();
         Some(desc)
@@ -705,6 +711,20 @@ impl SpanDescriptor {
         self.integrity.load(Ordering::Acquire) == self.compute_integrity()
     }
 
+    /// The next pointer in the central partial list (for central module use).
+    /// Only valid under the central bin's lock.
+    #[inline]
+    pub fn central_next_ptr(&self) -> *mut SpanDescriptor {
+        self.central_next.load(Ordering::Relaxed)
+    }
+
+    /// Set the next pointer in the central partial list (for central module use).
+    /// Only valid under the central bin's lock.
+    #[inline]
+    pub fn set_central_next(&self, next: *mut SpanDescriptor) {
+        self.central_next.store(next, Ordering::Relaxed);
+    }
+
     /// Recycle this descriptor slot for a different span (§16.6): re-base, re-class,
     /// re-arena, **bump the generation**, resize+clear the bitmap, and reset the
     /// accounting. `false` if the bitmap must grow but `meta` cannot supply it (safe
@@ -756,6 +776,13 @@ impl SpanDescriptor {
         self.slab_header.store(slab_header, Ordering::Release);
         self.flags.store(SpanFlags::NONE.0, Ordering::Release);
         self.state.store(SpanState::Active as u8, Ordering::Release);
+        // The caller MUST have removed this span from the central list before
+        // recycling. Reset the link as defence in depth.
+        debug_assert!(
+            self.central_next.load(Ordering::Relaxed).is_null(),
+            "recycle: span still linked in the central list"
+        );
+        self.central_next.store(ptr::null_mut(), Ordering::Relaxed);
         self.refresh_integrity();
         // Close the seqlock (even ⇒ stable): publishes every geometry store to a
         // classifier's acquire-load of the version. `_span_lock` then releases.
@@ -940,6 +967,90 @@ impl SpanGuard<'_> {
             && non_central.transfer_cached == 0
             && non_central.quarantined == 0
             && self.central_free_count() == self.span.object_count()
+    }
+
+    // --- batch operations for the central free list (W5-4b/c) ----------------
+
+    /// Remove up to `max_count` central-free objects from the bitmap and write
+    /// their indices into `out[..returned]`. Returns the number removed. Scans
+    /// the bitmap word-by-word with `trailing_zeros` for efficiency. Does **not**
+    /// update `live_count` — the caller does (the central list moves objects from
+    /// central-free to live when it hands them out, W5-4b).
+    ///
+    /// SPEC-transition: object `FreeInCentral -> Allocated` batch (§7.2/§A.4)
+    pub fn central_remove_batch(&self, out: &mut [u16], max_count: usize) -> usize {
+        let max = max_count.min(out.len());
+        if max == 0 {
+            return 0;
+        }
+        let mut removed = 0;
+        let words = self.span.free_bitmap.active_words();
+        let obj_count = self.span.object_count() as usize;
+
+        'outer: for w in 0..words {
+            if removed >= max {
+                break;
+            }
+            let word_ref = self.span.free_bitmap.word(w);
+            let mut bits = word_ref.load(Ordering::Relaxed);
+            let mut clear_mask = 0u64;
+
+            while bits != 0 && removed < max {
+                let bit_pos = bits.trailing_zeros();
+                if bit_pos >= 64 {
+                    break;
+                }
+                let idx = w * 64 + bit_pos as usize;
+                if idx >= obj_count {
+                    break 'outer;
+                }
+                let bit = 1u64 << bit_pos;
+                clear_mask |= bit;
+                bits &= !bit;
+                out[removed] = idx as u16;
+                removed += 1;
+            }
+
+            if clear_mask != 0 {
+                let old = word_ref.load(Ordering::Relaxed);
+                word_ref.store(old & !clear_mask, Ordering::Relaxed);
+            }
+        }
+
+        if removed > 0 {
+            let old = self.span.central_free_count.load(Ordering::Relaxed);
+            debug_assert!(
+                old >= removed as u32,
+                "central_free_count underflow in batch removal"
+            );
+            self.span
+                .central_free_count
+                .store(old - removed as u32, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// Fill the bitmap with the first `object_count` objects as central-free and
+    /// set accounting for span activation (W5-5). After this the span has
+    /// `live == 0`, `central_free == object_count`, and the conservation law
+    /// holds.
+    ///
+    /// SPEC-transition: span activation (§14.6)
+    pub fn activate(&self, object_count: u32) {
+        self.span.free_bitmap.fill_below(object_count as usize);
+        self.span
+            .central_free_count
+            .store(object_count, Ordering::Relaxed);
+        self.span.live_count.store(0, Ordering::Relaxed);
+        debug_assert!(self.central_count_matches_bitmap());
+    }
+
+    /// Clear the bitmap and reset all accounting (failed activation cleanup or
+    /// span deactivation).
+    pub fn deactivate(&self) {
+        self.span.free_bitmap.clear();
+        self.span.central_free_count.store(0, Ordering::Relaxed);
+        self.span.live_count.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1303,7 +1414,7 @@ mod tests {
         // fixed, compact size for every class — a 32-byte control block (inline
         // 2-word bitmap + out-of-line pointer + word counts) plus a 64-byte header.
         assert_eq!(core::mem::size_of::<FreeBitmap>(), 32);
-        assert_eq!(core::mem::size_of::<SpanDescriptor>(), 96);
+        assert_eq!(core::mem::size_of::<SpanDescriptor>(), 104);
         // The old design carried a 128-byte inline bitmap in *every* descriptor; the
         // hybrid is well under that whatever the class.
         assert!(core::mem::size_of::<SpanDescriptor>() <= 128);

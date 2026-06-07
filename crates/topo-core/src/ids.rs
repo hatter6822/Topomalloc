@@ -52,6 +52,17 @@ pub struct SpanId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LargeId(pub u32);
 
+/// Identifies a NUMA node (§14.5). Node 0 is the default (and only) node at M1;
+/// topology-aware placement arrives with plan 05 W7. The central free list is
+/// keyed `(node, arena, label, sc)` (W5-4a), collapsing to `(sc)` at M1.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct NodeId(pub u32);
+
+impl NodeId {
+    /// The single node used before NUMA awareness (M1/M2).
+    pub const DEFAULT: NodeId = NodeId(0);
+}
+
 /// A span generation counter (§16.6 / §27.5). Bumped whenever a span descriptor
 /// is recycled for a different size class, arena, or allocation type, so a stale
 /// reference captured before the recycle can be detected (ABA / use-after-free

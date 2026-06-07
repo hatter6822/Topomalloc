@@ -1,7 +1,7 @@
 # Plan 03 — Core Allocator
 
 **Workstreams:** W2 (size classes/classify), W3 (metadata/pagemap/bootstrap), W5 (spans/slabs/central) ·
-**Status:** rev 2.1 · **Overview:** [README.md](README.md)
+**Status:** rev 2.2 — W5-1/2/3a/3b/3d/3e/4a/4b/4c/5 landed · **Overview:** [README.md](README.md)
 **SPEC anchors:** §9, §16, §17, §14, §25.5, §A.1/§A.4, P-Map-001..006, C-001..C-005, S-007, §27.5.
 **Upstream deps:** [02](02-formal-model.md) (size-class table, theorems), [04](04-backend-hugepages-release.md)
 (the `TopoBackingProvider` seam + extents). **Downstream:** [05](05-caches-concurrency-fastpath.md) (refills
@@ -307,9 +307,14 @@ generator, never a literal.
       (`central_insert`/`central_remove`), the only mutation path, so the
       `central_free == popcount` invariant is never observed torn. W5 wires the central
       list around this lock.
-- [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
-      the hot path.
-- [ ] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for.
+- [x] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
+      the hot path — `SpanDescriptor::central_free_count()` is the source of truth, stored in a span-locked
+      atomic that moves with the bitmap; cache residency (`NonCentralResidency`) is summed only in
+      `is_empty()`, never maintained in a separate counter.
+- [x] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for —
+      `CentralCache::insert_batch` calls `is_empty(NonCentralResidency::NONE)` after every
+      return and, if the span is fully empty, removes it from the partial list and signals
+      the caller via `InsertResult::span_empty`. No polling or background scan.
 - [x] Pagemap and span state never move in separate critical sections (W3-6) — the
       pagemap (`crates/topo-core/src/pagemap.rs`) is the **single** mutator: every
       change goes through `install_span`/`release_span`/`retire_span`/`install_large`,
@@ -317,4 +322,7 @@ generator, never a literal.
       `release_span` debug-asserts the span is marked `Released` first) under
       release/acquire ordering. W4-2b (split/merge) and W5-5 (span lifecycle) route
       through these and never poke a leaf directly.
-- [ ] Span creation stays out of the locked central critical section (W5-4b returns `empty`).
+- [x] Span creation stays out of the locked central critical section (W5-4b returns `empty`) —
+      `CentralCache::remove_batch` returns `RemoveResult::NeedSpan` when no partial span
+      exists; the **caller** creates a new span outside the lock, then retries. The central
+      lock is never held while allocating metadata or mapping pages.
