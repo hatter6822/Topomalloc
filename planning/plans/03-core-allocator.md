@@ -261,8 +261,10 @@ else activate an empty/backend span → carve → return; or `Empty` so the call
 (W5-4b). 3. `insert_batch`: return objects, update bitmap+count atomically, run W5-3e (W5-4c). 4. shard locks
 under the hierarchy (W5-4d).
 
-**Invariants.** C-001..C-004: a batch is single-arena, single-label, distinct, correct-size; an empty span is
-returned, a non-empty one never is.
+**Invariants.** C-001 (correct-size-class): every object in a batch belongs to the bin's size class.
+C-002 (correct-arena): a batch is single-arena. C-003 (empty-detection): an empty span is detected and
+recycled or deactivated. C-004 (non-empty-protection): a non-empty span is never deactivated.
+C-005 (lock-ordering): central lock is always acquired before any span lock it nests.
 
 **Verify.** unit on carve/return; the §A.2 OOM-retry path is exercised (remove returns `Empty`, caller gets a
 span, retries); contention measured in plan 08 W21-3.
@@ -344,3 +346,7 @@ generator, never a literal.
       and `slab_pages > 0` alongside the existing capacity and count checks.
 - [x] `is_valid` verifies `object0 >= base` — prevents a manually constructed
       `SlabLayout` from passing validation with objects that extend before the slab start.
+- [x] `total_central_free` is maintained at every mutation point — `activate_span` adds
+      the initial `central_free_count`, `remove_batch` subtracts carved objects,
+      `insert_batch` adds returned objects, and `deactivate_span` subtracts the residual.
+      A `debug_assert` in `remove_batch` guards against `live_count` overflow.

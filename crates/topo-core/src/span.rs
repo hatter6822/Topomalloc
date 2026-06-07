@@ -860,6 +860,18 @@ impl SpanDescriptor {
     pub fn is_empty_central_only(&self) -> bool {
         self.is_empty(NonCentralResidency::NONE)
     }
+
+    /// Reconstruct the non-central residency terms for this span.
+    ///
+    /// **M2 action (plan 05, W5-3c):** this currently returns `NONE` because no
+    /// local/transfer/quarantine caches exist at M1. When plan 05 lands caches,
+    /// replace the body with an actual cache scan or cache-bitmap popcount.
+    /// Every call site of `NonCentralResidency::NONE` should migrate to calling
+    /// this method instead.
+    #[inline]
+    pub fn reconstruct_non_central_residency(&self) -> NonCentralResidency {
+        NonCentralResidency::NONE
+    }
 }
 
 /// A held [`SpanDescriptor`] span lock (§27.2 / §8.5). While alive, the accounting
