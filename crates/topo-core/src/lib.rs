@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod bootstrap;
+pub mod central;
 pub mod classify;
 pub mod error;
 pub mod extent;
@@ -28,6 +29,7 @@ pub mod profile;
 pub mod ptr_class;
 pub mod size_class;
 pub mod skeleton;
+pub mod slab;
 pub mod span;
 pub mod trace;
 
@@ -42,6 +44,7 @@ pub use backend::{
     TopoBackingProvider, VWindow,
 };
 pub use bootstrap::{Bootstrap, BumpArena, MetadataAlloc};
+pub use central::{Batch, CentralCache, CentralError, InsertResult, RemoveResult, MAX_BATCH_LEN};
 pub use classify::{classify, Request, RequestKind};
 pub use error::BackendError;
 pub use extent::{
@@ -49,7 +52,7 @@ pub use extent::{
     Fit, HugeRange, NoRegionCache, RegionCacheHook, RetainPolicy, StateBytes,
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
-pub use ids::{ArenaId, Generation, Label, LargeId, SizeClassId, SpanId};
+pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
 pub use large::{LargeAllocator, LargeConfig};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
@@ -59,6 +62,7 @@ pub use ptr_class::{
 };
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
+pub use slab::SlabLayout;
 pub use span::{
     ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
     SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,

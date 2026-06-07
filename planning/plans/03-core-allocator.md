@@ -1,7 +1,7 @@
 # Plan 03 — Core Allocator
 
 **Workstreams:** W2 (size classes/classify), W3 (metadata/pagemap/bootstrap), W5 (spans/slabs/central) ·
-**Status:** rev 2.1 · **Overview:** [README.md](README.md)
+**Status:** rev 2.2 — W5-1/2/3a/3b/3d/3e/4a/4b/4c/5 landed · **Overview:** [README.md](README.md)
 **SPEC anchors:** §9, §16, §17, §14, §25.5, §A.1/§A.4, P-Map-001..006, C-001..C-005, S-007, §27.5.
 **Upstream deps:** [02](02-formal-model.md) (size-class table, theorems), [04](04-backend-hugepages-release.md)
 (the `TopoBackingProvider` seam + extents). **Downstream:** [05](05-caches-concurrency-fastpath.md) (refills
@@ -261,8 +261,10 @@ else activate an empty/backend span → carve → return; or `Empty` so the call
 (W5-4b). 3. `insert_batch`: return objects, update bitmap+count atomically, run W5-3e (W5-4c). 4. shard locks
 under the hierarchy (W5-4d).
 
-**Invariants.** C-001..C-004: a batch is single-arena, single-label, distinct, correct-size; an empty span is
-returned, a non-empty one never is.
+**Invariants.** C-001 (correct-size-class): every object in a batch belongs to the bin's size class.
+C-002 (correct-arena): a batch is single-arena. C-003 (empty-detection): an empty span is detected and
+recycled or deactivated. C-004 (non-empty-protection): a non-empty span is never deactivated.
+C-005 (lock-ordering): central lock is always acquired before any span lock it nests.
 
 **Verify.** unit on carve/return; the §A.2 OOM-retry path is exercised (remove returns `Empty`, caller gets a
 span, retries); contention measured in plan 08 W21-3.
@@ -307,9 +309,18 @@ generator, never a literal.
       (`central_insert`/`central_remove`), the only mutation path, so the
       `central_free == popcount` invariant is never observed torn. W5 wires the central
       list around this lock.
-- [ ] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
-      the hot path.
-- [ ] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for.
+- [x] Central-residency is authoritative + cheap; cache residency is reconstructed in debug, not tracked on
+      the hot path — `SpanDescriptor::central_free_count()` is the source of truth, stored in a span-locked
+      atomic that moves with the bitmap; cache residency (`NonCentralResidency`) is summed only in
+      `is_empty()`, never maintained in a separate counter.
+- [x] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for —
+      `CentralCache::insert_batch` calls `is_empty(NonCentralResidency::NONE)` after every
+      return and, if the span is fully empty, removes it from the partial list.  The span
+      is then offered to the per-bin empty-span cache (DD-4, bounded LIFO,
+      `MAX_EMPTY_CACHED_PER_BIN = 1`); only when the cache is full does
+      `InsertResult::span_empty` signal the caller to deactivate via the backend.
+      `remove_batch` checks the empty cache before returning `NeedSpan`, so a
+      recently-emptied span can be reused without a backend round-trip.
 - [x] Pagemap and span state never move in separate critical sections (W3-6) — the
       pagemap (`crates/topo-core/src/pagemap.rs`) is the **single** mutator: every
       change goes through `install_span`/`release_span`/`retire_span`/`install_large`,
@@ -317,4 +328,25 @@ generator, never a literal.
       `release_span` debug-asserts the span is marked `Released` first) under
       release/acquire ordering. W4-2b (split/merge) and W5-5 (span lifecycle) route
       through these and never poke a leaf directly.
-- [ ] Span creation stays out of the locked central critical section (W5-4b returns `empty`).
+- [x] Span creation stays out of the locked central critical section (W5-4b returns `empty`) —
+      `CentralCache::remove_batch` returns `RemoveResult::NeedSpan` when no partial span
+      exists; the **caller** creates a new span outside the lock, then retries. The central
+      lock is never held while allocating metadata or mapping pages.
+- [x] Bitmap bounds are validated before every insert/remove — `central_insert` and
+      `central_remove` reject indices `>= object_count` before touching the bitmap,
+      preventing out-of-bounds access on corrupted or adversarial index values.
+- [x] `central_remove_batch` applies accumulated bitmap clears before exiting —
+      the inner loop `break` ensures the `clear_mask` store runs for every word,
+      even when an out-of-range index terminates the scan mid-word.
+- [x] `deactivate_span` is infallible — it panics on invariant violation (C-004/C-005)
+      rather than returning a meaningless `true`.  The `-> bool` return type was
+      removed to match the unconditional semantics.
+- [x] Compile-time table validation covers section 9.3 invariants — the const assertion
+      in `slab.rs` now verifies `align.is_power_of_two()`, `size.is_multiple_of(align)`,
+      and `slab_pages > 0` alongside the existing capacity and count checks.
+- [x] `is_valid` verifies `object0 >= base` — prevents a manually constructed
+      `SlabLayout` from passing validation with objects that extend before the slab start.
+- [x] `total_central_free` is maintained at every mutation point — `activate_span` adds
+      the initial `central_free_count`, `remove_batch` subtracts carved objects,
+      `insert_batch` adds returned objects, and `deactivate_span` subtracts the residual.
+      A `debug_assert` in `remove_batch` guards against `live_count` overflow.
