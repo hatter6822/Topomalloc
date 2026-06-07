@@ -313,8 +313,12 @@ generator, never a literal.
       `is_empty()`, never maintained in a separate counter.
 - [x] Empty-detection is *triggered* (W5-3e), so emptiness is found, not waited for —
       `CentralCache::insert_batch` calls `is_empty(NonCentralResidency::NONE)` after every
-      return and, if the span is fully empty, removes it from the partial list and signals
-      the caller via `InsertResult::span_empty`. No polling or background scan.
+      return and, if the span is fully empty, removes it from the partial list.  The span
+      is then offered to the per-bin empty-span cache (DD-4, bounded LIFO,
+      `MAX_EMPTY_CACHED_PER_BIN = 1`); only when the cache is full does
+      `InsertResult::span_empty` signal the caller to deactivate via the backend.
+      `remove_batch` checks the empty cache before returning `NeedSpan`, so a
+      recently-emptied span can be reused without a backend round-trip.
 - [x] Pagemap and span state never move in separate critical sections (W3-6) — the
       pagemap (`crates/topo-core/src/pagemap.rs`) is the **single** mutator: every
       change goes through `install_span`/`release_span`/`retire_span`/`install_large`,

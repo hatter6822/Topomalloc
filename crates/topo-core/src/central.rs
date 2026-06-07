@@ -7,14 +7,17 @@
 //!
 //! **Structure (W5-4a).** Keyed `(node, arena, label, sc)`: at M1 the node is
 //! `DEFAULT` (single NUMA), label is `PUBLIC` (single authority), and arenas are
-//! verified but not sharded. Each key maps to a [`CentralBin`] holding a partial-span
-//! list, occupancy counters, and a per-bin spinlock.
+//! verified but not sharded. Each key maps to a [`CentralBin`] holding a
+//! partial-span list, an empty-span cache (DD-4), occupancy counters, and a
+//! per-bin spinlock.
 //!
 //! **Remove (W5-4b, §A.4/§A.2).** [`CentralCache::remove_batch`] pulls objects from
-//! the head partial span. If no partial span exists, it returns
-//! [`RemoveResult::NeedSpan`] so the **caller** creates a new span and retries (§A.2
-//! OOM-retry loop) — span creation stays outside the locked central critical section
-//! (DD-4).
+//! a partial span matching the requested arena (scanning the list). If no partial
+//! span is available, it tries the empty-span cache — reactivating a recently
+//! emptied span without a backend round-trip. Only if both are exhausted does it
+//! return [`RemoveResult::NeedSpan`] so the **caller** creates a new span and
+//! retries (§A.2 OOM-retry loop) — span creation stays outside the locked central
+//! critical section (DD-4).
 //!
 //! **Insert (W5-4c).** [`CentralCache::insert_batch`] returns objects, updating bitmap
 //! + count atomically (W5-3b), then runs the empty-detection trigger (W5-3e): if the
@@ -59,6 +62,18 @@ const fn max_batch_in_table() -> usize {
     }
     max
 }
+
+// Object indices are stored as u16 in Batch::indices and central_remove_batch.
+// This compile-time guard prevents silent truncation if a future table revision
+// pushes objects_per_slab past 65535.
+const _: () = assert!(
+    crate::span::max_objects_per_slab() <= u16::MAX as usize,
+    "objects_per_slab exceeds u16::MAX; Batch indices would truncate"
+);
+
+/// Maximum empty spans cached per bin (LIFO, bounded). Avoids a backend
+/// round-trip when a recently-emptied span can be reused immediately.
+const MAX_EMPTY_CACHED_PER_BIN: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -124,11 +139,10 @@ impl Batch {
         self.len == 0
     }
 
-    /// Object index at position `i`.
+    /// Object index at position `i`. Panics if `i >= len()`.
     #[inline]
     pub fn index(&self, i: usize) -> u16 {
-        debug_assert!(i < self.len as usize);
-        self.indices[i]
+        self.indices()[i]
     }
 
     /// The valid indices as a slice.
@@ -166,9 +180,10 @@ pub enum RemoveResult {
 pub struct InsertResult {
     /// Number of objects successfully inserted.
     pub inserted: usize,
-    /// Whether the span is now **empty** and should be returned to the backend
-    /// (W5-5, C-003). If `true`, the caller should call
-    /// [`CentralCache::deactivate_span`].
+    /// Whether the span is empty **and** the empty-span cache is full, so the
+    /// caller must call [`CentralCache::deactivate_span`] (W5-5, C-003). When
+    /// the span is empty but could be cached internally for reuse, this is
+    /// `false` — the central list handled the transition.
     pub span_empty: bool,
 }
 
@@ -217,9 +232,9 @@ impl Drop for CentralGuard<'_> {
 // CentralBin — per-sc structure (W5-4a)
 // ---------------------------------------------------------------------------
 
-/// Per-size-class central structure (W5-4a): a partial-span list, occupancy
-/// counters, and a lock. At M1 this is the only allocation path; at M2, caches
-/// drain/refill through it.
+/// Per-size-class central structure (W5-4a): a partial-span list, an
+/// empty-span cache, occupancy counters, and a lock (DD-4). At M1 this is the
+/// only allocation path; at M2, caches drain/refill through it.
 pub struct CentralBin {
     /// Spinlock protecting all mutable state below.
     lock: CentralLock,
@@ -228,7 +243,15 @@ pub struct CentralBin {
     partial_head: AtomicPtr<SpanDescriptor>,
     /// Number of spans in the partial list.
     partial_count: AtomicU32,
-    /// Number of active spans (partial + exhausted) tracked by this bin.
+    /// Head of the empty-span LIFO cache (null when empty). Spans here have
+    /// been fully returned (`is_empty() == true`, bitmap full) but not yet
+    /// deactivated. They can be reused immediately, avoiding a backend
+    /// round-trip. Bounded by [`MAX_EMPTY_CACHED_PER_BIN`].
+    empty_head: AtomicPtr<SpanDescriptor>,
+    /// Number of spans in the empty cache.
+    empty_count: AtomicU32,
+    /// Number of active spans (partial + exhausted + empty-cached) tracked
+    /// by this bin.
     span_count: AtomicU32,
     /// Total central-free objects across all spans in this bin.
     total_central_free: AtomicU64,
@@ -240,6 +263,8 @@ impl CentralBin {
             lock: CentralLock::new(),
             partial_head: AtomicPtr::new(core::ptr::null_mut()),
             partial_count: AtomicU32::new(0),
+            empty_head: AtomicPtr::new(core::ptr::null_mut()),
+            empty_count: AtomicU32::new(0),
             span_count: AtomicU32::new(0),
             total_central_free: AtomicU64::new(0),
         }
@@ -314,10 +339,79 @@ impl CentralBin {
         }
     }
 
+    // --- empty-cache operations (all under the bin lock) ----------------------
+
+    /// Push `span` to the head of the empty cache.
+    fn push_empty(&self, span: &SpanDescriptor) {
+        let old_head = self.empty_head.load(Ordering::Relaxed);
+        span.set_central_next(old_head);
+        self.empty_head.store(
+            span as *const SpanDescriptor as *mut SpanDescriptor,
+            Ordering::Relaxed,
+        );
+        self.empty_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pop the head of the empty cache. Returns null if empty.
+    fn pop_empty(&self) -> *const SpanDescriptor {
+        let head = self.empty_head.load(Ordering::Relaxed);
+        if head.is_null() {
+            return core::ptr::null();
+        }
+        // SAFETY: head was installed by push_empty from a valid &SpanDescriptor;
+        // metadata is never freed (§27.5).
+        let span = unsafe { &*head };
+        let next = span.central_next_ptr();
+        span.set_central_next(core::ptr::null_mut());
+        self.empty_head.store(next, Ordering::Relaxed);
+        self.empty_count.fetch_sub(1, Ordering::Relaxed);
+        head
+    }
+
+    /// Remove `target` from the empty cache. Returns `true` if found.
+    fn remove_empty(&self, target: *const SpanDescriptor) -> bool {
+        let head = self.empty_head.load(Ordering::Relaxed);
+        if head.is_null() {
+            return false;
+        }
+        if core::ptr::eq(head, target) {
+            self.pop_empty();
+            return true;
+        }
+        let mut prev = head;
+        loop {
+            // SAFETY: prev was installed from a valid &SpanDescriptor; metadata
+            // is never freed.
+            let prev_span = unsafe { &*prev };
+            let next = prev_span.central_next_ptr();
+            if next.is_null() {
+                return false;
+            }
+            if core::ptr::eq(next, target) {
+                // SAFETY: target is a valid &SpanDescriptor.
+                let target_span = unsafe { &*target };
+                let after = target_span.central_next_ptr();
+                prev_span.set_central_next(after);
+                target_span.set_central_next(core::ptr::null_mut());
+                self.empty_count.fetch_sub(1, Ordering::Relaxed);
+                return true;
+            }
+            prev = next;
+        }
+    }
+
+    // --- accessors (relaxed reads, no lock needed) ---------------------------
+
     /// Number of partial spans (approximate without the lock).
     #[inline]
     pub fn partial_count(&self) -> u32 {
         self.partial_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of empty-cached spans (approximate without the lock).
+    #[inline]
+    pub fn empty_count(&self) -> u32 {
+        self.empty_count.load(Ordering::Relaxed)
     }
 
     /// Number of active spans tracked by this bin.
@@ -334,10 +428,11 @@ impl CentralBin {
 }
 
 // SAFETY: all shared state is behind atomics or the spinlock; the raw pointers
-// in the list reach `Sync` descriptors in monotonic metadata.
+// in both the partial and empty lists reach `Sync` descriptors in monotonic
+// metadata (never freed, §27.5).
 unsafe impl Sync for CentralBin {}
-// SAFETY: CentralBin fields are atomics and a spinlock; the AtomicPtr reaches
-// Sync descriptors that are never freed (monotonic metadata, §27.5).
+// SAFETY: CentralBin fields are atomics and a spinlock; the AtomicPtrs
+// (partial_head, empty_head) reach Sync descriptors that are never freed.
 unsafe impl Send for CentralBin {}
 
 // ---------------------------------------------------------------------------
@@ -369,10 +464,10 @@ impl CentralCache {
 
     /// Remove up to `desired` objects of size class `sc` (§A.4, W5-4b).
     ///
-    /// Returns [`RemoveResult::Ok`] with the batch, or [`RemoveResult::NeedSpan`]
-    /// if no partial span is available — the caller should then get a new span
-    /// from the backend, [`activate_span`](Self::activate_span) it, and retry
-    /// (§A.2 OOM-retry).
+    /// Tries, in order: (1) a partial span matching the requested arena,
+    /// (2) an empty-cached span matching the requested arena, (3) returns
+    /// [`RemoveResult::NeedSpan`] so the caller can get a new span from the
+    /// backend, [`activate_span`](Self::activate_span) it, and retry (§A.2).
     ///
     /// **C-001/C-002:** the returned batch is single-arena, single-label,
     /// correct-size (every object comes from one span of the right class).
@@ -382,33 +477,55 @@ impl CentralCache {
         &self,
         _node: NodeId,
         arena: ArenaId,
-        _label: Label,
+        label: Label,
         sc: SizeClassId,
         desired: usize,
     ) -> RemoveResult {
+        // C-002: at M1 only Label::PUBLIC is supported. Per-label partitioning
+        // arrives with plan 09 (seLe4n, M2+).
+        debug_assert_eq!(
+            label,
+            Label::PUBLIC,
+            "M1: only Label::PUBLIC is supported; per-label bins arrive at M2"
+        );
+
         let bin = match self.bins.get(sc.index()) {
             Some(b) => b,
             None => return RemoveResult::NeedSpan,
         };
         let _guard = bin.lock();
 
-        let head = bin.partial_head.load(Ordering::Relaxed);
-        if head.is_null() {
-            return RemoveResult::NeedSpan;
-        }
+        // --- step 1: find an arena-matching partial span ---------------------
+        let span_ptr = self.find_partial_for_arena(bin, arena);
 
-        // SAFETY: head was installed by activate_span/push_partial from a valid
-        // &SpanDescriptor; metadata is never freed (§27.5).
-        let span = unsafe { &*head };
+        // --- step 2: if no partial match, try the empty cache ----------------
+        let span_ptr = if span_ptr.is_null() {
+            let empty = bin.pop_empty();
+            if empty.is_null() {
+                return RemoveResult::NeedSpan;
+            }
+            // SAFETY: empty was installed by push_empty from a valid
+            // &SpanDescriptor; metadata is never freed (§27.5).
+            let empty_span = unsafe { &*empty };
+            if empty_span.arena() != arena {
+                // Wrong arena — put it back (M1: can't happen).
+                bin.push_empty(empty_span);
+                return RemoveResult::NeedSpan;
+            }
+            // The empty span has a full bitmap (all central-free). Push to
+            // partial so the carve logic below can process it uniformly.
+            bin.push_partial(empty_span);
+            empty
+        } else {
+            span_ptr
+        };
 
-        // C-001: verify the span belongs to the requested arena.
-        if span.arena() != arena {
-            return RemoveResult::NeedSpan;
-        }
-
+        // --- step 3: carve from the span ------------------------------------
+        // SAFETY: span_ptr came from a list installed from a valid &SpanDescriptor.
+        let span = unsafe { &*span_ptr };
         let sg = span.lock();
 
-        // If the head span is unexpectedly exhausted, pop it and report empty.
+        // Defensive: if the span is unexpectedly exhausted, pop and report empty.
         if sg.central_free_count() == 0 {
             drop(sg);
             bin.pop_partial();
@@ -419,17 +536,15 @@ impl CentralCache {
             .min(sg.central_free_count() as usize)
             .min(MAX_BATCH_LEN);
 
-        let mut batch = Batch::empty(head as *const SpanDescriptor);
+        let mut batch = Batch::empty(span_ptr);
         let removed = sg.central_remove_batch(&mut batch.indices, count);
         batch.len = removed as u16;
 
-        // Move the removed objects from central-free to live.
         let old_live = sg.live_count();
         sg.set_live_count(old_live + removed as u32);
 
         debug_assert!(sg.central_count_matches_bitmap());
 
-        // If the span is now exhausted, pop it from the partial list.
         if sg.central_free_count() == 0 {
             drop(sg);
             bin.pop_partial();
@@ -437,7 +552,6 @@ impl CentralCache {
             drop(sg);
         }
 
-        // Update the bin's aggregate counter.
         bin.total_central_free
             .fetch_sub(removed as u64, Ordering::Relaxed);
 
@@ -448,12 +562,59 @@ impl CentralCache {
         }
     }
 
+    /// Scan the partial list for the first span matching `arena`. Returns
+    /// a pointer to it (leaving it in the list), or null if none matches.
+    /// The matching span is moved to the head for efficient future access.
+    fn find_partial_for_arena(&self, bin: &CentralBin, arena: ArenaId) -> *const SpanDescriptor {
+        let head = bin.partial_head.load(Ordering::Relaxed);
+        if head.is_null() {
+            return core::ptr::null();
+        }
+
+        // Fast path: head matches.
+        // SAFETY: head was installed from a valid &SpanDescriptor; metadata
+        // is never freed (§27.5).
+        let head_span = unsafe { &*head };
+        if head_span.arena() == arena {
+            return head;
+        }
+
+        // Slow path: scan the rest of the list. If found, move the matching
+        // span to the head (so subsequent removes hit the fast path).
+        let mut prev = head;
+        loop {
+            // SAFETY: `prev` came from the partial list, which only stores
+            // pointers installed from valid &SpanDescriptor references;
+            // descriptors are never freed (§27.5 monotonic metadata).
+            let prev_span = unsafe { &*prev };
+            let next = prev_span.central_next_ptr();
+            if next.is_null() {
+                return core::ptr::null();
+            }
+            // SAFETY: same invariant — `next` was written by set_central_next
+            // from a valid descriptor pointer.
+            let next_span = unsafe { &*next };
+            if next_span.arena() == arena {
+                // Unlink `next` from its current position.
+                let after = next_span.central_next_ptr();
+                prev_span.set_central_next(after);
+                // Push it to the head.
+                next_span.set_central_next(head);
+                bin.partial_head.store(next, Ordering::Relaxed);
+                // partial_count is unchanged (same number of spans).
+                return next;
+            }
+            prev = next;
+        }
+    }
+
     // --- insert batch (W5-4c) ------------------------------------------------
 
     /// Return objects to the central free list (W5-4c). The objects (given by
     /// `indices[..count]`) are inserted into `span`'s bitmap + count atomically
     /// (W5-3b), and the live count is decremented. Empty detection (W5-3d/3e)
-    /// runs after the insert: if the span is now empty, [`InsertResult::span_empty`]
+    /// runs after the insert: if the span is now empty, it is moved to the
+    /// empty-span cache if room exists; otherwise [`InsertResult::span_empty`]
     /// is `true` and the caller should [`deactivate_span`](Self::deactivate_span).
     ///
     /// **C-003/C-004:** an empty span is detected; a non-empty span is never
@@ -487,6 +648,9 @@ impl CentralCache {
             if sg.central_insert(idx) {
                 inserted += 1;
             } else {
+                // Release-mode double-free detection is plan 08 W18-2. At M1
+                // this is debug-only; the hardened profile will upgrade this to
+                // a recorded event with diagnostic context.
                 debug_assert!(
                     false,
                     "double insert in insert_batch: object {idx} already central-free"
@@ -513,35 +677,34 @@ impl CentralCache {
         // If it now has central-free objects, add it back.
         let was_exhausted = {
             let head = bin.partial_head.load(Ordering::Relaxed);
-            // A span is "in the partial list" if it's reachable from the head.
-            // For efficiency, we check central_free_count: if it was 0 before
-            // this insert but is now >0, the span was exhausted and needs
-            // re-adding. We know it was exhausted if the count equals exactly
-            // what we just inserted (it was 0 before).
-            sg.central_free_count() == inserted && inserted > 0 && {
-                // Double-check: not already the head (defensive).
-                !core::ptr::eq(head, span)
-            }
+            sg.central_free_count() == inserted && inserted > 0 && { !core::ptr::eq(head, span) }
         };
 
-        // W5-3d/3e: empty detection trigger.
-        let span_empty = sg.is_empty(NonCentralResidency::NONE);
+        // W5-3d/3e: empty detection trigger (M2 action: replace NONE with
+        // actual cache residency from plan 05).
+        let is_empty = sg.is_empty(NonCentralResidency::NONE);
+        drop(sg);
 
-        if span_empty {
+        let mut caller_must_deactivate = false;
+
+        if is_empty {
             // C-003: the span is empty. Remove from partial list if present.
-            drop(sg);
             bin.remove_partial(span as *const SpanDescriptor);
+
+            // Try to cache the empty span for reuse (DD-4 SpanCache).
+            if bin.empty_count.load(Ordering::Relaxed) < MAX_EMPTY_CACHED_PER_BIN {
+                bin.push_empty(span);
+            } else {
+                // Cache full — the caller must deactivate.
+                caller_must_deactivate = true;
+            }
         } else if was_exhausted {
-            // The span was exhausted, now has free objects — re-add to partial.
-            drop(sg);
             bin.push_partial(span);
-        } else {
-            drop(sg);
         }
 
         InsertResult {
             inserted: inserted as usize,
-            span_empty,
+            span_empty: caller_must_deactivate,
         }
     }
 
@@ -570,6 +733,7 @@ impl CentralCache {
         {
             let sg = span.lock();
             sg.activate(object_count);
+            // M2 action: replace NONE with actual cache residency (plan 05).
             debug_assert!(sg.conservation_holds(NonCentralResidency::NONE));
         }
 
@@ -592,38 +756,54 @@ impl CentralCache {
         Ok(())
     }
 
-    /// Deactivate an empty span (W5-5): remove it from the partial list,
-    /// transition its pagemap entries to `Released` (W3-6), and decrement the
-    /// bin's span count. The caller is responsible for returning the backing
-    /// extent to the backend.
+    /// Deactivate an empty span (W5-5): remove it from the partial or empty
+    /// list, transition its pagemap entries to `Released` (W3-6), and decrement
+    /// the bin's span count. The caller is responsible for returning the backing
+    /// extent to the backend. Returns `true` if the span was deactivated.
     ///
-    /// **C-005 acceptance:** never returns a non-empty span. The span MUST be
-    /// empty before calling (debug-asserted).
+    /// **C-004/C-005 acceptance:** panics if the span is not empty. Releasing
+    /// a non-empty span would recycle live memory — a catastrophic failure mode.
     ///
     /// SPEC-transition: span `Active -> Released` (§7.3, §14.6)
-    pub fn deactivate_span(&self, span: &SpanDescriptor, pagemap: &PageMap) {
-        debug_assert!(
-            span.is_empty_central_only(),
-            "W5-5: deactivate_span called on a non-empty span"
-        );
-
+    pub fn deactivate_span(&self, span: &SpanDescriptor, pagemap: &PageMap) -> bool {
         let sc = span.size_class();
         let bin = &self.bins[sc.index()];
         let _guard = bin.lock();
 
-        bin.remove_partial(span as *const SpanDescriptor);
+        // C-004/C-005: verify emptiness under both locks. The central lock
+        // serializes against insert_batch, preventing a TOCTOU race.
+        let free_before = {
+            let sg = span.lock();
+            assert!(
+                sg.is_empty(NonCentralResidency::NONE),
+                "W5-5/C-004: deactivate_span called on a non-empty span \
+                 (live={}, central_free={}, object_count={})",
+                sg.live_count(),
+                sg.central_free_count(),
+                span.object_count()
+            );
+            let free = sg.central_free_count();
+            sg.deactivate();
+            free
+        };
+
+        // Remove from whichever list the span is in.
+        if !bin.remove_partial(span as *const SpanDescriptor) {
+            bin.remove_empty(span as *const SpanDescriptor);
+        }
         bin.span_count.fetch_sub(1, Ordering::Relaxed);
 
-        // Clear the accounting under the span lock so the span is clean for
-        // recycling.
-        {
-            let sg = span.lock();
-            sg.deactivate();
+        // Adjust total_central_free for the deactivated objects.
+        if free_before > 0 {
+            bin.total_central_free
+                .fetch_sub(free_before as u64, Ordering::Relaxed);
         }
 
         // W3-6: transition pagemap entries.
         span.set_state(SpanState::Released);
         pagemap.release_span(span);
+
+        true
     }
 }
 
@@ -659,10 +839,20 @@ mod tests {
     }
 
     fn make_span(id: u32, sc: SizeClassId, base: usize, m: &BumpArena) -> SpanDescriptor {
+        make_span_arena(id, ArenaId::DEFAULT, sc, base, m)
+    }
+
+    fn make_span_arena(
+        id: u32,
+        arena: ArenaId,
+        sc: SizeClassId,
+        base: usize,
+        m: &BumpArena,
+    ) -> SpanDescriptor {
         let row = size_class::row(sc);
         SpanDescriptor::new(
             SpanId(id),
-            ArenaId::DEFAULT,
+            arena,
             sc,
             base,
             row.slab_pages,
@@ -671,6 +861,22 @@ mod tests {
             m,
         )
         .expect("span creation failed")
+    }
+
+    fn drain_all(cache: &CentralCache, sc: SizeClassId) -> Vec<u16> {
+        let mut all = Vec::new();
+        while let RemoveResult::Ok(batch) = cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            MAX_BATCH_LEN,
+        ) {
+            for i in 0..batch.len() {
+                all.push(batch.index(i));
+            }
+        }
+        all
     }
 
     #[test]
@@ -744,32 +950,19 @@ mod tests {
 
         cache.activate_span(&span, &pm, &m).unwrap();
 
-        // Remove all objects.
-        let mut all_indices = Vec::new();
-        while let RemoveResult::Ok(batch) = cache.remove_batch(
-            NodeId::DEFAULT,
-            ArenaId::DEFAULT,
-            Label::PUBLIC,
-            sc,
-            MAX_BATCH_LEN,
-        ) {
-            for i in 0..batch.len() {
-                all_indices.push(batch.index(i));
-            }
-        }
+        let all_indices = drain_all(&cache, sc);
         assert_eq!(all_indices.len(), obj_count);
         assert_eq!(span.live_count() as usize, obj_count);
         assert_eq!(span.central_free_count(), 0);
         assert!(span.conservation_holds_central_only());
 
-        // Return all objects — the span should become empty.
+        // Return all objects — the span is empty, cached internally.
         let result = cache.insert_batch(&span, &all_indices, all_indices.len());
         assert_eq!(result.inserted, obj_count);
-        assert!(
-            result.span_empty,
-            "span should be empty after returning all objects"
-        );
+        // The empty cache has room → span is cached, not signalled for deactivation.
+        assert!(!result.span_empty);
         assert!(span.is_empty_central_only());
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 1);
     }
 
     #[test]
@@ -809,19 +1002,7 @@ mod tests {
 
         cache.activate_span(&span, &pm, &m).unwrap();
 
-        // Drain all objects so the span is exhausted (popped from partial list).
-        let mut all = Vec::new();
-        while let RemoveResult::Ok(batch) = cache.remove_batch(
-            NodeId::DEFAULT,
-            ArenaId::DEFAULT,
-            Label::PUBLIC,
-            sc,
-            MAX_BATCH_LEN,
-        ) {
-            for i in 0..batch.len() {
-                all.push(batch.index(i));
-            }
-        }
+        let all = drain_all(&cache, sc);
         assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
 
         // Return some (not all) objects. The span should re-enter the partial list.
@@ -849,25 +1030,17 @@ mod tests {
         cache.activate_span(&span, &pm, &m).unwrap();
         assert_eq!(cache.bin(sc).unwrap().span_count(), 1);
 
-        // Return all objects to make it empty, then deactivate.
-        let mut all = Vec::new();
-        while let RemoveResult::Ok(batch) = cache.remove_batch(
-            NodeId::DEFAULT,
-            ArenaId::DEFAULT,
-            Label::PUBLIC,
-            sc,
-            MAX_BATCH_LEN,
-        ) {
-            for i in 0..batch.len() {
-                all.push(batch.index(i));
-            }
-        }
-        let result = cache.insert_batch(&span, &all, all.len());
-        assert!(result.span_empty);
+        // Return all objects to make it empty.
+        let all = drain_all(&cache, sc);
+        let _result = cache.insert_batch(&span, &all, all.len());
+        // The span is empty and cached internally.
+        assert!(span.is_empty_central_only());
 
-        cache.deactivate_span(&span, &pm);
+        // Deactivate removes from whichever list (partial or empty cache).
+        assert!(cache.deactivate_span(&span, &pm));
         assert_eq!(cache.bin(sc).unwrap().span_count(), 0);
         assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 0);
         assert_eq!(span.state(), SpanState::Released);
 
         // Pagemap should show Released.
@@ -1039,19 +1212,7 @@ mod tests {
 
         cache.activate_span(&span, &pm, &m).unwrap();
 
-        // Drain all objects.
-        let mut all = Vec::new();
-        while let RemoveResult::Ok(batch) = cache.remove_batch(
-            NodeId::DEFAULT,
-            ArenaId::DEFAULT,
-            Label::PUBLIC,
-            sc,
-            MAX_BATCH_LEN,
-        ) {
-            for i in 0..batch.len() {
-                all.push(batch.index(i));
-            }
-        }
+        let all = drain_all(&cache, sc);
         assert_eq!(all.len(), obj_count);
 
         // Return all but the last one — NOT empty.
@@ -1060,12 +1221,317 @@ mod tests {
         assert_eq!(result.inserted, obj_count - 1);
         assert!(!result.span_empty);
 
-        // Return the last one — NOW empty.
+        // Return the last one — NOW empty. The span is detected as empty and
+        // moved to the empty cache.
         let result = cache.insert_batch(&span, last, 1);
         assert_eq!(result.inserted, 1);
-        assert!(
-            result.span_empty,
-            "span should be empty after the last object returns"
-        );
+        assert!(span.is_empty_central_only());
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 1);
+    }
+
+    // --- new tests closing W5 gaps -------------------------------------------
+
+    #[test]
+    fn oom_retry_integration() {
+        // W5-4b acceptance: "OOM-retry path exercised."
+        // Simulate the full caller retry loop: NeedSpan → activate → retry → Ok.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+
+        // Step 1: empty cache returns NeedSpan.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+            RemoveResult::NeedSpan => {}
+            RemoveResult::Ok(_) => panic!("expected NeedSpan from empty cache"),
+        }
+
+        // Step 2: caller creates a span from the backend and activates it.
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        cache.activate_span(&span, &pm, &m).unwrap();
+
+        // Step 3: retry succeeds.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+            RemoveResult::Ok(batch) => {
+                assert_eq!(batch.len(), 4);
+                assert!(span.conservation_holds_central_only());
+            }
+            RemoveResult::NeedSpan => panic!("expected batch after retry"),
+        }
+    }
+
+    #[test]
+    fn arena_mismatch_returns_need_span() {
+        // C-001: a span from arena A should not serve a request for arena B.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+
+        let arena_a = ArenaId(1);
+        let arena_b = ArenaId(2);
+
+        let span_a = make_span_arena(1, arena_a, sc, 0x4000_0000, &m);
+        cache.activate_span(&span_a, &pm, &m).unwrap();
+
+        // Request for arena B should get NeedSpan (no matching span).
+        match cache.remove_batch(NodeId::DEFAULT, arena_b, Label::PUBLIC, sc, 4) {
+            RemoveResult::NeedSpan => {}
+            RemoveResult::Ok(_) => panic!("should not get objects from wrong arena"),
+        }
+
+        // Request for arena A should succeed.
+        match cache.remove_batch(NodeId::DEFAULT, arena_a, Label::PUBLIC, sc, 4) {
+            RemoveResult::Ok(batch) => assert_eq!(batch.len(), 4),
+            RemoveResult::NeedSpan => panic!("expected batch for matching arena"),
+        }
+    }
+
+    #[test]
+    fn arena_scan_finds_matching_span_behind_head() {
+        // C-001: remove_batch should scan past non-matching arenas.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let row = size_class::row(sc);
+        let span_bytes = row.slab_pages as usize * PAGE_SIZE;
+
+        let arena_a = ArenaId(1);
+        let arena_b = ArenaId(2);
+
+        // Activate: A first (pushed deep), then B (becomes head).
+        let span_a = make_span_arena(1, arena_a, sc, 0x4000_0000, &m);
+        let span_b = make_span_arena(2, arena_b, sc, 0x4000_0000 + span_bytes, &m);
+        cache.activate_span(&span_a, &pm, &m).unwrap();
+        cache.activate_span(&span_b, &pm, &m).unwrap();
+
+        // Head is B. Request for A should scan past B and find A.
+        match cache.remove_batch(NodeId::DEFAULT, arena_a, Label::PUBLIC, sc, 4) {
+            RemoveResult::Ok(batch) => {
+                assert_eq!(batch.span(), &span_a as *const SpanDescriptor);
+                assert_eq!(batch.len(), 4);
+            }
+            RemoveResult::NeedSpan => panic!("expected batch from scanned arena A"),
+        }
+    }
+
+    #[test]
+    fn concurrent_mixed_remove_and_insert() {
+        // Concurrent remove + insert from multiple threads.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(0); // 1024 objects
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        cache.activate_span(&span, &pm, &m).unwrap();
+
+        let cache_ref = &cache;
+        let span_ref = &span;
+
+        std::thread::scope(|s| {
+            // 2 threads removing, 2 threads inserting what they took.
+            let handles: Vec<_> = (0..4)
+                .map(|t| {
+                    s.spawn(move || {
+                        for _ in 0..50 {
+                            if let RemoveResult::Ok(batch) = cache_ref.remove_batch(
+                                NodeId::DEFAULT,
+                                ArenaId::DEFAULT,
+                                Label::PUBLIC,
+                                sc,
+                                2,
+                            ) {
+                                // Some threads return immediately.
+                                if t % 2 == 0 {
+                                    let indices: Vec<u16> = batch.indices().to_vec();
+                                    cache_ref.insert_batch(span_ref, &indices, indices.len());
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // The conservation law must hold after the storm.
+        assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn full_lifecycle_conservation() {
+        // Activate → drain → return all → deactivate. Conservation at every step.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        let row = size_class::row(sc);
+        let obj_count = row.objects_per_slab as usize;
+
+        // Step 1: activate. conservation holds.
+        cache.activate_span(&span, &pm, &m).unwrap();
+        assert!(span.conservation_holds_central_only());
+        assert_eq!(span.live_count(), 0);
+        assert_eq!(span.central_free_count() as usize, obj_count);
+
+        // Step 2: drain all. conservation holds.
+        let all = drain_all(&cache, sc);
+        assert_eq!(all.len(), obj_count);
+        assert!(span.conservation_holds_central_only());
+        assert_eq!(span.live_count() as usize, obj_count);
+        assert_eq!(span.central_free_count(), 0);
+
+        // Step 3: return all. conservation holds. Span detected as empty.
+        cache.insert_batch(&span, &all, all.len());
+        assert!(span.conservation_holds_central_only());
+        assert!(span.is_empty_central_only());
+        assert_eq!(span.live_count(), 0);
+        assert_eq!(span.central_free_count() as usize, obj_count);
+
+        // Step 4: deactivate. All counts zero.
+        assert!(cache.deactivate_span(&span, &pm));
+        assert_eq!(span.live_count(), 0);
+        assert_eq!(span.central_free_count(), 0);
+        assert_eq!(cache.bin(sc).unwrap().span_count(), 0);
+        assert_eq!(cache.bin(sc).unwrap().total_central_free(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "W5-5/C-004")]
+    fn deactivate_non_empty_span_panics() {
+        // C-004/C-005: deactivating a non-empty span is a hard failure.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+
+        // Remove some objects (span is NOT empty).
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+            RemoveResult::Ok(_) => {}
+            RemoveResult::NeedSpan => panic!("expected batch"),
+        }
+
+        // This must panic: the span has live objects.
+        cache.deactivate_span(&span, &pm);
+    }
+
+    #[test]
+    fn partition_terms_sum_to_object_count() {
+        // W5-3a: the five-term partition sums correctly, no double-counts.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        let obj_count = size_class::row(sc).objects_per_slab;
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+
+        // After activation: live=0, central_free=all, cached/quarantined=0.
+        let sg = span.lock();
+        let terms = sg.partition(NonCentralResidency::NONE);
+        assert_eq!(terms, [0, 0, 0, obj_count, 0]);
+        assert_eq!(terms.iter().sum::<u32>(), obj_count);
+        drop(sg);
+
+        // After removing 8 objects: live=8, central_free=all-8.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 8) {
+            RemoveResult::Ok(batch) => assert_eq!(batch.len(), 8),
+            RemoveResult::NeedSpan => panic!("expected batch"),
+        }
+        let sg = span.lock();
+        let terms = sg.partition(NonCentralResidency::NONE);
+        assert_eq!(terms[0], 8); // live
+        assert_eq!(terms[3], obj_count - 8); // central_free
+        assert_eq!(terms.iter().sum::<u32>(), obj_count);
+        drop(sg);
+    }
+
+    #[test]
+    fn empty_cache_reuses_span_without_backend() {
+        // DD-4 SpanCache: an empty span is cached and reused by remove_batch
+        // without going back to the backend.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+
+        // Drain all objects.
+        let all = drain_all(&cache, sc);
+        assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
+
+        // Return all → span is empty, cached.
+        cache.insert_batch(&span, &all, all.len());
+        assert!(span.is_empty_central_only());
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 1);
+        assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
+
+        // Next remove should pull from the empty cache, NOT return NeedSpan.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+            RemoveResult::Ok(batch) => {
+                assert_eq!(batch.len(), 4);
+                assert_eq!(batch.span(), &span as *const SpanDescriptor);
+            }
+            RemoveResult::NeedSpan => panic!("empty cache should have provided a span"),
+        }
+
+        // The span moved from empty cache to partial (then possibly exhausted
+        // if all objects were carved, but we only took 4).
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 0);
+        assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn empty_cache_overflow_signals_caller() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let row = size_class::row(sc);
+        let span_bytes = row.slab_pages as usize * PAGE_SIZE;
+        let obj_count = row.objects_per_slab as usize;
+
+        let s1 = make_span(1, sc, 0x4000_0000, &m);
+        let s2 = make_span(2, sc, 0x4000_0000 + span_bytes, &m);
+
+        // Step 1: fill the empty cache with s1.
+        cache.activate_span(&s1, &pm, &m).unwrap();
+        let all1 = drain_all(&cache, sc);
+        assert_eq!(all1.len(), obj_count);
+        let r1 = cache.insert_batch(&s1, &all1, all1.len());
+        assert!(!r1.span_empty, "s1 should be cached, not signalled");
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 1);
+
+        // Step 2: activate s2 and drain exactly its objects (avoiding the
+        // empty-cache pop that drain_all would trigger).
+        cache.activate_span(&s2, &pm, &m).unwrap();
+        let mut s2_objects = Vec::new();
+        while s2_objects.len() < obj_count {
+            let want = (obj_count - s2_objects.len()).min(MAX_BATCH_LEN);
+            match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, want) {
+                RemoveResult::Ok(batch) => {
+                    for i in 0..batch.len() {
+                        s2_objects.push(batch.index(i));
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(s2_objects.len(), obj_count);
+        assert_eq!(cache.bin(sc).unwrap().empty_count(), 1, "s1 still cached");
+
+        // Step 3: return all objects to s2 → empty, but cache is full (MAX=1).
+        let r2 = cache.insert_batch(&s2, &s2_objects, obj_count);
+        assert!(r2.span_empty, "cache full (MAX=1) → caller must deactivate");
     }
 }

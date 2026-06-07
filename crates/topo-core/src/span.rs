@@ -56,7 +56,7 @@ use crate::size_class;
 /// Largest `objects_per_slab` over every size class in the generated table — the
 /// number of bits the widest slab's bitmap must cover. Computed from the table (a
 /// `const` scan) so it cannot drift from the shipped size classes (DD-1).
-const fn max_objects_per_slab() -> usize {
+pub(crate) const fn max_objects_per_slab() -> usize {
     let mut max = 0usize;
     let mut i = 0;
     while i < SIZE_CLASSES.len() {
@@ -333,6 +333,10 @@ pub struct NonCentralResidency {
 impl NonCentralResidency {
     /// The trivial residency before any cache exists (M1): every cached/quarantined
     /// term is zero, so the law reduces to `object_count = live + central_free`.
+    ///
+    /// **M2 action required (plan 05):** when local/transfer caches arrive, every
+    /// call site using `NONE` must supply actual cached and quarantined counts.
+    /// Search for `NonCentralResidency::NONE` to find all sites.
     pub const NONE: NonCentralResidency = NonCentralResidency {
         local_cached: 0,
         transfer_cached: 0,
@@ -711,17 +715,25 @@ impl SpanDescriptor {
         self.integrity.load(Ordering::Acquire) == self.compute_integrity()
     }
 
-    /// The next pointer in the central partial list (for central module use).
-    /// Only valid under the central bin's lock.
+    /// The next pointer in the central list chain (partial or empty, W5-4a).
+    ///
+    /// # Lock contract
+    ///
+    /// Only valid under the owning [`CentralBin`](crate::central::CentralBin)'s
+    /// lock. The span lock does NOT protect this field.
     #[inline]
-    pub fn central_next_ptr(&self) -> *mut SpanDescriptor {
+    pub(crate) fn central_next_ptr(&self) -> *mut SpanDescriptor {
         self.central_next.load(Ordering::Relaxed)
     }
 
-    /// Set the next pointer in the central partial list (for central module use).
-    /// Only valid under the central bin's lock.
+    /// Set the next pointer in the central list chain (partial or empty, W5-4a).
+    ///
+    /// # Lock contract
+    ///
+    /// Only valid under the owning [`CentralBin`](crate::central::CentralBin)'s
+    /// lock. The span lock does NOT protect this field.
     #[inline]
-    pub fn set_central_next(&self, next: *mut SpanDescriptor) {
+    pub(crate) fn set_central_next(&self, next: *mut SpanDescriptor) {
         self.central_next.store(next, Ordering::Relaxed);
     }
 
