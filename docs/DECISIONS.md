@@ -520,9 +520,10 @@ implementation choices are ratified here, the module docs carry the rest.
 
 * **Performance is measured, not asserted.** `crates/topo-core/benches/cpu_cache.rs`
   compares the RSEQ fast path against the locked baseline; on a 4-core x86-64 host
-  with RSEQ active the push/pop round-trip is **~21 ns → ~13 ns (≈ 37 % faster)** and a
-  16-op burst **~265 ns → ~192 ns (≈ 28 %)** — the per-op lock-CAS the restartable
-  sequence removes. Non-gating (`cargo xtask bench`).
+  with RSEQ active the push/pop round-trip is **≈ 21 ns → ≈ 12.5 ns (≈ 40 % faster)**
+  and a 16-op burst **≈ 265 ns → ≈ 190 ns (≈ 28 %)** — the per-op lock-CAS the
+  restartable sequence removes (plus one saved thread-pointer read on the hot path).
+  Non-gating (`cargo xtask bench`).
 
 * **Concurrency runs under TSan (the DoD addendum).** `cargo xtask test --kind tsan`
   (opt-in nightly, a gating CI job) runs the equivalence/W7-4/battery and the W6
