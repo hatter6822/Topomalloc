@@ -132,7 +132,7 @@ pub fn gen(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `test [--kind unit|prop|diff|fuzz|loom|rseq] [--target T]` — run the test suites.
+/// `test [--kind unit|prop|diff|fuzz|loom|tsan|rseq] [--target T]` — run the test suites.
 ///
 /// With `--target` (used by the AArch64 CI job), tests are built for that target
 /// and run via the `.cargo/config.toml` runner (`qemu-aarch64`). Without it, the
@@ -184,6 +184,9 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("loom") => {
             loom_steps(&mut r);
         }
+        Some("tsan") => {
+            tsan_steps(&mut r);
+        }
         Some("rseq") => {
             // The W7 RSEQ / pinned-core battery (also part of the default
             // `--workspace` run; this is the focused subset, G-fast).
@@ -204,7 +207,7 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
             );
         }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|rseq)");
+            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|tsan|rseq)");
             r.record("unknown test kind", false);
         }
         None => {
@@ -504,6 +507,80 @@ fn loom_steps(r: &mut Runner<'_>) {
         "loom protocols (seqlock + publish/read + large-free)",
         "cargo",
         &["test", "-p", "topo-core", "--test", "loom_protocols"],
+    );
+    std::env::remove_var("RUSTFLAGS");
+}
+
+/// Whether a `nightly` toolchain is installed (TSan needs `-Zsanitizer=thread`
+/// + `-Zbuild-std`, both nightly-only).
+fn nightly_available() -> bool {
+    matches!(
+        Command::new("rustc").args(["+nightly", "--version"]).output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// ThreadSanitizer over the W6/W7 concurrency tests (the DoD addendum: every
+/// concurrency WU runs under TSan). Needs the nightly toolchain (opt-in for the
+/// allocator, like `cargo-fuzz`); a missing nightly is noted and skipped, not a
+/// failure. **Blind spot:** TSan instruments compiler-generated accesses, *not*
+/// inline assembly, so the RSEQ sequence interior is invisible to it — the
+/// asm-vs-atomic interactions are covered by the forced-migration conservation
+/// tests instead. TSan here validates the locked path, every atomic, and the
+/// W7-4 lock/fence coordination.
+fn tsan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping TSan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    std::env::set_var("RUSTFLAGS", "-Zsanitizer=thread");
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "tsan: rseq equivalence + W7-4 coordination (topo-core)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--test",
+            "rseq_equivalence",
+        ],
+    );
+    r.run(
+        "tsan: rseq battery (topo-arch)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-arch",
+            "--test",
+            "rseq",
+        ],
+    );
+    r.run(
+        "tsan: cache concurrency (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--lib",
+        ],
     );
     std::env::remove_var("RUSTFLAGS");
 }

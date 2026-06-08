@@ -118,6 +118,26 @@ jobs:
             attempt || { echo "::warning::AArch64 test flaked; retrying once (DD-2)"; attempt; }
           fi
 
+  # G-conc (TSan): the W6/W7 concurrency tests run under ThreadSanitizer (DoD
+  # addendum). Nightly is opt-in for the allocator (like cargo-fuzz); this job
+  # installs it just for `-Zsanitizer=thread` + `-Zbuild-std`. The RSEQ assembly
+  # interior is a TSan blind spot (covered by the forced-migration conservation
+  # tests); TSan validates the locked path, the atomics, and the W7-4 lock/fence
+  # coordination.
+  tsan:
+    name: tsan (concurrency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install nightly + rust-src (for the sanitizer)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+      - run: cargo xtask test --kind tsan
+
   # ABI compatibility (§34.1): compile + link + run the C harness against the
   # generated header and the staticlib.
   abi-test:
