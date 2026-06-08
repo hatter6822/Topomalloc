@@ -55,5 +55,9 @@ harness = false
 name = "extent"
 harness = false
 
+[[bench]]
+name = "cpu_cache"
+harness = false
+
 [lints]
 workspace = true
