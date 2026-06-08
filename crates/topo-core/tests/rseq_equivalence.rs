@@ -11,7 +11,7 @@
 //! qemu-user), `enable_rseq()` reports `false`, the cache stays on the locked
 //! baseline, and the same tests still pass (the fallback *is* the baseline).
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use topo_core::{size_class, ArenaId, BumpArena, CoreId, CpuCache, FeOutcome, SizeClassId};
@@ -143,7 +143,9 @@ fn forced_migration_conserves_tokens_real_cache() {
     let placed = cc.push_batch(CoreId(0), sc, &tokens);
     assert_eq!(placed, ntok, "seed must fit one slot");
 
-    let aborts = Arc::new(AtomicU64::new(0));
+    // Note: `fe_pop`/`fe_push` retry `Abort` internally, so the worker only ever
+    // observes `Success`/`Empty`/`Full` — the abort handling is invisible here by
+    // design (the asm-level abort battery lives in `topo-arch/tests/rseq.rs`).
     let in_flight = Arc::new(AtomicUsize::new(0));
     let nthreads = ncpu;
     let iters = 200_000u64;
@@ -153,7 +155,6 @@ fn forced_migration_conserves_tokens_real_cache() {
             let cc = cc.clone();
             let m = &m;
             let in_flight = in_flight.clone();
-            let _aborts = aborts.clone();
             s.spawn(move || {
                 cc.register_current_thread();
                 let mut rng =
