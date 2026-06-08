@@ -69,6 +69,15 @@ pub struct FlushResult {
 ///
 /// **Hand-over-hand:** the transfer lock is released BEFORE the central lock
 /// is acquired.
+///
+/// **OOM-retry contract.** When `need_span` is `true`, the central free list
+/// is empty for this `(node, arena, label, sc)`. The caller must:
+/// 1. Create a new span from the backend (§A.2 OOM-retry).
+/// 2. Activate it via [`CentralCache::activate_span`].
+/// 3. Call `refill` again.
+///
+/// Use [`refill_with_retry`] for a convenience wrapper that automates
+/// the retry loop with a caller-provided span-creation callback.
 #[allow(clippy::too_many_arguments)]
 pub fn refill(
     core: CoreId,
@@ -86,7 +95,7 @@ pub fn refill(
     let mut buf = [0usize; MAX_BATCH_LEN];
 
     // Step 1: try the transfer cache (lock rank 3, released before step 3).
-    let popped = transfer.try_pop_batch(sc, &mut buf, batch_size, meta);
+    let popped = transfer.try_pop_batch(arena, sc, &mut buf, batch_size, meta);
 
     if popped > 0 {
         // Step 2: push into CPU cache slot (per-CPU lock, released on return).
@@ -112,7 +121,7 @@ pub fn refill(
             // holds active spans in monotonic metadata).
             let span = unsafe { &*batch.span() };
             let base = span.base();
-            let slab_header = 0usize; // common case, out-of-line metadata
+            let slab_header = span.slab_header() as usize;
             let layout = match SlabLayout::compute(sc, base, slab_header) {
                 Some(l) => l,
                 None => {
@@ -144,6 +153,48 @@ pub fn refill(
     }
 }
 
+/// Convenience wrapper around [`refill`] that retries when the central free
+/// list is empty, using a caller-provided callback to create and activate
+/// new spans.
+///
+/// `create_span` is called with `sc` and should return `true` if a span was
+/// successfully created and activated in the central cache. The loop retries
+/// up to `max_retries` times. No locks are held during the callback.
+#[allow(clippy::too_many_arguments)]
+pub fn refill_with_retry<F>(
+    core: CoreId,
+    node: NodeId,
+    arena: ArenaId,
+    label: Label,
+    sc: SizeClassId,
+    cpu_cache: &CpuCache,
+    transfer: &TransferCache,
+    central: &CentralCache,
+    pagemap: &PageMap,
+    meta: &dyn MetadataAlloc,
+    max_retries: usize,
+    mut create_span: F,
+) -> RefillResult
+where
+    F: FnMut(SizeClassId) -> bool,
+{
+    for _ in 0..=max_retries {
+        let r = refill(
+            core, node, arena, label, sc, cpu_cache, transfer, central, pagemap, meta,
+        );
+        if !r.need_span || r.filled > 0 {
+            return r;
+        }
+        if !create_span(sc) {
+            return r;
+        }
+    }
+    RefillResult {
+        filled: 0,
+        need_span: true,
+    }
+}
+
 /// Flush the per-CPU cache for `(core, sc)` to the transfer cache or central
 /// free list (W6-3b, W6-3c).
 ///
@@ -157,8 +208,10 @@ pub fn refill(
 ///
 /// **Hand-over-hand:** the transfer lock is released BEFORE the central lock
 /// is acquired (step 3).
+#[allow(clippy::too_many_arguments)]
 pub fn flush(
     core: CoreId,
+    arena: ArenaId,
     sc: SizeClassId,
     cpu_cache: &CpuCache,
     transfer: &TransferCache,
@@ -179,7 +232,7 @@ pub fn flush(
     }
 
     // Step 2: try pushing to transfer cache (lock rank 3).
-    let pushed_to_transfer = transfer.try_push_batch(sc, &buf[..popped], meta);
+    let pushed_to_transfer = transfer.try_push_batch(arena, sc, &buf[..popped], meta);
 
     if pushed_to_transfer >= popped {
         return FlushResult {
@@ -203,8 +256,12 @@ pub fn flush(
 ///
 /// Iterates over all size classes and flushes each non-empty slot.
 /// Returns the total number of objects flushed.
+/// **Plan 07 hook site:** when background memory management lands, this
+/// function is the natural place to notify the extent manager about emptied
+/// spans and reclaimable memory.
 pub fn flush_idle_cpu(
     core: CoreId,
+    arena: ArenaId,
     cpu_cache: &CpuCache,
     transfer: &TransferCache,
     central: &CentralCache,
@@ -215,7 +272,7 @@ pub fn flush_idle_cpu(
 
     for i in 0..NUM_SIZE_CLASSES {
         let sc = SizeClassId::new(i);
-        let result = flush(core, sc, cpu_cache, transfer, central, pagemap, meta);
+        let result = flush(core, arena, sc, cpu_cache, transfer, central, pagemap, meta);
         total_flushed = total_flushed.saturating_add(result.flushed);
 
         // Continue flushing until the slot is empty.
@@ -223,7 +280,7 @@ pub fn flush_idle_cpu(
         // we drain it in a loop.
         let mut more = result.flushed > 0;
         while more {
-            let r = flush(core, sc, cpu_cache, transfer, central, pagemap, meta);
+            let r = flush(core, arena, sc, cpu_cache, transfer, central, pagemap, meta);
             total_flushed = total_flushed.saturating_add(r.flushed);
             more = r.flushed > 0;
         }
@@ -266,8 +323,8 @@ fn flush_addrs_to_central(
                 // which only stores valid pointers.
                 let span = unsafe { &*span_ptr };
                 let base = span.base();
-                // Compute the object index from the address.
-                let layout = match SlabLayout::compute(sc, base, 0) {
+                let slab_hdr = span.slab_header() as usize;
+                let layout = match SlabLayout::compute(sc, base, slab_hdr) {
                     Some(l) => l,
                     None => continue,
                 };
@@ -352,12 +409,7 @@ mod tests {
         unsafe { BumpArena::new(ptr, len) }
     }
 
-    fn make_span(
-        id: u32,
-        sc: SizeClassId,
-        base: usize,
-        m: &BumpArena,
-    ) -> SpanDescriptor {
+    fn make_span(id: u32, sc: SizeClassId, base: usize, m: &BumpArena) -> SpanDescriptor {
         let row = size_class::row(sc);
         SpanDescriptor::new(
             SpanId(id),
@@ -384,7 +436,7 @@ mod tests {
 
         // Pre-populate the transfer cache.
         let addrs: Vec<usize> = (1000..1032).collect();
-        let pushed = tc.try_push_batch(sc, &addrs, &m);
+        let pushed = tc.try_push_batch(ArenaId::DEFAULT, sc, &addrs, &m);
         assert!(pushed > 0);
 
         // Init the CPU slot.
@@ -491,7 +543,7 @@ mod tests {
         cc.push_batch(core, sc, &addrs);
 
         // Flush should push to transfer cache.
-        let result = flush(core, sc, &cc, &tc, &central, &pm, &m);
+        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
         assert!(result.flushed > 0);
 
         // Transfer cache should have the addresses.
@@ -534,7 +586,7 @@ mod tests {
         // Fill the transfer cache to capacity.
         let transfer_cap = size_class::batch(sc) * 4; // default capacity
         let dummy_addrs: Vec<usize> = (5000..5000 + transfer_cap).collect();
-        tc.try_push_batch(sc, &dummy_addrs, &m);
+        tc.try_push_batch(ArenaId::DEFAULT, sc, &dummy_addrs, &m);
 
         // Compute addresses from indices and put some in the CPU cache.
         let layout = SlabLayout::compute(sc, base, 0).unwrap();
@@ -550,7 +602,7 @@ mod tests {
         cc.push_batch(core, sc, &addrs_to_flush);
 
         // Flush -- transfer is full, so objects go to central.
-        let result = flush(core, sc, &cc, &tc, &central, &pm, &m);
+        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
         assert!(result.flushed > 0);
 
         // Conservation law should hold on the span.
@@ -575,7 +627,7 @@ mod tests {
         cc.push_batch(core, sc0, &[100, 200, 300]);
         cc.push_batch(core, sc1, &[400, 500]);
 
-        let total = flush_idle_cpu(core, &cc, &tc, &central, &pm, &m);
+        let total = flush_idle_cpu(core, ArenaId::DEFAULT, &cc, &tc, &central, &pm, &m);
         assert_eq!(total, 5);
 
         // CPU slots should be empty.
@@ -667,7 +719,7 @@ mod tests {
         assert!(span.conservation_holds_central_only());
 
         // Flush back (via transfer or central).
-        let r2 = flush(core, sc, &cc, &tc, &central, &pm, &m);
+        let r2 = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
         assert!(r2.flushed > 0);
 
         // The transfer cache has some objects now; they are logically in the
@@ -678,5 +730,86 @@ mod tests {
         // (objects moved from CPU cache to transfer cache, not back to central).
         // Conservation holds because live_count includes cached objects.
         assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn refill_with_retry_creates_span_and_succeeds() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let base = 0x4000_0000usize;
+
+        cc.init_slot(core, sc, &m, 32);
+
+        // First attempt: central is empty → need_span.
+        // The create_span callback activates a span, so the retry succeeds.
+        let span = make_span(1, sc, base, &m);
+        let span_ref = &span;
+        let central_ref = &central;
+        let pm_ref = &pm;
+        let m_ref = &m;
+        let mut called = 0u32;
+
+        let result = refill_with_retry(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            central_ref,
+            pm_ref,
+            m_ref,
+            3,
+            |_sc| {
+                called += 1;
+                central_ref.activate_span(span_ref, pm_ref, m_ref).is_ok()
+            },
+        );
+
+        assert!(result.filled > 0);
+        assert!(!result.need_span);
+        assert_eq!(called, 1);
+    }
+
+    #[test]
+    fn refill_with_retry_respects_max_retries() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+
+        cc.init_slot(core, sc, &m, 32);
+
+        let mut called = 0u32;
+        let result = refill_with_retry(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            3,
+            |_sc| {
+                called += 1;
+                false // always fail
+            },
+        );
+
+        assert_eq!(result.filled, 0);
+        assert!(result.need_span);
+        assert_eq!(called, 1); // fails on first attempt, stops
     }
 }

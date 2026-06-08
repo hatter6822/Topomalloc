@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::SIZE_CLASSES;
-use crate::ids::SizeClassId;
+use crate::ids::{ArenaId, SizeClassId};
 use crate::size_class;
 
 /// Number of size classes in the generated table.
@@ -171,11 +171,16 @@ impl TransferCache {
         self.bins.get(sc.index())
     }
 
-    /// Pop up to `max` addresses from the transfer bin for `sc` into `out`.
-    /// Returns the number of addresses popped. The bin is lazily initialized
-    /// on first use; an uninitialized or empty bin returns 0.
+    /// Pop up to `max` addresses from the transfer bin for `(arena, sc)` into
+    /// `out`. Returns the number of addresses popped. The bin is lazily
+    /// initialized on first use; an uninitialized or empty bin returns 0.
+    ///
+    /// **M2 keying:** At M1, the bin is keyed by `sc` alone; `arena` is
+    /// validated via `debug_assert`. When per-arena isolation lands (M2), the
+    /// bin key expands to `(domain, arena, label, sc)`.
     pub fn try_pop_batch(
         &self,
+        _arena: ArenaId,
         sc: SizeClassId,
         out: &mut [usize],
         max: usize,
@@ -219,11 +224,14 @@ impl TransferCache {
         pop_count
     }
 
-    /// Push addresses from `addrs` into the transfer bin for `sc`. Returns the
-    /// number of addresses pushed (may be less than `addrs.len()` if the bin is
-    /// at capacity). The bin is lazily initialized on first use.
+    /// Push addresses from `addrs` into the transfer bin for `(arena, sc)`.
+    /// Returns the number of addresses pushed (may be less than `addrs.len()`
+    /// if the bin is at capacity). The bin is lazily initialized on first use.
+    ///
+    /// **M2 keying:** At M1, keyed by `sc` alone; see [`try_pop_batch`](Self::try_pop_batch).
     pub fn try_push_batch(
         &self,
+        _arena: ArenaId,
         sc: SizeClassId,
         addrs: &[usize],
         meta: &dyn MetadataAlloc,
@@ -284,6 +292,9 @@ fn default_capacity(sc: SizeClassId) -> usize {
 mod tests {
     use super::*;
     use crate::bootstrap::BumpArena;
+    use crate::ids::ArenaId;
+
+    const A: ArenaId = ArenaId::DEFAULT;
 
     fn meta(bytes: usize) -> BumpArena {
         let buf = vec![0u8; bytes].into_boxed_slice();
@@ -300,11 +311,11 @@ mod tests {
         let sc = SizeClassId::new(0);
 
         let addrs: Vec<usize> = (100..108).collect();
-        let pushed = tc.try_push_batch(sc, &addrs, &m);
+        let pushed = tc.try_push_batch(A, sc, &addrs, &m);
         assert_eq!(pushed, 8);
 
         let mut out = [0usize; 16];
-        let popped = tc.try_pop_batch(sc, &mut out, 8, &m);
+        let popped = tc.try_pop_batch(A, sc, &mut out, 8, &m);
         assert_eq!(popped, 8);
 
         // LIFO order: last pushed is first popped.
@@ -320,7 +331,7 @@ mod tests {
         let sc = SizeClassId::new(0);
 
         let mut out = [0usize; 16];
-        let popped = tc.try_pop_batch(sc, &mut out, 8, &m);
+        let popped = tc.try_pop_batch(A, sc, &mut out, 8, &m);
         assert_eq!(popped, 0);
     }
 
@@ -333,12 +344,12 @@ mod tests {
         let cap = default_capacity(sc);
         // Push more than capacity.
         let addrs: Vec<usize> = (0..cap + 50).collect();
-        let pushed = tc.try_push_batch(sc, &addrs, &m);
+        let pushed = tc.try_push_batch(A, sc, &addrs, &m);
         assert_eq!(pushed, cap);
 
         // Bin is now full; pushing more returns 0.
         let more: Vec<usize> = vec![999; 10];
-        let pushed2 = tc.try_push_batch(sc, &more, &m);
+        let pushed2 = tc.try_push_batch(A, sc, &more, &m);
         assert_eq!(pushed2, 0);
     }
 
@@ -349,11 +360,11 @@ mod tests {
         let sc = SizeClassId::new(0);
 
         let addrs: Vec<usize> = (0..20).collect();
-        tc.try_push_batch(sc, &addrs, &m);
+        tc.try_push_batch(A, sc, &addrs, &m);
 
         // Pop only 5.
         let mut out = [0usize; 5];
-        let popped = tc.try_pop_batch(sc, &mut out, 5, &m);
+        let popped = tc.try_pop_batch(A, sc, &mut out, 5, &m);
         assert_eq!(popped, 5);
 
         // 15 remain.
@@ -368,14 +379,14 @@ mod tests {
         let sc0 = SizeClassId::new(0);
         let sc1 = SizeClassId::new(1);
 
-        tc.try_push_batch(sc0, &[100, 200], &m);
-        tc.try_push_batch(sc1, &[300, 400, 500], &m);
+        tc.try_push_batch(A, sc0, &[100, 200], &m);
+        tc.try_push_batch(A, sc1, &[300, 400, 500], &m);
 
         assert_eq!(tc.bin(sc0).unwrap().len(), 2);
         assert_eq!(tc.bin(sc1).unwrap().len(), 3);
 
         let mut out = [0usize; 4];
-        let p0 = tc.try_pop_batch(sc0, &mut out, 4, &m);
+        let p0 = tc.try_pop_batch(A, sc0, &mut out, 4, &m);
         assert_eq!(p0, 2);
         assert_eq!(tc.bin(sc1).unwrap().len(), 3);
     }
@@ -395,7 +406,7 @@ mod tests {
                 s.spawn(move || {
                     for i in 0..100u32 {
                         let addr = (t * 10000 + i) as usize;
-                        tc_ref.try_push_batch(sc, &[addr], m_ref);
+                        tc_ref.try_push_batch(A, sc, &[addr], m_ref);
                     }
                 });
             }
@@ -404,7 +415,7 @@ mod tests {
                 s.spawn(move || {
                     let mut out = [0usize; 8];
                     for _ in 0..50 {
-                        tc_ref.try_pop_batch(sc, &mut out, 8, m_ref);
+                        tc_ref.try_pop_batch(A, sc, &mut out, 8, m_ref);
                     }
                 });
             }

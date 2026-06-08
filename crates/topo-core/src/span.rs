@@ -540,6 +540,13 @@ impl SpanDescriptor {
         self.object_count.load(Ordering::Acquire)
     }
 
+    /// Bytes reserved at the span start before object 0 (§16.3). Zero when
+    /// metadata is out-of-line (the common case); non-zero for inline metadata.
+    #[inline]
+    pub fn slab_header(&self) -> u32 {
+        self.slab_header.load(Ordering::Acquire)
+    }
+
     /// Byte length of the span (`page_count * PAGE_SIZE`). Never overflows for a
     /// real span (its bytes fit the address space).
     #[inline]

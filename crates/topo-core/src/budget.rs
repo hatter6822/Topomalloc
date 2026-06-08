@@ -34,7 +34,22 @@ const DEFAULT_MISS_THRESHOLD: u64 = 64;
 /// last reset.
 const DEFAULT_OVERFLOW_THRESHOLD: u64 = 64;
 
+/// Default number of allocations between `adapt` calls.
+const DEFAULT_ADAPT_INTERVAL: u64 = 4096;
+
 /// The cache budget controller (W6-5).
+///
+/// **Periodic invocation.** The budget controller must be invoked periodically
+/// by the allocator. Two strategies:
+/// - **Timer-based:** Call [`adapt`](Self::adapt) every N milliseconds (e.g., 10ms).
+/// - **Count-based:** Call [`adapt`](Self::adapt) every N allocations. The fast
+///   path increments a per-CPU counter and calls `adapt` when the counter
+///   crosses [`adapt_interval`](Self::adapt_interval).
+///
+/// **Thread cache budgets.** The controller currently manages per-CPU cache
+/// soft capacities. Per-thread cache budgets are managed independently by
+/// [`ThreadCache::set_budget`](crate::thread_cache::ThreadCache::set_budget);
+/// a future enhancement may unify them under a single global budget.
 pub struct CacheBudget {
     /// Global budget: maximum total soft capacity across all CPUs and SCs
     /// (in objects). When the total exceeds this, the least-active slots are
@@ -44,6 +59,10 @@ pub struct CacheBudget {
     miss_threshold: u64,
     /// Overflow threshold for shrinking a slot.
     overflow_threshold: u64,
+    /// Number of allocations between `adapt` calls (count-based invocation).
+    adapt_interval: u64,
+    /// Per-instance allocation counter for `should_adapt`.
+    alloc_counter: core::sync::atomic::AtomicU64,
 }
 
 impl CacheBudget {
@@ -53,6 +72,8 @@ impl CacheBudget {
             global_budget,
             miss_threshold: DEFAULT_MISS_THRESHOLD,
             overflow_threshold: DEFAULT_OVERFLOW_THRESHOLD,
+            adapt_interval: DEFAULT_ADAPT_INTERVAL,
+            alloc_counter: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -78,6 +99,28 @@ impl CacheBudget {
     #[inline]
     pub fn set_overflow_threshold(&mut self, threshold: u64) {
         self.overflow_threshold = threshold;
+    }
+
+    /// The adapt interval (allocations between `adapt` calls).
+    #[inline]
+    pub fn adapt_interval(&self) -> u64 {
+        self.adapt_interval
+    }
+
+    /// Set the adapt interval.
+    #[inline]
+    pub fn set_adapt_interval(&mut self, interval: u64) {
+        self.adapt_interval = interval;
+    }
+
+    /// Returns `true` every `adapt_interval` calls, for count-based periodic
+    /// invocation. Thread-safe (lock-free atomic counter).
+    #[inline]
+    pub fn should_adapt(&self) -> bool {
+        let n = self
+            .alloc_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.adapt_interval > 0 && n.is_multiple_of(self.adapt_interval)
     }
 
     /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for each
@@ -252,7 +295,9 @@ mod tests {
     use crate::bootstrap::BumpArena;
     use crate::cpu_cache::CpuCache;
     use crate::fe::CoreId;
-    use crate::ids::SizeClassId;
+    use crate::ids::{ArenaId, SizeClassId};
+
+    const A: ArenaId = ArenaId::DEFAULT;
 
     fn meta(bytes: usize) -> BumpArena {
         let buf = vec![0u8; bytes].into_boxed_slice();
@@ -281,7 +326,7 @@ mod tests {
 
         // Simulate many misses.
         for _ in 0..100 {
-            cc.fe_pop(core, sc, &m); // each miss increments the counter
+            cc.fe_pop(core, A, sc, &m); // each miss increments the counter
         }
 
         let budget = CacheBudget::new(100_000);
@@ -314,12 +359,12 @@ mod tests {
 
         // Fill to hard capacity.
         for i in 0..hard_cap {
-            cc.fe_push(core, sc, i as usize + 1, &m);
+            cc.fe_push(core, A, sc, i as usize + 1, &m);
         }
 
         // Simulate many overflows.
         for _ in 0..100 {
-            cc.fe_push(core, sc, 999, &m); // each overflow increments counter
+            cc.fe_push(core, A, sc, 999, &m); // each overflow increments counter
         }
 
         let budget = CacheBudget::new(100_000);
@@ -396,8 +441,8 @@ mod tests {
         cc.init_slot(core, sc, &m, batch);
 
         // Push some addresses.
-        cc.fe_push(core, sc, 100, &m);
-        cc.fe_push(core, sc, 200, &m);
+        cc.fe_push(core, A, sc, 100, &m);
+        cc.fe_push(core, A, sc, 200, &m);
 
         let budget = CacheBudget::new(1000);
         let stats = budget.slot_stats(&cc, 0, sc).unwrap();
@@ -414,5 +459,20 @@ mod tests {
         assert!(budget.global_budget() > 0);
         assert_eq!(budget.miss_threshold, DEFAULT_MISS_THRESHOLD);
         assert_eq!(budget.overflow_threshold, DEFAULT_OVERFLOW_THRESHOLD);
+    }
+
+    #[test]
+    fn should_adapt_fires_at_interval() {
+        let mut budget = CacheBudget::new(100_000);
+        budget.set_adapt_interval(100);
+
+        let mut fire_count = 0u32;
+        for _ in 0..500 {
+            if budget.should_adapt() {
+                fire_count += 1;
+            }
+        }
+        // Should fire at 0, 100, 200, 300, 400 = 5 times.
+        assert_eq!(fire_count, 5);
     }
 }

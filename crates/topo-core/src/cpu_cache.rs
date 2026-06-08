@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use crate::bootstrap::MetadataAlloc;
 use crate::fe::{CoreId, FeOutcome};
 use crate::generated::tables::SIZE_CLASSES;
-use crate::ids::SizeClassId;
+use crate::ids::{ArenaId, SizeClassId};
 use crate::size_class;
 
 /// Number of size classes in the generated table.
@@ -131,8 +131,7 @@ impl CpuSlot {
     #[inline]
     pub fn set_soft_capacity(&self, cap: u32) {
         let hard = self.hard_capacity.load(Ordering::Relaxed);
-        self.soft_capacity
-            .store(cap.min(hard), Ordering::Relaxed);
+        self.soft_capacity.store(cap.min(hard), Ordering::Relaxed);
     }
 
     /// Initialize the slot: allocate the address buffer from `meta`.
@@ -295,7 +294,7 @@ impl CpuCache {
         slot.init(meta, hard_cap, initial_soft_cap)
     }
 
-    /// Pop an address from the per-CPU slot for `(core, sc)`.
+    /// Pop an address from the per-CPU slot for `(core, arena, sc)`.
     ///
     /// Returns `FeOutcome::Success(addr)` on success, `FeOutcome::Empty` if
     /// the slot is empty (needs refill). The slot is lazily initialized on
@@ -303,6 +302,7 @@ impl CpuCache {
     pub fn fe_pop(
         &self,
         core: CoreId,
+        _arena: ArenaId,
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<usize> {
@@ -342,14 +342,15 @@ impl CpuCache {
         FeOutcome::Success(addr)
     }
 
-    /// Push an address into the per-CPU slot for `(core, sc)`.
+    /// Push an address into the per-CPU slot for `(core, arena, sc)`.
     ///
     /// Returns `FeOutcome::Success(())` on success, `FeOutcome::Full` if the
-    /// slot is at capacity (needs flush). The slot is lazily initialized on
-    /// first use via `meta`.
+    /// slot is at soft capacity (needs flush). The slot is lazily initialized
+    /// on first use via `meta`.
     pub fn fe_push(
         &self,
         core: CoreId,
+        _arena: ArenaId,
         sc: SizeClassId,
         addr: usize,
         meta: &dyn MetadataAlloc,
@@ -374,8 +375,10 @@ impl CpuCache {
         }
 
         let cur_len = slot.len.load(Ordering::Relaxed);
+        let soft = slot.soft_capacity.load(Ordering::Relaxed);
         let hard = slot.hard_capacity.load(Ordering::Relaxed);
-        if cur_len >= hard {
+        let effective = if soft > 0 { soft } else { hard };
+        if cur_len >= effective {
             slot.overflows.fetch_add(1, Ordering::Relaxed);
             return FeOutcome::Full;
         }
@@ -392,13 +395,7 @@ impl CpuCache {
     /// Pop up to `max` addresses from the per-CPU slot for `(core, sc)` into
     /// `out`. Returns the number of addresses popped. Used by flush operations
     /// (cache_ops W6-3b).
-    pub fn pop_batch(
-        &self,
-        core: CoreId,
-        sc: SizeClassId,
-        out: &mut [usize],
-        max: usize,
-    ) -> usize {
+    pub fn pop_batch(&self, core: CoreId, sc: SizeClassId, out: &mut [usize], max: usize) -> usize {
         let cpu = match self.cpus.get(core.index()) {
             Some(c) => c,
             None => return 0,
@@ -437,12 +434,7 @@ impl CpuCache {
     /// Returns the number of addresses pushed (may be less than `addrs.len()`
     /// if the slot hits hard capacity). Used by refill operations (cache_ops
     /// W6-3a).
-    pub fn push_batch(
-        &self,
-        core: CoreId,
-        sc: SizeClassId,
-        addrs: &[usize],
-    ) -> usize {
+    pub fn push_batch(&self, core: CoreId, sc: SizeClassId, addrs: &[usize]) -> usize {
         let cpu = match self.cpus.get(core.index()) {
             Some(c) => c,
             None => return 0,
@@ -491,6 +483,9 @@ unsafe impl Send for CpuCache {}
 mod tests {
     use super::*;
     use crate::bootstrap::BumpArena;
+    use crate::ids::ArenaId;
+
+    const A: ArenaId = ArenaId::DEFAULT;
 
     fn meta(bytes: usize) -> BumpArena {
         let buf = vec![0u8; bytes].into_boxed_slice();
@@ -506,7 +501,7 @@ mod tests {
         let cc = CpuCache::new();
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
-        assert!(cc.fe_pop(core, sc, &m).is_empty());
+        assert!(cc.fe_pop(core, A, sc, &m).is_empty());
     }
 
     #[test]
@@ -516,13 +511,31 @@ mod tests {
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
 
-        assert!(cc.fe_push(core, sc, 0xDEAD, &m).is_success());
-        assert!(cc.fe_push(core, sc, 0xBEEF, &m).is_success());
+        assert!(cc.fe_push(core, A, sc, 0xDEAD, &m).is_success());
+        assert!(cc.fe_push(core, A, sc, 0xBEEF, &m).is_success());
 
         // LIFO: last pushed first popped.
-        assert_eq!(cc.fe_pop(core, sc, &m).unwrap(), 0xBEEF);
-        assert_eq!(cc.fe_pop(core, sc, &m).unwrap(), 0xDEAD);
-        assert!(cc.fe_pop(core, sc, &m).is_empty());
+        assert_eq!(cc.fe_pop(core, A, sc, &m).unwrap(), 0xBEEF);
+        assert_eq!(cc.fe_pop(core, A, sc, &m).unwrap(), 0xDEAD);
+        assert!(cc.fe_pop(core, A, sc, &m).is_empty());
+    }
+
+    #[test]
+    fn push_beyond_soft_capacity_returns_full() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+
+        // Lazy init sets soft_cap = batch_size. Fill to that limit.
+        for i in 0..batch {
+            let result = cc.fe_push(core, A, sc, i as usize + 1, &m);
+            assert!(result.is_success(), "push {i} of {batch} failed");
+        }
+
+        // Next push hits soft_capacity -- returns Full.
+        assert!(cc.fe_push(core, A, sc, 999, &m).is_full());
     }
 
     #[test]
@@ -531,19 +544,18 @@ mod tests {
         let cc = CpuCache::new();
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
-        let hard_cap = size_class::max_local_capacity(sc);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
 
-        // Fill to hard capacity.
+        // Init with soft_cap = hard_cap so fe_push fills to the absolute ceiling.
+        cc.init_slot(core, sc, &m, hard_cap);
+
         for i in 0..hard_cap {
-            let result = cc.fe_push(core, sc, i + 1, &m);
-            assert!(
-                result.is_success(),
-                "push {i} of {hard_cap} failed"
-            );
+            let result = cc.fe_push(core, A, sc, i as usize + 1, &m);
+            assert!(result.is_success(), "push {i} of {hard_cap} failed");
         }
 
         // Next push should return Full.
-        assert!(cc.fe_push(core, sc, 999, &m).is_full());
+        assert!(cc.fe_push(core, A, sc, 999, &m).is_full());
     }
 
     #[test]
@@ -552,18 +564,20 @@ mod tests {
         let cc = CpuCache::new();
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
-        let hard_cap = size_class::max_local_capacity(sc);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
 
-        // Fill to hard capacity.
+        // Init with soft_cap = hard_cap to fill to hard ceiling.
+        cc.init_slot(core, sc, &m, hard_cap);
+
         for i in 0..hard_cap {
-            cc.fe_push(core, sc, i + 1, &m);
+            cc.fe_push(core, A, sc, i as usize + 1, &m);
         }
 
         // Verify len does not exceed hard_capacity.
         let cpu = cc.per_cpu(core).unwrap();
         let slot = cpu.slot(sc).unwrap();
         assert!(slot.len() <= slot.hard_capacity());
-        assert_eq!(slot.len() as usize, hard_cap);
+        assert_eq!(slot.len(), hard_cap);
     }
 
     #[test]
@@ -579,7 +593,7 @@ mod tests {
         assert!(!slot.is_initialized());
 
         // First push triggers lazy init.
-        assert!(cc.fe_push(core, sc, 42, &m).is_success());
+        assert!(cc.fe_push(core, A, sc, 42, &m).is_success());
         assert!(slot.is_initialized());
     }
 
@@ -589,21 +603,24 @@ mod tests {
         let cc = CpuCache::new();
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
-        let hard_cap = size_class::max_local_capacity(sc);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+
+        // Init with soft_cap = hard_cap so we can fill to the absolute ceiling.
+        cc.init_slot(core, sc, &m, hard_cap);
 
         // Pop from empty -> miss
-        cc.fe_pop(core, sc, &m);
-        cc.fe_pop(core, sc, &m);
+        cc.fe_pop(core, A, sc, &m);
+        cc.fe_pop(core, A, sc, &m);
         let cpu = cc.per_cpu(core).unwrap();
         let slot = cpu.slot(sc).unwrap();
         assert_eq!(slot.misses(), 2);
 
         // Fill to capacity then overflow
         for i in 0..hard_cap {
-            cc.fe_push(core, sc, i + 1, &m);
+            cc.fe_push(core, A, sc, i as usize + 1, &m);
         }
-        cc.fe_push(core, sc, 999, &m);
-        cc.fe_push(core, sc, 998, &m);
+        cc.fe_push(core, A, sc, 999, &m);
+        cc.fe_push(core, A, sc, 998, &m);
         assert_eq!(slot.overflows(), 2);
 
         // Reset counters
@@ -621,15 +638,15 @@ mod tests {
         let core1 = CoreId(1);
         let sc = SizeClassId::new(0);
 
-        cc.fe_push(core0, sc, 100, &m);
-        cc.fe_push(core1, sc, 200, &m);
+        cc.fe_push(core0, A, sc, 100, &m);
+        cc.fe_push(core1, A, sc, 200, &m);
 
-        assert_eq!(cc.fe_pop(core0, sc, &m).unwrap(), 100);
-        assert_eq!(cc.fe_pop(core1, sc, &m).unwrap(), 200);
+        assert_eq!(cc.fe_pop(core0, A, sc, &m).unwrap(), 100);
+        assert_eq!(cc.fe_pop(core1, A, sc, &m).unwrap(), 200);
 
         // Each CPU's slot is independent.
-        assert!(cc.fe_pop(core0, sc, &m).is_empty());
-        assert!(cc.fe_pop(core1, sc, &m).is_empty());
+        assert!(cc.fe_pop(core0, A, sc, &m).is_empty());
+        assert!(cc.fe_pop(core1, A, sc, &m).is_empty());
     }
 
     #[test]
@@ -652,10 +669,8 @@ mod tests {
         let popped = cc.pop_batch(core, sc, &mut out, 8);
         assert_eq!(popped, 8);
 
-        let popped_set: std::collections::BTreeSet<usize> =
-            out[..8].iter().copied().collect();
-        let orig_set: std::collections::BTreeSet<usize> =
-            addrs.iter().copied().collect();
+        let popped_set: std::collections::BTreeSet<usize> = out[..8].iter().copied().collect();
+        let orig_set: std::collections::BTreeSet<usize> = addrs.iter().copied().collect();
         assert_eq!(popped_set, orig_set);
     }
 
@@ -675,10 +690,10 @@ mod tests {
                     let core = CoreId(t);
                     for i in 0..100u32 {
                         let addr = (t * 10000 + i) as usize;
-                        cc_ref.fe_push(core, sc, addr, m_ref);
+                        cc_ref.fe_push(core, A, sc, addr, m_ref);
                     }
                     for _ in 0..50 {
-                        cc_ref.fe_pop(core, sc, m_ref);
+                        cc_ref.fe_pop(core, A, sc, m_ref);
                     }
                 });
             }
@@ -699,8 +714,8 @@ mod tests {
         let cc = CpuCache::new();
         let bad_core = CoreId(MAX_CPUS as u32);
         let sc = SizeClassId::new(0);
-        assert!(cc.fe_pop(bad_core, sc, &m).is_empty());
-        assert!(cc.fe_push(bad_core, sc, 42, &m).is_full());
+        assert!(cc.fe_pop(bad_core, A, sc, &m).is_empty());
+        assert!(cc.fe_push(bad_core, A, sc, 42, &m).is_full());
     }
 
     #[test]

@@ -76,10 +76,12 @@ pub use span::{
 
 // W6 cache layer re-exports (plan 05).
 pub use budget::CacheBudget;
-pub use cache_ops::{flush, flush_idle_cpu, refill, FlushResult, RefillResult};
+pub use cache_ops::{flush, flush_idle_cpu, refill, refill_with_retry, FlushResult, RefillResult};
 pub use cpu_cache::CpuCache;
 pub use fe::{CoreId, FeOutcome};
-pub use thread_cache::ThreadCache;
+#[cfg(any(test, feature = "std"))]
+pub use thread_cache::init_thread_cache;
+pub use thread_cache::{with_thread_cache, FlushHookFn, ThreadCache};
 pub use transfer_cache::TransferCache;
 
 #[cfg(test)]
