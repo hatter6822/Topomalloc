@@ -221,3 +221,93 @@ fn migration_flush_handoff_empties_the_core() {
     // The new owner on this core sees an empty cache.
     assert_eq!(cc.fe_pop_pinned(core, A, sc, &p, &m), FeOutcome::Empty);
 }
+
+/// Pin the calling thread to `cpu`. Returns whether it succeeded.
+fn pin_to(cpu: usize) -> bool {
+    #[repr(C)]
+    struct CpuSet {
+        bits: [u64; 16],
+    }
+    extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const CpuSet) -> i32;
+    }
+    let mut set = CpuSet { bits: [0; 16] };
+    set.bits[cpu / 64] |= 1u64 << (cpu % 64);
+    // SAFETY: `set` is a valid cpu_set_t of the given size.
+    unsafe { sched_setaffinity(0, core::mem::size_of::<CpuSet>(), &set) == 0 }
+}
+
+/// The pinned-core oracle: the OS view of the current core.
+fn getcpu_oracle() -> i32 {
+    extern "C" {
+        fn sched_getcpu() -> i32;
+    }
+    // SAFETY: no arguments; reads kernel state only.
+    unsafe { sched_getcpu() }
+}
+
+#[test]
+fn pinned_mode_dispatch_routes_fe_pop_push() {
+    // W7-5 integration: enable_pinned_core makes the shared fe_pop/fe_push entry
+    // points run the pinned sequence (behind the same FeOutcome contract).
+    let m = meta(2 * 1024 * 1024);
+    let cc = CpuCache::new();
+    cc.enable_pinned_core(getcpu_oracle);
+    assert!(cc.pinned_mode());
+    assert!(!cc.rseq_mode());
+
+    let cpu = getcpu_oracle();
+    if cpu < 0 || !pin_to(cpu as usize) {
+        return;
+    }
+    // The `core` argument is a hint in pinned mode (the oracle is authoritative).
+    let core = CoreId(getcpu_oracle() as u32);
+    let sc = SizeClassId::new(2);
+
+    assert_eq!(cc.fe_pop(core, A, sc, &m), FeOutcome::Empty);
+    for i in 0..5 {
+        assert!(
+            cc.fe_push(core, A, sc, 0x500 + i, &m).is_success(),
+            "push {i}"
+        );
+    }
+    for i in (0..5).rev() {
+        assert_eq!(cc.fe_pop(core, A, sc, &m), FeOutcome::Success(0x500 + i));
+    }
+    assert_eq!(cc.fe_pop(core, A, sc, &m), FeOutcome::Empty);
+}
+
+#[test]
+fn pinned_dispatch_matches_locked() {
+    // The dispatched pinned path makes the same moves as the locked baseline.
+    let m = meta(4 * 1024 * 1024);
+    let locked = CpuCache::new();
+    let pinned = CpuCache::new();
+    pinned.enable_pinned_core(getcpu_oracle);
+
+    let cpu = getcpu_oracle();
+    if cpu < 0 || !pin_to(cpu as usize) {
+        return;
+    }
+    let core = CoreId(getcpu_oracle() as u32);
+    let sc = SizeClassId::new(1);
+
+    let mut rng = 0x0BAD_F00D_DEAD_C0DEu64;
+    for _ in 0..10_000 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        if rng & 1 == 0 {
+            let v = (rng >> 1) as usize | 1;
+            assert_eq!(
+                locked.fe_push(core, A, sc, v, &m),
+                pinned.fe_push(core, A, sc, v, &m)
+            );
+        } else {
+            assert_eq!(
+                locked.fe_pop(core, A, sc, &m),
+                pinned.fe_pop(core, A, sc, &m)
+            );
+        }
+    }
+}

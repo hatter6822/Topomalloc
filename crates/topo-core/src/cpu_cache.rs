@@ -21,7 +21,7 @@
 //! `hard_capacity`; push operations that would breach it return
 //! [`FeOutcome::Full`].
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use topo_arch::rseq;
 
@@ -42,6 +42,14 @@ pub const MAX_CPUS: usize = 128;
 /// almost always exits on the first iteration; the bound only prevents a
 /// pathological livelock under extreme scheduler churn.
 const RSEQ_ABORT_RETRY: u32 = 128;
+
+/// Front-end fast-path mode (W7). Selected at runtime: `Locked` is the always-
+/// correct baseline (W6-4); `Rseq` is the Linux restartable fast path (W7-2/3);
+/// `PinnedCore` is the seLe4n pinned-thread per-core path (W7-5). The modes are
+/// mutually exclusive deployment choices (Linux uses `Rseq`, seLe4n `PinnedCore`).
+const MODE_LOCKED: u8 = 0;
+const MODE_RSEQ: u8 = 1;
+const MODE_PINNED: u8 = 2;
 
 /// Per-size-class slot within a [`PerCpu`]: a lazily-allocated LIFO stack of
 /// object addresses.
@@ -306,6 +314,24 @@ unsafe fn pop_slot(slot: &CpuSlot, out: &mut [usize], max: usize) -> usize {
     pop_count
 }
 
+/// Adapts a `fn() -> i32` core oracle to the [`CoreProvider`](crate::pinned::CoreProvider)
+/// trait for the pinned-mode dispatch (W7-5). A returned `-1` (unknown core) maps
+/// to a sentinel that cannot equal any in-range expected core, so the pinned
+/// sequence aborts with no change rather than committing to a wrong slot.
+struct FnCoreProvider(fn() -> i32);
+
+impl crate::pinned::CoreProvider for FnCoreProvider {
+    #[inline]
+    fn current_core(&self) -> CoreId {
+        let c = (self.0)();
+        if c < 0 {
+            CoreId(u32::MAX)
+        } else {
+            CoreId(c as u32)
+        }
+    }
+}
+
 /// The per-CPU cache: `MAX_CPUS` [`PerCpu`] entries (W6-4).
 ///
 /// Thread-safe by construction: each CPU has its own spinlock. The fast-path
@@ -316,23 +342,29 @@ pub struct CpuCache {
     /// Number of active (online) CPUs. Operations on a core beyond this
     /// count are valid but will always miss (no slots initialized).
     active_cpus: AtomicU32,
-    /// Whether the RSEQ fast path is in use (W7). `false` is the locked baseline
-    /// (W6-4); set by [`enable_rseq`](Self::enable_rseq) when the platform
-    /// supports RSEQ, cleared by [`disable_rseq`](Self::disable_rseq) (e.g. the
-    /// child fork handler, which must go conservative until per-CPU state is
-    /// safe, §28.1).
-    rseq_enabled: AtomicBool,
+    /// Front-end fast-path mode (`MODE_LOCKED`/`MODE_RSEQ`/`MODE_PINNED`, W7).
+    /// `MODE_LOCKED` is the baseline (W6-4); [`enable_rseq`](Self::enable_rseq)
+    /// and [`enable_pinned_core`](Self::enable_pinned_core) select the fast
+    /// paths; [`disable_rseq`](Self::disable_rseq) reverts to conservative
+    /// (locked) mode (e.g. the child fork handler, §28.1).
+    mode: AtomicU8,
+    /// In `MODE_PINNED`, a `fn() -> i32` (cast to `usize`) that returns the
+    /// calling thread's current core (the seLe4n runtime's per-core identity, the
+    /// analogue of `rseq`'s `cpu_id`), or `-1` if unknown. `0` when unset.
+    pinned_core_fn: AtomicUsize,
 }
 
 impl CpuCache {
     /// A fresh, empty CPU cache (no slots initialized), in the locked baseline
-    /// mode. Call [`enable_rseq`](Self::enable_rseq) to opt into the RSEQ fast
-    /// path after the cache is wired up.
+    /// mode. Call [`enable_rseq`](Self::enable_rseq) (Linux) or
+    /// [`enable_pinned_core`](Self::enable_pinned_core) (seLe4n) to opt into a
+    /// fast path after the cache is wired up.
     pub const fn new() -> Self {
         Self {
             cpus: [const { PerCpu::new() }; MAX_CPUS],
             active_cpus: AtomicU32::new(0),
-            rseq_enabled: AtomicBool::new(false),
+            mode: AtomicU8::new(MODE_LOCKED),
+            pinned_core_fn: AtomicUsize::new(0),
         }
     }
 
@@ -347,26 +379,50 @@ impl CpuCache {
     /// (§27.6) — a no-op beyond a presence check in glibc mode.
     pub fn enable_rseq(&self) -> bool {
         let ok = rseq::enable();
-        self.rseq_enabled.store(ok, Ordering::Release);
+        self.mode
+            .store(if ok { MODE_RSEQ } else { MODE_LOCKED }, Ordering::Release);
         ok
     }
 
-    /// Disable the RSEQ fast path, reverting to the locked baseline (§28.1 child
-    /// fork handler / conservative mode). Already-cached objects are unaffected;
-    /// subsequent operations take the spinlock path.
+    /// Enable the seLe4n pinned-thread per-core fast path (W7-5, §36.10 option 1).
+    /// `current_core` is the runtime's per-core identity oracle: it returns the
+    /// calling thread's current core, or `-1` if unknown. `fe_pop`/`fe_push` then
+    /// run the pinned restartable sequence (abort-with-no-change on a core
+    /// mismatch), falling back to the locked path when the oracle reports an
+    /// invalid core.
+    ///
+    /// **Non-owner coordination in pinned mode is the §36.10 hand-off contract**
+    /// (a cache is flushed or made unreachable before core ownership changes) —
+    /// *not* the RSEQ membarrier fence. A non-owner [`drain`](Self::drain_cpu) of
+    /// an *active* pinned cache is therefore the caller's responsibility to
+    /// serialize (the idle-flush path operates on quiesced cores).
+    pub fn enable_pinned_core(&self, current_core: fn() -> i32) {
+        self.pinned_core_fn
+            .store(current_core as usize, Ordering::Release);
+        self.mode.store(MODE_PINNED, Ordering::Release);
+    }
+
+    /// Disable any fast path, reverting to the locked baseline (§28.1 child fork
+    /// handler / conservative mode). Already-cached objects are unaffected.
     pub fn disable_rseq(&self) {
-        self.rseq_enabled.store(false, Ordering::Release);
+        self.mode.store(MODE_LOCKED, Ordering::Release);
     }
 
     /// Whether the RSEQ fast path is currently active.
     #[inline]
     pub fn rseq_mode(&self) -> bool {
-        self.rseq_enabled.load(Ordering::Acquire)
+        self.mode.load(Ordering::Acquire) == MODE_RSEQ
+    }
+
+    /// Whether the seLe4n pinned-core fast path is currently active.
+    #[inline]
+    pub fn pinned_mode(&self) -> bool {
+        self.mode.load(Ordering::Acquire) == MODE_PINNED
     }
 
     /// Register the calling thread for the RSEQ fast path (§27.6, W7-1). Returns
-    /// whether this thread can use it; in the locked baseline this is a no-op
-    /// returning `false`.
+    /// whether this thread can use it; in the locked/pinned modes this is a no-op
+    /// returning `false` (pinned mode needs no per-thread RSEQ registration).
     #[inline]
     pub fn register_current_thread(&self) -> bool {
         self.rseq_mode() && rseq::register_current_thread()
@@ -435,13 +491,21 @@ impl CpuCache {
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<usize> {
-        if self.rseq_mode() {
-            if let Some(out) = self.fe_pop_rseq(sc) {
-                return out;
+        match self.mode.load(Ordering::Acquire) {
+            MODE_RSEQ => {
+                if let Some(out) = self.fe_pop_rseq(sc) {
+                    return out;
+                }
+                self.fe_pop_locked(self.effective_core(core), arena, sc, meta)
             }
-            return self.fe_pop_locked(self.effective_core(core), arena, sc, meta);
+            MODE_PINNED => {
+                if let Some(out) = self.fe_pop_pinned_dispatch(arena, sc, meta) {
+                    return out;
+                }
+                self.fe_pop_locked(core, arena, sc, meta)
+            }
+            _ => self.fe_pop_locked(core, arena, sc, meta),
         }
-        self.fe_pop_locked(core, arena, sc, meta)
     }
 
     /// The locked (spinlock) pop — the RSEQ-free correct baseline (W6-4) and the
@@ -507,13 +571,21 @@ impl CpuCache {
         addr: usize,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<()> {
-        if self.rseq_mode() {
-            if let Some(out) = self.fe_push_rseq(sc, addr) {
-                return out;
+        match self.mode.load(Ordering::Acquire) {
+            MODE_RSEQ => {
+                if let Some(out) = self.fe_push_rseq(sc, addr) {
+                    return out;
+                }
+                self.fe_push_locked(self.effective_core(core), arena, sc, addr, meta)
             }
-            return self.fe_push_locked(self.effective_core(core), arena, sc, addr, meta);
+            MODE_PINNED => {
+                if let Some(out) = self.fe_push_pinned_dispatch(arena, sc, addr, meta) {
+                    return out;
+                }
+                self.fe_push_locked(core, arena, sc, addr, meta)
+            }
+            _ => self.fe_push_locked(core, arena, sc, addr, meta),
         }
-        self.fe_push_locked(core, arena, sc, addr, meta)
     }
 
     /// The locked (spinlock) push — the RSEQ-free correct baseline (W6-4) and the
@@ -623,12 +695,13 @@ impl CpuCache {
         if sc.index() >= NUM_SIZE_CLASSES {
             return None;
         }
-        let cpu = rseq::current_cpu();
-        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
-            return None;
-        }
+        // Resolve the thread's rseq area once; derive the CPU from it (a null
+        // area yields -1). This avoids a second thread-pointer read on the hot
+        // path. The asm re-reads `cpu_id` inside the CS (the authoritative read);
+        // `cpu` here only guards bounds and tags the approximate miss stat.
         let area = rseq::current_area();
-        if area.is_null() {
+        let cpu = rseq::cpu_of(area);
+        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
             return None;
         }
         let base = self.cpus_base();
@@ -667,12 +740,10 @@ impl CpuCache {
         if sc.index() >= NUM_SIZE_CLASSES {
             return None;
         }
-        let cpu = rseq::current_cpu();
-        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
-            return None;
-        }
+        // Resolve the area once (see `fe_pop_rseq`).
         let area = rseq::current_area();
-        if area.is_null() {
+        let cpu = rseq::cpu_of(area);
+        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
             return None;
         }
         let base = self.cpus_base();
@@ -705,6 +776,70 @@ impl CpuCache {
     }
 
     // --- seLe4n pinned-thread per-core fast path (W7-5, §36.10 option 1) ---
+
+    /// The pinned-core oracle as a typed function pointer, or `None` if unset.
+    #[inline]
+    fn pinned_oracle(&self) -> Option<fn() -> i32> {
+        let f = self.pinned_core_fn.load(Ordering::Acquire);
+        if f == 0 {
+            None
+        } else {
+            // SAFETY: `f` was produced by `enable_pinned_core` as `(fn() -> i32)
+            // as usize`; transmuting it back to the same `fn` type is sound.
+            Some(unsafe { core::mem::transmute::<usize, fn() -> i32>(f) })
+        }
+    }
+
+    /// `MODE_PINNED` dispatch for `fe_pop`: run the pinned sequence on the
+    /// thread's current core (from the oracle), retrying the abort-on-migration
+    /// case on the (now-current) core. Returns `Some(Success/Empty/Full)` or
+    /// `None` to fall back to the locked path (no oracle / invalid core / the
+    /// abort bound).
+    #[inline]
+    fn fe_pop_pinned_dispatch(
+        &self,
+        arena: ArenaId,
+        sc: SizeClassId,
+        meta: &dyn MetadataAlloc,
+    ) -> Option<FeOutcome<usize>> {
+        let oracle = self.pinned_oracle()?;
+        let provider = FnCoreProvider(oracle);
+        for _ in 0..RSEQ_ABORT_RETRY {
+            let cpu = oracle();
+            if cpu < 0 || (cpu as usize) >= MAX_CPUS {
+                return None;
+            }
+            match self.fe_pop_pinned(CoreId(cpu as u32), arena, sc, &provider, meta) {
+                FeOutcome::Abort => continue,
+                other => return Some(other),
+            }
+        }
+        None
+    }
+
+    /// `MODE_PINNED` dispatch for `fe_push`. See [`fe_pop_pinned_dispatch`].
+    #[inline]
+    fn fe_push_pinned_dispatch(
+        &self,
+        arena: ArenaId,
+        sc: SizeClassId,
+        addr: usize,
+        meta: &dyn MetadataAlloc,
+    ) -> Option<FeOutcome<()>> {
+        let oracle = self.pinned_oracle()?;
+        let provider = FnCoreProvider(oracle);
+        for _ in 0..RSEQ_ABORT_RETRY {
+            let cpu = oracle();
+            if cpu < 0 || (cpu as usize) >= MAX_CPUS {
+                return None;
+            }
+            match self.fe_push_pinned(CoreId(cpu as u32), arena, sc, addr, &provider, meta) {
+                FeOutcome::Abort => continue,
+                other => return Some(other),
+            }
+        }
+        None
+    }
 
     /// Pinned-thread per-core pop (W7-5). A software restartable sequence behind
     /// the same [`FeOutcome`] contract: it reads the current core from

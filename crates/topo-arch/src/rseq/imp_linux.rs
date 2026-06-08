@@ -357,10 +357,11 @@ pub(super) fn current_area() -> *mut Rseq {
     }
 }
 
-/// The current CPU from this thread's rseq area, or `-1` if unavailable or the
-/// area is not yet kernel-initialised (e.g. an unregistered thread).
-pub(super) fn current_cpu() -> i32 {
-    let area = current_area();
+/// The current CPU read from an already-resolved `area`, or `-1` if `area` is
+/// null. Lets the hot path resolve the area once and avoid a second thread-pointer
+/// read (`current_cpu` would recompute it).
+#[inline]
+pub(super) fn cpu_of(area: *mut Rseq) -> i32 {
     if area.is_null() {
         return -1;
     }
@@ -373,6 +374,13 @@ pub(super) fn current_cpu() -> i32 {
         let cpu_ptr = core::ptr::addr_of!((*area).cpu_id).cast::<core::sync::atomic::AtomicU32>();
         (*cpu_ptr).load(core::sync::atomic::Ordering::Relaxed) as i32
     }
+}
+
+/// The current CPU from this thread's rseq area, or `-1` if unavailable or the
+/// area is not yet kernel-initialised (e.g. an unregistered thread).
+#[inline]
+pub(super) fn current_cpu() -> i32 {
+    cpu_of(current_area())
 }
 
 /// The W7-4 non-owner fence: abort any in-flight rseq critical section on other

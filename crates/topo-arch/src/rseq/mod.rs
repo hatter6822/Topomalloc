@@ -218,6 +218,28 @@ pub fn current_cpu() -> i32 {
     }
 }
 
+/// The current CPU read from an already-resolved `area` (from [`current_area`]),
+/// or `-1` if `area` is null. The hot path uses this to resolve the area **once**
+/// and avoid a second thread-pointer read.
+#[inline]
+pub fn cpu_of(area: *mut Rseq) -> i32 {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        imp_linux::cpu_of(area)
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        let _ = area;
+        -1
+    }
+}
+
 /// The W7-4 non-owner fence: abort any in-flight rseq critical section on other
 /// CPUs (§27.4). The caller must already hold the per-CPU lock for the slots it
 /// will touch, so that after this returns no sequence can commit to them.
