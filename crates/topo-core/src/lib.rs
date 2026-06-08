@@ -15,10 +15,14 @@
 
 pub mod backend;
 pub mod bootstrap;
+pub mod budget;
+pub mod cache_ops;
 pub mod central;
 pub mod classify;
+pub mod cpu_cache;
 pub mod error;
 pub mod extent;
+pub mod fe;
 pub mod flags;
 pub mod generated;
 pub mod ids;
@@ -31,7 +35,9 @@ pub mod size_class;
 pub mod skeleton;
 pub mod slab;
 pub mod span;
+pub mod thread_cache;
 pub mod trace;
+pub mod transfer_cache;
 
 /// The TopoMalloc version string, reported by stats JSON (Appendix D) and the
 /// control namespace `topo.version` (W0-13). Sourced from the crate version so
@@ -67,6 +73,16 @@ pub use span::{
     ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
     SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,
 };
+
+// W6 cache layer re-exports (plan 05).
+pub use budget::{CacheBudget, SlotStats};
+pub use cache_ops::{flush, flush_idle_cpu, refill, refill_with_retry, FlushResult, RefillResult};
+pub use cpu_cache::CpuCache;
+pub use fe::{CoreId, FeOutcome};
+#[cfg(any(test, feature = "std"))]
+pub use thread_cache::init_thread_cache;
+pub use thread_cache::{with_thread_cache, FlushHookFn, ThreadCache};
+pub use transfer_cache::TransferCache;
 
 #[cfg(test)]
 mod tests {

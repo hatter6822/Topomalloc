@@ -331,12 +331,9 @@ pub struct NonCentralResidency {
 }
 
 impl NonCentralResidency {
-    /// The trivial residency before any cache exists (M1): every cached/quarantined
-    /// term is zero, so the law reduces to `object_count = live + central_free`.
-    ///
-    /// **M2 action required (plan 05):** when local/transfer caches arrive, every
-    /// call site using `NONE` must supply actual cached and quarantined counts.
-    /// Search for `NonCentralResidency::NONE` to find all sites.
+    /// Zero residency: all non-central terms are zero. Correct when
+    /// `live_count` includes objects in caches (the current accounting
+    /// model), reducing the law to `object_count = live + central_free`.
     pub const NONE: NonCentralResidency = NonCentralResidency {
         local_cached: 0,
         transfer_cached: 0,
@@ -538,6 +535,13 @@ impl SpanDescriptor {
     #[inline]
     pub fn object_count(&self) -> u32 {
         self.object_count.load(Ordering::Acquire)
+    }
+
+    /// Bytes reserved at the span start before object 0 (§16.3). Zero when
+    /// metadata is out-of-line (the common case); non-zero for inline metadata.
+    #[inline]
+    pub fn slab_header(&self) -> u32 {
+        self.slab_header.load(Ordering::Acquire)
     }
 
     /// Byte length of the span (`page_count * PAGE_SIZE`). Never overflows for a
@@ -843,7 +847,9 @@ impl SpanDescriptor {
         self.lock().conservation_holds(non_central)
     }
 
-    /// The central-only conservation law (M1: no caches).
+    /// Conservation law where `live_count` includes all objects removed from
+    /// central (including those held in CPU/transfer/thread caches). Correct
+    /// as long as cache layers do not separately track per-span residency.
     #[inline]
     pub fn conservation_holds_central_only(&self) -> bool {
         self.conservation_holds(NonCentralResidency::NONE)
@@ -855,7 +861,10 @@ impl SpanDescriptor {
         self.lock().is_empty(non_central)
     }
 
-    /// The M1 empty predicate (no caches).
+    /// Empty predicate where `live_count` includes cached objects. A span is
+    /// empty only when all objects have been returned to central (`live_count == 0`
+    /// and `central_free == object_count`). Objects in CPU/transfer/thread caches
+    /// keep `live_count > 0`, preventing false-positive empty detection.
     #[inline]
     pub fn is_empty_central_only(&self) -> bool {
         self.is_empty(NonCentralResidency::NONE)
@@ -863,11 +872,13 @@ impl SpanDescriptor {
 
     /// Reconstruct the non-central residency terms for this span.
     ///
-    /// **M2 action (plan 05, W5-3c):** this currently returns `NONE` because no
-    /// local/transfer/quarantine caches exist at M1. When plan 05 lands caches,
-    /// replace the body with an actual cache scan or cache-bitmap popcount.
-    /// Every call site of `NonCentralResidency::NONE` should migrate to calling
-    /// this method instead.
+    /// Currently returns `NONE`: `live_count` already includes objects held in
+    /// CPU, transfer, and thread caches (they are counted as "removed from
+    /// central"), so the conservation law holds without explicit non-central
+    /// terms. If a future milestone redefines `live_count` to mean "in
+    /// application code only" (excluding cached objects), this method must
+    /// return actual cache/quarantine counts and all call sites using
+    /// `NonCentralResidency::NONE` must migrate.
     #[inline]
     pub fn reconstruct_non_central_residency(&self) -> NonCentralResidency {
         NonCentralResidency::NONE
