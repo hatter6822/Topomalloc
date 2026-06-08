@@ -666,6 +666,116 @@ impl CpuCache {
         None
     }
 
+    // --- seLe4n pinned-thread per-core fast path (W7-5, §36.10 option 1) ---
+
+    /// Pinned-thread per-core pop (W7-5). A software restartable sequence behind
+    /// the same [`FeOutcome`] contract: it reads the current core from
+    /// `provider`, **aborts with no state change** if the thread is not on
+    /// `expected` (migration / violated pinning contract), and commits with a
+    /// single store only when the core is stable across the read — mirroring
+    /// the RSEQ abort contract (`per_core_cache_abort_no_change`, plan 02 W1-12d).
+    ///
+    /// Under the §36.10 pinned-thread contract the calling thread is the sole
+    /// accessor of `expected`'s slot, so the read-modify-write is race-free; the
+    /// allocating lazy-init is done under the per-CPU lock (it cannot live in the
+    /// restartable section). See [`crate::pinned`].
+    pub fn fe_pop_pinned(
+        &self,
+        expected: CoreId,
+        _arena: ArenaId,
+        sc: SizeClassId,
+        provider: &dyn crate::pinned::CoreProvider,
+        meta: &dyn MetadataAlloc,
+    ) -> FeOutcome<usize> {
+        // Abort if not on the expected core (no state has been touched).
+        if provider.current_core() != expected {
+            return FeOutcome::Abort;
+        }
+        let cpu = match self.cpus.get(expected.index()) {
+            Some(c) => c,
+            None => return FeOutcome::Empty,
+        };
+        let slot = match cpu.slots.get(sc.index()) {
+            Some(s) => s,
+            None => return FeOutcome::Empty,
+        };
+        // Lazy init (allocating) under the lock — outside the restartable part.
+        if !slot.is_initialized() {
+            let _guard = cpu.lock();
+            let hard_cap = size_class::max_local_capacity(sc) as u32;
+            let soft_cap = size_class::batch(sc) as u32;
+            if !slot.init(meta, hard_cap, soft_cap) {
+                return FeOutcome::Empty;
+            }
+        }
+        let cur_len = slot.len.load(Ordering::Relaxed);
+        if cur_len == 0 {
+            slot.misses.fetch_add(1, Ordering::Relaxed);
+            return FeOutcome::Empty;
+        }
+        let new_len = cur_len - 1;
+        let buf = slot.buf_ptr();
+        // SAFETY: `new_len < cur_len <= hard_capacity`; under the pinned-thread
+        // contract this thread is the sole accessor, so the read is race-free.
+        let addr = unsafe { *buf.add(new_len as usize) };
+        // Abort-no-change: if the core changed before the commit, do not commit.
+        if provider.current_core() != expected {
+            return FeOutcome::Abort;
+        }
+        slot.len.store(new_len, Ordering::Relaxed); // the single committing store
+        FeOutcome::Success(addr)
+    }
+
+    /// Pinned-thread per-core push (W7-5). The object is staged into the
+    /// logically-free `buf[len]` and published only by the committing `len`
+    /// store, so an abort before the commit is invisible. See
+    /// [`fe_pop_pinned`](Self::fe_pop_pinned).
+    pub fn fe_push_pinned(
+        &self,
+        expected: CoreId,
+        _arena: ArenaId,
+        sc: SizeClassId,
+        addr: usize,
+        provider: &dyn crate::pinned::CoreProvider,
+        meta: &dyn MetadataAlloc,
+    ) -> FeOutcome<()> {
+        if provider.current_core() != expected {
+            return FeOutcome::Abort;
+        }
+        let cpu = match self.cpus.get(expected.index()) {
+            Some(c) => c,
+            None => return FeOutcome::Full,
+        };
+        let slot = match cpu.slots.get(sc.index()) {
+            Some(s) => s,
+            None => return FeOutcome::Full,
+        };
+        if !slot.is_initialized() {
+            let _guard = cpu.lock();
+            let hard_cap = size_class::max_local_capacity(sc) as u32;
+            let soft_cap = size_class::batch(sc) as u32;
+            if !slot.init(meta, hard_cap, soft_cap) {
+                return FeOutcome::Full;
+            }
+        }
+        let cur_len = slot.len.load(Ordering::Relaxed);
+        let soft = slot.soft_capacity.load(Ordering::Relaxed);
+        if cur_len >= soft {
+            slot.overflows.fetch_add(1, Ordering::Relaxed);
+            return FeOutcome::Full;
+        }
+        let buf = slot.buf_ptr();
+        // SAFETY: `cur_len < soft_capacity <= hard_capacity`; sole accessor under
+        // the pinned-thread contract. The stage targets logically-free space.
+        unsafe { *buf.add(cur_len as usize) = addr };
+        // Abort-no-change: the staged value is unpublished until `len` commits.
+        if provider.current_core() != expected {
+            return FeOutcome::Abort;
+        }
+        slot.len.store(cur_len + 1, Ordering::Relaxed); // the single committing store
+        FeOutcome::Success(())
+    }
+
     /// Pop up to `max` addresses from the per-CPU slot for `(core, sc)` into
     /// `out`. Returns the number of addresses popped. Used by flush operations
     /// (cache_ops W6-3b).
