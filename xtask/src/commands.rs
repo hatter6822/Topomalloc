@@ -722,7 +722,16 @@ fn rseq_cs_issues(content: &str) -> Vec<(usize, String)> {
     issues
 }
 
-/// W7-2d gate: the per-architecture RSEQ sequences contain no call/branch-with-link.
+/// W7-2d gate over the per-architecture RSEQ sequence files. Two checks:
+///
+/// 1. **No call / branch-with-link** in any `asm!` instruction (§12.3). These
+///    files contain *only* the pop/push sequences (no helper code that could
+///    legitimately call), so scanning the whole file is the conservative,
+///    no-false-pass choice — a forbidden mnemonic anywhere is a real bug.
+/// 2. **Structural well-formedness:** each sequence must pair a CS descriptor
+///    section (`__rseq_cs`) with a signature-prefixed abort handler
+///    (`__rseq_failure` + `RSEQ_SIG`). A sequence missing its abort trampoline
+///    would be silently non-restartable, which this catches.
 fn check_rseq_cs(root: &Path) -> bool {
     let files = [
         root.join("crates/topo-arch/src/rseq/seq_x86_64.rs"),
@@ -735,13 +744,33 @@ fn check_rseq_cs(root: &Path) -> bool {
             continue;
         };
         scanned += 1;
+        let name = f.display();
         for (line, reason) in rseq_cs_issues(&content) {
-            issues.push(format!("{}:{}: {reason}", f.display(), line));
+            issues.push(format!("{name}:{line}: {reason}"));
+        }
+        // Each sequence pairs a `.pushsection __rseq_cs` (the descriptor) with a
+        // `.pushsection __rseq_failure` (the abort handler).
+        let descriptors = content.matches(".pushsection __rseq_cs").count();
+        let aborts = content.matches(".pushsection __rseq_failure").count();
+        if descriptors == 0 {
+            issues.push(format!("{name}: no `__rseq_cs` descriptor section"));
+        }
+        if descriptors != aborts {
+            issues.push(format!(
+                "{name}: {descriptors} CS descriptor(s) but {aborts} abort handler(s) — \
+                 every sequence needs both"
+            ));
+        }
+        if !content.contains("RSEQ_SIG") {
+            issues.push(format!(
+                "{name}: abort handlers must be prefixed by `RSEQ_SIG` (kernel-verified)"
+            ));
         }
     }
     if issues.is_empty() {
         println!(
-            "  · RSEQ critical sections: no calls / branch-with-link ({scanned} files, §12.3)"
+            "  · RSEQ critical sections: no calls/branch-with-link + descriptor↔abort paired \
+             ({scanned} files, §12.3)"
         );
         true
     } else {

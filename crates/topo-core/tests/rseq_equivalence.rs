@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use topo_core::{
-    flush_idle_cpu, size_class, ArenaId, BumpArena, CentralCache, CoreId, CpuCache, FeOutcome,
-    PageMap, SizeClassId, TransferCache,
+    flush_idle_cpu, size_class, ArenaId, BumpArena, CacheBudget, CentralCache, CoreId, CpuCache,
+    FeOutcome, PageMap, SizeClassId, TransferCache,
 };
 
 const A: ArenaId = ArenaId::DEFAULT;
@@ -515,5 +515,49 @@ fn flush_idle_cpu_vs_fastpath_conserves() {
     assert_eq!(
         recovered, expected,
         "tokens conserved across concurrent idle-flush + fast path"
+    );
+}
+
+/// W6-5 + W7: the cache budget controller adapts to the miss statistics the
+/// **fast path** records. The RSEQ `Empty` path bumps the per-slot miss counter
+/// exactly like the locked path, so a burst of fast-path misses must drive the
+/// budget controller to grow that slot's soft capacity. (Works in either mode:
+/// where RSEQ is unavailable, the locked fallback records the same stat.)
+#[test]
+fn budget_adapts_to_fast_path_miss_stats() {
+    let m = meta(4 * 1024 * 1024);
+    let ncpu = ncpus();
+    let cc = CpuCache::new();
+    cc.enable_rseq();
+    cc.register_current_thread();
+    cc.set_active_cpus(ncpu as u32);
+
+    // Pin so the fast path uses a stable, known CPU (< ncpu, in adapt's range).
+    let cpu = getcpu();
+    if !pin_to(cpu) {
+        return;
+    }
+    let cpu = getcpu();
+    let core = CoreId(cpu as u32);
+    let sc = SizeClassId::new(0);
+    let batch = size_class::batch(sc) as u32;
+    cc.init_slot(core, sc, &m, batch); // initialized, soft = batch
+    let soft_before = cc.per_cpu(core).unwrap().slot(sc).unwrap().soft_capacity();
+    assert_eq!(soft_before, batch);
+
+    // A burst of misses on the (empty, initialized) slot via the fast path.
+    for _ in 0..256 {
+        assert!(matches!(cc.fe_pop(core, A, sc, &m), FeOutcome::Empty));
+    }
+    let misses = cc.per_cpu(core).unwrap().slot(sc).unwrap().misses();
+    assert!(misses >= 256, "fast-path misses recorded ({misses})");
+
+    // The budget controller should grow this slot on the recorded misses.
+    let budget = CacheBudget::new(1_000_000);
+    budget.adapt(&cc);
+    let soft_after = cc.per_cpu(core).unwrap().slot(sc).unwrap().soft_capacity();
+    assert!(
+        soft_after > soft_before,
+        "budget must grow soft capacity on fast-path misses: {soft_before} -> {soft_after}"
     );
 }

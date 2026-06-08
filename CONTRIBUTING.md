@@ -30,8 +30,9 @@ notice; CI always runs them.
 ## Toolchains (pinned)
 
 * **Rust** — `rust-toolchain.toml` pins the exact stable channel, components, and
-  cross targets. We do **not** use nightly for the allocator core; the only
-  nightly tool, `cargo-fuzz`, is opt-in (`cargo xtask test --kind fuzz`).
+  cross targets. We do **not** use nightly for the allocator core; the nightly-only
+  *tools* — `cargo-fuzz` and ThreadSanitizer — are opt-in
+  (`cargo xtask test --kind fuzz|tsan`).
 * **Lean** — `lean-toolchain` pins the Lean version (matched to upstream seLe4n
   so the bridge model co-develops without skew, D2). `cargo xtask setup` installs
   it via [`scripts/setup_lean.sh`](scripts/setup_lean.sh), which downloads the
