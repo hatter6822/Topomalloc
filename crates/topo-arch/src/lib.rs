@@ -4,7 +4,7 @@
 //! per-CPU sequences (§12) arrive with plan 05 (W7), per-arch for x86-64 and
 //! AArch64. Keeping this seam present from M0 means the dual-arch CI matrix
 //! (DD-2) exercises real code on both architectures from the start.
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 pub mod rseq;
 

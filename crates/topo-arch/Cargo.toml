@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 license = "MIT"
 
+[features]
+default = []
+# Enables the self-registration RSEQ fallback (W7-1), which needs a
+# `thread_local!` to store the per-thread area. The primary glibc-area path and
+# all of `topo-arch` are otherwise `no_std`. See `rseq::imp_linux`.
+std = []
+
 [dependencies]
 
 [lints]
