@@ -6,6 +6,8 @@
 //! (DD-2) exercises real code on both architectures from the start.
 #![cfg_attr(not(test), no_std)]
 
+pub mod rseq;
+
 /// The architecture this build targets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
