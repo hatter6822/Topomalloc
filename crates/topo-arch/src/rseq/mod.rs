@@ -221,14 +221,23 @@ pub fn current_cpu() -> i32 {
 /// The W7-4 non-owner fence: abort any in-flight rseq critical section on other
 /// CPUs (§27.4). The caller must already hold the per-CPU lock for the slots it
 /// will touch, so that after this returns no sequence can commit to them.
+/// Returns whether the fence succeeded (always `true` where RSEQ is unavailable —
+/// there is nothing to fence).
 #[inline]
-pub fn fence_rseq() {
+pub fn fence_rseq() -> bool {
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        imp_linux::fence_rseq();
+        imp_linux::fence_rseq()
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        true
     }
 }
 

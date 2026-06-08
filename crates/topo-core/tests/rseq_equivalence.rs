@@ -11,10 +11,13 @@
 //! qemu-user), `enable_rseq()` reports `false`, the cache stays on the locked
 //! baseline, and the same tests still pass (the fallback *is* the baseline).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use topo_core::{size_class, ArenaId, BumpArena, CoreId, CpuCache, FeOutcome, SizeClassId};
+use topo_core::{
+    flush_idle_cpu, size_class, ArenaId, BumpArena, CentralCache, CoreId, CpuCache, FeOutcome,
+    PageMap, SizeClassId, TransferCache,
+};
 
 const A: ArenaId = ArenaId::DEFAULT;
 /// Drain-buffer capacity for the conservation collectors.
@@ -381,4 +384,136 @@ fn fallback_and_disable_are_correct() {
     assert!(!cc.rseq_mode());
     assert!(cc.fe_push(core, A, sc, 0x22, &m).is_success());
     assert_eq!(cc.fe_pop(core, A, sc, &m), FeOutcome::Success(0x22));
+}
+
+/// W7-4 end-to-end: the **real** `cache_ops::flush_idle_cpu` (which now drains a
+/// CPU under a single lock + a single RSEQ fence via `CpuCache::drain_cpu`)
+/// running concurrently with the RSEQ fast path conserves tokens. Tokens flow
+/// CPU-slots <-> hands (fast path) and CPU-slots -> transfer cache (the idle
+/// flush); the pool is sized to fit the transfer bin so nothing overflows to
+/// central, keeping the final tally enumerable.
+#[test]
+fn flush_idle_cpu_vs_fastpath_conserves() {
+    let ncpu = ncpus();
+    if ncpu < 2 {
+        return;
+    }
+    let m = meta(64 * 1024 * 1024);
+    let cc = Arc::new(CpuCache::new());
+    cc.set_active_cpus(ncpu as u32);
+    cc.enable_rseq();
+    let tc = Arc::new(TransferCache::new());
+    let central = Arc::new(CentralCache::new());
+    let pm = Arc::new(PageMap::new());
+    let sc = SizeClassId::new(1);
+    let hard = size_class::max_local_capacity(sc) as u32;
+    let transfer_cap = size_class::batch(sc) * 4; // default per-bin transfer capacity
+    for c in 0..ncpu {
+        cc.init_slot(CoreId(c as u32), sc, &m, hard);
+    }
+    // Fit the transfer bin so the idle flush never overflows to central.
+    let ntok = transfer_cap.min(hard as usize).min(64);
+    let tokens: Vec<usize> = (0..ntok).map(|i| 0xB00000 + i).collect();
+    assert_eq!(
+        cc.push_batch(CoreId(0), sc, &tokens),
+        ntok,
+        "seed fits one slot"
+    );
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|s| {
+        // Owners: RSEQ pop/push within the CPU caches, under affinity churn.
+        for t in 0..ncpu {
+            let cc = cc.clone();
+            let m = &m;
+            let in_flight = in_flight.clone();
+            let stop = stop.clone();
+            s.spawn(move || {
+                cc.register_current_thread();
+                let mut rng = 0xF00D ^ (t as u64).wrapping_mul(0x9E3779B1);
+                let mut hand: Option<usize> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    if rng.is_multiple_of(4096) {
+                        pin_to((rng as usize) % ncpu);
+                    }
+                    let core = CoreId(getcpu() as u32);
+                    match hand {
+                        None => {
+                            if let FeOutcome::Success(v) = cc.fe_pop(core, A, sc, m) {
+                                hand = Some(v);
+                                in_flight.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Some(tok) => {
+                            if let FeOutcome::Success(()) = cc.fe_push(core, A, sc, tok, m) {
+                                hand = None;
+                                in_flight.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                while let Some(tok) = hand {
+                    let core = CoreId(getcpu() as u32);
+                    if let FeOutcome::Success(()) = cc.fe_push(core, A, sc, tok, m) {
+                        in_flight.fetch_sub(1, Ordering::Relaxed);
+                        hand = None;
+                    }
+                }
+            });
+        }
+        // Non-owner: the real idle-CPU flush on random CPUs.
+        {
+            let cc = cc.clone();
+            let tc = tc.clone();
+            let central = central.clone();
+            let pm = pm.clone();
+            let m = &m;
+            let stop = stop.clone();
+            s.spawn(move || {
+                let mut rng = 0x1357_9BDFu64;
+                for _ in 0..30_000 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let c = (rng as usize) % ncpu;
+                    flush_idle_cpu(CoreId(c as u32), A, &cc, &tc, &central, &pm, m);
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        }
+    });
+
+    assert_eq!(in_flight.load(Ordering::Relaxed), 0, "all hands returned");
+
+    // Collect every token: CPU slots + the transfer cache (nothing reached central).
+    let mut recovered = Vec::new();
+    let mut buf = [0usize; BUF_CAP];
+    for c in 0..ncpu {
+        loop {
+            let n = cc.pop_batch(CoreId(c as u32), sc, &mut buf, BUF_CAP);
+            if n == 0 {
+                break;
+            }
+            recovered.extend_from_slice(&buf[..n]);
+        }
+    }
+    loop {
+        let n = tc.try_pop_batch(A, sc, &mut buf, BUF_CAP, &m);
+        if n == 0 {
+            break;
+        }
+        recovered.extend_from_slice(&buf[..n]);
+    }
+    recovered.sort_unstable();
+    let mut expected = tokens.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        recovered, expected,
+        "tokens conserved across concurrent idle-flush + fast path"
+    );
 }

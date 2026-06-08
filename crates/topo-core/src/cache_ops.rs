@@ -26,16 +26,12 @@ use crate::bootstrap::MetadataAlloc;
 use crate::central::{CentralCache, InsertResult, RemoveResult};
 use crate::cpu_cache::CpuCache;
 use crate::fe::CoreId;
-use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::{ArenaId, Label, NodeId, SizeClassId};
 use crate::pagemap::{PageEntry, PageMap};
 use crate::slab::SlabLayout;
 use crate::span::SpanDescriptor;
 use crate::transfer_cache::TransferCache;
 use crate::{size_class, MAX_BATCH_LEN};
-
-/// Number of size classes in the generated table.
-const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 
 /// Result of a refill operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,13 +256,18 @@ pub fn flush(
     }
 }
 
-/// Flush all slots of a specific CPU (W6-7: idle CPU flush).
+/// Flush all slots of a specific CPU (W6-7 idle-CPU flush; W7-4 coordination).
 ///
-/// Iterates over all size classes and flushes each non-empty slot.
-/// Returns the total number of objects flushed.
-/// **Plan 07 hook site:** when background memory management lands, this
-/// function is the natural place to notify the extent manager about emptied
-/// spans and reclaimable memory.
+/// Drains every initialized slot of `core` into the transfer cache (overflow to
+/// central), returning the total number of objects flushed. **Plan 07 hook site:**
+/// when background memory management lands, this is the natural place to notify
+/// the extent manager about emptied spans and reclaimable memory.
+///
+/// **W7-4.** This goes through [`CpuCache::drain_cpu`], which holds the per-CPU
+/// lock for the whole drain and issues the RSEQ fence **once** when `core` is a
+/// non-owner CPU — rather than one membarrier per size class (a membarrier is an
+/// all-CPU IPI). The transfer→central moves run hand-over-hand under the
+/// (outermost) per-CPU lock.
 pub fn flush_idle_cpu(
     core: CoreId,
     arena: ArenaId,
@@ -276,22 +277,15 @@ pub fn flush_idle_cpu(
     pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
 ) -> usize {
-    let mut total_flushed = 0usize;
-
-    for i in 0..NUM_SIZE_CLASSES {
-        let sc = SizeClassId::new(i);
-        // Drain each slot completely: flush pops at most batch_size per call,
-        // so loop until nothing is left.
-        loop {
-            let r = flush(core, arena, sc, cpu_cache, transfer, central, pagemap, meta);
-            total_flushed = total_flushed.saturating_add(r.flushed);
-            if r.flushed == 0 {
-                break;
-            }
+    let mut buf = [0usize; MAX_BATCH_LEN];
+    cpu_cache.drain_cpu(core, &mut buf, |sc, batch| {
+        // Push to the transfer cache; overflow goes to central (empty-span
+        // detection fires there, W6-3c). Same hand-over-hand discipline as `flush`.
+        let pushed = transfer.try_push_batch(arena, sc, batch, meta);
+        if pushed < batch.len() {
+            let _ = flush_addrs_to_central(&batch[pushed..], sc, central, pagemap);
         }
-    }
-
-    total_flushed
+    })
 }
 
 /// Flush a set of addresses to the central free list, classifying each by

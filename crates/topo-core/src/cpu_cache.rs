@@ -279,6 +279,33 @@ const _: () = {
     assert!(SLOT_CAP_OFF + core::mem::size_of::<u32>() <= SLOT_STRIDE);
 };
 
+/// Pop up to `max` (and `out.len()`) addresses off the top of an **already-locked**
+/// slot into `out`, returning the count. The single point that moves objects out
+/// of a slot under the per-CPU lock; shared by `pop_batch` and `drain_cpu`.
+///
+/// # Safety
+/// The caller must hold the slot's per-CPU lock (so this thread is the sole
+/// accessor) and have run the RSEQ fence for a non-owner drain.
+unsafe fn pop_slot(slot: &CpuSlot, out: &mut [usize], max: usize) -> usize {
+    let cur_len = slot.len.load(Ordering::Relaxed) as usize;
+    if cur_len == 0 {
+        return 0;
+    }
+    let pop_count = max.min(cur_len).min(out.len());
+    if pop_count == 0 {
+        return 0;
+    }
+    let buf = slot.buf_ptr();
+    let new_len = cur_len - pop_count;
+    for (i, dst) in out[..pop_count].iter_mut().enumerate() {
+        // SAFETY: `buf` points to a valid array of `hard_capacity` `usize`s;
+        // `new_len + i < cur_len <= hard_capacity`. The lock is held.
+        *dst = unsafe { *buf.add(new_len + i) };
+    }
+    slot.len.store(new_len as u32, Ordering::Relaxed);
+    pop_count
+}
+
 /// The per-CPU cache: `MAX_CPUS` [`PerCpu`] entries (W6-4).
 ///
 /// Thread-safe by construction: each CPU has its own spinlock. The fast-path
@@ -579,7 +606,11 @@ impl CpuCache {
     #[inline]
     fn fence_if_non_owner(&self, core: CoreId) {
         if self.rseq_mode() && (core.0 as i32) != rseq::current_cpu() {
-            rseq::fence_rseq();
+            let ok = rseq::fence_rseq();
+            // The fence is validated at `enable_rseq` time, so a failure here is
+            // a kernel anomaly: fail loudly in debug rather than silently risk a
+            // non-owner racing an in-flight sequence.
+            debug_assert!(ok, "RSEQ non-owner fence failed unexpectedly (W7-4)");
         }
     }
 
@@ -809,26 +840,9 @@ impl CpuCache {
         if !slot.is_initialized() {
             return 0;
         }
-
-        let cur_len = slot.len.load(Ordering::Relaxed) as usize;
-        if cur_len == 0 {
-            return 0;
-        }
-
-        let pop_count = max.min(cur_len).min(out.len());
-        if pop_count == 0 {
-            return 0;
-        }
-
-        let buf = slot.buf_ptr();
-        let new_len = cur_len - pop_count;
-        for (i, slot) in out[..pop_count].iter_mut().enumerate() {
-            // SAFETY: buf points to a valid array of `hard_capacity` usize elements.
-            // `new_len + i` < cur_len <= hard_capacity. We hold the per-CPU lock.
-            *slot = unsafe { *buf.add(new_len + i) };
-        }
-        slot.len.store(new_len as u32, Ordering::Relaxed);
-        pop_count
+        // SAFETY: the per-CPU lock is held (and, for a non-owner, the RSEQ fence
+        // has run), so this thread is the sole accessor of the slot.
+        unsafe { pop_slot(slot, out, max) }
     }
 
     /// Push addresses from `addrs` into the per-CPU slot for `(core, sc)`.
@@ -867,6 +881,56 @@ impl CpuCache {
         slot.len
             .store((cur_len + push_count) as u32, Ordering::Relaxed);
         push_count
+    }
+
+    /// Drain every initialized slot of `core` for an idle-CPU flush / hand-off,
+    /// holding the per-CPU lock **once** for the whole drain and, when `core` is
+    /// a non-owner CPU in RSEQ mode, issuing the RSEQ fence **once** (not per
+    /// size class — a membarrier is an all-CPU IPI, so per-batch fencing is a
+    /// maintenance-path storm). For each non-empty slot it repeatedly fills `buf`
+    /// (up to `buf.len()` per chunk) and calls `sink(sc, &buf[..n])`; the sink
+    /// moves the chunk to the middle-end. Returns the total drained.
+    ///
+    /// The per-CPU lock is the outermost cache lock, so the sink may take the
+    /// transfer then central locks (hand-over-hand) underneath it without
+    /// violating the §27.2 hierarchy. Holding it across the drain is sound for
+    /// the *idle* path (the target CPU is, by definition, not running the fast
+    /// path) and is what lets the fence be issued exactly once.
+    pub fn drain_cpu<F>(&self, core: CoreId, buf: &mut [usize], mut sink: F) -> usize
+    where
+        F: FnMut(SizeClassId, &[usize]),
+    {
+        let cpu = match self.cpus.get(core.index()) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let _guard = cpu.lock();
+        // One fence under the held lock: new sequences on `core` see the lock and
+        // divert; the fence aborts any already in-flight one before we read.
+        self.fence_if_non_owner(core);
+        let max = buf.len();
+        let mut total = 0usize;
+        for i in 0..NUM_SIZE_CLASSES {
+            let slot = match cpu.slots.get(i) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !slot.is_initialized() {
+                continue;
+            }
+            let sc = SizeClassId::new(i);
+            loop {
+                // SAFETY: the per-CPU lock is held across the whole drain and the
+                // fence has run, so this thread is the sole accessor of the slot.
+                let n = unsafe { pop_slot(slot, buf, max) };
+                if n == 0 {
+                    break;
+                }
+                total = total.saturating_add(n);
+                sink(sc, &buf[..n]);
+            }
+        }
+        total
     }
 }
 

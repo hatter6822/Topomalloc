@@ -286,9 +286,14 @@ pub(super) fn enable() -> bool {
 /// Decide the registration model. The membarrier-RSEQ intent is required (W7-4):
 /// without it the non-owner coordination is unsound, so we report unavailable.
 fn decide_mode() -> u8 {
-    // The fence must be registerable for the non-owner coordination to be sound.
+    // The fence must be registerable AND actually work for the non-owner
+    // coordination to be sound (W7-4). Validate both here so a runtime fence is
+    // reliable (a failure post-registration would be a kernel anomaly).
     if sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ) < 0 {
         return MODE_UNAVAILABLE;
+    }
+    if sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ) < 0 {
+        return MODE_UNAVAILABLE; // registered but the fence itself fails
     }
     // glibc already registered every thread's area: use it.
     if !glibc_area().is_null() {
@@ -372,7 +377,9 @@ pub(super) fn current_cpu() -> i32 {
 
 /// The W7-4 non-owner fence: abort any in-flight rseq critical section on other
 /// CPUs. The caller must already hold the per-CPU lock for the slots it will
-/// touch, so that after this returns no sequence can commit to them.
-pub(super) fn fence_rseq() {
-    let _ = sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ);
+/// touch, so that after this returns no sequence can commit to them. Returns
+/// whether the fence succeeded — it is validated at [`enable`] time, so `false`
+/// here would be a kernel anomaly the caller should treat as fatal in debug.
+pub(super) fn fence_rseq() -> bool {
+    sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ) >= 0
 }
