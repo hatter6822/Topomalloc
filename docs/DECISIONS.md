@@ -509,8 +509,44 @@ implementation choices are ratified here, the module docs carry the rest.
   against the **real kernel mechanism**. Under qemu-user (AArch64 CI) rseq is
   unavailable, so the cache uses the locked fallback there; to still exercise the
   AArch64 *instruction encoding/logic* in CI, a test drives the sequence with an
-  explicit, unregistered area whose `cpu_id` it controls. The kernel-*restart*
-  property on AArch64 is validated on real hardware (the seLe4n RPi5 target), per the
-  plan's "QEMU where needed" note. The `#[repr(C)]` `CpuSlot`/`PerCpu` layout the asm
-  addresses is pinned by `offset_of!` const guards, so a field reorder fails the
-  build rather than silently corrupting the cache.
+  explicit, unregistered area whose `cpu_id` it controls. The AArch64 kernel-*restart*
+  property is validated on a **native arm64 CI runner** (`ubuntu-24.04-arm`, a real ARM
+  kernel where glibc registers rseq) — the only place real preemption/migration
+  exercises the AArch64 commit (the seLe4n RPi5 target is the same arch). The
+  `#[repr(C)]` `CpuSlot`/`PerCpu` layout the asm addresses is pinned by `offset_of!`
+  const guards; the asm also bounds-checks the kernel `cpu_id` against `MAX_CPUS`
+  before forming a slot address (a migration to a CPU beyond the array on a
+  >128-core host would otherwise be an out-of-bounds commit).
+
+* **Performance is measured, not asserted.** `crates/topo-core/benches/cpu_cache.rs`
+  compares the RSEQ fast path against the locked baseline; on a 4-core x86-64 host
+  with RSEQ active the push/pop round-trip is **~21 ns → ~13 ns (≈ 37 % faster)** and a
+  16-op burst **~265 ns → ~192 ns (≈ 28 %)** — the per-op lock-CAS the restartable
+  sequence removes. Non-gating (`cargo xtask bench`).
+
+* **Concurrency runs under TSan (the DoD addendum).** `cargo xtask test --kind tsan`
+  (opt-in nightly, a gating CI job) runs the equivalence/W7-4/battery and the W6
+  cache-concurrency tests under ThreadSanitizer; all pass clean, validating the
+  locked path, every atomic, and the W7-4 lock/fence coordination as race-free.
+  **Blind spot:** TSan instruments compiler-generated accesses, not inline assembly,
+  so the RSEQ sequence interior is invisible to it — the asm-vs-atomic interactions
+  are covered by the conservation tests instead.
+
+* **Three modes behind one `fe_pop`/`fe_push`; W7-4 fence validated.** `CpuCache` is a
+  runtime three-way mode (`Locked`/`Rseq`/`PinnedCore`); `enable_rseq` (Linux) and
+  `enable_pinned_core` (seLe4n, given a per-core oracle) select the fast paths, and
+  the shared `fe_pop`/`fe_push` dispatch to them — so the seLe4n pinned path is behind
+  the *same* entry point, not just the same return type. The idle-CPU flush goes
+  through `CpuCache::drain_cpu`, which holds the per-CPU lock once and issues the RSEQ
+  fence **once** (a membarrier is an all-CPU IPI, so the previous per-size-class fence
+  was a maintenance-path storm). The fence is validated with a test membarrier at
+  `enable` time, so RSEQ mode is only selected if the fence actually works; the
+  per-use fence return is `debug_assert`ed. Pinned mode's non-owner coordination is
+  the §36.10 hand-off contract, not the membarrier.
+
+* **One stable-Rust limitation, documented.** The glibc-area path takes a **hard** link
+  reference to `__rseq_offset`/`__rseq_size` (glibc ≥ 2.35). On a `-gnu` target linked
+  against older glibc the crate fails to *link* (not just fall back); the robust fix is
+  weak linkage, which is nightly-only, so it is rejected to keep the stable invariant
+  (W0-3). The supported `-gnu` targets are modern; musl is unaffected (it uses
+  self-registration, which references no glibc symbol).

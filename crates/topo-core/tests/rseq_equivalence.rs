@@ -561,3 +561,67 @@ fn budget_adapts_to_fast_path_miss_stats() {
         "budget must grow soft capacity on fast-path misses: {soft_before} -> {soft_after}"
     );
 }
+
+/// Empirical mirror of the Lean `rseq_pop_success_frame` axiom (§33.5): a
+/// successful fast-path pop changes **only** the popped object's slot — every
+/// other CPU's slot is untouched (the frame condition the conservation theorems
+/// consume). Pinned so the pop lands on a known CPU.
+#[test]
+fn fast_path_pop_obeys_the_frame_condition() {
+    let ncpu = ncpus();
+    if ncpu < 2 {
+        return;
+    }
+    let m = meta(16 * 1024 * 1024);
+    let cc = CpuCache::new();
+    cc.enable_rseq();
+    cc.register_current_thread();
+    cc.set_active_cpus(ncpu as u32);
+
+    let cpu = getcpu();
+    if !pin_to(cpu) {
+        return;
+    }
+    let cpu = getcpu();
+    let core = CoreId(cpu as u32);
+    let sc = SizeClassId::new(0);
+    let hard = size_class::max_local_capacity(sc) as u32;
+    for c in 0..ncpu {
+        cc.init_slot(CoreId(c as u32), sc, &m, hard);
+    }
+    // Seed the current CPU (LIFO: 0x30 on top) and every other CPU with distinct
+    // tokens, so any disturbance to a non-owner slot would show up.
+    cc.push_batch(core, sc, &[0x10, 0x20, 0x30]);
+    for c in 0..ncpu {
+        if c != cpu {
+            cc.push_batch(CoreId(c as u32), sc, &[0x1000 + c, 0x2000 + c]);
+        }
+    }
+    let lens_before: Vec<u32> = (0..ncpu)
+        .map(|c| {
+            cc.per_cpu(CoreId(c as u32))
+                .unwrap()
+                .slot(sc)
+                .unwrap()
+                .len()
+        })
+        .collect();
+
+    // One fast-path pop on the pinned CPU.
+    assert_eq!(cc.fe_pop(core, A, sc, &m), FeOutcome::Success(0x30));
+
+    // Frame: the popped CPU's slot dropped by exactly one; all others unchanged.
+    for (c, &len_before) in lens_before.iter().enumerate() {
+        let len_after = cc
+            .per_cpu(CoreId(c as u32))
+            .unwrap()
+            .slot(sc)
+            .unwrap()
+            .len();
+        if c == cpu {
+            assert_eq!(len_after, len_before - 1, "popped slot decremented by one");
+        } else {
+            assert_eq!(len_after, len_before, "frame: CPU {c}'s slot untouched");
+        }
+    }
+}

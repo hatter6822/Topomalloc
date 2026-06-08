@@ -170,6 +170,15 @@ fn thread_pointer() -> usize {
 
 // glibc ≥ 2.35 exports these; the rseq area lives at `thread_pointer + __rseq_offset`
 // when `__rseq_size != 0`. They are referenced only on `target_env = "gnu"`.
+//
+// LIMITATION (documented): this is a **hard** link reference. On a `-gnu` target
+// linked against glibc < 2.35 (which does not export these), the crate fails to
+// *link* — even on a host that would otherwise fall back to self-registration or
+// the locked baseline. The robust fix is weak linkage (resolve to 0 when absent),
+// but `#[linkage = "extern_weak"]` is nightly-only, and the project is pinned to
+// stable (W0-3). The supported `-gnu` targets are modern (glibc ≥ 2.35), so this
+// is accepted; musl (`target_env = "musl"`) is unaffected — it takes the
+// self-registration path, which references no glibc symbol.
 #[cfg(target_env = "gnu")]
 extern "C" {
     static __rseq_offset: isize;

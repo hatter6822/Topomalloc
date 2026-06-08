@@ -60,11 +60,16 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 
 > **▸ Implementation status.** W7 is **landed**. The RSEQ ABI, registration, and
 > per-arch restartable sequences live in [`topo-arch/src/rseq/`](../../crates/topo-arch/src/rseq/);
-> the mode-aware front end and the seLe4n pinned-core mode in
-> [`topo-core`](../../crates/topo-core/src/) (`cpu_cache.rs`, `pinned.rs`). RSEQ is
-> active on x86-64 in CI (glibc-registered; real kernel sequence) and falls back to
-> the locked baseline where unavailable (qemu-aarch64, sandboxes). The forced-migration
-> equivalence and the §34.5 battery are in `crates/{topo-arch,topo-core}/tests/`. See
+> the runtime three-way mode (`Locked`/`Rseq`/`PinnedCore`) front end and the seLe4n
+> pinned-core mode in [`topo-core`](../../crates/topo-core/src/) (`cpu_cache.rs`,
+> `pinned.rs`). RSEQ is active on x86-64 in CI (glibc-registered; real kernel sequence),
+> validated on a **native arm64 runner** for the real AArch64 restart, and falls back to
+> the locked baseline where unavailable (qemu-aarch64, sandboxes). Verified four ways:
+> the forced-migration/abort/signal equivalence battery (`crates/{topo-arch,topo-core}/tests/`),
+> **ThreadSanitizer** (`xtask test --kind tsan`, gating CI), the no-call + structural
+> **CS audit** (`xtask` lint), and **criterion benchmarks** (`benches/cpu_cache.rs`:
+> RSEQ ≈ 37 % faster per op). W7-4 uses a one-lock-one-fence idle drain with a
+> fence validated at `enable` time. See
 > [DD-2](#dd-2--rseq-restartable-sequences-w7-2w7-3--the-only-assembly) and
 > [docs/DECISIONS.md](../../docs/DECISIONS.md) (W7).
 
