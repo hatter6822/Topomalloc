@@ -106,7 +106,13 @@ impl Cache {
         // SAFETY: `area` is this thread's area and the layout arguments describe
         // this live synthetic cache (see the `Cache` invariant above).
         unsafe {
-            rseq::pop::<LEN_OFF, BUF_OFF>(area, self.slot_base(sc), self.base(), self.stride())
+            rseq::pop::<LEN_OFF, BUF_OFF>(
+                area,
+                self.slot_base(sc),
+                self.base(),
+                self.stride(),
+                MAX_CPUS,
+            )
         }
     }
     fn push(&self, sc: usize, v: usize) -> Push {
@@ -118,6 +124,7 @@ impl Cache {
                 self.slot_base(sc),
                 self.base(),
                 self.stride(),
+                MAX_CPUS,
                 v,
             )
         }
@@ -130,7 +137,13 @@ impl Cache {
         // SAFETY: `area` is a valid (if unregistered) area and the layout
         // arguments describe this live cache; no concurrent access.
         unsafe {
-            rseq::pop::<LEN_OFF, BUF_OFF>(area, self.slot_base(sc), self.base(), self.stride())
+            rseq::pop::<LEN_OFF, BUF_OFF>(
+                area,
+                self.slot_base(sc),
+                self.base(),
+                self.stride(),
+                MAX_CPUS,
+            )
         }
     }
     fn push_with(&self, sc: usize, v: usize, area: *mut Rseq) -> Push {
@@ -141,6 +154,7 @@ impl Cache {
                 self.slot_base(sc),
                 self.base(),
                 self.stride(),
+                MAX_CPUS,
                 v,
             )
         }
@@ -231,6 +245,28 @@ fn asm_sequence_logic_runs_with_explicit_area() {
     cache.cpus[0].locked.store(1, Ordering::Release);
     assert_eq!(cache.pop_with(sc, area_ptr), Pop::Fallback);
     cache.cpus[0].locked.store(0, Ordering::Release);
+}
+
+#[test]
+fn out_of_range_cpu_diverts_to_fallback() {
+    // Memory-safety guard: a kernel-reported CPU id >= MAX_CPUS must NOT index
+    // past the per-CPU array; the sequence bounds-checks it and returns Fallback.
+    // Driven via an explicit area so it runs on every target (incl. qemu).
+    let cache = Cache::new(); // exactly MAX_CPUS entries
+    let sc = 0;
+    let mut area = Rseq::zeroed();
+    // cpu_id one past the last valid index — cpus[MAX_CPUS] is out of bounds.
+    area.cpu_id = MAX_CPUS as u32;
+    let ap = &mut area as *mut Rseq;
+    assert_eq!(cache.pop_with(sc, ap), Pop::Fallback);
+    assert_eq!(cache.push_with(sc, 1, ap), Push::Fallback);
+    // A far-out-of-range id is also safely diverted.
+    area.cpu_id = u32::MAX;
+    let ap = &mut area as *mut Rseq;
+    assert_eq!(cache.pop_with(sc, ap), Pop::Fallback);
+    assert_eq!(cache.push_with(sc, 1, ap), Push::Fallback);
+    // No slot was touched.
+    assert_eq!(cache.slot_len(0, sc), 0);
 }
 
 #[test]

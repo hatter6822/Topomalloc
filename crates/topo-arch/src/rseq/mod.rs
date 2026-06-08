@@ -10,7 +10,8 @@
 //!
 //! ## Layers
 //!
-//! - [`abi`] — the kernel-shared `struct rseq` / `struct rseq_cs` layout (W7-2a).
+//! - the ABI layer ([`Rseq`] / [`RseqCs`]) — the kernel-shared `struct rseq` /
+//!   `struct rseq_cs` layout (W7-2a).
 //! - registration & detection ([`enable`], [`register_current_thread`],
 //!   [`current_cpu`], [`current_area`]) — glibc-area and self-registration
 //!   models (W7-1), Linux-only; every other target reports unavailable.
@@ -239,30 +240,37 @@ pub fn fence_rseq() {
 /// `LEN_OFF`/`BUF_OFF` are the byte offsets of the slot's length and buffer
 /// pointer; `slot_base = &cpus[0] + slots_offset + sc * slot_stride`;
 /// `locked_base = &cpus[0]` (the per-CPU lock byte, offset 0); `stride =
-/// size_of::<PerCpu>()`.
+/// size_of::<PerCpu>()`; `max_cpus` is the length of the per-CPU array — the
+/// sequence bounds-checks the kernel-reported CPU against it (memory safety on
+/// machines with more cores than the array holds).
 ///
 /// # Safety
 /// `area` must be this thread's registered area and the layout arguments must
-/// describe a live per-CPU cache (see [`seq_x86_64::pop`](self) docs).
+/// describe a live per-CPU cache of `max_cpus` entries (see [`seq_x86_64::pop`](self) docs).
 #[inline]
 pub unsafe fn pop<const LEN_OFF: usize, const BUF_OFF: usize>(
     area: *mut Rseq,
     slot_base: *const u8,
     locked_base: *const u8,
     stride: usize,
+    max_cpus: usize,
 ) -> Pop {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     // SAFETY: forwarded contract.
-    return unsafe { seq_x86_64::pop::<LEN_OFF, BUF_OFF>(area, slot_base, locked_base, stride) };
+    return unsafe {
+        seq_x86_64::pop::<LEN_OFF, BUF_OFF>(area, slot_base, locked_base, stride, max_cpus)
+    };
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     // SAFETY: forwarded contract.
-    return unsafe { seq_aarch64::pop::<LEN_OFF, BUF_OFF>(area, slot_base, locked_base, stride) };
+    return unsafe {
+        seq_aarch64::pop::<LEN_OFF, BUF_OFF>(area, slot_base, locked_base, stride, max_cpus)
+    };
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (area, slot_base, locked_base, stride);
+        let _ = (area, slot_base, locked_base, stride, max_cpus);
         Pop::Fallback
     }
 }
@@ -283,24 +291,39 @@ pub unsafe fn push<const LEN_OFF: usize, const BUF_OFF: usize, const CAP_OFF: us
     slot_base: *const u8,
     locked_base: *const u8,
     stride: usize,
+    max_cpus: usize,
     value: usize,
 ) -> Push {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     // SAFETY: forwarded contract.
     return unsafe {
-        seq_x86_64::push::<LEN_OFF, BUF_OFF, CAP_OFF>(area, slot_base, locked_base, stride, value)
+        seq_x86_64::push::<LEN_OFF, BUF_OFF, CAP_OFF>(
+            area,
+            slot_base,
+            locked_base,
+            stride,
+            max_cpus,
+            value,
+        )
     };
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     // SAFETY: forwarded contract.
     return unsafe {
-        seq_aarch64::push::<LEN_OFF, BUF_OFF, CAP_OFF>(area, slot_base, locked_base, stride, value)
+        seq_aarch64::push::<LEN_OFF, BUF_OFF, CAP_OFF>(
+            area,
+            slot_base,
+            locked_base,
+            stride,
+            max_cpus,
+            value,
+        )
     };
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (area, slot_base, locked_base, stride, value);
+        let _ = (area, slot_base, locked_base, stride, max_cpus, value);
         Push::Fallback
     }
 }

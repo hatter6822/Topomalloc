@@ -609,7 +609,13 @@ impl CpuCache {
             // `PERCPU_STRIDE` describe this live per-CPU cache, with `len` at
             // `SLOT_LEN_OFF` and `buf` at `SLOT_BUF_OFF`.
             match unsafe {
-                rseq::pop::<SLOT_LEN_OFF, SLOT_BUF_OFF>(area, slot_base, base, PERCPU_STRIDE)
+                rseq::pop::<SLOT_LEN_OFF, SLOT_BUF_OFF>(
+                    area,
+                    slot_base,
+                    base,
+                    PERCPU_STRIDE,
+                    MAX_CPUS,
+                )
             } {
                 rseq::Pop::Success(addr) => return Some(FeOutcome::Success(addr)),
                 rseq::Pop::Empty => {
@@ -651,6 +657,7 @@ impl CpuCache {
                     slot_base,
                     base,
                     PERCPU_STRIDE,
+                    MAX_CPUS,
                     addr,
                 )
             } {

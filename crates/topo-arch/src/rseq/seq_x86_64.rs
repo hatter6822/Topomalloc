@@ -55,6 +55,7 @@ pub(super) unsafe fn pop<const LEN_OFF: usize, const BUF_OFF: usize>(
     slot_base: *const u8,
     locked_base: *const u8,
     stride: usize,
+    max_cpus: usize,
 ) -> Pop {
     let status: u32;
     let val: usize;
@@ -76,6 +77,8 @@ pub(super) unsafe fn pop<const LEN_OFF: usize, const BUF_OFF: usize>(
             // ---- start_ip ----
             "3:",
             "mov {cpu:e}, [{area} + 4]",        // cpu = rseq.cpu_id  (inside the CS)
+            "cmp {cpu}, {maxcpus}",             // bounds-check cpu < MAX_CPUS
+            "jae 6f",                           // out of range → Fallback (memory safety)
             "imul {cpu}, {stride}",             // cpu *= stride  → byte offset
             "cmp byte ptr [{lbase} + {cpu}], 0",
             "jne 6f",                           // per-CPU lock held → Fallback (W7-4)
@@ -114,6 +117,7 @@ pub(super) unsafe fn pop<const LEN_OFF: usize, const BUF_OFF: usize>(
             sbase = in(reg) slot_base,
             lbase = in(reg) locked_base,
             stride = in(reg) stride,
+            maxcpus = in(reg) max_cpus,
             lenoff = const LEN_OFF,
             bufoff = const BUF_OFF,
             sig = const RSEQ_SIG,
@@ -147,6 +151,7 @@ pub(super) unsafe fn push<const LEN_OFF: usize, const BUF_OFF: usize, const CAP_
     slot_base: *const u8,
     locked_base: *const u8,
     stride: usize,
+    max_cpus: usize,
     value: usize,
 ) -> Push {
     let status: u32;
@@ -164,6 +169,8 @@ pub(super) unsafe fn push<const LEN_OFF: usize, const BUF_OFF: usize, const CAP_
             "mov [{area} + 8], {tmp}",
             "3:",
             "mov {cpu:e}, [{area} + 4]",
+            "cmp {cpu}, {maxcpus}",             // bounds-check cpu < MAX_CPUS
+            "jae 6f",                           // out of range → Fallback (memory safety)
             "imul {cpu}, {stride}",
             "cmp byte ptr [{lbase} + {cpu}], 0",
             "jne 6f",                           // locked → Fallback
@@ -199,6 +206,7 @@ pub(super) unsafe fn push<const LEN_OFF: usize, const BUF_OFF: usize, const CAP_
             sbase = in(reg) slot_base,
             lbase = in(reg) locked_base,
             stride = in(reg) stride,
+            maxcpus = in(reg) max_cpus,
             val = in(reg) value,
             lenoff = const LEN_OFF,
             bufoff = const BUF_OFF,
