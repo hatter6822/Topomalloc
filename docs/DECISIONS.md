@@ -413,3 +413,104 @@ module docs carry the detail.
   well-formed on failure (W4-5): `ExtentMap::check_invariants` (the executable §18
   tiling/index predicate) is `debug_assert`ed after every mutation and held green by
   the property, failure-injection, concurrency, and fuzz (`fuzz/.../extent.rs`) tests.
+
+## W7 — RSEQ / restartable fast paths & per-arch assembly (plan 05)
+
+The W7 fast path (`crates/topo-arch/src/rseq/**`, plus `topo-core`'s
+`cpu_cache.rs` and `pinned.rs`) makes per-CPU `pop`/`push` lock-free. It is the
+only hand-written assembly in the project and the highest-risk code; six
+implementation choices are ratified here, the module docs carry the rest.
+
+* **Correct before fast — one front-end contract.** The locked per-CPU baseline
+  (W6-4) ships first and is *never* replaced, only fronted. The RSEQ path and the
+  seLe4n pinned-core path implement the *same* `FeOutcome` contract and must be
+  **behaviourally equivalent** to the locked path (P-003, §12.1). `CpuCache` is
+  mode-aware: `enable_rseq()` flips `fe_pop`/`fe_push` to the restartable sequence
+  when the platform supports it, and on *any* condition the sequence cannot handle
+  (a non-owner holding the per-CPU lock, an uninitialised slot, the abort retry
+  bound) it falls through to the locked path on the current CPU. Equivalence is the
+  acceptance criterion (G-fast), proven empirically by a pinned outcome-for-outcome
+  comparison and a forced-migration token-conservation differential against the
+  locked baseline — *not* merely "it passes".
+
+* **Registration: use glibc's area, self-register as the fallback — "support
+  both".** On the supported `-gnu` targets glibc ≥ 2.35 auto-registers an `rseq`
+  area per thread and exports `__rseq_offset`/`__rseq_size`; we read it at
+  `thread_pointer + __rseq_offset` (a direct `%fs`/`tpidr_el0` register read — *no
+  TLS of our own*, no allocation, the DD-4-correct path). Where glibc did **not**
+  register (musl, glibc < 2.35, the rseq tunable off) we self-register our own area
+  via the raw `rseq(2)` syscall, stored in a `thread_local!` (the `std` fallback).
+  RSEQ mode is enabled only when the non-owner fence
+  (`membarrier(…_PRIVATE_EXPEDITED_RSEQ)`) is also registerable, so W7-4 stays sound
+  wherever the fast path runs at all. Everything else (no kernel rseq, other arch,
+  non-Linux) reports unavailable and uses the locked baseline.
+
+* **The self-registration area uses stable `thread_local!`, not nightly
+  `#[thread_local]`.** This is a deliberate, measured choice tied to the DD-4 / R3
+  TLS-re-entrancy rule. The *primary* (glibc) path owns no TLS, so DD-4 is satisfied
+  by construction on every supported target and in CI; the TLS-model question only
+  touches the narrow self-registration fallback. A `const`-initialised
+  `thread_local!` compiles to **Local Exec** (a direct `%fs:…@TPOFF` load, no
+  `__tls_get_addr`, no lazy-init guard) in an executable — verified by inspecting the
+  generated asm — i.e. exactly DD-4's "a static `__thread` slot reached without a
+  dynamic TLS allocation". It is General Dynamic only as a `cdylib`, and even then
+  only allocates for a `dlopen`ed module's *first* access; we neutralise that by
+  registering **explicitly at thread start** (§27.6), never lazily on the malloc
+  path, and by letting the fast path receive the resolved area pointer from the
+  caller's IE bootstrap (plan 06 / W16-2). Nightly `#[thread_local]+IE` was rejected:
+  it would break the ratified stable-toolchain invariant (W0-3) for a benefit that is
+  (a) only on a fallback the `-gnu` targets never run, (b) not free (also needs the
+  nightly `-Z tls-model` flag), (c) no cure for the `dlopen` case (IE can fail to
+  load there), and (d) without a consumer here (the `no_std` target, seLe4n, uses
+  pinned-core, not rseq).
+
+* **The restartable sequence shape (§12.3, the non-negotiable rules).** Each
+  per-arch `pop`/`push` is a single `asm!` critical section: arm the descriptor
+  (`rseq.rseq_cs = &cs`), then `start_ip` loads `cpu_id` **inside** the CS (so
+  migration after the load aborts), computes `&cpus[cpu]`, checks the per-CPU lock
+  byte and the buffer pointer (diverting to the locked path if set/null), bounds-
+  checks, and ends with **one committing store** of the new length. Everything before
+  the commit is a load or a register op, so an abort before it is a logical no-op
+  (the plan 02 W1-7 frame condition); for `push` the object is staged into the
+  logically-free `buf[len]` and published only by the `len` increment. The descriptor
+  lives in a `__rseq_cs` section; the abort handler sits in `__rseq_failure` prefixed
+  by the four `RSEQ_SIG` bytes the kernel verifies. **No calls and no possibly-
+  faulting reference** in the CS: every reference is to already-resident per-CPU
+  metadata, and an `xtask` lint (`check_rseq_cs`, W7-2d) fails the build on any
+  `call`/`bl`/`blr`/`svc`/`syscall` in the sequence files. AArch64 is **co-primary**
+  (it is the seLe4n target), not a port; its only deviation from x86-64 is a
+  load-acquire (`ldarb`) on the lock byte for the weak memory model.
+
+* **W7-4 non-owner coordination: per-CPU lock checked in the CS + an RSEQ fence.**
+  A thread draining a CPU it is not running on (idle-CPU flush) takes that CPU's
+  spinlock — so new sequences see the lock byte and divert — and then issues
+  `membarrier(…_PRIVATE_EXPEDITED_RSEQ)`, which aborts any *in-flight* sequence on
+  other CPUs before it can commit (§27.4). Owner-side batch ops (the common
+  refill/flush on the current CPU) need no fence: only a thread running on a CPU can
+  mutate its slot via RSEQ, the kernel aborts a preempted sequence, and that thread
+  is the one holding the lock. `pop_batch`/`push_batch` fence exactly when `core` is
+  not the caller's current CPU.
+
+* **seLe4n pinned-core mode (§36.10 option 1) behind the same contract.** seLe4n is
+  not Linux and has no `rseq`; the per-core fast path there is a *software*
+  restartable sequence (`fe_pop_pinned`/`fe_push_pinned`) that reads the current core
+  from an injectable `CoreProvider` (the runtime's per-core identity, the analogue of
+  `cpu_id`), **aborts with no state change** if the thread is not on the expected
+  core, and commits with a single store only when the core is stable across the read
+  — mirroring the Lean `per_core_cache_abort_no_change` obligation (W1-12d). Under the
+  pinned-thread contract the thread is the sole accessor, so the read-modify-write is
+  race-free; a fully migration-atomic commit on a non-pinned thread is option 2 (a
+  kernel restartable section) and slots in behind the same contract when seLe4n
+  exposes that ABI. The migration flush/hand-off is the caller's responsibility
+  (flush or make the cache unreachable before affinity changes).
+
+* **Coverage honesty (what runs where).** On x86-64 CI, glibc registers rseq, so the
+  sequences, the forced-migration conservation, and the signal-near-CS battery run
+  against the **real kernel mechanism**. Under qemu-user (AArch64 CI) rseq is
+  unavailable, so the cache uses the locked fallback there; to still exercise the
+  AArch64 *instruction encoding/logic* in CI, a test drives the sequence with an
+  explicit, unregistered area whose `cpu_id` it controls. The kernel-*restart*
+  property on AArch64 is validated on real hardware (the seLe4n RPi5 target), per the
+  plan's "QEMU where needed" note. The `#[repr(C)]` `CpuSlot`/`PerCpu` layout the asm
+  addresses is pinned by `offset_of!` const guards, so a field reorder fails the
+  build rather than silently corrupting the cache.

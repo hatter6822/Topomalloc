@@ -132,7 +132,7 @@ pub fn gen(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `test [--kind unit|prop|diff|fuzz] [--target T]` — run the test suites.
+/// `test [--kind unit|prop|diff|fuzz|loom|rseq] [--target T]` — run the test suites.
 ///
 /// With `--target` (used by the AArch64 CI job), tests are built for that target
 /// and run via the `.cargo/config.toml` runner (`qemu-aarch64`). Without it, the
@@ -184,8 +184,27 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("loom") => {
             loom_steps(&mut r);
         }
+        Some("rseq") => {
+            // The W7 RSEQ / pinned-core battery (also part of the default
+            // `--workspace` run; this is the focused subset, G-fast).
+            r.run(
+                "rseq sequences (topo-arch)",
+                "cargo",
+                &["test", "-p", "topo-arch", "--test", "rseq"],
+            );
+            r.run(
+                "rseq equivalence (topo-core)",
+                "cargo",
+                &["test", "-p", "topo-core", "--test", "rseq_equivalence"],
+            );
+            r.run(
+                "pinned-core (topo-core)",
+                "cargo",
+                &["test", "-p", "topo-core", "--test", "pinned_core"],
+            );
+        }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom)");
+            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|rseq)");
             r.record("unknown test kind", false);
         }
         None => {
@@ -644,7 +663,9 @@ fn check_rseq_cs(root: &Path) -> bool {
         }
     }
     if issues.is_empty() {
-        println!("  · RSEQ critical sections: no calls / branch-with-link ({scanned} files, §12.3)");
+        println!(
+            "  · RSEQ critical sections: no calls / branch-with-link ({scanned} files, §12.3)"
+        );
         true
     } else {
         for it in issues.iter().take(50) {

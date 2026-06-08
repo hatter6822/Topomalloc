@@ -16,7 +16,7 @@ cargo xtask setup     # install the pinned Rust + Lean toolchains and cross targ
 cargo xtask ci        # the exact sequence CI runs: fmt, lint, gen-check, build, test, lean
 cargo xtask build [--target aarch64-unknown-linux-gnu] [--profile performance]
 cargo xtask gen [--check]   # regenerate / verify the size-class tables (G-table)
-cargo xtask test [--kind unit|prop|diff|fuzz|loom]
+cargo xtask test [--kind unit|prop|diff|fuzz|loom|rseq]
 cargo xtask fmt --check
 cargo xtask lint
 cargo xtask lean      # build the Lean model and run `lake exe check`

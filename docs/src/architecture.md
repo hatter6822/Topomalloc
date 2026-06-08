@@ -29,7 +29,7 @@ Formal: Lean model + seLe4n bridge                           lean/
 | `topo-abi` | C ABI + `GlobalAlloc` + runtime backend selector | MIT |
 | `topo-backend-posix` | `PosixBackingProvider` (degenerate single-authority case) | MIT |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later |
-| `topo-arch` | per-arch identity + fast-path mode (RSEQ lands in plan 05) | MIT |
+| `topo-arch` | per-arch identity + the RSEQ restartable per-CPU sequences (plan 05 W7) | MIT |
 | `topo-stats` | stats snapshot + additive JSON (`topomalloc_version`) | MIT |
 | `topo-control` | configuration + control namespace | MIT |
 | `topo-test-support` | trace parser, deterministic PRNG, executable model | MIT |
@@ -264,6 +264,44 @@ model by a Rust differential test (`extent_state_transition_matches_lean`) and t
 `lake exe check` `extentStateGate` — the §20.1 analogue of `providerChainGate` — and
 `can_transition` is `debug_assert`ed at every physical-state write, so the extent-state
 transitions the allocator actually runs cannot drift from the model.
+
+## Front-end: per-CPU caches & the RSEQ fast path (plan 05 W6/W7)
+
+The front-end holds free objects in per-`(cpu, size-class)` slots and serves the
+common small `malloc`/`free` without touching the middle-end. The **locked**
+per-CPU cache (`cpu_cache.rs`, W6-4) is the correct baseline: a per-CPU spinlock
+serialises each slot, and refill/flush move batches up/down the hierarchy
+hand-over-hand (`cache_ops.rs`, never two middle-end locks at once). Everything
+obeys one **front-end contract** — `FeOutcome::{Success, Empty, Full, Abort}` —
+where `Abort` (a preempted/migrated fast path → retry, state unchanged) is kept
+distinct from `Empty`/`Full` (genuine under/overflow → slow path).
+
+**RSEQ fast path (W7, `topo-arch/src/rseq/`).** On Linux the per-CPU `pop`/`push`
+become lock-free via a restartable sequence the kernel **restarts** on
+preemption/migration before its single committing store — the only hand-written
+assembly in the project, per-arch for x86-64 (W7-2) and AArch64 (W7-3, co-primary
+as the seLe4n target). The shape is non-negotiable (§12.3): load `cpu_id` *inside*
+the critical section, address `&cpus[cpu]`'s slot, bounds-check, then commit with
+**one store**; an abort before it is a logical no-op (the plan 02 W1-7 frame
+condition). There are no calls and no possibly-faulting references in the section
+(an `xtask` lint enforces the no-call rule, W7-2d). `CpuCache` is **mode-aware**:
+`enable_rseq()` fronts `fe_pop`/`fe_push` with the sequence and falls through to
+the locked path on anything it cannot handle, so the two are behaviourally
+identical — the acceptance criterion (G-fast), proven by a pinned outcome-equality
+comparison and a forced-migration token-conservation differential against the
+locked baseline. RSEQ availability is detected at run time (glibc's registered
+area where present, a `std` self-registration fallback otherwise); where it is
+absent the allocator uses the locked baseline unchanged (P-003). A **non-owner**
+draining an idle CPU coordinates with the owner's sequence by taking the per-CPU
+lock (new sequences then divert) and issuing `membarrier(…_RSEQ)` to abort any
+in-flight one (W7-4, §27.4).
+
+**seLe4n pinned-core (W7-5, `pinned.rs`).** The non-Linux target has no `rseq`, so
+its per-core fast path (§36.10 option 1) is a software restartable sequence behind
+the *same* contract: it reads the current core from the runtime, **aborts with no
+state change** if the thread is not on its pinned core, and commits a single store
+only when the core is stable across the read — mirroring the Lean
+`per_core_cache_abort_no_change` obligation (W1-12d).
 
 ## Single source of truth (DD-1)
 

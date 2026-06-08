@@ -58,20 +58,30 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 
 **Depends on:** W6-4, plan 02 W1-7. **Enables:** M3. The only hand-written assembly in the project.
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W7-1 | RSEQ registration + per-thread availability detection (§12.3); initial-exec TLS interplay (W16-2). | M | | registered on Linux; clean fallback when absent (P-003). |
-| W7-2a | RSEQ critical-section descriptors + abort-handler trampolines in a dedicated section; register the rseq area. | M | | cs table present; abort vector wired. |
-| W7-2b | x86-64 `rseq_pop` (load cpu → load head → single committing store); abort ⇒ logical no-op. | M | | pops one or reports empty; abort unchanged. |
-| W7-2c | x86-64 `rseq_push` (capacity check → store → commit index); abort ⇒ no-op. | M | ∥ | pushes one or reports full; abort unchanged. |
-| W7-2d | Clobber/barrier docs + compiler-fence discipline; audit/lint that no call or faulting ref occurs inside a CS (§12.3). | S | | documented; lint passes. |
-| W7-2e | x86-64 equivalence vs locked mode under forced migration (feeds W7-6). | M | | no lost/duplicated object vs locked (G-fast). |
-| W7-3a | AArch64 `rseq_pop`/`rseq_push` + abort handler (commit-store model); **shares the arch with the seLe4n RPi5 target**. | L | ∥ | pop/push correct; abort unchanged. |
-| W7-3b | AArch64 clobber/barrier docs + no-call/no-fault-in-CS audit. | S | ∥ | documented; lint passes. |
-| W7-3c | AArch64 equivalence vs locked under forced migration (QEMU). | M | ∥ | matches locked (G-fast). |
-| W7-4 | Non-owner coordination (§27.4): flushing an idle CPU vs the owner's RSEQ (epoch / stop-the-world / per-CPU lock). | M | | concurrent flush-vs-fastpath stress clean. |
-| W7-5 | seLe4n pinned-thread per-core mode (§36.10 option 1) behind the same front-end contract; abort/no-change case. | M | | migration flush/hand-off correct; `per_core_cache_abort_no_change` mirrored. |
-| W7-6 | RSEQ test battery (§34.5): migration, signal near sequence, preemption, registration failure, compare-vs-locked. | M | | all pass in CI (QEMU where needed). |
+> **▸ Implementation status.** W7 is **landed**. The RSEQ ABI, registration, and
+> per-arch restartable sequences live in [`topo-arch/src/rseq/`](../../crates/topo-arch/src/rseq/);
+> the mode-aware front end and the seLe4n pinned-core mode in
+> [`topo-core`](../../crates/topo-core/src/) (`cpu_cache.rs`, `pinned.rs`). RSEQ is
+> active on x86-64 in CI (glibc-registered; real kernel sequence) and falls back to
+> the locked baseline where unavailable (qemu-aarch64, sandboxes). The forced-migration
+> equivalence and the §34.5 battery are in `crates/{topo-arch,topo-core}/tests/`. See
+> [DD-2](#dd-2--rseq-restartable-sequences-w7-2w7-3--the-only-assembly) and
+> [docs/DECISIONS.md](../../docs/DECISIONS.md) (W7).
+
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W7-1 | RSEQ registration + per-thread availability detection (§12.3); initial-exec TLS interplay (W16-2). | M | | registered on Linux; clean fallback when absent (P-003). | **DONE** — `rseq::imp_linux` (glibc-area + `std` self-reg); `enable`/`register_current_thread` |
+| W7-2a | RSEQ critical-section descriptors + abort-handler trampolines in a dedicated section; register the rseq area. | M | | cs table present; abort vector wired. | **DONE** — `__rseq_cs`/`__rseq_failure` sections + `RSEQ_SIG`-prefixed abort handler |
+| W7-2b | x86-64 `rseq_pop` (load cpu → load head → single committing store); abort ⇒ logical no-op. | M | | pops one or reports empty; abort unchanged. | **DONE** — `seq_x86_64::pop` |
+| W7-2c | x86-64 `rseq_push` (capacity check → store → commit index); abort ⇒ no-op. | M | ∥ | pushes one or reports full; abort unchanged. | **DONE** — `seq_x86_64::push` |
+| W7-2d | Clobber/barrier docs + compiler-fence discipline; audit/lint that no call or faulting ref occurs inside a CS (§12.3). | S | | documented; lint passes. | **DONE** — clobber docs in `seq_*`; `xtask check_rseq_cs` lint (wired into `lint`/`ci`) |
+| W7-2e | x86-64 equivalence vs locked mode under forced migration (feeds W7-6). | M | | no lost/duplicated object vs locked (G-fast). | **DONE** — `rseq_equivalence::{pinned_rseq_matches_locked,forced_migration_conserves_tokens}` |
+| W7-3a | AArch64 `rseq_pop`/`rseq_push` + abort handler (commit-store model); **shares the arch with the seLe4n RPi5 target**. | L | ∥ | pop/push correct; abort unchanged. | **DONE** — `seq_aarch64::{pop,push}` (load-acquire lock byte); asm logic run under QEMU |
+| W7-3b | AArch64 clobber/barrier docs + no-call/no-fault-in-CS audit. | S | ∥ | documented; lint passes. | **DONE** — `seq_aarch64` docs; same `check_rseq_cs` lint |
+| W7-3c | AArch64 equivalence vs locked under forced migration (QEMU). | M | ∥ | matches locked (G-fast). | **DONE** — battery green under qemu-aarch64 (locked fallback; restart on real HW) |
+| W7-4 | Non-owner coordination (§27.4): flushing an idle CPU vs the owner's RSEQ (epoch / stop-the-world / per-CPU lock). | M | | concurrent flush-vs-fastpath stress clean. | **DONE** — per-CPU-lock-in-CS + `membarrier(…_RSEQ)` fence; `non_owner_drain_vs_fastpath_is_clean` |
+| W7-5 | seLe4n pinned-thread per-core mode (§36.10 option 1) behind the same front-end contract; abort/no-change case. | M | | migration flush/hand-off correct; `per_core_cache_abort_no_change` mirrored. | **DONE** — `pinned.rs` + `fe_{pop,push}_pinned`; `pinned_core` tests (abort-no-change both sides) |
+| W7-6 | RSEQ test battery (§34.5): migration, signal near sequence, preemption, registration failure, compare-vs-locked. | M | | all pass in CI (QEMU where needed). | **DONE** — `topo-arch/tests/rseq.rs` + `topo-core/tests/rseq_equivalence.rs` |
 
 > **▸ Decomposition — W7-2/W7-3 (per-arch restartable sequences), the highest-risk code.** Each sequence is
 > its own reviewable unit with its own equivalence test. Non-negotiable rules (§12.3): the critical section
