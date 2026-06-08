@@ -247,6 +247,51 @@ fn asm_sequence_logic_runs_with_explicit_area() {
     cache.cpus[0].locked.store(0, Ordering::Release);
 }
 
+/// W7-1 (the self-registration model): with glibc's auto-registration disabled
+/// (`GLIBC_TUNABLES=glibc.pthread.rseq=0`), RSEQ — if the kernel supports it at
+/// all — must come through *our own* `rseq(2)` registration, not glibc's area.
+/// We validate it by re-exec'ing this very test with the tunable set (gated to
+/// x86-64 native, where re-exec is reliable; the self-reg logic is arch-neutral).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn self_registration_path_works() {
+    const MARKER: &str = "TOPO_RSEQ_SELFREG_CHILD";
+    if std::env::var(MARKER).is_ok() {
+        // Child: glibc rseq is disabled, so a present RSEQ must be self-registered.
+        let on = rseq::enable();
+        assert_ne!(
+            rseq::mode(),
+            rseq::Mode::GlibcArea,
+            "glibc rseq should be disabled"
+        );
+        if !on {
+            return; // kernel lacks rseq (sandbox): clean fallback, nothing to prove
+        }
+        assert_eq!(rseq::mode(), rseq::Mode::SelfRegistered);
+        assert!(rseq::register_current_thread());
+        let cpu = rseq::current_cpu();
+        assert!(cpu >= 0 && (cpu as usize) < MAX_CPUS);
+        // A round-trip through the self-registered area exercises the real asm.
+        if pin_to(cpu as usize) {
+            let cache = Cache::new();
+            let sc = 0;
+            assert_eq!(cache.pop(sc), Pop::Empty);
+            assert_eq!(cache.push(sc, 0x5E1F), Push::Success);
+            assert_eq!(cache.pop(sc), Pop::Success(0x5E1F));
+        }
+        return;
+    }
+    // Parent: re-run this test in a fresh process with glibc rseq disabled.
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = std::process::Command::new(exe)
+        .args(["--exact", "self_registration_path_works"])
+        .env("GLIBC_TUNABLES", "glibc.pthread.rseq=0")
+        .env(MARKER, "1")
+        .status()
+        .expect("spawn self-registration child");
+    assert!(status.success(), "self-registration child failed");
+}
+
 #[test]
 fn out_of_range_cpu_diverts_to_fallback() {
     // Memory-safety guard: a kernel-reported CPU id >= MAX_CPUS must NOT index
