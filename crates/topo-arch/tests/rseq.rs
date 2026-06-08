@@ -11,7 +11,7 @@
 //! API reports it and the tests assert the clean fallback instead of skipping.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use topo_arch::rseq::{self, Pop, Push, Rseq};
@@ -336,6 +336,116 @@ fn uninitialised_buffer_diverts_to_fallback() {
     cache.cpus[cpu].slots[sc].buf.store(0, Ordering::Release);
     assert_eq!(cache.pop(sc), Pop::Fallback);
     assert_eq!(cache.push(sc, 1), Push::Fallback);
+}
+
+/// W7-6 / §34.5: signal delivery near the critical sequence. A worker pinned to
+/// one CPU round-trips tokens through its slot while another thread bombards it
+/// with a thread-directed signal. Each signal delivered while the worker is in
+/// the critical section aborts it (the kernel jumps to `abort_ip` before running
+/// the handler), so the worker simply retries — and the token multiset is
+/// conserved exactly.
+#[test]
+fn signal_near_sequence_conserves() {
+    if !rseq::enable() {
+        return;
+    }
+    assert!(rseq::register_current_thread());
+    let cpu0 = rseq::current_cpu();
+    if cpu0 < 0 || !pin_to(cpu0 as usize) {
+        return;
+    }
+
+    // Install a no-op SIGUSR1 handler so the directed signals don't terminate.
+    extern "C" fn noop_handler(_sig: i32) {}
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+        fn pthread_self() -> u64;
+        fn pthread_kill(thread: u64, sig: i32) -> i32;
+    }
+    const SIGUSR1: i32 = 10;
+    // SAFETY: installing a trivial async-signal-safe handler for SIGUSR1.
+    unsafe { signal(SIGUSR1, noop_handler as *const () as usize) };
+
+    let cache = Arc::new(Cache::new());
+    let sc = 1;
+    const NTOK: usize = 100;
+    let cpu = rseq::current_cpu() as usize;
+    let tokens: Vec<usize> = (0..NTOK).map(|i| 0xE00000 + i).collect();
+    cache.seed(cpu, sc, &tokens);
+
+    let worker_tid = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let signals = Arc::new(AtomicU64::new(0));
+
+    std::thread::scope(|s| {
+        // Worker: pin to the seeded CPU and round-trip tokens until told to stop.
+        {
+            let cache = cache.clone();
+            let worker_tid = worker_tid.clone();
+            let stop = stop.clone();
+            s.spawn(move || {
+                rseq::register_current_thread();
+                pin_to(cpu);
+                // SAFETY: pthread_self is a no-argument query of the current thread.
+                worker_tid.store(unsafe { pthread_self() }, Ordering::Release);
+                let mut hand: Option<usize> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    match hand {
+                        None => match cache.pop(sc) {
+                            Pop::Success(v) => hand = Some(v),
+                            Pop::Empty => {}
+                            Pop::Abort | Pop::Fallback => {}
+                        },
+                        Some(tok) => match cache.push(sc, tok) {
+                            Push::Success => hand = None,
+                            Push::Full => {}
+                            Push::Abort | Push::Fallback => {}
+                        },
+                    }
+                }
+                // Return any token still in hand.
+                while let Some(tok) = hand {
+                    if let Push::Success = cache.push(sc, tok) {
+                        hand = None;
+                    }
+                }
+            });
+        }
+        // Signaller: bombard the worker with thread-directed signals, then stop.
+        {
+            let worker_tid = worker_tid.clone();
+            let stop = stop.clone();
+            let signals = signals.clone();
+            s.spawn(move || {
+                let tid = loop {
+                    let t = worker_tid.load(Ordering::Acquire);
+                    if t != 0 {
+                        break t;
+                    }
+                    std::hint::spin_loop();
+                };
+                for _ in 0..200_000 {
+                    // SAFETY: `tid` is the live worker thread; SIGUSR1 has a handler.
+                    unsafe { pthread_kill(tid, SIGUSR1) };
+                    signals.fetch_add(1, Ordering::Relaxed);
+                }
+                // Stop only after the last signal, so no signal races thread exit.
+                stop.store(true, Ordering::Release);
+            });
+        }
+    });
+
+    let recovered = cache.collect(sc);
+    let mut recovered = recovered;
+    recovered.sort_unstable();
+    let mut expected = tokens.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        recovered,
+        expected,
+        "token multiset conserved under {} signals near the CS",
+        signals.load(Ordering::Relaxed)
+    );
 }
 
 #[test]

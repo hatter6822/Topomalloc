@@ -227,6 +227,7 @@ pub fn lint(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -275,6 +276,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -585,6 +587,73 @@ fn check_lean_style(root: &Path) -> bool {
     }
 }
 
+/// The RSEQ no-call discipline (W7-2d, §12.3): a restartable critical section
+/// MUST contain no calls and no branch-with-link, because the kernel does not
+/// restart across them. The per-architecture sequences in `topo-arch` are the
+/// only hand-written assembly in the project; this scans their `asm!` string
+/// literals and flags any forbidden mnemonic. (The companion "no possibly-faulting
+/// memory reference" rule is an audit — every reference is to already-resident
+/// per-CPU cache metadata — documented in those modules.)
+fn rseq_cs_issues(content: &str) -> Vec<(usize, String)> {
+    // Calls / branch-with-link / traps the kernel will not restart across.
+    const FORBIDDEN: &[&str] = &[
+        "call", "callq", "bl", "blr", "blx", "syscall", "svc", "int", "int3", "ud2",
+    ];
+    let mut issues = Vec::new();
+    for (i, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        // Only inspect asm string literals (instruction lines start with `"`).
+        if !line.starts_with('"') {
+            continue;
+        }
+        let inner = match line[1..].split('"').next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        // The mnemonic is the first whitespace-delimited token (skip `.directive`
+        // and `label:` lines, which never name an instruction we forbid).
+        let mnem = match inner.split_whitespace().next() {
+            Some(t) => t.trim_end_matches(',').to_ascii_lowercase(),
+            None => continue,
+        };
+        if FORBIDDEN.contains(&mnem.as_str()) {
+            issues.push((
+                i + 1,
+                format!("forbidden `{mnem}` inside an RSEQ critical sequence (§12.3)"),
+            ));
+        }
+    }
+    issues
+}
+
+/// W7-2d gate: the per-architecture RSEQ sequences contain no call/branch-with-link.
+fn check_rseq_cs(root: &Path) -> bool {
+    let files = [
+        root.join("crates/topo-arch/src/rseq/seq_x86_64.rs"),
+        root.join("crates/topo-arch/src/rseq/seq_aarch64.rs"),
+    ];
+    let mut issues = Vec::new();
+    let mut scanned = 0usize;
+    for f in &files {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        scanned += 1;
+        for (line, reason) in rseq_cs_issues(&content) {
+            issues.push(format!("{}:{}: {reason}", f.display(), line));
+        }
+    }
+    if issues.is_empty() {
+        println!("  · RSEQ critical sections: no calls / branch-with-link ({scanned} files, §12.3)");
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ RSEQ CS: {it}");
+        }
+        false
+    }
+}
+
 /// Run `shellcheck` over every `.sh` file, if it is installed.
 fn shellcheck_step(r: &mut Runner<'_>, root: &Path) {
     if !have("shellcheck") {
@@ -802,5 +871,29 @@ mod tests {
             lean_style_issues("def x := 1"),
             vec![(0, "missing final newline")]
         );
+    }
+
+    #[test]
+    fn rseq_cs_audit_flags_calls_only() {
+        // Allowed instructions and directives — no findings.
+        let ok = r#"
+            "mov {len:e}, [{slot} + 8]",
+            "test {len:e}, {len:e}",
+            "jz 7f",
+            "b 8f",
+            "ldarb {t:w}, [{laddr}]",
+            "cbnz {t:w}, 6f",
+            ".quad 3f, 4f - 3f, 5f",
+            "3:",
+        "#;
+        assert!(rseq_cs_issues(ok).is_empty());
+
+        // A call, a branch-with-link, and a syscall are each flagged.
+        assert_eq!(rseq_cs_issues("            \"call {f}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"bl {f}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"blr {x}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"syscall\",\n").len(), 1);
+        // A comment mentioning "call" is not an asm string literal — not flagged.
+        assert!(rseq_cs_issues("            // never call inside the CS\n").is_empty());
     }
 }
