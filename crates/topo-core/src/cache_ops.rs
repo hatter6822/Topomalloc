@@ -100,6 +100,10 @@ pub fn refill(
     if popped > 0 {
         // Step 2: push into CPU cache slot (per-CPU lock, released on return).
         let pushed = cpu_cache.push_batch(core, sc, &buf[..popped]);
+        // Return any unpushed objects to the transfer cache to prevent leaks.
+        if pushed < popped {
+            transfer.try_push_batch(arena, sc, &buf[pushed..popped], meta);
+        }
         return RefillResult {
             filled: pushed,
             need_span: false,
@@ -145,6 +149,10 @@ pub fn refill(
 
             // Push addresses into the CPU cache slot.
             let pushed = cpu_cache.push_batch(core, sc, &addrs[..addr_count]);
+            // Return any unpushed objects to the transfer cache to prevent leaks.
+            if pushed < addr_count {
+                transfer.try_push_batch(arena, sc, &addrs[pushed..addr_count], meta);
+            }
             RefillResult {
                 filled: pushed,
                 need_span: false,
@@ -272,17 +280,14 @@ pub fn flush_idle_cpu(
 
     for i in 0..NUM_SIZE_CLASSES {
         let sc = SizeClassId::new(i);
-        let result = flush(core, arena, sc, cpu_cache, transfer, central, pagemap, meta);
-        total_flushed = total_flushed.saturating_add(result.flushed);
-
-        // Continue flushing until the slot is empty.
-        // The first flush pops at most batch_size; if the slot has more,
-        // we drain it in a loop.
-        let mut more = result.flushed > 0;
-        while more {
+        // Drain each slot completely: flush pops at most batch_size per call,
+        // so loop until nothing is left.
+        loop {
             let r = flush(core, arena, sc, cpu_cache, transfer, central, pagemap, meta);
             total_flushed = total_flushed.saturating_add(r.flushed);
-            more = r.flushed > 0;
+            if r.flushed == 0 {
+                break;
+            }
         }
     }
 
@@ -410,6 +415,16 @@ mod tests {
     }
 
     fn make_span(id: u32, sc: SizeClassId, base: usize, m: &BumpArena) -> SpanDescriptor {
+        make_span_with_header(id, sc, base, 0, m)
+    }
+
+    fn make_span_with_header(
+        id: u32,
+        sc: SizeClassId,
+        base: usize,
+        slab_header: u32,
+        m: &BumpArena,
+    ) -> SpanDescriptor {
         let row = size_class::row(sc);
         SpanDescriptor::new(
             SpanId(id),
@@ -418,7 +433,7 @@ mod tests {
             base,
             row.slab_pages,
             row.objects_per_slab,
-            0,
+            slab_header,
             m,
         )
         .expect("span creation failed")
@@ -811,5 +826,198 @@ mod tests {
         assert_eq!(result.filled, 0);
         assert!(result.need_span);
         assert_eq!(called, 1); // fails on first attempt, stops
+    }
+
+    #[test]
+    fn refill_partial_push_returns_remainder_to_transfer() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let hard_cap = size_class::max_local_capacity(sc);
+
+        // Init CPU slot normally (hard_cap from size class table).
+        cc.init_slot(core, sc, &m, hard_cap as u32);
+
+        // Pre-fill the slot to near capacity, leaving room for only 4 objects.
+        let fill_count = hard_cap - 4;
+        let fill_addrs: Vec<usize> = (10_000..10_000 + fill_count).collect();
+        cc.push_batch(core, sc, &fill_addrs);
+
+        // Pre-populate transfer cache with a full batch (32 addresses).
+        let batch_size = size_class::batch(sc);
+        let addrs: Vec<usize> = (1000..1000 + batch_size).collect();
+        let pushed = tc.try_push_batch(ArenaId::DEFAULT, sc, &addrs, &m);
+        assert_eq!(pushed, batch_size);
+
+        // Refill: pops batch_size from transfer, but CPU slot can only fit 4.
+        // The remaining (batch_size - 4) should be returned to transfer.
+        let result = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+        );
+        assert_eq!(result.filled, 4);
+        assert!(!result.need_span);
+
+        // The remainder should be back in the transfer cache.
+        let bin = tc.bin(sc).unwrap();
+        assert!(
+            !bin.is_empty(),
+            "unpushed objects should be returned to transfer"
+        );
+        assert_eq!(bin.len() as usize, batch_size - 4);
+    }
+
+    #[test]
+    fn flush_partial_transfer_push_goes_to_central() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let base = 0x4000_0000usize;
+
+        // Activate a span in central.
+        let span = make_span(1, sc, base, &m);
+        central.activate_span(&span, &pm, &m).unwrap();
+
+        // Remove objects from central, convert to addresses.
+        let mut all_indices = Vec::new();
+        while let RemoveResult::Ok(batch) = central.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            MAX_BATCH_LEN,
+        ) {
+            for i in 0..batch.len() {
+                all_indices.push(batch.index(i));
+            }
+        }
+
+        // Partially fill the transfer cache so it can only accept a few more.
+        let transfer_cap = size_class::batch(sc) * 4;
+        let fill_count = transfer_cap - 2; // leave room for only 2
+        let dummy_addrs: Vec<usize> = (5000..5000 + fill_count).collect();
+        tc.try_push_batch(ArenaId::DEFAULT, sc, &dummy_addrs, &m);
+
+        // Put some real addresses into the CPU cache.
+        let layout = SlabLayout::compute(sc, base, 0).unwrap();
+        cc.init_slot(core, sc, &m, 32);
+        let batch_size = size_class::batch(sc).min(all_indices.len());
+        let mut addrs_to_flush = Vec::new();
+        for &idx in &all_indices[..batch_size] {
+            if let Some(addr) = layout.object_addr(idx as usize) {
+                addrs_to_flush.push(addr);
+            }
+        }
+        cc.push_batch(core, sc, &addrs_to_flush);
+
+        // Flush: transfer can only accept 2, rest goes to central.
+        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        assert!(result.flushed > 0);
+
+        // Conservation law should hold.
+        assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn flush_idle_cpu_handles_transfer_full() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let core = CoreId::DEFAULT;
+
+        // Initialize and populate one SC.
+        let sc0 = SizeClassId::new(0);
+        cc.init_slot(core, sc0, &m, 32);
+        cc.push_batch(core, sc0, &[100, 200, 300]);
+
+        // Fill transfer cache so objects must go to central.
+        let transfer_cap = size_class::batch(sc0) * 4;
+        let dummy: Vec<usize> = (5000..5000 + transfer_cap).collect();
+        tc.try_push_batch(ArenaId::DEFAULT, sc0, &dummy, &m);
+
+        // flush_idle_cpu should still drain the slot even if transfer is full.
+        let total = flush_idle_cpu(core, ArenaId::DEFAULT, &cc, &tc, &central, &pm, &m);
+        assert_eq!(total, 3);
+
+        let cpu = cc.per_cpu(core).unwrap();
+        assert_eq!(cpu.slot(sc0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn nonzero_slab_header_refill_flush_round_trip() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let base = 0x4000_0000usize;
+        let slab_header = 64u32;
+
+        let span = make_span_with_header(1, sc, base, slab_header, &m);
+        central.activate_span(&span, &pm, &m).unwrap();
+
+        let layout_hdr = SlabLayout::compute(sc, base, slab_header as usize).unwrap();
+        let layout_no_hdr = SlabLayout::compute(sc, base, 0).unwrap();
+        assert!(
+            layout_hdr.object0 > layout_no_hdr.object0,
+            "header should shift object0 forward"
+        );
+
+        cc.init_slot(core, sc, &m, 32);
+
+        // Refill from central — addresses must use the header-shifted layout.
+        let r1 = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+        );
+        assert!(r1.filled > 0);
+
+        // Every address in the CPU slot must be valid under the header layout.
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        let mut popped = [0usize; MAX_BATCH_LEN];
+        let n = cc.pop_batch(core, sc, &mut popped, slot.len() as usize);
+        for &addr in &popped[..n] {
+            assert!(
+                layout_hdr.addr_to_index(addr).is_some(),
+                "addr {:#x} should be valid under header layout",
+                addr
+            );
+        }
+
+        // Push them back and flush to central.
+        cc.push_batch(core, sc, &popped[..n]);
+        let r2 = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        assert_eq!(r2.flushed, n);
+
+        assert!(span.conservation_holds_central_only());
     }
 }

@@ -12,8 +12,8 @@
 //! - If overflows exceed a threshold and the soft capacity is above the
 //!   minimum (one batch), shrink by one batch size (the slot has too much).
 //! - After adjusting, if the total capacity across all CPUs/SCs exceeds the
-//!   global budget, shrink the least-active slots (those with the fewest
-//!   misses) until the budget is met.
+//!   global budget, shrink slots above the minimum (one batch) in index order
+//!   until the budget is met.
 //!
 //! The controller is designed to run periodically (e.g. on a timer or on
 //! every N-th allocation) and is not on the allocation fast path.
@@ -89,10 +89,22 @@ impl CacheBudget {
         self.global_budget = budget;
     }
 
+    /// The miss threshold (misses above this trigger a grow).
+    #[inline]
+    pub fn miss_threshold(&self) -> u64 {
+        self.miss_threshold
+    }
+
     /// Set the miss threshold.
     #[inline]
     pub fn set_miss_threshold(&mut self, threshold: u64) {
         self.miss_threshold = threshold;
+    }
+
+    /// The overflow threshold (overflows above this trigger a shrink).
+    #[inline]
+    pub fn overflow_threshold(&self) -> u64 {
+        self.overflow_threshold
     }
 
     /// Set the overflow threshold.
@@ -115,6 +127,10 @@ impl CacheBudget {
 
     /// Returns `true` every `adapt_interval` calls, for count-based periodic
     /// invocation. Thread-safe (lock-free atomic counter).
+    ///
+    /// Fires on the very first call (counter = 0) to prime the controller;
+    /// subsequent fires occur every `adapt_interval` calls.
+    /// Returns `false` unconditionally when `adapt_interval` is 0.
     #[inline]
     pub fn should_adapt(&self) -> bool {
         let n = self
@@ -160,12 +176,13 @@ impl CacheBudget {
                 let mut new_soft = cur_soft;
 
                 // Grow on high misses (the slot needs more cache).
+                // Shrink on high overflows (the slot has too much).
+                // Uses else-if: if both thresholds are exceeded, grow
+                // takes precedence (miss recovery is more latency-critical
+                // than overflow reduction).
                 if misses > self.miss_threshold && cur_soft < hard_cap {
                     new_soft = cur_soft.saturating_add(batch).min(hard_cap);
-                }
-
-                // Shrink on high overflows (the slot has too much).
-                if overflows > self.overflow_threshold && cur_soft > batch {
+                } else if overflows > self.overflow_threshold && cur_soft > batch {
                     new_soft = cur_soft.saturating_sub(batch).max(batch);
                 }
 
@@ -175,9 +192,11 @@ impl CacheBudget {
             }
         }
 
-        // Phase 2: enforce the global budget. Repeatedly shrink the
-        // least-active slots (those above minimum batch size) until the
-        // total is within budget or no further reduction is possible.
+        // Phase 2: enforce the global budget. Repeatedly shrink slots that
+        // are above the minimum batch size until the total is within budget
+        // or no further reduction is possible. Iteration is in index order
+        // (lowest CPU, lowest SC first); a future enhancement could sort by
+        // activity to prefer shrinking the least-active slots.
         let mut total = self.compute_total_capacity(cpu_cache, active);
 
         while total > self.global_budget {
@@ -206,8 +225,8 @@ impl CacheBudget {
                     let batch = size_class::batch(sc) as u32;
                     let cur_soft = slot.soft_capacity();
                     if cur_soft > batch {
-                        let reduction = batch.min(cur_soft - batch) as usize;
                         let new_soft = cur_soft.saturating_sub(batch).max(batch);
+                        let reduction = (cur_soft - new_soft) as usize;
                         slot.set_soft_capacity(new_soft);
                         total = total.saturating_sub(reduction);
                         made_progress = true;
@@ -457,8 +476,8 @@ mod tests {
     fn default_budget_is_reasonable() {
         let budget = CacheBudget::default();
         assert!(budget.global_budget() > 0);
-        assert_eq!(budget.miss_threshold, DEFAULT_MISS_THRESHOLD);
-        assert_eq!(budget.overflow_threshold, DEFAULT_OVERFLOW_THRESHOLD);
+        assert_eq!(budget.miss_threshold(), DEFAULT_MISS_THRESHOLD);
+        assert_eq!(budget.overflow_threshold(), DEFAULT_OVERFLOW_THRESHOLD);
     }
 
     #[test]
@@ -474,5 +493,115 @@ mod tests {
         }
         // Should fire at 0, 100, 200, 300, 400 = 5 times.
         assert_eq!(fire_count, 5);
+    }
+
+    #[test]
+    fn adapt_interval_zero_never_fires() {
+        let mut budget = CacheBudget::new(100_000);
+        budget.set_adapt_interval(0);
+
+        let mut fire_count = 0u32;
+        for _ in 0..500 {
+            if budget.should_adapt() {
+                fire_count += 1;
+            }
+        }
+        assert_eq!(fire_count, 0);
+    }
+
+    #[test]
+    fn simultaneous_misses_and_overflows_grow_wins() {
+        let m = meta(4 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+
+        // Start at midpoint so both grow and shrink are possible.
+        let mid = (batch + hard_cap) / 2;
+        cc.init_slot(core, sc, &m, mid);
+
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        assert_eq!(slot.soft_capacity(), mid);
+
+        // Simulate high misses.
+        for _ in 0..100 {
+            cc.fe_pop(core, A, sc, &m);
+        }
+        // Also fill to cause overflows.
+        for i in 0..mid {
+            cc.fe_push(core, A, sc, i as usize + 1, &m);
+        }
+        for _ in 0..100 {
+            cc.fe_push(core, A, sc, 999, &m);
+        }
+
+        let budget = CacheBudget::new(100_000);
+        budget.adapt(&cc);
+
+        // Grow should take precedence: soft capacity should increase.
+        let new_soft = slot.soft_capacity();
+        assert!(
+            new_soft > mid,
+            "grow should win when both thresholds exceeded: was {mid}, now {new_soft}"
+        );
+    }
+
+    #[test]
+    fn multi_sc_phase2_budget_enforcement() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId(0);
+        let batch = size_class::batch(SizeClassId::new(0)) as u32;
+
+        // Init 4 size classes with max soft capacity.
+        let mut initialized_scs = Vec::new();
+        for i in 0..4 {
+            let sc = SizeClassId::new(i);
+            let hard = size_class::max_local_capacity(sc) as u32;
+            cc.init_slot(core, sc, &m, hard);
+            initialized_scs.push(sc);
+        }
+
+        // Budget: 4 slots x batch = minimum total. This forces Phase 2 to
+        // shrink all slots down to their minimums.
+        let target = (batch as usize) * 4;
+        let budget = CacheBudget::new(target);
+        let total = budget.adapt(&cc);
+
+        assert!(
+            total <= budget.global_budget(),
+            "total {total} should be <= budget {}",
+            budget.global_budget()
+        );
+
+        // All slots should have been reduced to minimum (batch size).
+        let cpu = cc.per_cpu(core).unwrap();
+        for &sc in &initialized_scs {
+            let s = cpu.slot(sc).unwrap();
+            let b = size_class::batch(sc) as u32;
+            assert_eq!(
+                s.soft_capacity(),
+                b,
+                "sc {} should be at minimum batch size after tight budget",
+                sc.index()
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_getters() {
+        let mut budget = CacheBudget::new(1000);
+        assert_eq!(budget.miss_threshold(), DEFAULT_MISS_THRESHOLD);
+        assert_eq!(budget.overflow_threshold(), DEFAULT_OVERFLOW_THRESHOLD);
+
+        budget.set_miss_threshold(128);
+        budget.set_overflow_threshold(256);
+        assert_eq!(budget.miss_threshold(), 128);
+        assert_eq!(budget.overflow_threshold(), 256);
     }
 }

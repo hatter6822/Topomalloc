@@ -127,11 +127,13 @@ impl CpuSlot {
         self.overflows.swap(0, Ordering::Relaxed)
     }
 
-    /// Set the soft capacity. Clamped to `[0, hard_capacity]`.
+    /// Set the soft capacity. Clamped to `[1, hard_capacity]` to maintain the
+    /// buffer bounds invariant (`cur_len < soft_capacity <= hard_capacity`).
     #[inline]
     pub fn set_soft_capacity(&self, cap: u32) {
         let hard = self.hard_capacity.load(Ordering::Relaxed);
-        self.soft_capacity.store(cap.min(hard), Ordering::Relaxed);
+        self.soft_capacity
+            .store(cap.min(hard).max(1), Ordering::Relaxed);
     }
 
     /// Initialize the slot: allocate the address buffer from `meta`.
@@ -155,7 +157,10 @@ impl CpuSlot {
         unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
         self.buf.store(ptr.as_ptr() as usize, Ordering::Release);
         self.hard_capacity.store(hard_cap, Ordering::Release);
-        self.soft_capacity.store(soft_cap, Ordering::Release);
+        // Clamp soft_cap: must be in [1, hard_cap] to guarantee the buffer
+        // bounds invariant (cur_len < soft_cap <= hard_cap).
+        let clamped_soft = soft_cap.min(hard_cap).max(1);
+        self.soft_capacity.store(clamped_soft, Ordering::Release);
         self.initialized.store(true, Ordering::Release);
         true
     }
@@ -376,17 +381,16 @@ impl CpuCache {
 
         let cur_len = slot.len.load(Ordering::Relaxed);
         let soft = slot.soft_capacity.load(Ordering::Relaxed);
-        let hard = slot.hard_capacity.load(Ordering::Relaxed);
-        let effective = if soft > 0 { soft } else { hard };
-        if cur_len >= effective {
+        if cur_len >= soft {
             slot.overflows.fetch_add(1, Ordering::Relaxed);
             return FeOutcome::Full;
         }
 
         let buf = slot.buf_ptr();
         // SAFETY: buf points to a valid array of `hard_capacity` elements.
-        // `cur_len` < hard_capacity (the check above), so the write is in bounds.
-        // We hold the per-CPU lock, so no concurrent access.
+        // `cur_len` < `soft_capacity` <= `hard_capacity` (init clamps soft
+        // to hard, set_soft_capacity clamps likewise), so the write is in
+        // bounds. We hold the per-CPU lock, so no concurrent access.
         unsafe { *buf.add(cur_len as usize) = addr };
         slot.len.store(cur_len + 1, Ordering::Relaxed);
         FeOutcome::Success(())
@@ -734,5 +738,79 @@ mod tests {
         assert!(slot.is_initialized());
         assert_eq!(slot.soft_capacity(), batch_size);
         assert_eq!(slot.hard_capacity(), hard_cap);
+    }
+
+    #[test]
+    fn init_clamps_soft_to_hard() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+
+        // Pass soft_cap > hard_cap: should be clamped to hard_cap.
+        assert!(cc.init_slot(core, sc, &m, hard_cap + 100));
+
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        assert_eq!(slot.soft_capacity(), hard_cap);
+    }
+
+    #[test]
+    fn set_soft_capacity_clamps() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+
+        cc.init_slot(core, sc, &m, hard_cap);
+
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+
+        // Setting above hard_cap clamps to hard_cap.
+        slot.set_soft_capacity(hard_cap + 50);
+        assert_eq!(slot.soft_capacity(), hard_cap);
+
+        // Setting to 0 clamps to 1 (minimum).
+        slot.set_soft_capacity(0);
+        assert_eq!(slot.soft_capacity(), 1);
+
+        // Normal value within range works.
+        slot.set_soft_capacity(64);
+        assert_eq!(slot.soft_capacity(), 64);
+    }
+
+    #[test]
+    fn push_respects_soft_capacity() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+
+        cc.init_slot(core, sc, &m, batch);
+
+        // Fill to soft capacity.
+        for i in 0..batch {
+            let r = cc.fe_push(core, A, sc, i as usize + 1, &m);
+            assert!(r.is_success(), "push {i} should succeed");
+        }
+
+        // Next push should return Full.
+        let r = cc.fe_push(core, A, sc, 999, &m);
+        assert!(r.is_full(), "push beyond soft capacity should return Full");
+
+        // Reduce soft capacity and try pushing (already at old soft cap).
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        slot.set_soft_capacity(batch / 2);
+
+        // Slot len is still `batch` which is > new soft_capacity.
+        // fe_push should return Full.
+        let r = cc.fe_push(core, A, sc, 888, &m);
+        assert!(r.is_full());
     }
 }

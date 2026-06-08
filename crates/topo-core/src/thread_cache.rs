@@ -100,15 +100,6 @@ mod imp {
             self.addrs.is_empty()
         }
 
-        /// Drain up to `max` addresses into `out`. Returns the number drained.
-        pub fn drain_to(&mut self, out: &mut [usize], max: usize) -> usize {
-            let count = max.min(self.addrs.len()).min(out.len());
-            for slot in out[..count].iter_mut() {
-                *slot = self.addrs.pop().unwrap();
-            }
-            count
-        }
-
         /// Drain all addresses into a Vec and return them.
         pub fn drain_all(&mut self) -> Vec<usize> {
             core::mem::take(&mut self.addrs)
@@ -228,14 +219,14 @@ mod imp {
         /// The callback receives `(sc, addrs)` for each non-empty slot.
         pub fn flush_all<F>(&mut self, mut flush_fn: F)
         where
-            F: FnMut(SizeClassId, Vec<usize>),
+            F: FnMut(SizeClassId, &[usize]),
         {
             for i in 0..NUM_SIZE_CLASSES {
                 let slot = &mut self.slots[i];
                 if !slot.is_empty() {
                     let addrs = slot.drain_all();
                     let sc = SizeClassId::new(i);
-                    flush_fn(sc, addrs);
+                    flush_fn(sc, &addrs);
                 }
             }
             self.total_cached = 0;
@@ -244,14 +235,14 @@ mod imp {
         /// Flush one size class, returning addresses via the provided callback.
         pub fn flush_sc<F>(&mut self, sc: SizeClassId, mut flush_fn: F)
         where
-            F: FnMut(SizeClassId, Vec<usize>),
+            F: FnMut(SizeClassId, &[usize]),
         {
             if let Some(slot) = self.slots.get_mut(sc.index()) {
                 if !slot.is_empty() {
                     let count = slot.len();
                     let addrs = slot.drain_all();
                     self.total_cached = self.total_cached.saturating_sub(count);
-                    flush_fn(sc, addrs);
+                    flush_fn(sc, &addrs);
                 }
             }
         }
@@ -269,7 +260,7 @@ mod imp {
             mut drain_fn: F,
         ) where
             C: FnMut(usize) -> Option<crate::ids::ArenaId>,
-            F: FnMut(SizeClassId, Vec<usize>),
+            F: FnMut(SizeClassId, &[usize]),
         {
             for i in 0..NUM_SIZE_CLASSES {
                 let slot = &mut self.slots[i];
@@ -292,7 +283,7 @@ mod imp {
                     slot.push(addr);
                 }
                 if !drain.is_empty() {
-                    drain_fn(sc, drain);
+                    drain_fn(sc, &drain);
                 }
                 self.total_cached = self.total_cached.saturating_sub(drained);
             }
@@ -306,13 +297,15 @@ mod imp {
                 self.flush_all(|sc, addrs| {
                     // SAFETY: ctx was validated by the caller of set_flush_hook,
                     // which requires ctx to remain valid until Drop.
-                    unsafe { hook(ctx, sc, &addrs) };
+                    unsafe { hook(ctx, sc, addrs) };
                 });
             }
-            debug_assert!(
-                self.total_cached == 0 || self.flush_hook.is_none(),
-                "ThreadCache dropped with {} cached objects and no flush hook",
-                self.total_cached
+            debug_assert_eq!(
+                self.total_cached,
+                0,
+                "ThreadCache dropped with {} cached objects (flush hook present: {})",
+                self.total_cached,
+                self.flush_hook.is_some()
             );
         }
     }
@@ -326,8 +319,22 @@ mod imp {
 
     /// Access the current thread's cache. The cache is lazily created on
     /// first access and flushed on thread exit via its `Drop` impl.
+    ///
+    /// Falls back to a temporary cache during thread shutdown (TLS destroyed)
+    /// or re-entrant access (e.g. a flush hook calling back into the cache).
     pub fn with_thread_cache<R>(f: impl FnOnce(&mut ThreadCache) -> R) -> R {
-        THREAD_CACHE.with(|tc| f(&mut tc.borrow_mut()))
+        let mut f_opt = Some(f);
+        let result = THREAD_CACHE.try_with(|tc| {
+            let f = f_opt.take().unwrap();
+            match tc.try_borrow_mut() {
+                Ok(mut guard) => f(&mut guard),
+                Err(_) => f(&mut ThreadCache::with_default_budget()),
+            }
+        });
+        match result {
+            Ok(r) => r,
+            Err(_) => (f_opt.take().unwrap())(&mut ThreadCache::with_default_budget()),
+        }
     }
 
     /// Register the flush hook on the current thread's cache.
@@ -337,7 +344,7 @@ mod imp {
     /// `ctx` must remain valid until the thread exits (typically a `&'static`
     /// pointer to the global allocator struct).
     pub unsafe fn init_thread_cache(hook: FlushHookFn, ctx: *const ()) {
-        THREAD_CACHE.with(|tc| {
+        let _ = THREAD_CACHE.try_with(|tc| {
             // SAFETY: caller guarantees ctx validity for the thread's lifetime.
             unsafe { tc.borrow_mut().set_flush_hook(hook, ctx) };
         });
@@ -395,6 +402,13 @@ mod imp {
             Self
         }
 
+        /// No-op: flush hook is not supported in no_std.
+        ///
+        /// # Safety
+        ///
+        /// Same contract as the std version.
+        pub unsafe fn set_flush_hook(&mut self, _hook: FlushHookFn, _ctx: *const ()) {}
+
         /// Always returns `None`.
         #[inline]
         pub fn pop(&mut self, _sc: SizeClassId) -> Option<usize> {
@@ -423,6 +437,12 @@ mod imp {
         #[inline]
         pub fn set_budget(&mut self, _budget: usize) {}
 
+        /// Always returns `None` (no slots in no_std stub).
+        #[inline]
+        pub fn slot(&self, _sc: SizeClassId) -> Option<&ThreadCacheSlot> {
+            None
+        }
+
         /// No-op.
         pub fn flush_all<F>(&mut self, _flush_fn: F)
         where
@@ -433,6 +453,14 @@ mod imp {
         /// No-op.
         pub fn flush_sc<F>(&mut self, _sc: SizeClassId, _flush_fn: F)
         where
+            F: FnMut(SizeClassId, &[usize]),
+        {
+        }
+
+        /// No-op: no caching in no_std, so nothing to drain.
+        pub fn drain_arena<C, F>(&mut self, _arena: crate::ids::ArenaId, _classify: C, _drain_fn: F)
+        where
+            C: FnMut(usize) -> Option<crate::ids::ArenaId>,
             F: FnMut(SizeClassId, &[usize]),
         {
         }
@@ -492,6 +520,9 @@ mod tests {
         assert_eq!(tc.total_cached(), 2);
         assert!(tc.push(sc, 5));
         assert_eq!(tc.total_cached(), 3);
+
+        // Drain before drop to avoid debug_assert.
+        tc.flush_all(|_, _| {});
     }
 
     #[test]
@@ -506,7 +537,7 @@ mod tests {
 
         let mut flushed: Vec<(usize, Vec<usize>)> = Vec::new();
         tc.flush_all(|sc, addrs| {
-            flushed.push((sc.index(), addrs));
+            flushed.push((sc.index(), addrs.to_vec()));
         });
 
         assert_eq!(tc.total_cached(), 0);
@@ -535,7 +566,7 @@ mod tests {
 
         let mut flushed = Vec::new();
         tc.flush_sc(sc0, |sc, addrs| {
-            flushed.push((sc.index(), addrs));
+            flushed.push((sc.index(), addrs.to_vec()));
         });
 
         assert_eq!(tc.total_cached(), 1); // sc1 still has one
@@ -597,19 +628,14 @@ mod tests {
     }
 
     #[test]
-    fn drop_without_hook_is_noop() {
+    fn drop_without_hook_leaks_silently_in_release() {
         let sc = SizeClassId::new(0);
         let mut tc = ThreadCache::new(1024);
         tc.push(sc, 42);
-        // No hook set — Drop should not panic (debug_assert only fires
-        // when total_cached > 0 AND flush_hook is None, but we suppress
-        // the assert in this test by using std::mem::forget ... actually,
-        // the debug_assert condition is: total_cached == 0 || hook is None.
-        // With total_cached=1 and hook=None, the assert passes because
-        // the OR is satisfied. The assert warns when neither condition
-        // holds, which is: total_cached > 0 AND hook is Some — that can't
-        // happen after a successful flush. So Drop with no hook is safe.)
-        drop(tc);
+        // No hook set and objects cached — this is a leak. The debug_assert
+        // in Drop will fire in debug builds. In release, the objects are
+        // silently lost. We use forget to avoid the debug_assert in tests.
+        core::mem::forget(tc);
     }
 
     #[test]
@@ -670,7 +696,7 @@ mod tests {
                     Some(arena_b)
                 }
             },
-            |sc_id, addrs| drained.push((sc_id.index(), addrs)),
+            |sc_id, addrs| drained.push((sc_id.index(), addrs.to_vec())),
         );
 
         // Only arena A's 3 addresses should be drained.
@@ -684,5 +710,71 @@ mod tests {
         let mut remaining = vec![a, b];
         remaining.sort();
         assert_eq!(remaining, vec![200, 201]);
+    }
+
+    #[test]
+    fn tls_flush_on_thread_exit() {
+        use std::sync::{Arc, Mutex};
+
+        type FlushedData = Vec<(usize, Vec<usize>)>;
+        let flushed: Arc<Mutex<FlushedData>> = Arc::new(Mutex::new(Vec::new()));
+
+        unsafe fn test_hook(ctx: *const (), sc: SizeClassId, addrs: &[usize]) {
+            // SAFETY: ctx points to a heap-allocated Arc<Mutex<...>> (via
+            // Box::into_raw), valid until after the thread exits.
+            let flushed = unsafe { &*ctx.cast::<Arc<Mutex<FlushedData>>>() };
+            flushed.lock().unwrap().push((sc.index(), addrs.to_vec()));
+        }
+
+        // Heap-allocate the Arc so the pointer outlives the thread's stack.
+        let ctx_box = Box::new(flushed.clone());
+        let ctx_ptr = Box::into_raw(ctx_box);
+        let ctx_addr = ctx_ptr as usize; // usize is Send
+
+        let handle = std::thread::spawn(move || {
+            // SAFETY: ctx_addr points to a heap-allocated Arc that outlives
+            // this thread (reclaimed by the main thread after join).
+            unsafe {
+                init_thread_cache(test_hook, ctx_addr as *const ());
+            }
+
+            let sc = SizeClassId::new(0);
+            with_thread_cache(|tc| {
+                tc.push(sc, 0x100);
+                tc.push(sc, 0x200);
+                tc.push(sc, 0x300);
+            });
+            // Thread exits here; TLS Drop fires the flush hook.
+        });
+
+        handle.join().unwrap();
+
+        // Reclaim the heap-allocated context.
+        // SAFETY: ctx_ptr was created by Box::into_raw and the thread is
+        // joined, so no more references exist.
+        unsafe { drop(Box::from_raw(ctx_ptr)) };
+
+        // The flush hook should have been called with the 3 addresses.
+        let data = flushed.lock().unwrap();
+        assert!(!data.is_empty(), "flush hook should fire on thread exit");
+        let total_addrs: usize = data.iter().map(|(_, addrs)| addrs.len()).sum();
+        assert_eq!(total_addrs, 3, "all 3 cached objects should be flushed");
+    }
+
+    #[test]
+    fn with_thread_cache_reentrant_does_not_panic() {
+        with_thread_cache(|tc| {
+            let sc = SizeClassId::new(0);
+            tc.push(sc, 42);
+
+            // Simulate re-entrant access (e.g. a flush hook calling back).
+            // Should not panic; falls back to a temporary cache.
+            let val = with_thread_cache(|inner_tc| inner_tc.pop(sc));
+            // The inner cache is a fresh temporary, so pop returns None.
+            assert!(val.is_none());
+
+            // The outer cache still has the object.
+            assert_eq!(tc.pop(sc), Some(42));
+        });
     }
 }

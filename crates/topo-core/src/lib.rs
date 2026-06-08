@@ -75,7 +75,7 @@ pub use span::{
 };
 
 // W6 cache layer re-exports (plan 05).
-pub use budget::CacheBudget;
+pub use budget::{CacheBudget, SlotStats};
 pub use cache_ops::{flush, flush_idle_cpu, refill, refill_with_retry, FlushResult, RefillResult};
 pub use cpu_cache::CpuCache;
 pub use fe::{CoreId, FeOutcome};

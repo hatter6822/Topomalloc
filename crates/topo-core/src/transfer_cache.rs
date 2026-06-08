@@ -425,4 +425,63 @@ mod tests {
         let bin = tc.bin(sc).unwrap();
         assert!(bin.len() <= bin.capacity());
     }
+
+    #[test]
+    fn concurrent_conservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let m = meta(4 * 1024 * 1024);
+        let tc = TransferCache::new();
+        let sc = SizeClassId::new(0);
+        let total_pushed = AtomicUsize::new(0);
+        let total_popped = AtomicUsize::new(0);
+
+        let tc_ref = &tc;
+        let m_ref = &m;
+        let pushed_ref = &total_pushed;
+        let popped_ref = &total_popped;
+
+        std::thread::scope(|s| {
+            for t in 0..4u32 {
+                s.spawn(move || {
+                    for i in 0..50u32 {
+                        let addr = (t * 10000 + i) as usize;
+                        let p = tc_ref.try_push_batch(A, sc, &[addr], m_ref);
+                        pushed_ref.fetch_add(p, Ordering::Relaxed);
+                    }
+                });
+            }
+            for _ in 0..4 {
+                s.spawn(move || {
+                    let mut out = [0usize; 8];
+                    for _ in 0..25 {
+                        let p = tc_ref.try_pop_batch(A, sc, &mut out, 8, m_ref);
+                        popped_ref.fetch_add(p, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let pushed = total_pushed.load(Ordering::Relaxed);
+        let popped = total_popped.load(Ordering::Relaxed);
+        let remaining = tc.bin(sc).unwrap().len() as usize;
+
+        // Conservation: pushed == popped + remaining.
+        assert_eq!(
+            pushed,
+            popped + remaining,
+            "conservation: pushed({pushed}) should equal popped({popped}) + remaining({remaining})"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_size_class_returns_zero() {
+        let m = meta(1024 * 1024);
+        let tc = TransferCache::new();
+        let bad_sc = SizeClassId::new(9999);
+
+        let mut out = [0usize; 8];
+        assert_eq!(tc.try_pop_batch(A, bad_sc, &mut out, 8, &m), 0);
+        assert_eq!(tc.try_push_batch(A, bad_sc, &[100, 200], &m), 0);
+    }
 }

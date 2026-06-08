@@ -39,7 +39,7 @@ impl CoreId {
 ///   transfer cache or central list before retrying.
 /// - `Abort` — the operation was preempted mid-sequence (RSEQ, plan 06). The
 ///   caller retries the fast path. Before RSEQ, this variant is never produced.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeOutcome<T> {
     /// The operation completed successfully.
     Success(T),
