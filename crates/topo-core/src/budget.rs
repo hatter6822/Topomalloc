@@ -52,8 +52,8 @@ const DEFAULT_ADAPT_INTERVAL: u64 = 4096;
 /// a future enhancement may unify them under a single global budget.
 pub struct CacheBudget {
     /// Global budget: maximum total soft capacity across all CPUs and SCs
-    /// (in objects). When the total exceeds this, the least-active slots are
-    /// shrunk.
+    /// (in objects). When the total exceeds this, slots above the minimum are
+    /// shrunk in index order (lowest CPU, lowest SC first).
     global_budget: usize,
     /// Miss threshold for growing a slot.
     miss_threshold: u64,

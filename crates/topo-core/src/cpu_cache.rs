@@ -746,6 +746,7 @@ mod tests {
         let cc = CpuCache::new();
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
+        let sc2 = SizeClassId::new(1);
         let hard_cap = size_class::max_local_capacity(sc) as u32;
 
         // Pass soft_cap > hard_cap: should be clamped to hard_cap.
@@ -754,6 +755,11 @@ mod tests {
         let cpu = cc.per_cpu(core).unwrap();
         let slot = cpu.slot(sc).unwrap();
         assert_eq!(slot.soft_capacity(), hard_cap);
+
+        // Pass soft_cap = 0: should be clamped to 1.
+        assert!(cc.init_slot(core, sc2, &m, 0));
+        let slot2 = cpu.slot(sc2).unwrap();
+        assert_eq!(slot2.soft_capacity(), 1);
     }
 
     #[test]
