@@ -31,18 +31,18 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 
 **Depends on:** plan 03 W5. **Enables:** W7, plan 06 (fast path), plan 04 W12 (drain).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W6-1a | Thread cache (§13): per-`(arena,sc,label)` free lists; push/pop/refill/flush. | M | | basic tcache correct under single thread. |
-| W6-1b | Thread-cache GC on exit/pressure/budget (§13.3) + arena-reset drain precondition (§13.4). | M | ∥ | thread-exit flush; budget bounded (B.2); reset drains. |
-| W6-2 | Transfer cache `(domain, arena, label, sc)` with `Batch` (§14.2); distinct/correct/free guarantee. | M | ∥ | batch invariants tested. |
-| W6-3a | Refill (§14.3): transfer batch → central batch (plan 03 W5-4b) → new span; push to cpu/thread cache. **Hand-over-hand:** release the transfer lock before taking the central lock. | M | | never holds two middle-end locks; conservation matches plan 02 W1-6c. |
-| W6-3b | Flush (§14.4): pop a batch → transfer cache if capacity else central (W5-4c); same hand-over-hand. | M | ∥ | lock-order checker clean; conservation matches W1-6c. |
-| W6-3c | Wire empty-span detection (plan 03 W5-3e) into flush-to-central; debug conservation check (B.2). | S | | a flush that empties a span triggers detection. |
-| W6-4 | Per-CPU cache structure + **locked** per-CPU mode (§11.2–§11.5) as the RSEQ-free correct baseline + RSEQ fallback. | M | | hard-capacity invariant (§11.5) holds; ready as fallback. |
-| W6-5 | Cache budget controller v1 (§11.5, P-005): adapt to miss/overflow counts; global budget + per-CPU soft/hard. | M | ∥ | budget honored; stats expose miss/overflow. |
-| W6-6 | Arena routing (D6, §11.7): bound-arena fast path now; arena-qualified `(cpu,arena,sc)` slots wired for M4. | M | | free always returns to the owning arena's structures; alloc from A returns only A's objects. |
-| W6-7 | Idle-CPU/affinity-change flush (§11.6) + a control to release stranded caches. | S | ∥ | flushing an idle CPU moves objects to transfer/central; control hook present (plan 07). |
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W6-1a | Thread cache (§13): per-`(arena,sc,label)` free lists; push/pop/refill/flush. | M | | basic tcache correct under single thread. | **DONE** — `thread_cache.rs` |
+| W6-1b | Thread-cache GC on exit/pressure/budget (§13.3) + arena-reset drain precondition (§13.4). | M | ∥ | thread-exit flush; budget bounded (B.2); reset drains. | **DONE** — `flush_all`/`flush_sc` + budget tracking |
+| W6-2 | Transfer cache `(domain, arena, label, sc)` with `Batch` (§14.2); distinct/correct/free guarantee. | M | ∥ | batch invariants tested. | **DONE** — `transfer_cache.rs` |
+| W6-3a | Refill (§14.3): transfer batch → central batch (plan 03 W5-4b) → new span; push to cpu/thread cache. **Hand-over-hand:** release the transfer lock before taking the central lock. | M | | never holds two middle-end locks; conservation matches plan 02 W1-6c. | **DONE** — `cache_ops::refill` |
+| W6-3b | Flush (§14.4): pop a batch → transfer cache if capacity else central (W5-4c); same hand-over-hand. | M | ∥ | lock-order checker clean; conservation matches W1-6c. | **DONE** — `cache_ops::flush` |
+| W6-3c | Wire empty-span detection (plan 03 W5-3e) into flush-to-central; debug conservation check (B.2). | S | | a flush that empties a span triggers detection. | **DONE** — `flush_addrs_to_central` wires `span_empty` |
+| W6-4 | Per-CPU cache structure + **locked** per-CPU mode (§11.2–§11.5) as the RSEQ-free correct baseline + RSEQ fallback. | M | | hard-capacity invariant (§11.5) holds; ready as fallback. | **DONE** — `cpu_cache.rs` |
+| W6-5 | Cache budget controller v1 (§11.5, P-005): adapt to miss/overflow counts; global budget + per-CPU soft/hard. | M | ∥ | budget honored; stats expose miss/overflow. | **DONE** — `budget.rs` |
+| W6-6 | Arena routing (D6, §11.7): bound-arena fast path now; arena-qualified `(cpu,arena,sc)` slots wired for M4. | M | | free always returns to the owning arena's structures; alloc from A returns only A's objects. | **PARTIAL** — `ArenaId::DEFAULT` at M2; arena-qualified routing wired for M4 |
+| W6-7 | Idle-CPU/affinity-change flush (§11.6) + a control to release stranded caches. | S | ∥ | flushing an idle CPU moves objects to transfer/central; control hook present (plan 07). | **DONE** — `cache_ops::flush_idle_cpu` |
 
 > **▸ Decomposition — W6-3 (refill/flush), the hand-over-hand rule.** Refill and flush are the only places
 > two middle-end locks could be wanted at once; the lock hierarchy (W16-1) forbids holding them together, so

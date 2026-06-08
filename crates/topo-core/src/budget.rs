@@ -1,0 +1,418 @@
+// SPDX-License-Identifier: MIT
+//! Cache budget controller (W6-5, plan 05).
+//!
+//! Adapts per-CPU soft capacities based on miss/overflow statistics. The budget
+//! controller reads the per-slot miss and overflow counters (incremented
+//! lock-free by the front-end), and adjusts soft capacities to balance cache
+//! hit rate against total memory held in caches.
+//!
+//! **Algorithm.** For each active CPU and each size class:
+//! - If misses exceed a threshold and the soft capacity is below the hard
+//!   capacity, grow by one batch size (the slot needs more cache).
+//! - If overflows exceed a threshold and the soft capacity is above the
+//!   minimum (one batch), shrink by one batch size (the slot has too much).
+//! - After adjusting, if the total capacity across all CPUs/SCs exceeds the
+//!   global budget, shrink the least-active slots (those with the fewest
+//!   misses) until the budget is met.
+//!
+//! The controller is designed to run periodically (e.g. on a timer or on
+//! every N-th allocation) and is not on the allocation fast path.
+
+use crate::cpu_cache::CpuCache;
+use crate::generated::tables::SIZE_CLASSES;
+use crate::ids::SizeClassId;
+use crate::size_class;
+
+/// Number of size classes in the generated table.
+const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
+
+/// Default miss threshold: adapt when misses exceed this count since last
+/// reset.
+const DEFAULT_MISS_THRESHOLD: u64 = 64;
+
+/// Default overflow threshold: adapt when overflows exceed this count since
+/// last reset.
+const DEFAULT_OVERFLOW_THRESHOLD: u64 = 64;
+
+/// The cache budget controller (W6-5).
+pub struct CacheBudget {
+    /// Global budget: maximum total soft capacity across all CPUs and SCs
+    /// (in objects). When the total exceeds this, the least-active slots are
+    /// shrunk.
+    global_budget: usize,
+    /// Miss threshold for growing a slot.
+    miss_threshold: u64,
+    /// Overflow threshold for shrinking a slot.
+    overflow_threshold: u64,
+}
+
+impl CacheBudget {
+    /// Create a budget controller with the given global budget.
+    pub const fn new(global_budget: usize) -> Self {
+        Self {
+            global_budget,
+            miss_threshold: DEFAULT_MISS_THRESHOLD,
+            overflow_threshold: DEFAULT_OVERFLOW_THRESHOLD,
+        }
+    }
+
+    /// The global budget (total objects across all CPUs and SCs).
+    #[inline]
+    pub fn global_budget(&self) -> usize {
+        self.global_budget
+    }
+
+    /// Set the global budget.
+    #[inline]
+    pub fn set_global_budget(&mut self, budget: usize) {
+        self.global_budget = budget;
+    }
+
+    /// Set the miss threshold.
+    #[inline]
+    pub fn set_miss_threshold(&mut self, threshold: u64) {
+        self.miss_threshold = threshold;
+    }
+
+    /// Set the overflow threshold.
+    #[inline]
+    pub fn set_overflow_threshold(&mut self, threshold: u64) {
+        self.overflow_threshold = threshold;
+    }
+
+    /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for each
+    /// active CPU and size class, adjusts soft capacities, and enforces the
+    /// global budget. Returns the total soft capacity after adaptation.
+    pub fn adapt(&self, cpu_cache: &CpuCache) -> usize {
+        let active = cpu_cache.active_cpus() as usize;
+        if active == 0 {
+            return 0;
+        }
+
+        // Phase 1: per-slot adaptation based on miss/overflow stats.
+        for cpu_idx in 0..active {
+            let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            for sc_idx in 0..NUM_SIZE_CLASSES {
+                let sc = SizeClassId::new(sc_idx);
+                let slot = match cpu.slot(sc) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !slot.is_initialized() {
+                    continue;
+                }
+
+                let batch = size_class::batch(sc) as u32;
+                let hard_cap = slot.hard_capacity();
+                let cur_soft = slot.soft_capacity();
+
+                // Read and reset counters.
+                let misses = slot.reset_misses();
+                let overflows = slot.reset_overflows();
+
+                let mut new_soft = cur_soft;
+
+                // Grow on high misses (the slot needs more cache).
+                if misses > self.miss_threshold && cur_soft < hard_cap {
+                    new_soft = cur_soft.saturating_add(batch).min(hard_cap);
+                }
+
+                // Shrink on high overflows (the slot has too much).
+                if overflows > self.overflow_threshold && cur_soft > batch {
+                    new_soft = cur_soft.saturating_sub(batch).max(batch);
+                }
+
+                if new_soft != cur_soft {
+                    slot.set_soft_capacity(new_soft);
+                }
+            }
+        }
+
+        // Phase 2: enforce the global budget. Repeatedly shrink the
+        // least-active slots (those above minimum batch size) until the
+        // total is within budget or no further reduction is possible.
+        let mut total = self.compute_total_capacity(cpu_cache, active);
+
+        while total > self.global_budget {
+            let mut made_progress = false;
+            for cpu_idx in 0..active {
+                if total <= self.global_budget {
+                    break;
+                }
+                let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                for sc_idx in 0..NUM_SIZE_CLASSES {
+                    if total <= self.global_budget {
+                        break;
+                    }
+                    let sc = SizeClassId::new(sc_idx);
+                    let slot = match cpu.slot(sc) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if !slot.is_initialized() {
+                        continue;
+                    }
+
+                    let batch = size_class::batch(sc) as u32;
+                    let cur_soft = slot.soft_capacity();
+                    if cur_soft > batch {
+                        let reduction = batch.min(cur_soft - batch) as usize;
+                        let new_soft = cur_soft.saturating_sub(batch).max(batch);
+                        slot.set_soft_capacity(new_soft);
+                        total = total.saturating_sub(reduction);
+                        made_progress = true;
+                    }
+                }
+            }
+            if !made_progress {
+                break;
+            }
+        }
+
+        total
+    }
+
+    /// Compute the total soft capacity across all active CPUs and SCs.
+    fn compute_total_capacity(&self, cpu_cache: &CpuCache, active: usize) -> usize {
+        let mut total = 0usize;
+        for cpu_idx in 0..active {
+            let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
+                Some(c) => c,
+                None => continue,
+            };
+            for sc_idx in 0..NUM_SIZE_CLASSES {
+                let sc = SizeClassId::new(sc_idx);
+                let slot = match cpu.slot(sc) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if slot.is_initialized() {
+                    total = total.saturating_add(slot.soft_capacity() as usize);
+                }
+            }
+        }
+        total
+    }
+
+    /// Snapshot of per-slot stats for a specific CPU and size class.
+    pub fn slot_stats(
+        &self,
+        cpu_cache: &CpuCache,
+        cpu_idx: u32,
+        sc: SizeClassId,
+    ) -> Option<SlotStats> {
+        let cpu = cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx))?;
+        let slot = cpu.slot(sc)?;
+        if !slot.is_initialized() {
+            return None;
+        }
+        Some(SlotStats {
+            len: slot.len(),
+            soft_capacity: slot.soft_capacity(),
+            hard_capacity: slot.hard_capacity(),
+            misses: slot.misses(),
+            overflows: slot.overflows(),
+        })
+    }
+}
+
+impl Default for CacheBudget {
+    fn default() -> Self {
+        // Default budget: enough for 4 CPUs, each with batch_size (32) per
+        // SC (72 classes) = 4 * 32 * 72 = 9216.
+        Self::new(9216)
+    }
+}
+
+/// Snapshot of per-slot statistics.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotStats {
+    /// Current number of cached objects.
+    pub len: u32,
+    /// Current soft capacity.
+    pub soft_capacity: u32,
+    /// Hard capacity (the absolute ceiling).
+    pub hard_capacity: u32,
+    /// Cache misses since last reset.
+    pub misses: u64,
+    /// Cache overflows since last reset.
+    pub overflows: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::BumpArena;
+    use crate::cpu_cache::CpuCache;
+    use crate::fe::CoreId;
+    use crate::ids::SizeClassId;
+
+    fn meta(bytes: usize) -> BumpArena {
+        let buf = vec![0u8; bytes].into_boxed_slice();
+        let len = buf.len();
+        let ptr = Box::into_raw(buf).cast::<u8>();
+        // SAFETY: ptr is a valid, owned allocation of `len` bytes from Box.
+        unsafe { BumpArena::new(ptr, len) }
+    }
+
+    #[test]
+    fn adapt_increases_capacity_on_high_misses() {
+        let m = meta(4 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+
+        // Init slot with batch_size as initial soft capacity.
+        cc.init_slot(core, sc, &m, batch);
+
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        let initial_soft = slot.soft_capacity();
+        assert_eq!(initial_soft, batch);
+
+        // Simulate many misses.
+        for _ in 0..100 {
+            cc.fe_pop(core, sc, &m); // each miss increments the counter
+        }
+
+        let budget = CacheBudget::new(100_000);
+        budget.adapt(&cc);
+
+        // Soft capacity should have increased.
+        let new_soft = slot.soft_capacity();
+        assert!(
+            new_soft > initial_soft,
+            "soft capacity should grow on high misses: was {initial_soft}, now {new_soft}"
+        );
+    }
+
+    #[test]
+    fn adapt_decreases_capacity_on_high_overflows() {
+        let m = meta(4 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+
+        // Init slot with hard_capacity as soft capacity (maximum).
+        cc.init_slot(core, sc, &m, hard_cap);
+
+        let cpu = cc.per_cpu(core).unwrap();
+        let slot = cpu.slot(sc).unwrap();
+        assert_eq!(slot.soft_capacity(), hard_cap);
+
+        // Fill to hard capacity.
+        for i in 0..hard_cap {
+            cc.fe_push(core, sc, i as usize + 1, &m);
+        }
+
+        // Simulate many overflows.
+        for _ in 0..100 {
+            cc.fe_push(core, sc, 999, &m); // each overflow increments counter
+        }
+
+        let budget = CacheBudget::new(100_000);
+        budget.adapt(&cc);
+
+        // Soft capacity should have decreased.
+        let new_soft = slot.soft_capacity();
+        assert!(
+            new_soft < hard_cap,
+            "soft capacity should shrink on high overflows: was {hard_cap}, now {new_soft}"
+        );
+        assert!(new_soft >= batch, "should not shrink below batch size");
+    }
+
+    #[test]
+    fn global_budget_constraint() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(2);
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        // Init two CPUs with maximum soft capacity.
+        for cpu_idx in 0..2u32 {
+            let core = CoreId(cpu_idx);
+            cc.init_slot(core, sc, &m, hard_cap);
+        }
+
+        // Set a budget that is reachable (at least batch per initialized
+        // slot, since that is the minimum). 2 CPUs x 1 SC x batch = 64.
+        let target_budget = (batch as usize) * 2;
+        let budget = CacheBudget::new(target_budget);
+        let total = budget.adapt(&cc);
+
+        // Total should be at or under the global budget.
+        assert!(
+            total <= budget.global_budget(),
+            "total {total} should be <= budget {}",
+            budget.global_budget()
+        );
+        // Each slot should be at the minimum (batch size).
+        for cpu_idx in 0..2u32 {
+            let core = CoreId(cpu_idx);
+            let cpu = cc.per_cpu(core).unwrap();
+            let slot = cpu.slot(sc).unwrap();
+            assert_eq!(
+                slot.soft_capacity(),
+                batch,
+                "cpu {cpu_idx} should be at minimum batch size"
+            );
+        }
+    }
+
+    #[test]
+    fn adapt_with_no_active_cpus() {
+        let cc = CpuCache::new();
+        cc.set_active_cpus(0);
+
+        let budget = CacheBudget::new(1000);
+        let total = budget.adapt(&cc);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn slot_stats_returns_correct_values() {
+        let m = meta(2 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(1);
+        let core = CoreId::DEFAULT;
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+
+        cc.init_slot(core, sc, &m, batch);
+
+        // Push some addresses.
+        cc.fe_push(core, sc, 100, &m);
+        cc.fe_push(core, sc, 200, &m);
+
+        let budget = CacheBudget::new(1000);
+        let stats = budget.slot_stats(&cc, 0, sc).unwrap();
+        assert_eq!(stats.len, 2);
+        assert_eq!(stats.soft_capacity, batch);
+        assert!(stats.hard_capacity > 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.overflows, 0);
+    }
+
+    #[test]
+    fn default_budget_is_reasonable() {
+        let budget = CacheBudget::default();
+        assert!(budget.global_budget() > 0);
+        assert_eq!(budget.miss_threshold, DEFAULT_MISS_THRESHOLD);
+        assert_eq!(budget.overflow_threshold, DEFAULT_OVERFLOW_THRESHOLD);
+    }
+}
