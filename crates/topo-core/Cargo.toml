@@ -12,7 +12,9 @@ license = "MIT"
 [features]
 default = []
 # Pull in `std` (only the test harness needs it; the crate is otherwise no_std).
-std = []
+# Also enables `topo-arch/std` so the RSEQ self-registration fallback (W7-1) has
+# its `thread_local!` area storage in hosted builds.
+std = ["topo-arch/std"]
 # Debug/hardened invariant checks (Appendix B) compiled in.
 debug-checks = []
 # Profiles are features, not forks (overview principle 8; §30.1). Each selects a
@@ -25,6 +27,9 @@ low-rss = []
 hugepage-optimized = []
 
 [dependencies]
+# Per-architecture RSEQ restartable sequences + registration (W7, plan 05). The
+# only crate the per-CPU fast path reaches into; `no_std`, no transitive deps.
+topo-arch = { path = "../topo-arch" }
 
 [dev-dependencies]
 # Micro-benchmark harness (W0-8, §34.6) for the W3 metadata paths. Default features

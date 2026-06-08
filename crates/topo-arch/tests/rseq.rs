@@ -376,7 +376,7 @@ fn forced_migration_conserves_tokens() {
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
-                    if i % 2048 == 0 {
+                    if i.is_multiple_of(2048) {
                         pin_to((rng as usize) % ncpu);
                     }
                     match hand {

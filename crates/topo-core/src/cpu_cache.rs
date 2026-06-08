@@ -23,6 +23,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use topo_arch::rseq;
+
 use crate::bootstrap::MetadataAlloc;
 use crate::fe::{CoreId, FeOutcome};
 use crate::generated::tables::SIZE_CLASSES;
@@ -35,24 +37,37 @@ const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 /// Maximum logical CPUs supported. This bounds the `CpuCache` array size.
 pub const MAX_CPUS: usize = 128;
 
+/// Bound on RSEQ abort retries before the fast path falls back to the locked
+/// path (W7). Aborts are rare (only on real preemption/migration), so the loop
+/// almost always exits on the first iteration; the bound only prevents a
+/// pathological livelock under extreme scheduler churn.
+const RSEQ_ABORT_RETRY: u32 = 128;
+
 /// Per-size-class slot within a [`PerCpu`]: a lazily-allocated LIFO stack of
 /// object addresses.
 ///
-/// The slot is **not self-synchronizing**; all access is serialized by the
-/// owning [`PerCpu`]'s spinlock.
+/// In the **locked** baseline (W6-4) the slot is not self-synchronizing; all
+/// access is serialized by the owning [`PerCpu`]'s spinlock. In **RSEQ** mode
+/// (W7) the per-architecture restartable sequence reads `len`/`buf`/
+/// `soft_capacity` directly, so the layout is `#[repr(C)]` with those fields
+/// first and their offsets fed to the assembly via `offset_of!`. The asm does a
+/// single committing store of `len`; aligned word access is atomic on x86-64 and
+/// AArch64, so it never tears against the `Relaxed` reads here.
+#[repr(C)]
 pub struct CpuSlot {
-    /// Whether the slot has been initialized (buffer allocated).
-    initialized: AtomicBool,
     /// Pointer to the metadata-allocated array of `usize` addresses.
-    /// Null (0) until initialized.
+    /// Null (0) until initialized — the RSEQ sequence treats null as "take the
+    /// locked path" (it cannot allocate the buffer itself).
     buf: AtomicUsize,
-    /// Number of valid entries in the buffer.
+    /// Number of valid entries in the buffer. The RSEQ commit store targets this.
     len: AtomicU32,
     /// Soft capacity -- the budget controller may grow or shrink this within
-    /// `[batch_size, hard_capacity]` (W6-5).
+    /// `[batch_size, hard_capacity]` (W6-5). The RSEQ push bounds against it.
     soft_capacity: AtomicU32,
     /// Hard capacity -- the absolute ceiling for this slot (SS11.5).
     hard_capacity: AtomicU32,
+    /// Whether the slot has been initialized (buffer allocated).
+    initialized: AtomicBool,
     /// Cache miss count (pop from empty slot). Incremented lock-free (Relaxed)
     /// by the fast path; read and reset by the budget controller (W6-5).
     misses: AtomicU64,
@@ -174,8 +189,14 @@ impl CpuSlot {
 }
 
 /// Per-CPU state: a spinlock and per-size-class slots.
+///
+/// `#[repr(C)]` with `locked` first (offset 0): the RSEQ sequence reads the lock
+/// byte at `&cpus[cpu]` to divert to the locked path when a non-owner holds it
+/// (W7-4), and indexes `slots` by the kernel-reported CPU. The offsets and the
+/// `size_of::<PerCpu>()` stride are fed to the assembly via `offset_of!`.
+#[repr(C)]
 pub struct PerCpu {
-    /// Spinlock protecting all slots for this CPU.
+    /// Spinlock protecting all slots for this CPU. Offset 0 (the RSEQ lock byte).
     locked: AtomicBool,
     /// Per-size-class slots.
     slots: [CpuSlot; NUM_SIZE_CLASSES],
@@ -236,6 +257,28 @@ unsafe impl Sync for PerCpu {}
 // SAFETY: PerCpu's fields are atomics and a spinlock.
 unsafe impl Send for PerCpu {}
 
+// ---------------------------------------------------------------------------
+// RSEQ layout constants (W7). These describe the per-CPU array to the
+// per-architecture assembly: a slot's `len`/`buf`/`soft_capacity` offsets, the
+// per-CPU stride, and the offset of the `slots` array. `locked` must be at
+// offset 0 so `&cpus[cpu]` is both the lock byte and the per-CPU base.
+
+const SLOT_LEN_OFF: usize = core::mem::offset_of!(CpuSlot, len);
+const SLOT_BUF_OFF: usize = core::mem::offset_of!(CpuSlot, buf);
+const SLOT_CAP_OFF: usize = core::mem::offset_of!(CpuSlot, soft_capacity);
+const SLOT_STRIDE: usize = core::mem::size_of::<CpuSlot>();
+const PERCPU_STRIDE: usize = core::mem::size_of::<PerCpu>();
+const PERCPU_SLOTS_OFF: usize = core::mem::offset_of!(PerCpu, slots);
+
+const _: () = {
+    // The RSEQ lock-byte / per-CPU base coincide only if `locked` is first.
+    assert!(core::mem::offset_of!(PerCpu, locked) == 0);
+    // The committing store writes a `u32` length; the buffer pointer is a word.
+    assert!(SLOT_BUF_OFF + core::mem::size_of::<usize>() <= SLOT_STRIDE);
+    assert!(SLOT_LEN_OFF + core::mem::size_of::<u32>() <= SLOT_STRIDE);
+    assert!(SLOT_CAP_OFF + core::mem::size_of::<u32>() <= SLOT_STRIDE);
+};
+
 /// The per-CPU cache: `MAX_CPUS` [`PerCpu`] entries (W6-4).
 ///
 /// Thread-safe by construction: each CPU has its own spinlock. The fast-path
@@ -246,15 +289,60 @@ pub struct CpuCache {
     /// Number of active (online) CPUs. Operations on a core beyond this
     /// count are valid but will always miss (no slots initialized).
     active_cpus: AtomicU32,
+    /// Whether the RSEQ fast path is in use (W7). `false` is the locked baseline
+    /// (W6-4); set by [`enable_rseq`](Self::enable_rseq) when the platform
+    /// supports RSEQ, cleared by [`disable_rseq`](Self::disable_rseq) (e.g. the
+    /// child fork handler, which must go conservative until per-CPU state is
+    /// safe, §28.1).
+    rseq_enabled: AtomicBool,
 }
 
 impl CpuCache {
-    /// A fresh, empty CPU cache (no slots initialized).
+    /// A fresh, empty CPU cache (no slots initialized), in the locked baseline
+    /// mode. Call [`enable_rseq`](Self::enable_rseq) to opt into the RSEQ fast
+    /// path after the cache is wired up.
     pub const fn new() -> Self {
         Self {
             cpus: [const { PerCpu::new() }; MAX_CPUS],
             active_cpus: AtomicU32::new(0),
+            rseq_enabled: AtomicBool::new(false),
         }
+    }
+
+    /// Enable the RSEQ fast path if the platform supports it (W7). Idempotent:
+    /// detects/initialises RSEQ for the process (registration model + the
+    /// non-owner fence) and, on success, switches `fe_pop`/`fe_push` to the
+    /// restartable sequences. Returns whether RSEQ mode is now active; on
+    /// `false` the cache stays on the correct locked baseline (P-003).
+    ///
+    /// Each thread that will use the fast path must additionally call
+    /// [`register_current_thread`](Self::register_current_thread) at start-up
+    /// (§27.6) — a no-op beyond a presence check in glibc mode.
+    pub fn enable_rseq(&self) -> bool {
+        let ok = rseq::enable();
+        self.rseq_enabled.store(ok, Ordering::Release);
+        ok
+    }
+
+    /// Disable the RSEQ fast path, reverting to the locked baseline (§28.1 child
+    /// fork handler / conservative mode). Already-cached objects are unaffected;
+    /// subsequent operations take the spinlock path.
+    pub fn disable_rseq(&self) {
+        self.rseq_enabled.store(false, Ordering::Release);
+    }
+
+    /// Whether the RSEQ fast path is currently active.
+    #[inline]
+    pub fn rseq_mode(&self) -> bool {
+        self.rseq_enabled.load(Ordering::Acquire)
+    }
+
+    /// Register the calling thread for the RSEQ fast path (§27.6, W7-1). Returns
+    /// whether this thread can use it; in the locked baseline this is a no-op
+    /// returning `false`.
+    #[inline]
+    pub fn register_current_thread(&self) -> bool {
+        self.rseq_mode() && rseq::register_current_thread()
     }
 
     /// Set the number of active CPUs.
@@ -304,7 +392,34 @@ impl CpuCache {
     /// Returns `FeOutcome::Success(addr)` on success, `FeOutcome::Empty` if
     /// the slot is empty (needs refill). The slot is lazily initialized on
     /// first use via `meta`.
+    ///
+    /// In RSEQ mode (W7) this first attempts the lock-free restartable sequence
+    /// on the **current** CPU's slot (the `core` argument is a hint there, the
+    /// hardware CPU is authoritative); on `Abort` it retries, and on a genuine
+    /// `Empty` it returns. Any condition the sequence cannot handle (lock held
+    /// by a non-owner, an uninitialised slot, or the abort bound) falls through
+    /// to the locked path, which is behaviourally identical (proven by the
+    /// forced-migration equivalence tests, G-fast).
+    #[inline]
     pub fn fe_pop(
+        &self,
+        core: CoreId,
+        arena: ArenaId,
+        sc: SizeClassId,
+        meta: &dyn MetadataAlloc,
+    ) -> FeOutcome<usize> {
+        if self.rseq_mode() {
+            if let Some(out) = self.fe_pop_rseq(sc) {
+                return out;
+            }
+            return self.fe_pop_locked(self.effective_core(core), arena, sc, meta);
+        }
+        self.fe_pop_locked(core, arena, sc, meta)
+    }
+
+    /// The locked (spinlock) pop — the RSEQ-free correct baseline (W6-4) and the
+    /// RSEQ-mode fallback.
+    fn fe_pop_locked(
         &self,
         core: CoreId,
         _arena: ArenaId,
@@ -352,7 +467,31 @@ impl CpuCache {
     /// Returns `FeOutcome::Success(())` on success, `FeOutcome::Full` if the
     /// slot is at soft capacity (needs flush). The slot is lazily initialized
     /// on first use via `meta`.
+    ///
+    /// In RSEQ mode (W7) this first attempts the restartable sequence on the
+    /// current CPU's slot, falling through to the locked path on any condition
+    /// it cannot handle (see [`fe_pop`](Self::fe_pop)).
+    #[inline]
     pub fn fe_push(
+        &self,
+        core: CoreId,
+        arena: ArenaId,
+        sc: SizeClassId,
+        addr: usize,
+        meta: &dyn MetadataAlloc,
+    ) -> FeOutcome<()> {
+        if self.rseq_mode() {
+            if let Some(out) = self.fe_push_rseq(sc, addr) {
+                return out;
+            }
+            return self.fe_push_locked(self.effective_core(core), arena, sc, addr, meta);
+        }
+        self.fe_push_locked(core, arena, sc, addr, meta)
+    }
+
+    /// The locked (spinlock) push — the RSEQ-free correct baseline (W6-4) and the
+    /// RSEQ-mode fallback.
+    fn fe_push_locked(
         &self,
         core: CoreId,
         _arena: ArenaId,
@@ -396,15 +535,156 @@ impl CpuCache {
         FeOutcome::Success(())
     }
 
+    // --- RSEQ fast path (W7) ---
+
+    /// The base address of the per-CPU array (`&cpus[0]`), which is both the
+    /// per-CPU lock-byte base (offset 0) and the per-CPU stride base for the asm.
+    #[inline]
+    fn cpus_base(&self) -> *const u8 {
+        core::ptr::addr_of!(self.cpus).cast::<u8>()
+    }
+
+    /// The effective core for the locked fallback in RSEQ mode: the hardware CPU
+    /// the thread runs on, or the caller's hint if RSEQ cannot report it.
+    #[inline]
+    fn effective_core(&self, hint: CoreId) -> CoreId {
+        let cpu = rseq::current_cpu();
+        if cpu >= 0 && (cpu as usize) < MAX_CPUS {
+            CoreId(cpu as u32)
+        } else {
+            hint
+        }
+    }
+
+    /// Increment the miss counter for `(cpu, sc)` (approximate stats; Relaxed).
+    #[inline]
+    fn bump_miss(&self, cpu: usize, sc: SizeClassId) {
+        if let Some(s) = self.cpus.get(cpu).and_then(|c| c.slots.get(sc.index())) {
+            s.misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Increment the overflow counter for `(cpu, sc)` (approximate; Relaxed).
+    #[inline]
+    fn bump_overflow(&self, cpu: usize, sc: SizeClassId) {
+        if let Some(s) = self.cpus.get(cpu).and_then(|c| c.slots.get(sc.index())) {
+            s.overflows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// W7-4 non-owner fence: in RSEQ mode, if `core` is not the caller's current
+    /// CPU (a non-owner drain), abort any in-flight RSEQ sequence on `core`. Must
+    /// be called with `core`'s per-CPU lock held (so new sequences see the lock
+    /// and divert); the fence then drains the in-flight ones (§27.4).
+    #[inline]
+    fn fence_if_non_owner(&self, core: CoreId) {
+        if self.rseq_mode() && (core.0 as i32) != rseq::current_cpu() {
+            rseq::fence_rseq();
+        }
+    }
+
+    /// Attempt the restartable pop on the current CPU's slot for `sc`. Returns
+    /// `Some(outcome)` when RSEQ handled it (`Success`/`Empty`), or `None` to
+    /// signal the caller to take the locked path (uninitialised slot, a
+    /// non-owner holding the lock, or the abort bound exceeded).
+    #[inline]
+    fn fe_pop_rseq(&self, sc: SizeClassId) -> Option<FeOutcome<usize>> {
+        if sc.index() >= NUM_SIZE_CLASSES {
+            return None;
+        }
+        let cpu = rseq::current_cpu();
+        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
+            return None;
+        }
+        let area = rseq::current_area();
+        if area.is_null() {
+            return None;
+        }
+        let base = self.cpus_base();
+        // SAFETY: `slots_off + sc*slot_stride` lies within one `PerCpu`, so this
+        // is the base of the per-`sc` slot column the asm indexes by CPU.
+        let slot_base = unsafe { base.add(PERCPU_SLOTS_OFF + sc.index() * SLOT_STRIDE) };
+        for _ in 0..RSEQ_ABORT_RETRY {
+            // SAFETY: `area` is this thread's registered area; `base`/`slot_base`/
+            // `PERCPU_STRIDE` describe this live per-CPU cache, with `len` at
+            // `SLOT_LEN_OFF` and `buf` at `SLOT_BUF_OFF`.
+            match unsafe {
+                rseq::pop::<SLOT_LEN_OFF, SLOT_BUF_OFF>(area, slot_base, base, PERCPU_STRIDE)
+            } {
+                rseq::Pop::Success(addr) => return Some(FeOutcome::Success(addr)),
+                rseq::Pop::Empty => {
+                    self.bump_miss(cpu as usize, sc);
+                    return Some(FeOutcome::Empty);
+                }
+                rseq::Pop::Abort => continue,
+                rseq::Pop::Fallback => return None,
+            }
+        }
+        None
+    }
+
+    /// Attempt the restartable push on the current CPU's slot for `sc`. See
+    /// [`fe_pop_rseq`](Self::fe_pop_rseq) for the `None` semantics.
+    #[inline]
+    fn fe_push_rseq(&self, sc: SizeClassId, addr: usize) -> Option<FeOutcome<()>> {
+        if sc.index() >= NUM_SIZE_CLASSES {
+            return None;
+        }
+        let cpu = rseq::current_cpu();
+        if cpu < 0 || (cpu as usize) >= MAX_CPUS {
+            return None;
+        }
+        let area = rseq::current_area();
+        if area.is_null() {
+            return None;
+        }
+        let base = self.cpus_base();
+        // SAFETY: as `fe_pop_rseq`.
+        let slot_base = unsafe { base.add(PERCPU_SLOTS_OFF + sc.index() * SLOT_STRIDE) };
+        for _ in 0..RSEQ_ABORT_RETRY {
+            // SAFETY: as `fe_pop_rseq`, plus `soft_capacity` at `SLOT_CAP_OFF`
+            // and a buffer of at least `soft_capacity` entries (init clamps
+            // `soft_capacity <= hard_capacity`, the buffer length).
+            match unsafe {
+                rseq::push::<SLOT_LEN_OFF, SLOT_BUF_OFF, SLOT_CAP_OFF>(
+                    area,
+                    slot_base,
+                    base,
+                    PERCPU_STRIDE,
+                    addr,
+                )
+            } {
+                rseq::Push::Success => return Some(FeOutcome::Success(())),
+                rseq::Push::Full => {
+                    self.bump_overflow(cpu as usize, sc);
+                    return Some(FeOutcome::Full);
+                }
+                rseq::Push::Abort => continue,
+                rseq::Push::Fallback => return None,
+            }
+        }
+        None
+    }
+
     /// Pop up to `max` addresses from the per-CPU slot for `(core, sc)` into
     /// `out`. Returns the number of addresses popped. Used by flush operations
     /// (cache_ops W6-3b).
+    ///
+    /// **W7-4 non-owner coordination.** In RSEQ mode, when this is called for a
+    /// CPU other than the caller's current one (a non-owner drain, e.g. idle-CPU
+    /// flush), it takes the per-CPU lock and then issues the RSEQ fence so any
+    /// in-flight sequence on that CPU is aborted before the slot is read — the
+    /// lock makes new sequences divert, the fence drains the in-flight ones
+    /// (§27.4). Owner-side batch ops (the common refill/flush on the current CPU)
+    /// need no fence: only a thread running on that CPU can mutate its slot via
+    /// RSEQ, and it is this thread.
     pub fn pop_batch(&self, core: CoreId, sc: SizeClassId, out: &mut [usize], max: usize) -> usize {
         let cpu = match self.cpus.get(core.index()) {
             Some(c) => c,
             None => return 0,
         };
         let _guard = cpu.lock();
+        self.fence_if_non_owner(core);
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return 0,
@@ -444,6 +724,7 @@ impl CpuCache {
             None => return 0,
         };
         let _guard = cpu.lock();
+        self.fence_if_non_owner(core);
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return 0,
