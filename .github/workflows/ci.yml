@@ -128,6 +128,14 @@ jobs:
   test-arm64-native:
     name: test (aarch64 native, real RSEQ)
     runs-on: ubuntu-24.04-arm
+    # The repo's .cargo/config.toml sets a `qemu-aarch64` runner for the
+    # aarch64 target (for x86->arm64 cross runs). On a NATIVE arm64 host that
+    # target *is* the host, so cargo would route `run`/`test` through qemu
+    # (which isn't installed, and would defeat the purpose — qemu-user doesn't
+    # emulate rseq). Override the runner with an `env` passthrough so the native
+    # binaries execute directly; scoped to this job only.
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: env
     steps:
       - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain

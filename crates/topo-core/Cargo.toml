@@ -29,7 +29,10 @@ hugepage-optimized = []
 [dependencies]
 # Per-architecture RSEQ restartable sequences + registration (W7, plan 05). The
 # only crate the per-CPU fast path reaches into; `no_std`, no transitive deps.
-topo-arch = { path = "../topo-arch" }
+# The explicit `version` (not a bare path) matches every other inter-crate dep
+# and keeps `cargo deny` happy: `topo-core` is publishable, and a wildcard path
+# dep is disallowed for public crates.
+topo-arch = { path = "../topo-arch", version = "0.1.0" }
 
 [dev-dependencies]
 # Micro-benchmark harness (W0-8, §34.6) for the W3 metadata paths. Default features
