@@ -190,10 +190,21 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("rseq") => {
             // The W7 RSEQ / pinned-core battery (also part of the default
             // `--workspace` run; this is the focused subset, G-fast).
+            // `--features std` so the self-registration path (its `thread_local!`
+            // area) is compiled in — otherwise `self_registration_path_works`
+            // passes vacuously through its "kernel lacks rseq" fallback.
             r.run(
-                "rseq sequences (topo-arch)",
+                "rseq sequences (topo-arch, std)",
                 "cargo",
-                &["test", "-p", "topo-arch", "--test", "rseq"],
+                &[
+                    "test",
+                    "-p",
+                    "topo-arch",
+                    "--test",
+                    "rseq",
+                    "--features",
+                    "std",
+                ],
             );
             r.run(
                 "rseq equivalence (topo-core)",
@@ -212,6 +223,15 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         }
         None => {
             r.run("workspace tests", "cargo", &["test", "--workspace"]);
+            // RSEQ self-registration path (W7-1): build `topo-arch` with `std` so
+            // its `thread_local!` self-reg area is compiled in (the workspace run
+            // above builds it `no_std`, leaving `self_registration_path_works`
+            // vacuous on glibc hosts).
+            r.run(
+                "rseq self-registration (topo-arch, std)",
+                "cargo",
+                &["test", "-p", "topo-arch", "--features", "std"],
+            );
             r.run(
                 "dual-backend (G-sim)",
                 "cargo",

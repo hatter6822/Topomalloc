@@ -68,7 +68,9 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 > the forced-migration/abort/signal equivalence battery (`crates/{topo-arch,topo-core}/tests/`),
 > **ThreadSanitizer** (`xtask test --kind tsan`, gating CI), the no-call + structural
 > **CS audit** (`xtask` lint), and **criterion benchmarks** (`benches/cpu_cache.rs`:
-> RSEQ ≈ 40 % faster per op). W7-4 uses a one-lock-one-fence idle drain with a
+> RSEQ ≈ 40 % faster per op). W7-4 drains idle CPUs hand-over-hand — lock-free
+> `is_initialized`/`len` pre-checks skip uninitialised and empty slots, and the
+> per-CPU lock is released before each sink call — with the non-owner `membarrier`
 > fence validated at `enable` time. See
 > [DD-2](#dd-2--rseq-restartable-sequences-w7-2w7-3--the-only-assembly) and
 > [docs/DECISIONS.md](../../docs/DECISIONS.md) (W7).

@@ -538,12 +538,16 @@ implementation choices are ratified here, the module docs carry the rest.
   `enable_pinned_core` (seLe4n, given a per-core oracle) select the fast paths, and
   the shared `fe_pop`/`fe_push` dispatch to them — so the seLe4n pinned path is behind
   the *same* entry point, not just the same return type. The idle-CPU flush goes
-  through `CpuCache::drain_cpu`, which holds the per-CPU lock once and issues the RSEQ
-  fence **once** (a membarrier is an all-CPU IPI, so the previous per-size-class fence
-  was a maintenance-path storm). The fence is validated with a test membarrier at
-  `enable` time, so RSEQ mode is only selected if the fence actually works; the
-  per-use fence return is `debug_assert`ed. Pinned mode's non-owner coordination is
-  the §36.10 hand-off contract, not the membarrier.
+  through `CpuCache::drain_cpu`, which is strict **hand-over-hand**: it pops each chunk
+  under the per-CPU lock + a non-owner RSEQ fence, then **releases the lock before**
+  the sink takes a transfer/central lock — so the per-CPU lock is never held while a
+  middle-end lock is taken, and it cannot form a cycle with the refill path (which
+  takes the transfer lock and then, separately, the per-CPU lock). Lock-free
+  `is_initialized`/`len != 0` pre-checks skip the (all-CPU-IPI) fence on empty and
+  uninitialised slots, so the idle path fences only when it actually drains. The fence
+  is validated with a test membarrier at `enable` time, so RSEQ mode is only selected
+  if the fence actually works; the per-use fence return is `debug_assert`ed. Pinned
+  mode's non-owner coordination is the §36.10 hand-off contract, not the membarrier.
 
 * **One stable-Rust limitation, documented.** The glibc-area path takes a **hard** link
   reference to `__rseq_offset`/`__rseq_size` (glibc ≥ 2.35). On a `-gnu` target linked
@@ -551,3 +555,16 @@ implementation choices are ratified here, the module docs carry the rest.
   weak linkage, which is nightly-only, so it is rejected to keep the stable invariant
   (W0-3). The supported `-gnu` targets are modern; musl is unaffected (it uses
   self-registration, which references no glibc symbol).
+
+* **Review-driven correctness fixes (PR #10).** Three subtle bugs an automated review
+  caught, all real, all fixed and the reasoning recorded: (1) the abort-handler
+  **signature is architecture-specific** — `0x53053053` on x86-64 but `0xd428bc00`
+  (`BRK #0x45E0`) on AArch64; using the x86 value on AArch64 made a real abort
+  `SIGSEGV` instead of jumping to the handler (caught only on a native-arm64 runner,
+  where RSEQ is truly active). (2) The AArch64 push commit is a **store-release**
+  (`stlr`), so a reader that acquire-observes the incremented `len` also observes the
+  staged `buf[len]` (the weak model would otherwise allow a stale/zero read). (3) The
+  self-registration probe treats `EBUSY` as **unavailable**, not success: `EBUSY` for
+  our fresh area means a *foreign* rseq area is already registered (musl / another
+  runtime), so using ours would arm `rseq_cs` in an untracked area; the kernel-set
+  `cpu_id` distinguishes "our area won" from "a foreign area owns it".

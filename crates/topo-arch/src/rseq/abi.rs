@@ -20,10 +20,26 @@
 /// The RSEQ signature placed immediately before every abort handler (§12.3).
 ///
 /// The kernel verifies that the four bytes preceding a sequence's `abort_ip`
-/// equal the signature registered for the thread, defending against jumps into
-/// the middle of a sequence. `0x53053053` is the architecture-neutral value
-/// glibc registers with, so our sequences interoperate with glibc's
-/// registration.
+/// equal the signature **registered for the thread**, defending against jumps
+/// into the middle of a sequence. The value is **architecture-specific** — it is
+/// the encoding of a trap instruction for that arch — and MUST match what glibc
+/// registered with (since [`super::enable`] prefers the glibc-registered area):
+///
+/// * x86-64: `0x53053053` (a `ud1` variant; glibc `bits/rseq.h`).
+/// * AArch64: `0xd428bc00` (`BRK #0x45E0`; glibc aarch64 `bits/rseq.h`).
+///
+/// A mismatch is fatal: on a real preempt/migrate/signal the kernel would find
+/// the wrong bytes before `abort_ip` and deliver `SIGSEGV` instead of jumping to
+/// the abort handler. For self-registration we pass this same value to `rseq(2)`,
+/// so both modes stay consistent.
+#[cfg(target_arch = "x86_64")]
+pub const RSEQ_SIG: u32 = 0x5305_3053;
+/// See [`RSEQ_SIG`] (x86-64). AArch64 value: `BRK #0x45E0`.
+#[cfg(target_arch = "aarch64")]
+pub const RSEQ_SIG: u32 = 0xd428_bc00;
+/// See [`RSEQ_SIG`]. Other architectures have no RSEQ fast path; the value is
+/// unused (kept defined so the shared code compiles).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const RSEQ_SIG: u32 = 0x5305_3053;
 
 /// `cpu_id` value before the kernel has updated the area (`RSEQ_CPU_ID_UNINITIALIZED`).
@@ -147,9 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn signature_is_the_glibc_value() {
-        // Interop with glibc's registration depends on this exact value.
+    fn signature_matches_the_arch_glibc_value() {
+        // Interop with glibc's registration depends on the *architecture-specific*
+        // value; a wrong value would make a real abort SIGSEGV the process.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(RSEQ_SIG, 0x5305_3053);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(RSEQ_SIG, 0xd428_bc00);
     }
 
     #[test]

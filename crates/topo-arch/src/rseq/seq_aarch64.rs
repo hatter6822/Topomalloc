@@ -162,7 +162,14 @@ pub(super) unsafe fn push<const LEN_OFF: usize, const BUF_OFF: usize, const CAP_
             "bhs 7f",                            // len >= soft cap → Full (no commit)
             "str {val}, [{buf}, {len}, lsl #3]", // stage into the logically-free slot
             "add {len:w}, {len:w}, #1",
-            "str {len:w}, [{slot}, {lenoff}]",   // COMMIT: len ← len+1
+            // COMMIT with store-RELEASE: publishes the staged `buf[len]` before
+            // the new `len` becomes visible, so any reader that acquire-observes
+            // the incremented length also observes the pushed object (the weak
+            // memory model would otherwise let `len` be seen with a stale slot).
+            // `stlr` needs a bare base register, so form `&len` first (reusing
+            // `laddr`, free after the lock-byte check).
+            "add {laddr}, {slot}, {lenoff}",
+            "stlr {len:w}, [{laddr}]",           // COMMIT (release): len ← len+1
             "4:",
             "mov {status:w}, #0",                // Success
             "b 8f",

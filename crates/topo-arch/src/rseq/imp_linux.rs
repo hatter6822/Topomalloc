@@ -51,9 +51,6 @@ const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 7;
 /// process's intent to use the RSEQ-expedited fence (required first; Linux ≥ 5.10).
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: usize = 1 << 8;
 
-/// `EBUSY`: an rseq area is already registered for this thread (e.g. by glibc).
-const EBUSY: isize = 16;
-
 // ---------------------------------------------------------------------------
 // Raw syscalls (no libc dependency; keeps the crate `no_std`).
 
@@ -314,12 +311,28 @@ fn decide_mode() -> u8 {
         return MODE_UNAVAILABLE; // no self-registration storage (no std)
     }
     // SAFETY: `area` is this thread's fresh, stable self-registration area.
-    let r = unsafe { sys_rseq_register(area) };
-    if r == 0 || r == -EBUSY {
+    unsafe {
+        let _ = sys_rseq_register(area);
+    }
+    // Accept self-registration only if *our* area is the one the kernel now
+    // tracks: it sets `cpu_id` on a successful registration. An `EBUSY` from a
+    // FOREIGN rseq area already registered for this thread (musl / another
+    // runtime) leaves our area uninitialised — using it would arm `rseq_cs` in
+    // an untracked area, so preemption would never abort and the cache could be
+    // corrupted. The `cpu_id` check distinguishes the two.
+    if registered_ok(area) {
         MODE_SELFREG
     } else {
         MODE_UNAVAILABLE
     }
+}
+
+/// Whether `area` is the rseq area the kernel currently tracks for this thread
+/// (the kernel publishes a valid `cpu_id` into the registered area). Used to
+/// accept a self-registration only when *our* area won — not when a foreign
+/// area is already registered (the `EBUSY` case).
+fn registered_ok(area: *mut Rseq) -> bool {
+    cpu_of(area) >= 0
 }
 
 /// Register the calling thread for the RSEQ fast path (§27.6, W7-1). Idempotent.
@@ -334,10 +347,15 @@ pub(super) fn register_current_thread() -> bool {
             if area.is_null() {
                 return false;
             }
-            // SAFETY: `area` is this thread's stable self-registration area;
-            // EBUSY means it was already registered (idempotent).
-            let r = unsafe { sys_rseq_register(area) };
-            r == 0 || r == -EBUSY
+            // SAFETY: `area` is this thread's stable self-registration area.
+            // Re-registering our own area returns EBUSY (idempotent); a foreign
+            // area already registered also returns EBUSY but leaves our area
+            // untracked — `registered_ok` (the kernel-set `cpu_id`) tells them
+            // apart, so a foreign-EBUSY thread correctly reports unusable.
+            unsafe {
+                let _ = sys_rseq_register(area);
+            }
+            registered_ok(area)
         }
         _ => false,
     }

@@ -1018,19 +1018,22 @@ impl CpuCache {
         push_count
     }
 
-    /// Drain every initialized slot of `core` for an idle-CPU flush / hand-off,
-    /// holding the per-CPU lock **once** for the whole drain and, when `core` is
-    /// a non-owner CPU in RSEQ mode, issuing the RSEQ fence **once** (not per
-    /// size class — a membarrier is an all-CPU IPI, so per-batch fencing is a
-    /// maintenance-path storm). For each non-empty slot it repeatedly fills `buf`
-    /// (up to `buf.len()` per chunk) and calls `sink(sc, &buf[..n])`; the sink
-    /// moves the chunk to the middle-end. Returns the total drained.
+    /// Drain every initialized slot of `core` for an idle-CPU flush / hand-off.
+    /// For each non-empty slot it repeatedly pops a chunk (up to `buf.len()`)
+    /// **under the per-CPU lock + a non-owner RSEQ fence**, then **releases the
+    /// lock before** invoking `sink(sc, &buf[..n])` — strict **hand-over-hand**:
+    /// the per-CPU lock is never held while the sink takes a middle-end
+    /// (transfer/central) lock. Returns the total drained.
     ///
-    /// The per-CPU lock is the outermost cache lock, so the sink may take the
-    /// transfer then central locks (hand-over-hand) underneath it without
-    /// violating the §27.2 hierarchy. Holding it across the drain is sound for
-    /// the *idle* path (the target CPU is, by definition, not running the fast
-    /// path) and is what lets the fence be issued exactly once.
+    /// **Lock discipline (W7-4 / §27.2).** Each chunk re-acquires the per-CPU
+    /// lock and re-issues the fence (the lock makes new sequences on `core`
+    /// divert; the fence aborts any in-flight one), so the read is race-free; the
+    /// lock is then dropped, and only afterwards does the sink lock the middle
+    /// end. This avoids holding the per-CPU lock across a transfer/central
+    /// acquisition entirely, so it cannot form a cycle with the refill path
+    /// (which acquires transfer then — separately — the per-CPU lock). A
+    /// membarrier per chunk is acceptable on the *idle* path; correctness over a
+    /// fence-count optimization.
     pub fn drain_cpu<F>(&self, core: CoreId, buf: &mut [usize], mut sink: F) -> usize
     where
         F: FnMut(SizeClassId, &[usize]),
@@ -1039,10 +1042,6 @@ impl CpuCache {
             Some(c) => c,
             None => return 0,
         };
-        let _guard = cpu.lock();
-        // One fence under the held lock: new sequences on `core` see the lock and
-        // divert; the fence aborts any already in-flight one before we read.
-        self.fence_if_non_owner(core);
         let max = buf.len();
         let mut total = 0usize;
         for i in 0..NUM_SIZE_CLASSES {
@@ -1050,19 +1049,31 @@ impl CpuCache {
                 Some(s) => s,
                 None => continue,
             };
+            // Lock-free pre-check: an uninitialised slot has no buffer (the RSEQ
+            // sequence diverts on a null `buf`), so it needs neither the lock nor
+            // the (expensive, all-CPU-IPI) fence.
             if !slot.is_initialized() {
                 continue;
             }
             let sc = SizeClassId::new(i);
-            loop {
-                // SAFETY: the per-CPU lock is held across the whole drain and the
-                // fence has run, so this thread is the sole accessor of the slot.
-                let n = unsafe { pop_slot(slot, buf, max) };
+            // Pop one chunk under the lock + fence, then drop the lock *before*
+            // sinking — strict hand-over-hand (the per-CPU lock is never held
+            // while the sink takes a middle-end lock). The lock-free `len != 0`
+            // guard skips the fence on an empty slot; a push racing it merely
+            // defers that object to a later flush (conservation still holds).
+            while slot.len.load(Ordering::Relaxed) != 0 {
+                let n = {
+                    let _guard = cpu.lock();
+                    self.fence_if_non_owner(core);
+                    // SAFETY: the per-CPU lock is held and the fence has run, so
+                    // this thread is the sole accessor of the slot.
+                    unsafe { pop_slot(slot, buf, max) }
+                }; // <-- per-CPU lock released here, before the sink
                 if n == 0 {
                     break;
                 }
                 total = total.saturating_add(n);
-                sink(sc, &buf[..n]);
+                sink(sc, &buf[..n]); // hand-over-hand: no per-CPU lock held
             }
         }
         total
