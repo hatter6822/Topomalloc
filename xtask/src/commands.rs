@@ -132,7 +132,7 @@ pub fn gen(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `test [--kind unit|prop|diff|fuzz] [--target T]` — run the test suites.
+/// `test [--kind unit|prop|diff|fuzz|loom|tsan|rseq] [--target T]` — run the test suites.
 ///
 /// With `--target` (used by the AArch64 CI job), tests are built for that target
 /// and run via the `.cargo/config.toml` runner (`qemu-aarch64`). Without it, the
@@ -184,12 +184,54 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("loom") => {
             loom_steps(&mut r);
         }
+        Some("tsan") => {
+            tsan_steps(&mut r);
+        }
+        Some("rseq") => {
+            // The W7 RSEQ / pinned-core battery (also part of the default
+            // `--workspace` run; this is the focused subset, G-fast).
+            // `--features std` so the self-registration path (its `thread_local!`
+            // area) is compiled in — otherwise `self_registration_path_works`
+            // passes vacuously through its "kernel lacks rseq" fallback.
+            r.run(
+                "rseq sequences (topo-arch, std)",
+                "cargo",
+                &[
+                    "test",
+                    "-p",
+                    "topo-arch",
+                    "--test",
+                    "rseq",
+                    "--features",
+                    "std",
+                ],
+            );
+            r.run(
+                "rseq equivalence (topo-core)",
+                "cargo",
+                &["test", "-p", "topo-core", "--test", "rseq_equivalence"],
+            );
+            r.run(
+                "pinned-core (topo-core)",
+                "cargo",
+                &["test", "-p", "topo-core", "--test", "pinned_core"],
+            );
+        }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom)");
+            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|tsan|rseq)");
             r.record("unknown test kind", false);
         }
         None => {
             r.run("workspace tests", "cargo", &["test", "--workspace"]);
+            // RSEQ self-registration path (W7-1): build `topo-arch` with `std` so
+            // its `thread_local!` self-reg area is compiled in (the workspace run
+            // above builds it `no_std`, leaving `self_registration_path_works`
+            // vacuous on glibc hosts).
+            r.run(
+                "rseq self-registration (topo-arch, std)",
+                "cargo",
+                &["test", "-p", "topo-arch", "--features", "std"],
+            );
             r.run(
                 "dual-backend (G-sim)",
                 "cargo",
@@ -227,6 +269,7 @@ pub fn lint(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -275,6 +318,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -487,6 +531,80 @@ fn loom_steps(r: &mut Runner<'_>) {
     std::env::remove_var("RUSTFLAGS");
 }
 
+/// Whether a `nightly` toolchain is installed (TSan needs `-Zsanitizer=thread`
+/// + `-Zbuild-std`, both nightly-only).
+fn nightly_available() -> bool {
+    matches!(
+        Command::new("rustc").args(["+nightly", "--version"]).output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// ThreadSanitizer over the W6/W7 concurrency tests (the DoD addendum: every
+/// concurrency WU runs under TSan). Needs the nightly toolchain (opt-in for the
+/// allocator, like `cargo-fuzz`); a missing nightly is noted and skipped, not a
+/// failure. **Blind spot:** TSan instruments compiler-generated accesses, *not*
+/// inline assembly, so the RSEQ sequence interior is invisible to it — the
+/// asm-vs-atomic interactions are covered by the forced-migration conservation
+/// tests instead. TSan here validates the locked path, every atomic, and the
+/// W7-4 lock/fence coordination.
+fn tsan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping TSan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    std::env::set_var("RUSTFLAGS", "-Zsanitizer=thread");
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "tsan: rseq equivalence + W7-4 coordination (topo-core)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--test",
+            "rseq_equivalence",
+        ],
+    );
+    r.run(
+        "tsan: rseq battery (topo-arch)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-arch",
+            "--test",
+            "rseq",
+        ],
+    );
+    r.run(
+        "tsan: cache concurrency (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--lib",
+        ],
+    );
+    std::env::remove_var("RUSTFLAGS");
+}
+
 /// Run the `#[global_allocator]` bootstrap smoke example (the re-entrancy guard,
 /// D1): registering `TopoMallocGlobal` as the process allocator must not deadlock
 /// when its lazy initializer allocates. Host-only — the bootstrap is arch-neutral.
@@ -580,6 +698,104 @@ fn check_lean_style(root: &Path) -> bool {
     } else {
         for it in issues.iter().take(50) {
             eprintln!("  ✗ Lean style: {it}");
+        }
+        false
+    }
+}
+
+/// The RSEQ no-call discipline (W7-2d, §12.3): a restartable critical section
+/// MUST contain no calls and no branch-with-link, because the kernel does not
+/// restart across them. The per-architecture sequences in `topo-arch` are the
+/// only hand-written assembly in the project; this scans their `asm!` string
+/// literals and flags any forbidden mnemonic. (The companion "no possibly-faulting
+/// memory reference" rule is an audit — every reference is to already-resident
+/// per-CPU cache metadata — documented in those modules.)
+fn rseq_cs_issues(content: &str) -> Vec<(usize, String)> {
+    // Calls / branch-with-link / traps the kernel will not restart across.
+    const FORBIDDEN: &[&str] = &[
+        "call", "callq", "bl", "blr", "blx", "syscall", "svc", "int", "int3", "ud2",
+    ];
+    let mut issues = Vec::new();
+    for (i, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        // Only inspect asm string literals (instruction lines start with `"`).
+        if !line.starts_with('"') {
+            continue;
+        }
+        let inner = match line[1..].split('"').next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        // The mnemonic is the first whitespace-delimited token (skip `.directive`
+        // and `label:` lines, which never name an instruction we forbid).
+        let mnem = match inner.split_whitespace().next() {
+            Some(t) => t.trim_end_matches(',').to_ascii_lowercase(),
+            None => continue,
+        };
+        if FORBIDDEN.contains(&mnem.as_str()) {
+            issues.push((
+                i + 1,
+                format!("forbidden `{mnem}` inside an RSEQ critical sequence (§12.3)"),
+            ));
+        }
+    }
+    issues
+}
+
+/// W7-2d gate over the per-architecture RSEQ sequence files. Two checks:
+///
+/// 1. **No call / branch-with-link** in any `asm!` instruction (§12.3). These
+///    files contain *only* the pop/push sequences (no helper code that could
+///    legitimately call), so scanning the whole file is the conservative,
+///    no-false-pass choice — a forbidden mnemonic anywhere is a real bug.
+/// 2. **Structural well-formedness:** each sequence must pair a CS descriptor
+///    section (`__rseq_cs`) with a signature-prefixed abort handler
+///    (`__rseq_failure` + `RSEQ_SIG`). A sequence missing its abort trampoline
+///    would be silently non-restartable, which this catches.
+fn check_rseq_cs(root: &Path) -> bool {
+    let files = [
+        root.join("crates/topo-arch/src/rseq/seq_x86_64.rs"),
+        root.join("crates/topo-arch/src/rseq/seq_aarch64.rs"),
+    ];
+    let mut issues = Vec::new();
+    let mut scanned = 0usize;
+    for f in &files {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        scanned += 1;
+        let name = f.display();
+        for (line, reason) in rseq_cs_issues(&content) {
+            issues.push(format!("{name}:{line}: {reason}"));
+        }
+        // Each sequence pairs a `.pushsection __rseq_cs` (the descriptor) with a
+        // `.pushsection __rseq_failure` (the abort handler).
+        let descriptors = content.matches(".pushsection __rseq_cs").count();
+        let aborts = content.matches(".pushsection __rseq_failure").count();
+        if descriptors == 0 {
+            issues.push(format!("{name}: no `__rseq_cs` descriptor section"));
+        }
+        if descriptors != aborts {
+            issues.push(format!(
+                "{name}: {descriptors} CS descriptor(s) but {aborts} abort handler(s) — \
+                 every sequence needs both"
+            ));
+        }
+        if !content.contains("RSEQ_SIG") {
+            issues.push(format!(
+                "{name}: abort handlers must be prefixed by `RSEQ_SIG` (kernel-verified)"
+            ));
+        }
+    }
+    if issues.is_empty() {
+        println!(
+            "  · RSEQ critical sections: no calls/branch-with-link + descriptor↔abort paired \
+             ({scanned} files, §12.3)"
+        );
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ RSEQ CS: {it}");
         }
         false
     }
@@ -802,5 +1018,29 @@ mod tests {
             lean_style_issues("def x := 1"),
             vec![(0, "missing final newline")]
         );
+    }
+
+    #[test]
+    fn rseq_cs_audit_flags_calls_only() {
+        // Allowed instructions and directives — no findings.
+        let ok = r#"
+            "mov {len:e}, [{slot} + 8]",
+            "test {len:e}, {len:e}",
+            "jz 7f",
+            "b 8f",
+            "ldarb {t:w}, [{laddr}]",
+            "cbnz {t:w}, 6f",
+            ".quad 3f, 4f - 3f, 5f",
+            "3:",
+        "#;
+        assert!(rseq_cs_issues(ok).is_empty());
+
+        // A call, a branch-with-link, and a syscall are each flagged.
+        assert_eq!(rseq_cs_issues("            \"call {f}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"bl {f}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"blr {x}\",\n").len(), 1);
+        assert_eq!(rseq_cs_issues("            \"syscall\",\n").len(), 1);
+        // A comment mentioning "call" is not an asm string literal — not flagged.
+        assert!(rseq_cs_issues("            // never call inside the CS\n").is_empty());
     }
 }

@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! Per-architecture support. M0 provides only architecture identity and the
-//! front-end fast-path *mode* selector; the RSEQ/restartable assembly and the
-//! per-CPU sequences (§12) arrive with plan 05 (W7), per-arch for x86-64 and
-//! AArch64. Keeping this seam present from M0 means the dual-arch CI matrix
-//! (DD-2) exercises real code on both architectures from the start.
-#![cfg_attr(not(test), no_std)]
+//! Per-architecture support: architecture identity, the front-end fast-path
+//! *mode* selector, and — the only hand-written assembly in the project — the
+//! Linux RSEQ restartable per-CPU sequences (§12), per-arch for x86-64 and
+//! AArch64 (plan 05 W7). The [`rseq`] module owns registration/detection and the
+//! `pop`/`push` sequences; the seLe4n pinned-core alternative (§36.10) lives with
+//! the cache in `topo-core`. The dual-arch CI matrix (DD-2) exercises the real
+//! sequences on both architectures.
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
+pub mod rseq;
 
 /// The architecture this build targets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,25 +43,37 @@ pub const fn current() -> Arch {
     }
 }
 
-/// The front-end fast-path mode (§12). Profiles/work that need a faster path
-/// extend this; the allocator is always *correct* in `Locked` (§2.4: a milestone
-/// may ship a dumb-but-correct policy, never an unsafe fast path).
+/// The front-end fast-path mode (§12). The allocator is always *correct* in
+/// `Locked` (§2.4: a milestone may ship a dumb-but-correct policy, never an
+/// unsafe fast path); `Rseq` and `PinnedCore` are the W7 acceleration modes,
+/// each proven behaviourally equivalent to `Locked` and selected at runtime.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FastPathMode {
-    /// Global/locked baseline — the only mode at M0. Always correct.
+    /// Global/locked baseline. Always correct; the fallback when no faster mode
+    /// is available (P-003).
     Locked,
+    /// Linux RSEQ restartable per-CPU sequences (W7-2/W7-3).
+    Rseq,
+    /// seLe4n pinned-thread per-core mode (W7-5, §36.10 option 1).
+    PinnedCore,
 }
 
-/// The fast-path mode for this build. Always `Locked` until plan 05 adds RSEQ
-/// (x86-64/AArch64) and pinned-core modes behind a proven abort contract.
+/// The **compile-time baseline** fast-path mode. Always `Locked`: which mode is
+/// actually *active* is a runtime decision made by the cache
+/// (`topo_core::CpuCache::enable_rseq`, gated on [`rseq::enable`]), because RSEQ
+/// availability can only be known at run time. This reports the floor the build
+/// always supports, not the selected mode.
 pub const fn fast_path_mode() -> FastPathMode {
     FastPathMode::Locked
 }
 
-/// Whether Linux RSEQ is available. Always `false` at M0; the real probe (and
-/// the §36.10 pinned-core alternative for seLe4n) arrive with plan 05.
-pub const fn rseq_available() -> bool {
-    false
+/// Whether Linux RSEQ is available **on this machine, right now** (W7-1). Runs
+/// the one-time process detection ([`rseq::enable`]): registration model present
+/// and the non-owner fence usable. `false` ⇒ the allocator uses the locked
+/// baseline (P-003). Not `const`: the answer is a property of the running kernel,
+/// not of the build.
+pub fn rseq_available() -> bool {
+    rseq::enable()
 }
 
 #[cfg(test)]
@@ -73,8 +89,14 @@ mod tests {
     }
 
     #[test]
-    fn m0_is_locked_baseline() {
+    fn locked_is_the_compile_time_baseline() {
+        // The build always supports the locked baseline; faster modes are opt-in.
         assert_eq!(fast_path_mode(), FastPathMode::Locked);
-        assert!(!rseq_available());
+    }
+
+    #[test]
+    fn rseq_available_is_consistent_with_the_module() {
+        // The convenience probe agrees with the rseq module's own detection.
+        assert_eq!(rseq_available(), rseq::available());
     }
 }

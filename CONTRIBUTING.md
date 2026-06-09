@@ -16,7 +16,7 @@ cargo xtask setup     # install the pinned Rust + Lean toolchains and cross targ
 cargo xtask ci        # the exact sequence CI runs: fmt, lint, gen-check, build, test, lean
 cargo xtask build [--target aarch64-unknown-linux-gnu] [--profile performance]
 cargo xtask gen [--check]   # regenerate / verify the size-class tables (G-table)
-cargo xtask test [--kind unit|prop|diff|fuzz|loom]
+cargo xtask test [--kind unit|prop|diff|fuzz|loom|tsan|rseq]
 cargo xtask fmt --check
 cargo xtask lint
 cargo xtask lean      # build the Lean model and run `lake exe check`
@@ -30,8 +30,9 @@ notice; CI always runs them.
 ## Toolchains (pinned)
 
 * **Rust** — `rust-toolchain.toml` pins the exact stable channel, components, and
-  cross targets. We do **not** use nightly for the allocator core; the only
-  nightly tool, `cargo-fuzz`, is opt-in (`cargo xtask test --kind fuzz`).
+  cross targets. We do **not** use nightly for the allocator core; the nightly-only
+  *tools* — `cargo-fuzz` and ThreadSanitizer — are opt-in
+  (`cargo xtask test --kind fuzz|tsan`).
 * **Lean** — `lean-toolchain` pins the Lean version (matched to upstream seLe4n
   so the bridge model co-develops without skew, D2). `cargo xtask setup` installs
   it via [`scripts/setup_lean.sh`](scripts/setup_lean.sh), which downloads the

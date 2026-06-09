@@ -29,6 +29,7 @@ pub mod ids;
 pub mod large;
 pub mod overflow;
 pub mod pagemap;
+pub mod pinned;
 pub mod profile;
 pub mod ptr_class;
 pub mod size_class;
@@ -79,6 +80,7 @@ pub use budget::{CacheBudget, SlotStats};
 pub use cache_ops::{flush, flush_idle_cpu, refill, refill_with_retry, FlushResult, RefillResult};
 pub use cpu_cache::CpuCache;
 pub use fe::{CoreId, FeOutcome};
+pub use pinned::{CoreProvider, FixedCore};
 #[cfg(any(test, feature = "std"))]
 pub use thread_cache::init_thread_cache;
 pub use thread_cache::{with_thread_cache, FlushHookFn, ThreadCache};

@@ -118,6 +118,56 @@ jobs:
             attempt || { echo "::warning::AArch64 test flaked; retrying once (DD-2)"; attempt; }
           fi
 
+  # G-fast (AArch64 real RSEQ): qemu-user does NOT emulate rseq, so the `test`
+  # job above only exercises the AArch64 *fallback* + the asm logic (explicit
+  # area). A native arm64 runner has a real ARM kernel, so glibc registers rseq
+  # and the AArch64 sequences run with real preemption/migration — the only place
+  # the W7-3c restart property is truly validated (DD-2: "QEMU where needed", the
+  # rest on real hardware). Requires GitHub's arm64 runners (free for public
+  # repos; billed for private — drop this job if undesired).
+  test-arm64-native:
+    name: test (aarch64 native, real RSEQ)
+    runs-on: ubuntu-24.04-arm
+    # The repo's .cargo/config.toml sets a `qemu-aarch64` runner for the
+    # aarch64 target (for x86->arm64 cross runs). On a NATIVE arm64 host that
+    # target *is* the host, so cargo would route `run`/`test` through qemu
+    # (which isn't installed, and would defeat the purpose — qemu-user doesn't
+    # emulate rseq). Override the runner with an `env` passthrough so the native
+    # binaries execute directly; scoped to this job only.
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: env
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: arm64-native
+      # Native build/run on aarch64: rseq is active, so the restartable sequences
+      # and the forced-migration equivalence exercise the real kernel mechanism.
+      - run: cargo xtask test --kind rseq
+      - run: cargo test -p topo-core --test rseq_equivalence --test pinned_core
+
+  # G-conc (TSan): the W6/W7 concurrency tests run under ThreadSanitizer (DoD
+  # addendum). Nightly is opt-in for the allocator (like cargo-fuzz); this job
+  # installs it just for `-Zsanitizer=thread` + `-Zbuild-std`. The RSEQ assembly
+  # interior is a TSan blind spot (covered by the forced-migration conservation
+  # tests); TSan validates the locked path, the atomics, and the W7-4 lock/fence
+  # coordination.
+  tsan:
+    name: tsan (concurrency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install nightly + rust-src (for the sanitizer)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+      - run: cargo xtask test --kind tsan
+
   # ABI compatibility (§34.1): compile + link + run the C harness against the
   # generated header and the staticlib.
   abi-test:

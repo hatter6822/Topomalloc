@@ -70,6 +70,14 @@ indicates a bug), not for user-input failures.
   their `unsafe` blocks explicitly.
 * Raw-pointer types (`Region`) are not `PartialEq`/`Ord` by default — comparisons
   must be intentional.
+* **Inline assembly is confined to the RSEQ sequences** (`topo-arch/src/rseq/seq_*.rs`,
+  the only hand-written assembly in the project). Inside a restartable critical
+  section there are **no calls and no possibly-faulting memory references** (§12.3);
+  the `xtask` lint `check_rseq_cs` (in `lint`/`ci`) fails the build on any
+  `call`/`bl`/`blr`/`svc`/`syscall` there. Every scratch register is declared as an
+  `asm!` output (clobber), and the per-module "Clobbers / barriers" docs state the
+  ordering each sequence relies on. Any struct an RSEQ sequence addresses is
+  `#[repr(C)]` with its field offsets pinned by `offset_of!` `const` guards.
 
 ## 5. `no_std` discipline
 

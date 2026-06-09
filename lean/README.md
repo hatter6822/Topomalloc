@@ -91,7 +91,12 @@ gaps — each is a stated modelling choice, not an unproven claim):
 - **RSEQ is a trusted primitive (§33.5).** Its success contract pins the successor to the
   exact owner relabel (`s' = setOwner p …`), so it frames *all* non-owner geometry; the
   remaining trust is the hardware↔model refinement (the asm itself) — open question 7 /
-  W1-14 per-arch verification.
+  W1-14 per-arch verification. The plan 05 **W7** implementation
+  ([`topo-arch/src/rseq/`](../crates/topo-arch/src/rseq/)) discharges this contract
+  *empirically*: a forced-migration differential test asserts the per-arch assembly makes
+  exactly the object movements the axiom permits (no lost/duplicated object vs. the locked
+  baseline), and the abort path leaves allocator-visible state unchanged
+  (`per_core_cache_abort_no_change`, exercised by the pinned-core mode too).
 - **The executable oracle** (`Exec.lean`) checks live **range-disjointness** on the §33.7
   trace — an allocation whose `[ptr, ptr+usable_size)` range overlaps a live object is
   rejected (`replay_disjoint`), not merely an equal base address. The host-side Rust oracle
