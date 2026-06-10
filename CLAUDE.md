@@ -243,7 +243,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 
 ## Source Organization
 
-```
+```text
 topomalloc/
 ├── crates/
 │   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents)
