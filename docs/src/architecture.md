@@ -2,11 +2,15 @@
 # Architecture
 
 The allocator is a stack of layers over a single backing seam. The full diagram
-and rationale are in the plan overview (§3); the M0 skeleton wires a thin
-vertical slice through it.
+and rationale are in the plan overview (§3). Since plan 06 W8 the public API
+runs over the **M1 central-path allocator** (`topo_core::Allocator`): classify
+→ central free lists (small) / extent-backed large path, composed from the
+plan-03/04 parts below; the M0 skeleton survives only as a test fixture.
 
 ```text
-Public API:  C ABI (topomalloc_*) + Rust GlobalAlloc        topo-abi
+Public API:  C ABI (topomalloc_*/topo_*x) + C++ header      topo-abi, include/
+             + Rust GlobalAlloc
+M1 engine:   classify → central lists / large path           topo-core (allocator)
 Request classifier: small/medium/large, size class,         topo-core (classify)
                     align, arena, label, hints
 Metadata substrate: bootstrap bump alloc, pagemap,          topo-core (bootstrap,
@@ -25,8 +29,8 @@ Formal: Lean model + seLe4n bridge                           lean/
 
 | Crate | Role | License |
 |-------|------|---------|
-| `topo-core` | classifier, size classes, the seam, the skeleton allocator (`no_std`) | MIT |
-| `topo-abi` | C ABI + `GlobalAlloc` + runtime backend selector | MIT |
+| `topo-core` | classifier, size classes, the seam, the M1 central-path allocator (`no_std`) | MIT |
+| `topo-abi` | the full prefixed C API (core/aligned/C23/extended + flags), errno + zero-size policy, `GlobalAlloc`, runtime backend selector | MIT |
 | `topo-backend-posix` | `PosixBackingProvider` (degenerate single-authority case) | MIT |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later |
 | `topo-arch` | per-arch identity + the RSEQ restartable per-CPU sequences (plan 05 W7) | MIT |

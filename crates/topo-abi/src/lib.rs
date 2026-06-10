@@ -1,70 +1,140 @@
 // SPDX-License-Identifier: MIT
-//! Public ABI surface: the C entry points (`topomalloc_*`), the Rust
-//! [`GlobalAlloc`] adapter, and the runtime backend selector (W0-14a/b).
+//! Public ABI surface (plan 06 W8): the standard C entry points
+//! (`topomalloc_*`, §10.1), the C23 sized-free family, the extended
+//! `topo_*x` API with validated flags (§10.3/§10.4), the Rust
+//! [`GlobalAlloc`] adapter (D1), and the runtime backend selector.
+//!
+//! From W8 the entry points run over the **M1 central-path allocator**
+//! ([`topo_core::Allocator`]): classify → central free lists / extent-backed
+//! large path, with real `free`, `realloc`, `malloc_usable_size`, errno
+//! semantics (W8-1b), and the configurable zero-size policy (W8-4). The M0
+//! bump skeleton remains only as a test fixture in `topo-core`.
 //!
 //! **Default build = MIT, POSIX-only.** Enabling the optional `sele4n-sim`
 //! feature additionally links the GPL seLe4n backend and produces a
 //! GPL-3.0-or-later artifact (`libtopomalloc-sele4n`, §36.3.2). The default
 //! artifact never links GPL code (D5, see NOTICE).
 //!
-//! The exported C symbols are **prefixed** (`topomalloc_malloc`, …), so linking
-//! this crate never hijacks the process's `malloc`. The interposition/override
-//! deployment that replaces system `malloc` (§35.1) is a deliberate, separately
-//! gated step in plan 10 — not something a test or dependent crate gets by
-//! accident.
+//! The exported C symbols are **prefixed** (`topomalloc_malloc`, …), so
+//! linking this crate never hijacks the process's `malloc`. The
+//! interposition/override deployment that replaces system `malloc` (§35.1)
+//! is a deliberate, separately gated step in plan 10 — not something a test
+//! or dependent crate gets by accident. The C++ operators follow the same
+//! rule: they ship as an opt-in header (`include/topomalloc_new_delete.hpp`)
+//! over these entry points, not as exported mangled symbols.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
-use core::ffi::{c_char, c_void};
 use core::ptr;
 use std::alloc::System;
 use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
-use topo_core::overflow::array_bytes;
-use topo_core::{SkeletonAllocator, MIN_ALIGN};
+use topo_core::{
+    reserve_meta_arena, Allocator, AllocatorConfig, ArenaId, FreeOutcome, InvalidFree, PageMap,
+    RequestFlags,
+};
 
-/// Backing size of the M0 skeleton heap. The skeleton leaks on free, so this is
-/// the total a process can hand out before OOM — ample for tests and demos.
-const SKELETON_HEAP_BYTES: usize = 16 * 1024 * 1024;
+mod c_api;
+mod errno_shim;
+mod extended;
+mod policy;
 
-/// A skeleton allocator over whichever backend was selected at runtime. Enum
-/// dispatch (not `dyn`) keeps the default build free of the GPL backend type.
+pub use c_api::{
+    topomalloc_aligned_alloc, topomalloc_backend, topomalloc_calloc, topomalloc_free,
+    topomalloc_free_aligned_sized, topomalloc_free_sized, topomalloc_malloc,
+    topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
+    topomalloc_realloc, topomalloc_reallocarray, topomalloc_version,
+};
+pub use extended::{
+    topo_align_lg, topo_arena, topo_dallocx, topo_hot, topo_mallocx, topo_nallocx, topo_rallocx,
+    topo_sdallocx, topo_xallocx, TOPO_ALIGN_LG_MASK, TOPO_GUARDED, TOPO_LIFETIME_LONG,
+    TOPO_LIFETIME_MEDIUM, TOPO_LIFETIME_SHORT, TOPO_NO_HUGEPAGE, TOPO_PREFER_HUGEPAGE,
+    TOPO_TCACHE_NONE, TOPO_ZERO,
+};
+pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
+
+/// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
+/// virtual, lazily faulted). Sized with ample headroom over the default
+/// configuration's fixed pools plus pagemap nodes and span bitmaps.
+const META_BYTES: usize = 64 * 1024 * 1024;
+
+/// Metadata arena for the simulator backend, whose untyped pool is charged
+/// eagerly — keep it modest (matches [`AllocatorConfig::small`]).
+#[cfg(feature = "sele4n-sim")]
+const SIM_META_BYTES: usize = 4 * 1024 * 1024;
+
+/// The process-wide allocator over whichever backend was selected at runtime.
+/// Enum dispatch (not `dyn`) keeps the default build free of the GPL backend
+/// type.
 pub enum AnyAllocator {
     /// POSIX backend (default).
-    Posix(SkeletonAllocator<PosixBackingProvider>),
+    Posix(Allocator<'static, PosixBackingProvider>),
     /// seLe4n host simulator (only when built with `sele4n-sim`).
     #[cfg(feature = "sele4n-sim")]
-    Sim(SkeletonAllocator<topo_backend_sele4n::Sele4nSim>),
+    Sim(Allocator<'static, topo_backend_sele4n::Sele4nSim>),
+}
+
+macro_rules! dispatch {
+    ($self:expr, $a:ident => $body:expr) => {
+        match $self {
+            AnyAllocator::Posix($a) => $body,
+            #[cfg(feature = "sele4n-sim")]
+            AnyAllocator::Sim($a) => $body,
+        }
+    };
 }
 
 impl AnyAllocator {
-    /// Allocate `size` bytes with `align`. Null on OOM/overflow.
-    pub fn malloc(&self, size: usize, align: usize) -> *mut u8 {
-        match self {
-            AnyAllocator::Posix(a) => a.malloc(size, align),
-            #[cfg(feature = "sele4n-sim")]
-            AnyAllocator::Sim(a) => a.malloc(size, align),
-        }
+    /// Allocate `size` bytes with `align` under validated `flags` (§A.1).
+    /// Null on OOM, overflow, or invalid alignment.
+    pub fn allocate(&self, size: usize, align: usize, flags: RequestFlags) -> *mut u8 {
+        dispatch!(self, a => a.allocate(size, align, flags))
     }
 
-    /// Free a pointer (M0: leaks; `free(NULL)` is a no-op).
-    pub fn free(&self, ptr: *mut u8) {
-        match self {
-            AnyAllocator::Posix(a) => a.free(ptr),
-            #[cfg(feature = "sele4n-sim")]
-            AnyAllocator::Sim(a) => a.free(ptr),
-        }
+    /// Free a pointer; see [`FreeOutcome`] for the validation outcomes.
+    ///
+    /// # Safety
+    ///
+    /// As [`topo_core::Allocator::free`]: `ptr` must be null, a live pointer
+    /// of this allocator the caller still owns, or memory never returned by
+    /// it (rejected harmlessly). A stale pointer aliasing a recycled live
+    /// allocation would free another owner's object.
+    pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // SAFETY: the caller upholds this method's identical contract.
+        dispatch!(self, a => unsafe { a.free(ptr) })
+    }
+
+    /// Reallocate under the §25.1 contract (failure preserves the original).
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free).
+    pub unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        new_size: usize,
+        min_align: usize,
+        flags: RequestFlags,
+    ) -> *mut u8 {
+        // SAFETY: the caller upholds this method's identical contract.
+        dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) })
+    }
+
+    /// The usable size of a live allocation (`None` for null/foreign/interior).
+    pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        dispatch!(self, a => a.usable_size(ptr))
+    }
+
+    /// Whether `ptr` is a live allocation of this allocator.
+    pub fn owns(&self, ptr: *mut u8) -> bool {
+        dispatch!(self, a => a.owns(ptr))
     }
 
     /// The active backend's name (`"posix"` / `"sele4n-sim"`), proving which
     /// provider the runtime flag selected (W0-14b).
     pub fn backend_name(&self) -> &'static str {
-        match self {
-            AnyAllocator::Posix(a) => a.backend_name(),
-            #[cfg(feature = "sele4n-sim")]
-            AnyAllocator::Sim(a) => a.backend_name(),
-        }
+        dispatch!(self, a => a.backend_name())
     }
 }
 
@@ -72,25 +142,60 @@ impl AnyAllocator {
 ///
 /// Returns `None` for an unknown name, or if a backend with that name is not
 /// compiled into this build (e.g. `"sele4n-sim"` without the feature).
-pub fn new_allocator_named(name: &str, heap_bytes: usize) -> Option<AnyAllocator> {
+///
+/// The metadata arena and pagemap are leaked into `'static` (§35.5: allocator
+/// metadata is process-lived by design); call this once per process per
+/// backend, as the global initializer does.
+pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
     match name {
         "posix" => {
-            let a = SkeletonAllocator::new(PosixBackingProvider::new(), heap_bytes).ok()?;
+            // The metadata provider must outlive the arena (reserve_meta_arena
+            // contract); both are leaked to 'static.
+            let meta_provider: &'static PosixBackingProvider =
+                Box::leak(Box::new(PosixBackingProvider::new()));
+            let meta = reserve_meta_arena(meta_provider, ArenaId::DEFAULT, META_BYTES).ok()?;
+            let meta = &*Box::leak(Box::new(meta));
+            let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+            let a = Allocator::new(
+                PosixBackingProvider::new(),
+                PosixBackingProvider::new(),
+                meta,
+                meta,
+                pagemap,
+                ArenaId::DEFAULT,
+                AllocatorConfig::default(),
+            )
+            .ok()?;
             Some(AnyAllocator::Posix(a))
         }
         #[cfg(feature = "sele4n-sim")]
         "sele4n-sim" => {
-            let sim = topo_backend_sele4n::Sele4nSim::new(heap_bytes);
-            let a = SkeletonAllocator::new(sim, heap_bytes).ok()?;
+            use topo_backend_sele4n::Sele4nSim;
+            let cfg = AllocatorConfig::small();
+            let meta_provider: &'static Sele4nSim =
+                Box::leak(Box::new(Sele4nSim::new(SIM_META_BYTES)));
+            let meta = reserve_meta_arena(meta_provider, ArenaId::DEFAULT, SIM_META_BYTES).ok()?;
+            let meta = &*Box::leak(Box::new(meta));
+            let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+            let a = Allocator::new(
+                Sele4nSim::new(cfg.span_region_bytes),
+                Sele4nSim::new(cfg.large_region_bytes),
+                meta,
+                meta,
+                pagemap,
+                ArenaId::DEFAULT,
+                cfg,
+            )
+            .ok()?;
             Some(AnyAllocator::Sim(a))
         }
         _ => None,
     }
 }
 
-/// The process-wide skeleton allocator, initialized once from the environment.
+/// The process-wide allocator, initialized once from the environment.
 /// `None` records that initialization failed (e.g. the host could not reserve
-/// the skeleton heap); the C ABI then reports OOM as a null result instead of
+/// the regions); the C ABI then reports OOM as a null result instead of
 /// aborting the process across the `extern "C"` boundary.
 static GLOBAL: OnceLock<Option<AnyAllocator>> = OnceLock::new();
 
@@ -103,10 +208,11 @@ fn selected_backend_name() -> String {
 thread_local! {
     /// Set while this thread is initializing [`GLOBAL`]. When `TopoMallocGlobal`
     /// is the process `#[global_allocator]`, the allocations the initializer makes
-    /// (reading the backend env var, reserving the backing heap, the provider's
-    /// bookkeeping) would otherwise route back through this same allocator and
-    /// re-enter `global()`, deadlocking the `OnceLock`. While the flag is set the
-    /// adapter serves those allocations straight from the system allocator.
+    /// (reading the backend env var, the providers' bookkeeping, the leaked
+    /// metadata-arena boxes) would otherwise route back through this same
+    /// allocator and re-enter `global()`, deadlocking the `OnceLock`. While the
+    /// flag is set the adapter serves those allocations straight from the system
+    /// allocator.
     static BOOTSTRAPPING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -127,10 +233,11 @@ impl Drop for BootstrapGuard {
     }
 }
 
-/// The lazily-initialized global allocator, or `None` if the skeleton heap could
-/// not be reserved. The result is memoized: a process that cannot reserve the
-/// heap once keeps reporting OOM (a null `malloc`) rather than retrying.
-fn global() -> Option<&'static AnyAllocator> {
+/// The lazily-initialized global allocator, or `None` if the backing regions
+/// could not be reserved. The result is memoized: a process that cannot
+/// reserve them once keeps reporting OOM (a null `malloc`) rather than
+/// retrying.
+pub(crate) fn global() -> Option<&'static AnyAllocator> {
     GLOBAL
         .get_or_init(|| {
             // `_guard` is declared first, so it drops *last* — after `name` and any
@@ -138,125 +245,59 @@ fn global() -> Option<&'static AnyAllocator> {
             // system allocator — and only then clears the bootstrap flag.
             let _guard = BootstrapGuard::enter();
             let name = selected_backend_name();
-            new_allocator_named(&name, SKELETON_HEAP_BYTES)
-                .or_else(|| new_allocator_named("posix", SKELETON_HEAP_BYTES))
+            new_allocator_named(&name).or_else(|| new_allocator_named("posix"))
         })
         .as_ref()
 }
 
-// ---------------------------------------------------------------------------
-// C ABI (§10.1). Prefixed symbols only; overriding system malloc is plan 10.
-// ---------------------------------------------------------------------------
-
-/// `void* topomalloc_malloc(size_t size)`.
-#[no_mangle]
-pub extern "C" fn topomalloc_malloc(size: usize) -> *mut c_void {
-    global().map_or(ptr::null_mut(), |a| {
-        a.malloc(size, MIN_ALIGN).cast::<c_void>()
-    })
-}
-
-/// `void topomalloc_free(void* ptr)`. `free(NULL)` is a no-op (§9.6).
-#[no_mangle]
-pub extern "C" fn topomalloc_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
-        if let Some(a) = global() {
-            a.free(ptr.cast::<u8>());
-        }
-    }
-}
-
-/// `void* topomalloc_calloc(size_t n, size_t size)`. Overflow-checked in both
-/// clauses of §26.1: (1) the `n * size` product is checked here via
-/// [`array_bytes`]; (2) the *subsequent* size-class/page rounding of that product
-/// is checked downstream — `malloc` classifies `total`, and `classify`'s checked
-/// `align_up` returns null rather than wrapping if the rounding would overflow.
-/// So a product that fits but rounds past `usize::MAX` still yields null, never a
-/// too-small region.
-#[no_mangle]
-pub extern "C" fn topomalloc_calloc(n: usize, size: usize) -> *mut c_void {
-    // §26.1 clause 1: reject an overflowing product before allocating.
-    let Some(total) = array_bytes(n, size) else {
-        return ptr::null_mut();
-    };
-    let Some(a) = global() else {
-        return ptr::null_mut();
-    };
-    // §26.1 clause 2: `malloc` → `classify` re-checks the post-product rounding and
-    // returns null on overflow; we propagate that null without zeroing.
-    let p = a.malloc(total, MIN_ALIGN);
-    if !p.is_null() && total > 0 {
-        // SAFETY: `malloc` returned a non-null pointer to at least `total`
-        // committed bytes; zeroing the whole region is in bounds.
-        unsafe { ptr::write_bytes(p, 0, total) };
-    }
-    p.cast::<c_void>()
-}
-
-/// `void* topomalloc_aligned_alloc(size_t alignment, size_t size)` (§25.5).
-/// `alignment` must be a power of two and `size` an integer multiple of it;
-/// otherwise null.
-#[no_mangle]
-pub extern "C" fn topomalloc_aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
-    // §25.5: validate the power-of-two alignment *and* the C `aligned_alloc`
-    // size-multiple constraint. `alignment` is a power of two here (hence
-    // nonzero), so `is_multiple_of` is well-defined.
-    if !alignment.is_power_of_two() || !size.is_multiple_of(alignment) {
-        return ptr::null_mut();
-    }
-    global().map_or(ptr::null_mut(), |a| {
-        a.malloc(size, alignment).cast::<c_void>()
-    })
-}
-
-/// `const char* topomalloc_version(void)` — the NUL-terminated version string.
-#[no_mangle]
-pub extern "C" fn topomalloc_version() -> *const c_char {
-    // Build a `&CStr` at compile time from the crate version plus a NUL, so the
-    // returned pointer is a valid C string for the process lifetime.
-    const V: &core::ffi::CStr = match core::ffi::CStr::from_bytes_with_nul(
-        concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes(),
-    ) {
-        Ok(c) => c,
-        Err(_) => panic!("version string contains an interior NUL"),
-    };
-    V.as_ptr()
-}
-
-/// `const char* topomalloc_backend(void)` — the active backend name (W0-14b).
-#[no_mangle]
-pub extern "C" fn topomalloc_backend() -> *const c_char {
-    match global().map_or("posix", |a| a.backend_name()) {
-        "sele4n-sim" => c"sele4n-sim".as_ptr(),
-        _ => c"posix".as_ptr(),
-    }
-}
-
-/// The Rust [`GlobalAlloc`] adapter (D1). Suitable for opt-in use as the process
-/// `#[global_allocator]`: the first allocation lazily initializes the skeleton
-/// heap, and a per-thread bootstrap guard serves the initializer's own
-/// allocations from the system allocator so it cannot deadlock (see `global`).
+/// The Rust [`GlobalAlloc`] adapter (D1, W8-7). Suitable for opt-in use as the
+/// process `#[global_allocator]`: the first allocation lazily initializes the
+/// backing regions, and a per-thread bootstrap guard serves the initializer's
+/// own allocations from the system allocator so it cannot deadlock (see
+/// `global`). Pointers handed out by the system allocator inside that
+/// bootstrap window are recognized later (the engine classifies them as
+/// foreign) and routed back to the system allocator, so nothing leaks and
+/// nothing is freed by the wrong allocator (§35.2).
+///
 /// It is intentionally **not** registered here, so linking this crate never
 /// replaces a test or dependent crate's allocator.
 pub struct TopoMallocGlobal;
 
 // SAFETY: `alloc` returns either null or a pointer to at least `layout.size()`
-// bytes aligned to `layout.align()`. During `GLOBAL` initialization it forwards
-// to the system allocator (so a re-entrant init allocation cannot deadlock);
-// otherwise it serves from the skeleton. `dealloc` returns each pointer to the
-// allocator that produced it — `System` within the bootstrap window, the skeleton
-// otherwise (which leaks in M0, and leaking is always memory-safe). These satisfy
-// the `GlobalAlloc` contract.
+// bytes aligned to `layout.align()` (the engine validates alignment and the
+// classifier never under-allocates, §9.7). During `GLOBAL` initialization it
+// forwards to the system allocator (so a re-entrant init allocation cannot
+// deadlock). `dealloc` returns each pointer to the allocator that produced it:
+// the engine frees what it owns; pointers it classifies as foreign are exactly
+// the bootstrap-window system allocations (the engine's regions and the system
+// heap are disjoint mappings), which go back to `System` with their original
+// layout. `realloc` preserves the same ownership split and the §25.1 contract.
 unsafe impl GlobalAlloc for TopoMallocGlobal {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if BOOTSTRAPPING.with(|b| b.get()) {
-            // Inside `GLOBAL` init: the skeleton heap does not exist yet, so serve
+            // Inside `GLOBAL` init: the engine does not exist yet, so serve
             // this init-path allocation from the system allocator and never
             // re-enter `global()`.
             // SAFETY: `layout` is forwarded unchanged to the system allocator.
             return unsafe { System.alloc(layout) };
         }
-        global().map_or(ptr::null_mut(), |a| a.malloc(layout.size(), layout.align()))
+        global().map_or(ptr::null_mut(), |a| {
+            a.allocate(layout.size(), layout.align(), RequestFlags::NONE)
+        })
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if BOOTSTRAPPING.with(|b| b.get()) {
+            // SAFETY: `layout` is forwarded unchanged to the system allocator.
+            return unsafe { System.alloc_zeroed(layout) };
+        }
+        global().map_or(ptr::null_mut(), |a| {
+            a.allocate(
+                layout.size(),
+                layout.align(),
+                RequestFlags::NONE.with_zero(),
+            )
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -266,9 +307,70 @@ unsafe impl GlobalAlloc for TopoMallocGlobal {
             // original `layout`.
             return unsafe { System.dealloc(ptr, layout) };
         }
-        if let Some(a) = global() {
-            a.free(ptr);
+        match global() {
+            // SAFETY: the `GlobalAlloc` contract gives us a pointer this
+            // adapter returned and the caller still owns — either engine
+            // memory (freed here exactly once) or a bootstrap-window `System`
+            // pointer (rejected as Foreign and routed below).
+            Some(a) => match unsafe { a.free(ptr) } {
+                FreeOutcome::Freed | FreeOutcome::Null => {}
+                FreeOutcome::Invalid(InvalidFree::Foreign) => {
+                    // Not engine memory ⇒ it was allocated by `System` inside
+                    // the bootstrap window (the only other source under this
+                    // adapter's contract).
+                    // SAFETY: the caller's `GlobalAlloc` contract guarantees
+                    // (ptr, layout) came from this adapter; the engine's
+                    // regions are disjoint from the system heap, so a Foreign
+                    // classification identifies a `System` allocation.
+                    unsafe { System.dealloc(ptr, layout) };
+                }
+                outcome => {
+                    // Interior/metadata/double-free: a caller contract
+                    // violation. Never corrupt state over it (§35.2).
+                    debug_assert!(
+                        false,
+                        "GlobalAlloc::dealloc on invalid pointer: {outcome:?}"
+                    );
+                }
+            },
+            None => {
+                // The engine never initialized: everything came from `System`.
+                // SAFETY: as above — (ptr, layout) came from this adapter, and
+                // without an engine the only source is `System`.
+                unsafe { System.dealloc(ptr, layout) };
+            }
         }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if BOOTSTRAPPING.with(|b| b.get()) {
+            // SAFETY: forwarded unchanged; the System allocator owns
+            // bootstrap-window pointers.
+            return unsafe { System.realloc(ptr, layout, new_size) };
+        }
+        let Some(a) = global() else {
+            // SAFETY: no engine ⇒ the pointer came from `System`.
+            return unsafe { System.realloc(ptr, layout, new_size) };
+        };
+        if a.owns(ptr) {
+            // SAFETY: `ptr` is a live engine allocation the caller owns (the
+            // `GlobalAlloc` realloc contract), reallocated exactly once.
+            return unsafe { a.realloc(ptr, new_size, layout.align(), RequestFlags::NONE) };
+        }
+        // A bootstrap-window `System` pointer: migrate it into the engine
+        // (allocate-before-free, so failure leaves the original intact).
+        let q = a.allocate(new_size, layout.align(), RequestFlags::NONE);
+        if !q.is_null() {
+            let copy = layout.size().min(new_size);
+            // SAFETY: `q` is a fresh engine allocation of ≥ `new_size ≥ copy`
+            // bytes; `ptr` is a live `System` allocation of `layout.size() ≥
+            // copy` bytes; the two heaps are disjoint mappings.
+            unsafe {
+                ptr::copy_nonoverlapping(ptr.cast_const(), q, copy);
+                System.dealloc(ptr, layout);
+            }
+        }
+        q
     }
 }
 
@@ -277,70 +379,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn c_abi_malloc_is_aligned_and_writable() {
-        let p = topomalloc_malloc(40);
-        assert!(!p.is_null());
-        assert_eq!(p as usize % MIN_ALIGN, 0);
-        // SAFETY: p points to at least 40 usable bytes.
-        unsafe {
-            ptr::write_bytes(p.cast::<u8>(), 0x5a, 40);
-            assert_eq!(p.cast::<u8>().read(), 0x5a);
-        }
-        topomalloc_free(p);
-    }
-
-    #[test]
-    fn calloc_zeroes_and_checks_overflow() {
-        let p = topomalloc_calloc(4, 16);
-        assert!(!p.is_null());
-        // SAFETY: 64 zeroed bytes are available.
-        unsafe {
-            for i in 0..64 {
-                assert_eq!(p.cast::<u8>().add(i).read(), 0);
-            }
-        }
-        topomalloc_free(p);
-        // Overflowing request must return null, not wrap (§26.1).
-        assert!(topomalloc_calloc(usize::MAX, 2).is_null());
-    }
-
-    #[test]
-    fn aligned_alloc_honors_alignment_and_size_multiple() {
-        // Size is an integer multiple of the power-of-two alignment: succeeds.
-        let p = topomalloc_aligned_alloc(4096, 8192);
-        assert!(!p.is_null());
-        assert_eq!(p as usize % 4096, 0);
-        topomalloc_free(p);
-        assert!(topomalloc_aligned_alloc(3, 64).is_null()); // alignment not power of two
-        assert!(topomalloc_aligned_alloc(256, 100).is_null()); // size not a multiple (§25.5)
-    }
-
-    #[test]
-    fn version_string_is_nul_terminated() {
-        let p = topomalloc_version();
-        // SAFETY: the version pointer is a valid static NUL-terminated string.
-        let s = unsafe { core::ffi::CStr::from_ptr(p) };
-        assert_eq!(s.to_str().unwrap(), topo_core::VERSION);
-    }
-
-    #[test]
-    fn global_alloc_adapter_roundtrips() {
+    fn global_alloc_adapter_roundtrips_and_frees() {
         let g = TopoMallocGlobal;
         let layout = Layout::from_size_align(128, 16).unwrap();
         // SAFETY: valid non-zero layout.
         let p = unsafe { g.alloc(layout) };
         assert!(!p.is_null());
-        // SAFETY: p has 128 bytes; dealloc accepts it (leaks in M0).
+        // SAFETY: p has 128 writable bytes; dealloc returns it to the engine.
         unsafe {
             ptr::write_bytes(p, 1, 128);
             g.dealloc(p, layout);
+        }
+        // The engine genuinely freed it: the same class slot comes back.
+        // SAFETY: valid layout; q freed below.
+        let q = unsafe { g.alloc(layout) };
+        assert_eq!(q, p, "freed object must be recycled by the engine");
+        // SAFETY: q is live.
+        unsafe { g.dealloc(q, layout) };
+    }
+
+    #[test]
+    fn global_alloc_zeroed_is_zeroed() {
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        // Dirty an object, free it, and ask for zeroed memory of the same class.
+        // SAFETY: valid layout, 256 writable bytes.
+        unsafe {
+            let p = g.alloc(layout);
+            assert!(!p.is_null());
+            ptr::write_bytes(p, 0xee, 256);
+            g.dealloc(p, layout);
+            let q = g.alloc_zeroed(layout);
+            assert!(!q.is_null());
+            for i in 0..256 {
+                assert_eq!(q.add(i).read(), 0, "byte {i} not zeroed");
+            }
+            g.dealloc(q, layout);
+        }
+    }
+
+    #[test]
+    fn global_alloc_realloc_preserves_content_and_alignment() {
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        // SAFETY: valid layout; pointers are used within their live windows.
+        unsafe {
+            let p = g.alloc(layout);
+            assert!(!p.is_null());
+            assert_eq!(p as usize % 64, 0);
+            for i in 0..64 {
+                p.add(i).write(i as u8);
+            }
+            let q = g.realloc(p, layout, 4096);
+            assert!(!q.is_null());
+            assert_eq!(q as usize % 64, 0, "realloc must preserve layout.align()");
+            for i in 0..64 {
+                assert_eq!(q.add(i).read(), i as u8);
+            }
+            g.dealloc(q, Layout::from_size_align(4096, 64).unwrap());
         }
     }
 
     #[test]
     fn named_selector_builds_posix() {
-        let a = new_allocator_named("posix", 4096).expect("posix");
+        let a = new_allocator_named("posix").expect("posix");
         assert_eq!(a.backend_name(), "posix");
-        assert!(new_allocator_named("nope", 4096).is_none());
+        let p = a.allocate(64, 16, RequestFlags::NONE);
+        assert!(!p.is_null());
+        // SAFETY: `p` was just returned by `a` and is owned by this test.
+        assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+        assert!(new_allocator_named("nope").is_none());
     }
 }

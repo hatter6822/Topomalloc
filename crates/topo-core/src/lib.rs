@@ -13,6 +13,7 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod allocator;
 pub mod backend;
 pub mod bootstrap;
 pub mod budget;
@@ -46,6 +47,7 @@ pub mod transfer_cache;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Convenience re-exports for the common surface.
+pub use allocator::{reserve_meta_arena, Allocator, AllocatorConfig, FreeOutcome};
 pub use backend::{
     CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,
     TopoBackingProvider, VWindow,

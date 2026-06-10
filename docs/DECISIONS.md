@@ -568,3 +568,111 @@ implementation choices are ratified here, the module docs carry the rest.
   our fresh area means a *foreign* rseq area is already registered (musl / another
   runtime), so using ours would arm `rseq_cs` in an untracked area; the kernel-set
   `cpu_id` distinguishes "our area won" from "a foreign area owns it".
+
+## W8 — public API & ABI over the M1 central path (plan 06)
+
+The W8 surface (`crates/topo-abi`, `topo-core/src/allocator.rs`,
+`include/topomalloc.h`, `include/topomalloc_new_delete.hpp`) makes nine
+implementation choices; the module docs carry the detail.
+
+* **The M1 engine is a composition, not a new mechanism.**
+  `topo_core::Allocator` (W8-1a) composes the proven plan-03/04 parts —
+  classify → `CentralCache` (small, one object per `remove_batch` at M1) and
+  `LargeAllocator` (medium + large) — borrowing a caller-supplied `PageMap`
+  and metadata arena (`reserve_meta_arena`). Span backing comes from a
+  dedicated `ExtentManager` region; span descriptors live in a recycling,
+  metadata-backed pool (the `LargePool` pattern: never freed, generation-
+  bumped on reuse, §27.5; the base kept as a *pointer* so object addresses
+  retain provenance). The span lifecycle's two cross-structure transitions
+  are single-owner by construction: creation by the `NeedSpan` observer (a
+  lost race only activates an extra span), retirement by exactly the thread
+  whose insert emptied the span. Retirement ordering is load-bearing and
+  documented: deactivate → clear pagemap entries → free the extent — the
+  pagemap must be clean *before* the address range can be reused
+  (P-Map-001). No front-end caches at M1: W16-4 (plan 05) wires them under
+  this unchanged API at M2.
+* **Two free-path hardening fixes in `central.rs` (found by W8 review).**
+  (1) `insert_batch` rejects spans whose state is no longer `Active` under
+  the bin lock — a stale/double free racing a deactivation would otherwise
+  "insert" into the cleared bitmap and underflow `live_count` in release
+  mode. (2) The empty-span transition is owned by the insert that *made*
+  the span empty (`inserted > 0`): a zero-insert double free can no longer
+  re-link an unlinked span or claim a second deactivation (which would
+  corrupt `span_count` and re-release retired pagemap entries). Both have
+  debug-loud / release-safe tests, and `xtask ci` gained a release-mode
+  `topo-core` test pass so the `cfg(not(debug_assertions))` semantics
+  actually run in CI.
+* **Pointer-consuming entry points are `unsafe` for Rust callers.** With a
+  real recycling `free`, a *stale* pointer aliasing a recycled live
+  allocation is indistinguishable from a valid free — classification rejects
+  everything else (foreign/interior/metadata/released/double-free) with no
+  state change (§35.2), but that one class makes a safe `free` unsound.
+  `Allocator::free/realloc`, their `AnyAllocator` mirrors, and the
+  `free`/`realloc`-family `extern "C"` exports carry the explicit contract
+  (`unsafe extern "C"` changes nothing for C callers). Allocation-only and
+  read-only entries stay safe. *Recorded follow-up:* `LargeAllocator::free`
+  (an internal W4 building block with the same theoretical window) keeps its
+  safe signature until plan 08's hardening pass sweeps it.
+* **errno is a protocol, not a side effect (W8-1b).** Two combinators in
+  `topo-abi::errno_shim` implement §10.1: `alloc_protocol` (preserve the
+  caller's errno across success — backend syscalls may clobber it — set
+  `ENOMEM` on null) and `preserving_errno` (free family, pure queries).
+  `EINVAL` is set explicitly at validation sites. Non-unix hosts compile a
+  no-op shim; the return values carry the whole story there.
+* **Zero-size policy: one lazily-initialized atomic (W8-4).** Default
+  `zero_unique` (the dominant-platform/glibc expectation, §9.6);
+  `TOPOMALLOC_ZERO_SIZE=null` or `set_zero_size_policy` flips to
+  `zero_null`. The env read uses `libc::getenv` (allocation-free), so
+  consulting the policy can never re-enter the allocator in
+  `#[global_allocator]` deployments. `realloc(p≠NULL, 0)` is fixed
+  free-and-NULL under both policies; `free(NULL)` is always a no-op.
+* **realloc states its alignment; it does not inherit one (§25.4).** The
+  engine's move path satisfies exactly the alignment the *call* states
+  (fundamental for C `realloc`, `TOPO_ALIGN_LG` for `topo_rallocx`) — the
+  glibc/jemalloc rule. The first draft preserved the original allocation's
+  alignment across moves; the C ABI harness caught it: an alignment-
+  inherited move changes the storage *family*, breaking sized-free hint
+  coherence (`sdallocx(p, size)` no longer classifies to the allocation's
+  actual storage) and pinning small reallocs to 16 KiB extents. In-place
+  paths (same small class; medium/large whose page-rounded size still fits
+  the extent) commit nothing and so cannot fail; the move path is
+  allocate-before-free with `copy = min(old_usable, new_size)` and
+  zero-then-copy under `TOPO_ZERO`. The composition is pinned in Lean:
+  `reallocMove = free ∘ malloc` with `realloc_move_preserves_wellformed`
+  (chaining the proved malloc/free preservation) and
+  `realloc_move_window_keeps_old_live` (old and new are simultaneously live
+  in the intermediate state, so §8.3 live-disjointness covers the copy).
+* **Sized-free hints are cross-checked, never trusted (W8-3).** The C23
+  `free_sized`/`free_aligned_sized`/`topo_sdallocx` size+alignment hints are
+  verified against the classifier when `debug_assertions` or the core's
+  `debug-checks` feature is on — a mismatch aborts (a heap-corruption
+  signal); the actual free is always the classified path, so a wrong hint
+  cannot corrupt state in *any* profile. Plan 08 W18-2 turns the full check
+  into production sampling.
+* **C++ operators are an opt-in header, not exported symbols (W8-5).**
+  `include/topomalloc_new_delete.hpp` defines all replacement forms (scalar/
+  array, nothrow, C++14 sized, C++17 over-aligned) over the C entry points,
+  with the conforming `new_handler` loop and zero-size-means-one semantics;
+  a program opts in by including it in exactly one TU (the mimalloc/jemalloc
+  deployment model). Exporting mangled operator symbols from the default
+  artifact would hijack linkees' allocators — that belongs to plan 10's
+  override artifact, with interposition.
+* **W8-8 "generated header" is realized as machine-verified equivalence.**
+  The function-declaration surface of `topomalloc.h` stays hand-authored
+  (the generated artifact remains `topomalloc_tables.h`), and `xtask
+  abi-test` enforces what generation would have only approximated: the
+  exported `topomalloc_*`/`topo_*` symbol set (via `nm`) must exactly equal
+  the header's declarations, the header must compile under C11 *and* C++17
+  (`-Wall -Wextra -Werror`), both harnesses call every entry point, and the
+  flag layout is pinned numerically on both sides. Drift in either
+  direction fails CI, which is strictly stronger than a generator whose
+  output could drift from intent.
+* **Extended-API flags: a public 64-bit word mapped at the boundary
+  (W8-6).** The public layout (documented in `extended.rs` and the header)
+  is independent of the internal `RequestFlags`, exactly as `flags.rs`
+  planned; `decode_flags` validates totally (§10.4) and rejects
+  deterministically with `EINVAL`. At M1 the acted-on flags are
+  `TOPO_ALIGN_LG`, `TOPO_ZERO`, and `TOPO_ARENA(0)`; the placement hints
+  validate and thread through `Request::flags` for plans 04/05/07/08.
+  Requests naming a nonexistent arena fail as allocation failures until W9
+  lands the arena API.

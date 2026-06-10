@@ -35,3 +35,7 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+# errno constants for the W8-1b errno-discipline assertions (unix only).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
