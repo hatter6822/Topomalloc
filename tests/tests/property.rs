@@ -324,3 +324,103 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// The W9 arena properties over an arbitrary alloc/free/reset stream
+    /// against a quota-bounded explicit arena: the quota gate never admits
+    /// more than the limit, `used` equals the engine's live bytes **exactly**
+    /// after every step (the runtime `ArenaQuotaExact`), a reset empties the
+    /// accounting wholesale and invalidates every outstanding pointer (later
+    /// frees are rejected, never honored), and the B.5/§22.7 oracle stays
+    /// green throughout.
+    #[test]
+    fn arena_quota_is_exact_and_reset_invalidates(
+        ops in prop::collection::vec((0u8..=2, 1usize..=8_192), 1..60)
+    ) {
+        use topo_core::{
+            AllocatorConfig, ArenaConfig, ArenaId, ArenaSet, BackendError, FreeOutcome,
+            PageMap, ProviderFactory,
+        };
+
+        struct Posix;
+        impl ProviderFactory for Posix {
+            type Provider = PosixBackingProvider;
+            fn make_provider(&self, _a: ArenaId) -> Result<PosixBackingProvider, BackendError> {
+                Ok(PosixBackingProvider::new())
+            }
+        }
+        let meta = {
+            let buf = vec![0u8; 8 * 1024 * 1024].into_boxed_slice();
+            let len = buf.len();
+            let ptr = Box::into_raw(buf).cast::<u8>();
+            // SAFETY: a valid, owned allocation of `len` bytes, leaked for the test.
+            Box::leak(Box::new(unsafe { topo_core::BumpArena::new(ptr, len) }))
+        };
+        let pm: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+        let tiny = AllocatorConfig {
+            span_region_bytes: 1024 * 1024,
+            span_extent_slots: 64,
+            span_slots: 64,
+            large_region_bytes: 2 * 1024 * 1024,
+            large_extent_slots: 64,
+            large_slots: 64,
+        };
+        let set = ArenaSet::new(
+            Posix,
+            meta,
+            meta,
+            pm,
+            &ArenaConfig { allocator: tiny, ..ArenaConfig::default() },
+            4,
+        )
+        .expect("arena set");
+        const QUOTA: u64 = 256 * 1024;
+        let a = set
+            .create(&ArenaConfig { quota_limit: QUOTA, allocator: tiny, ..ArenaConfig::default() })
+            .expect("create");
+
+        let mut live: Vec<*mut u8> = Vec::new();
+        for (op, size) in ops {
+            match op {
+                0 => {
+                    let p = set.allocate_in(a, size, 16, RequestFlags::NONE);
+                    if !p.is_null() {
+                        live.push(p);
+                    }
+                }
+                1 => {
+                    if !live.is_empty() {
+                        let p = live.swap_remove(size % live.len());
+                        // SAFETY: `p` is live and owned by this test.
+                        prop_assert_eq!(unsafe { set.free(p) }, FreeOutcome::Freed);
+                    }
+                }
+                _ => {
+                    set.reset(a).expect("reset");
+                    // §22.5: every outstanding pointer is now invalid; the
+                    // engine rejects (never honors) their frees.
+                    for p in live.drain(..) {
+                        // SAFETY: `p` was abandoned to the reset; the free is
+                        // specified to be rejected without state change.
+                        let out = unsafe { set.free(p) };
+                        prop_assert!(matches!(out, FreeOutcome::Invalid(_)));
+                    }
+                    let snap = set.snapshot(a).expect("snapshot");
+                    prop_assert_eq!(snap.quota_used, 0, "reset zeroes the quota exactly");
+                    prop_assert_eq!(snap.engine.live_bytes, 0);
+                }
+            }
+            // ArenaQuotaExact at every step, and the limit is never breached.
+            let snap = set.snapshot(a).expect("snapshot");
+            prop_assert_eq!(snap.quota_used, snap.engine.live_bytes, "quota drifted from live bytes");
+            prop_assert!(snap.quota_used <= QUOTA, "quota limit breached");
+        }
+        prop_assert!(set.check_invariants(), "B.5/§22.7 oracle went red");
+        for p in live {
+            // SAFETY: `p` is live and owned by this test.
+            prop_assert_eq!(unsafe { set.free(p) }, FreeOutcome::Freed);
+        }
+        set.destroy(a).expect("destroy");
+        prop_assert!(set.check_invariants());
+    }
+}

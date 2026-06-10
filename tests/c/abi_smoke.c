@@ -38,6 +38,27 @@ _Static_assert(sizeof(topo_flags_t) == 8, "topo_flags_t must be 64-bit");
 _Static_assert(sizeof(topo_arena_t) == 4, "topo_arena_t must be 32-bit");
 _Static_assert(sizeof(topo_tcache_t) == 4, "topo_tcache_t must be 32-bit");
 
+/* W9 (§35.3): the arena-config layout is pinned — the Rust #[repr(C)]
+ * TopoArenaConfig must match field-for-field. */
+_Static_assert(sizeof(topo_arena_config_t) == sizeof(const char *) + 8 + 16,
+               "topo_arena_config_t layout drifted");
+_Static_assert(offsetof(topo_arena_config_t, name) == 0, "name must be first");
+_Static_assert(offsetof(topo_arena_config_t, quota_bytes) ==
+                   sizeof(const char *),
+               "quota_bytes follows name");
+_Static_assert(offsetof(topo_arena_config_t, rights) ==
+                   sizeof(const char *) + 8,
+               "rights follows quota_bytes");
+_Static_assert(offsetof(topo_arena_config_t, numa_mode) ==
+                   sizeof(const char *) + 12,
+               "numa_mode follows rights");
+_Static_assert(offsetof(topo_arena_config_t, numa_node) ==
+                   sizeof(const char *) + 16,
+               "numa_node follows numa_mode");
+_Static_assert(offsetof(topo_arena_config_t, label) ==
+                   sizeof(const char *) + 20,
+               "label is last");
+
 int main(void) {
     /* version + backend identification */
     const char *v = topomalloc_version();
@@ -195,6 +216,53 @@ int main(void) {
     assert(topo_mallocx(64, TOPO_ALIGN_LG(64)) == NULL);
     assert(errno == EINVAL);
     assert(topo_nallocx(64, TOPO_ALIGN_LG(99)) == 0u);
+
+    /* ---- W9: the arena API (§22, §36.4, §36.14) ---- */
+    /* Create with the all-default ambient config, allocate via both routing
+     * paths, reset, destroy, and verify the id is retired forever. */
+    topo_arena_t arena = 0;
+    assert(topo_arena_create(NULL, &arena) == 0);
+    assert(arena != 0u);
+    void *ap = topo_mallocx_arena(arena, 256, 0);
+    assert(ap != NULL);
+    void *af = topo_mallocx(64, TOPO_ARENA(arena));
+    assert(af != NULL);
+    topo_dallocx(af, 0);
+    /* Conflicting routing (handle vs flag word) is a deterministic EINVAL. */
+    errno = 0;
+    assert(topo_mallocx_arena(arena, 64, TOPO_ARENA(0)) == NULL);
+    assert(errno == EINVAL);
+    /* Reset: `ap` is deliberately abandoned (its pointer becomes invalid and
+     * later frees of it are rejected, §22.5); the arena stays usable. */
+    assert(topo_arena_reset(arena) == 0);
+    void *ar = topo_mallocx_arena(arena, 64, 0);
+    assert(ar != NULL);
+    topo_dallocx(ar, 0);
+    /* Configure the NUMA mode (§15.5); an unknown mode is EINVAL. */
+    assert(topo_arena_configure(arena, TOPO_NUMA_LOCAL, 0) == 0);
+    assert(topo_arena_configure(arena, 99u, 0) == EINVAL);
+    /* Delegate an attenuated child (§36.4): alloc/free only, bounded quota. */
+    topo_arena_config_t child_cfg = {0};
+    child_cfg.quota_bytes = 256u * 1024u;
+    child_cfg.rights = TOPO_ARENA_RIGHT_ALLOC | TOPO_ARENA_RIGHT_FREE;
+    topo_arena_t child = 0;
+    assert(topo_arena_delegate(arena, &child_cfg, &child) == 0);
+    void *cp = topo_mallocx_arena(child, 128, 0);
+    assert(cp != NULL);
+    topo_dallocx(cp, 0);
+    /* The child cannot destroy itself (no DESTROY right): EPERM. */
+    assert(topo_arena_destroy(child) == EPERM);
+    /* Destroying the parent revokes the child too (§36.13); both ids are
+     * retired forever (B.5). */
+    assert(topo_arena_destroy(arena) == 0);
+    errno = 0;
+    assert(topo_mallocx_arena(arena, 64, 0) == NULL);
+    assert(errno == EINVAL);
+    assert(topo_mallocx_arena(child, 64, 0) == NULL);
+    assert(topo_arena_destroy(arena) == EINVAL);
+    /* The default arena is protected (§22.5, F-006). */
+    assert(topo_arena_reset(0) == EPERM);
+    assert(topo_arena_destroy(0) == EPERM);
 
     /* generated table header is consistent and usable from C */
     assert(TOPOMALLOC_QUANTUM == 16u);

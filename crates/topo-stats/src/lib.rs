@@ -137,6 +137,58 @@ impl Stats {
         self.record_backend(combined);
     }
 
+    /// Render a list of per-arena snapshots (plan 06 W9 / §31.1 "where is the
+    /// memory?", per authority domain) as a JSON array — the additive `arenas`
+    /// section of the stats surface. Arena names are user-supplied, so they
+    /// are JSON-escaped; every other string is a fixed identifier.
+    pub fn arenas_to_json(arenas: &[topo_core::ArenaSnapshot]) -> String {
+        let mut out = String::from("[");
+        for (i, a) in arenas.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let numa_node = match a.numa {
+                topo_core::NumaPolicy::Bind(n) => n.0,
+                _ => 0,
+            };
+            out.push_str(&format!(
+                concat!(
+                    "{{\"id\": {id}, \"name\": \"{name}\", \"state\": \"{state}\", ",
+                    "\"label\": {label}, \"parent\": {parent}, ",
+                    "\"quota\": {{\"limit\": {limit}, \"used\": {used}, ",
+                    "\"delegated\": {delegated}}}, ",
+                    "\"numa\": {{\"mode\": \"{numa}\", \"node\": {node}, ",
+                    "\"binding_failures\": {numa_fail}}}, ",
+                    "\"lifecycle\": {{\"resets\": {resets}, ",
+                    "\"reset_generation\": {reset_gen}, \"scrubs\": {scrubs}, ",
+                    "\"scrubs_skipped_label\": {scrubs_skipped}}}, ",
+                    "\"live_bytes\": {live}}}"
+                ),
+                id = a.id.0,
+                name = escape_json(a.name.as_str()),
+                state = a.state.as_str(),
+                label = a.label.0,
+                parent = match a.parent {
+                    Some(p) => format!("{}", p.0),
+                    None => String::from("null"),
+                },
+                limit = a.quota_limit,
+                used = a.quota_used,
+                delegated = a.quota_delegated,
+                numa = a.numa.as_str(),
+                node = numa_node,
+                numa_fail = a.numa_binding_failures,
+                resets = a.resets,
+                reset_gen = a.reset_generation,
+                scrubs = a.scrubs,
+                scrubs_skipped = a.scrubs_skipped_label,
+                live = a.engine.live_bytes,
+            ));
+        }
+        out.push(']');
+        out
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -193,6 +245,21 @@ impl Stats {
     }
 }
 
+/// Escape a user-supplied string for embedding in a JSON string literal
+/// (quotes, backslashes, and control characters — RFC 8259 §7).
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +314,51 @@ mod tests {
         assert_eq!(s.profile, Profile::Performance);
         let v: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(v["application"]["live_bytes"], 0);
+    }
+
+    #[test]
+    fn arena_snapshots_render_as_valid_escaped_json() {
+        // W9 (plan 07 DoD: new state reconciles in stats): per-arena
+        // authority/quota/lifecycle fields render as a valid JSON array, with
+        // user-supplied names escaped.
+        let snap = topo_core::ArenaSnapshot {
+            id: topo_core::ArenaId(3),
+            name: topo_core::ArenaName::new("evil\"name\\x").unwrap(),
+            state: topo_core::ArenaState::Active,
+            label: topo_core::Label(0),
+            rights: topo_core::CapRights::ALL,
+            parent: Some(topo_core::ArenaId(1)),
+            quota_limit: 1024,
+            quota_used: 100,
+            quota_delegated: 200,
+            numa: topo_core::NumaPolicy::Bind(topo_core::NodeId(0)),
+            resets: 2,
+            reset_generation: 2,
+            numa_binding_failures: 5,
+            scrubs: 1,
+            scrubs_skipped_label: 0,
+            engine: topo_core::AllocatorStats {
+                live_bytes: 100,
+                ..Default::default()
+            },
+        };
+        let json = Stats::arenas_to_json(&[snap]);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v[0]["id"], 3);
+        assert_eq!(v[0]["name"], "evil\"name\\x");
+        assert_eq!(v[0]["state"], "active");
+        assert_eq!(v[0]["parent"], 1);
+        assert_eq!(v[0]["quota"]["limit"], 1024);
+        assert_eq!(v[0]["quota"]["used"], 100);
+        assert_eq!(v[0]["quota"]["delegated"], 200);
+        assert_eq!(v[0]["numa"]["mode"], "bind");
+        assert_eq!(v[0]["numa"]["binding_failures"], 5);
+        assert_eq!(v[0]["lifecycle"]["resets"], 2);
+        assert_eq!(v[0]["live_bytes"], 100);
+        // The §36.17 exactness identity is visible in the rendered data.
+        assert_eq!(v[0]["quota"]["used"], v[0]["live_bytes"]);
+        // An empty registry renders an empty array.
+        assert_eq!(Stats::arenas_to_json(&[]), "[]");
     }
 
     #[test]

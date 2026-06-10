@@ -73,6 +73,20 @@ def extentStateGate : Bool :=
   ExtentState.all.all (fun s => ExtentState.all.all (fun t =>
     ExtentState.canTransition s t == (s == t || ExtentState.hasEdge s t)))
 
+/-- The §22.3/§36.13 arena-lifecycle differential (plan 06 W9-2/W9-6, G-arena):
+`ArenaState.canTransition` is exactly the canonical `arenaEdges` (no reflexivity —
+every lifecycle operation moves the state), over all 36 ordered pairs, and the two
+gating predicates admit exactly `active`. The Rust test
+`arena_lifecycle_matches_lean` pins the runtime `ArenaState::can_transition` and
+`allows_alloc`/`allows_delegation` to the *same* relation, so the runtime lifecycle
+and this model cannot drift (the §22.3 analogue of `extentStateGate`). -/
+def arenaLifecycleGate : Bool :=
+  ArenaState.all.all (fun s => ArenaState.all.all (fun t =>
+    ArenaState.canTransition s t == ArenaState.hasEdge s t))
+  && ArenaState.all.all (fun s =>
+    (ArenaState.allowsAlloc s == (s == ArenaState.active))
+      && (ArenaState.allowsDelegation s == (s == ArenaState.active)))
+
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
@@ -99,5 +113,10 @@ def main : IO UInt32 := do
     IO.println "lake check: extent state machine OK (§20.1 transitions match ExtentState.canTransition; pins Rust ExtentState, W4-2d)"
   else
     IO.eprintln "lake check: extent state machine FAILED (§20.1 transition drift, W4-2d)"
+    ok := false
+  if arenaLifecycleGate then
+    IO.println "lake check: arena lifecycle OK (§22.3/§36.13 transitions match ArenaState.canTransition; pins Rust ArenaState, W9-2)"
+  else
+    IO.eprintln "lake check: arena lifecycle FAILED (§22.3/§36.13 transition drift, W9-2)"
     ok := false
   return if ok then 0 else 1

@@ -15,11 +15,13 @@ use alloc::string::{String, ToString};
 use topo_core::VERSION;
 use topo_stats::{Profile, Stats};
 
-/// The control plane (§32). Holds the active profile and the latest stats
-/// snapshot, and answers reads against the Appendix-E namespace.
+/// The control plane (§32). Holds the active profile, the latest stats
+/// snapshot, and the latest per-arena snapshots (plan 06 W9), and answers
+/// reads against the Appendix-E namespace.
 pub struct Control {
     profile: Profile,
     stats: Stats,
+    arenas: alloc::vec::Vec<topo_core::ArenaSnapshot>,
 }
 
 impl Control {
@@ -31,12 +33,19 @@ impl Control {
                 profile,
                 ..Stats::default()
             },
+            arenas: alloc::vec::Vec::new(),
         }
     }
 
     /// Replace the current stats snapshot (called by the stats subsystem).
     pub fn set_stats(&mut self, stats: Stats) {
         self.stats = stats;
+    }
+
+    /// Replace the per-arena snapshots (plan 06 W9 — the `ArenaSet::snapshot_all`
+    /// output, collected by the stats subsystem).
+    pub fn set_arenas(&mut self, arenas: alloc::vec::Vec<topo_core::ArenaSnapshot>) {
+        self.arenas = arenas;
     }
 
     /// Read a control key (Appendix E). Returns `None` for unknown or
@@ -46,6 +55,10 @@ impl Control {
             "topo.version" => Some(VERSION.to_string()),
             "topo.profile" => Some(self.profile.as_str().to_string()),
             "topo.stats.json" => Some(self.stats.to_json()),
+            // The W9 arena surface (§22/§36.4): the live count and the
+            // per-arena JSON array (authority, quota, lifecycle, NUMA).
+            "topo.arenas.count" => Some(format_count(self.arenas.len())),
+            "topo.arenas.json" => Some(Stats::arenas_to_json(&self.arenas)),
             // The W8-4 zero-size policy (§9.6, Appendix E `compat.*`): read
             // from the core's process-wide knob, so this agrees with what the
             // allocation entry points actually do. Writable via the mutating
@@ -54,6 +67,13 @@ impl Control {
             _ => None,
         }
     }
+}
+
+/// Render a count (no_std-friendly).
+fn format_count(n: usize) -> String {
+    let mut s = String::new();
+    core::fmt::Write::write_fmt(&mut s, format_args!("{n}")).expect("infallible");
+    s
 }
 
 #[cfg(test)]
@@ -82,6 +102,39 @@ mod tests {
     fn unknown_keys_are_none() {
         let c = Control::new(Profile::Performance);
         assert_eq!(c.get("topo.nonexistent"), None);
+    }
+
+    #[test]
+    fn arena_keys_reflect_snapshots() {
+        let mut c = Control::new(Profile::Performance);
+        assert_eq!(c.get("topo.arenas.count").as_deref(), Some("0"));
+        assert_eq!(c.get("topo.arenas.json").as_deref(), Some("[]"));
+        c.set_arenas(alloc::vec![topo_core::ArenaSnapshot {
+            id: topo_core::ArenaId(0),
+            name: topo_core::ArenaName::new("default").unwrap(),
+            state: topo_core::ArenaState::Active,
+            label: topo_core::Label::PUBLIC,
+            rights: topo_core::CapRights::ALL,
+            parent: None,
+            quota_limit: u64::MAX,
+            quota_used: 42,
+            quota_delegated: 0,
+            numa: topo_core::NumaPolicy::OsDefault,
+            resets: 0,
+            reset_generation: 0,
+            numa_binding_failures: 0,
+            scrubs: 0,
+            scrubs_skipped_label: 0,
+            engine: topo_core::AllocatorStats {
+                live_bytes: 42,
+                ..Default::default()
+            },
+        }]);
+        assert_eq!(c.get("topo.arenas.count").as_deref(), Some("1"));
+        let json = c.get("topo.arenas.json").unwrap();
+        assert!(json.contains("\"name\": \"default\""));
+        assert!(json.contains("\"state\": \"active\""));
+        assert!(json.contains("\"used\": 42"));
     }
 
     #[test]

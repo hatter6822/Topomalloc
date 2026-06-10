@@ -8,8 +8,10 @@ runs over the **M1 central-path allocator** (`topo_core::Allocator`): classify
 plan-03/04 parts below; the M0 skeleton survives only as a test fixture.
 
 ```text
-Public API:  C ABI (topomalloc_*/topo_*x) + C++ header      topo-abi, include/
-             + Rust GlobalAlloc
+Public API:  C ABI (topomalloc_*/topo_*x/topo_arena_*)      topo-abi, include/
+             + C++ header + Rust GlobalAlloc
+Arena registry: per-arena engines; rights + label + quota    topo-core (arena),
+  + §22.3/§36.13 lifecycle; attenuation-only delegation        plan 06 W9
 M1 engine:   classify → central lists / large path           topo-core (allocator)
 Request classifier: small/medium/large, size class,         topo-core (classify)
                     align, arena, label, hints

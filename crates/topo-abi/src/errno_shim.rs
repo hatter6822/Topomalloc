@@ -45,6 +45,16 @@ mod imp {
     /// `EINVAL` for argument-validation failures (`aligned_alloc`,
     /// `posix_memalign`, invalid extended-API flag words).
     pub(crate) const EINVAL: i32 = libc::EINVAL;
+    /// `EPERM` for authority denials (§36.4 rights, the arena API W9).
+    pub(crate) const EPERM: i32 = libc::EPERM;
+    /// `EBUSY` for lifecycle-state conflicts (§22.3: an arena that is
+    /// draining/resetting/quarantined rejects the operation).
+    pub(crate) const EBUSY: i32 = libc::EBUSY;
+    /// `EAGAIN` for "could not quiesce; retry" (§22.6 fail-or-block, W9).
+    pub(crate) const EAGAIN: i32 = libc::EAGAIN;
+    /// `EDQUOT` for arena quota exhaustion (§36.4); falls back to `ENOMEM`
+    /// on hosts without it (none in this list).
+    pub(crate) const EDQUOT: i32 = libc::EDQUOT;
 
     /// The calling thread's errno cell.
     fn errno_ptr() -> *mut i32 {
@@ -109,6 +119,10 @@ mod imp {
     //! consistent for in-crate callers.
     pub(crate) const ENOMEM: i32 = 12;
     pub(crate) const EINVAL: i32 = 22;
+    pub(crate) const EPERM: i32 = 1;
+    pub(crate) const EBUSY: i32 = 16;
+    pub(crate) const EAGAIN: i32 = 11;
+    pub(crate) const EDQUOT: i32 = 122;
 
     pub(crate) fn get_errno() -> i32 {
         0
@@ -117,7 +131,7 @@ mod imp {
     pub(crate) fn set_errno(_v: i32) {}
 }
 
-pub(crate) use imp::{get_errno, set_errno, EINVAL, ENOMEM};
+pub(crate) use imp::{get_errno, set_errno, EAGAIN, EBUSY, EDQUOT, EINVAL, ENOMEM, EPERM};
 
 /// Run an allocation attempt under the §10.1 protocol: a null result sets
 /// `errno = ENOMEM`; a success restores the errno the caller entered with

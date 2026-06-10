@@ -20,26 +20,36 @@ namespace TopoMalloc.SeLe4n
 open TopoMalloc
 
 /-- The rights an arena capability grants (§36.4): allocate, free, observe stats,
-destroy. Capabilities are attenuable — a delegate may carry a subset. -/
+purge/decay-tune, destroy/reset the lifecycle, and delegate further. Capabilities
+are attenuable — a delegate may carry a subset (the §36.4 example: "allocation and
+free but not stats, purge, destroy"). Quota *enlargement* is deliberately not a
+right: quotas are fixed at creation/delegation and can only attenuate, so the
+§36.4 "no quota enlargement" rule holds by construction rather than by a bit.
+The Rust `topo_core::arena::CapRights` mirrors these six exactly
+(`cap_rights_match_lean_model`). -/
 structure CapRights where
   alloc : Bool
   free : Bool
   stats : Bool
+  purge : Bool
   destroy : Bool
+  delegate : Bool
   deriving Repr, DecidableEq
 
 /-- `a ≤ b`: every right `a` grants, `b` grants too (a is an attenuation of b). -/
 def CapRights.le (a b : CapRights) : Prop :=
   (a.alloc = true → b.alloc = true) ∧ (a.free = true → b.free = true) ∧
-    (a.stats = true → b.stats = true) ∧ (a.destroy = true → b.destroy = true)
+    (a.stats = true → b.stats = true) ∧ (a.purge = true → b.purge = true) ∧
+    (a.destroy = true → b.destroy = true) ∧ (a.delegate = true → b.delegate = true)
 
 instance (a b : CapRights) : Decidable (CapRights.le a b) := by unfold CapRights.le; infer_instance
 
-theorem CapRights.le_refl (a : CapRights) : a.le a := ⟨id, id, id, id⟩
+theorem CapRights.le_refl (a : CapRights) : a.le a := ⟨id, id, id, id, id, id⟩
 
 theorem CapRights.le_trans {a b c : CapRights} (h1 : a.le b) (h2 : b.le c) : a.le c :=
   ⟨fun h => h2.1 (h1.1 h), fun h => h2.2.1 (h1.2.1 h),
-   fun h => h2.2.2.1 (h1.2.2.1 h), fun h => h2.2.2.2 (h1.2.2.2 h)⟩
+   fun h => h2.2.2.1 (h1.2.2.1 h), fun h => h2.2.2.2.1 (h1.2.2.2.1 h),
+   fun h => h2.2.2.2.2.1 (h1.2.2.2.2.1 h), fun h => h2.2.2.2.2.2 (h1.2.2.2.2.2 h)⟩
 
 /-- A capability-backed arena (§36.4): identity, label, quota accounting, and the
 authority it confers, plus its delegating parent (if any). -/

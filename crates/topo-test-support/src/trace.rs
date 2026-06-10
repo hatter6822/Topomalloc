@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Parser for the SPEC §33.7 trace grammar. The counterpart to the emit side in
 //! `topo_core::trace`; round-tripping the two is tested there and here. The full
-//! grammar is supported (`ALLOC`/`FREE`/`REFILL`/`FLUSH`/`SPAN_ALLOC`/`RELEASE`)
-//! so the replay tool accepts any conforming trace, even though the M0 skeleton
-//! only emits `ALLOC`/`FREE`.
+//! grammar is supported (`ALLOC`/`FREE`/`REFILL`/`FLUSH`/`SPAN_ALLOC`/`RELEASE`/
+//! `ARENA_RESET`/`ARENA_DESTROY`) so the replay tool accepts any conforming
+//! trace, even though the M0 skeleton only emits `ALLOC`/`FREE`.
 
 use alloc::string::{String, ToString};
 
@@ -85,6 +85,18 @@ pub enum TraceRecord {
         len: u64,
         /// New memory state (e.g. `dirty`/`muzzy`/`released`).
         state: String,
+    },
+    /// `ARENA_RESET arena` (§22.5, plan 06 W9): every outstanding object of
+    /// the arena was discarded wholesale.
+    ArenaReset {
+        /// Arena id.
+        arena: u64,
+    },
+    /// `ARENA_DESTROY arena` (§22.6/§36.13, W9): the live-set effect of a
+    /// reset; the descriptor/backing teardown is below the oracle.
+    ArenaDestroy {
+        /// Arena id.
+        arena: u64,
     },
 }
 
@@ -227,6 +239,15 @@ pub fn parse_trace_line(line: &str) -> Result<TraceRecord, ParseError> {
             expect_end(&mut it)?;
             Ok(TraceRecord::Release { base, len, state })
         }
+        "ARENA_RESET" | "ARENA_DESTROY" => {
+            let arena = parse_u64(next()?)?;
+            expect_end(&mut it)?;
+            if verb == "ARENA_RESET" {
+                Ok(TraceRecord::ArenaReset { arena })
+            } else {
+                Ok(TraceRecord::ArenaDestroy { arena })
+            }
+        }
         _ => Err(ParseError::UnknownVerb),
     }
 }
@@ -342,6 +363,25 @@ mod tests {
                 len: 4096,
                 state: "released".to_string()
             }
+        );
+        // W9 (§22.5/§22.6): the arena lifecycle verbs, exactly as
+        // `topo_core::trace::emit_arena_reset`/`emit_arena_destroy` write them.
+        assert_eq!(
+            parse_trace_line("ARENA_RESET 7").unwrap(),
+            TraceRecord::ArenaReset { arena: 7 }
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_DESTROY 7").unwrap(),
+            TraceRecord::ArenaDestroy { arena: 7 }
+        );
+        assert_eq!(parse_trace_line("ARENA_RESET"), Err(ParseError::BadArity));
+        assert_eq!(
+            parse_trace_line("ARENA_RESET 1 2"),
+            Err(ParseError::BadArity)
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_DESTROY x"),
+            Err(ParseError::BadField)
         );
     }
 

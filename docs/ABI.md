@@ -102,13 +102,37 @@ bits 53–63 reserved — must be zero
 Validation is total (§10.4): reserved bits, the contradictory hugepage pair,
 an unrepresentable alignment, or a nonexistent arena fail deterministically —
 never a silently degraded allocation. "No such arena" is a single `EINVAL`
-at **any** id magnitude (until plan 06 W9 lands the arena API, only
-`TOPO_ARENA(0)`, the default arena, exists). Alignment is extracted into a
+at **any** id magnitude — a stale id (arenas are never reused after destroy,
+B.5) and an unencodable id fail identically. Alignment is extracted into a
 dedicated classifier argument, so it can never be dropped as an advisory
 bit. `TOPO_TCACHE(id)` / `TOPO_NUMA(node)` (§10.4 recommended) are not yet
 encoded: their subsystems land with plans 05/04, and the reserved bits hold
 space for them — encoding them before a consumer exists would freeze
 guesses into ABI.
+
+### Arena API (§22, §36.4, §36.14 — W9)
+
+| Symbol | Semantics |
+|--------|-----------|
+| `topo_arena_create(cfg, &id)` | create an explicit arena (§22.4); `cfg` may be null (ambient defaults); id written only on success |
+| `topo_arena_delegate(parent, cfg, &id)` | attenuation-only child (§36.4): rights ⊆ parent's (`0` = the parent's), quota (required nonzero) reserved from the parent's **remaining** quota, label must equal the parent's |
+| `topo_arena_configure(id, numa_mode, numa_node)` | update the NUMA mode (§15.5) — the mutable policy subset; identity/authority are immutable after creation; requires the `PURGE` right |
+| `topo_arena_reset(id)` | §22.5: discard every outstanding allocation (outstanding pointers become invalid; later frees of them are rejected); the arena stays active; requires `DESTROY`; the default arena is protected |
+| `topo_arena_destroy(id)` | §22.6/§36.13: the ordered revocation protocol (drain → unmap → scrub-if-needed → revoke → recycle); cascades over delegated children; partial failure quarantines (never reports destroyed) and a later call retries; the id is retired forever |
+| `topo_mallocx_arena(id, size, flags)` | allocate from an explicit arena (the path for ids beyond the `TOPO_ARENA` field); the flag word may not name a *different* arena |
+
+Lifecycle functions return `0` or a positive errno value (also set as
+`errno`): `EINVAL` (no such arena / invalid config), `EPERM`
+(missing capability right, label violation, or the protected default
+arena), `EDQUOT` (delegation over the parent's remaining quota), `EBUSY`
+(lifecycle state forbids the operation), `EAGAIN` (could not quiesce;
+retry), `ENOMEM` (registry/backing exhaustion). `topo_arena_config_t`
+(name ≤ 32 bytes, quota `0` = unlimited, `TOPO_ARENA_RIGHT_*` bits with
+`0` = all/parent's, `TOPO_NUMA_*` mode + node, label `0` = `PUBLIC`) is
+layout-pinned by `_Static_assert`s in the C harness. The capability rights
+are fixed at creation — authority not granted at mint cannot be conjured
+later, so an arena created without `TOPO_ARENA_RIGHT_DESTROY` is permanent
+and holds its quota until process exit.
 
 ### Identification
 

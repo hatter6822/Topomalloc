@@ -157,6 +157,26 @@ int main() {
         }
     }
 
+    // W9: the arena API compiles and works under C++ (aggregate init of the
+    // C config; the lifecycle round-trips; the id is retired after destroy).
+    {
+        topo_arena_config_t cfg{};
+        cfg.name = "cpp-arena";
+        cfg.quota_bytes = 1u << 20;
+        topo_arena_t id = 0;
+        assert(topo_arena_create(&cfg, &id) == 0);
+        void *p = topo_mallocx_arena(id, 512, TOPO_ZERO);
+        assert(p != nullptr);
+        for (std::size_t i = 0; i < 512; i++) {
+            assert(static_cast<unsigned char *>(p)[i] == 0u);
+        }
+        topo_dallocx(p, 0);
+        assert(topo_arena_reset(id) == 0);
+        assert(topo_arena_destroy(id) == 0);
+        assert(topo_mallocx_arena(id, 16, 0) == nullptr);
+        assert(topo_arena_reset(0) == EPERM);
+    }
+
     std::printf("C++ ABI smoke: OK (version=%s, %u size classes)\n",
                 topomalloc_version(),
                 static_cast<unsigned>(TOPOMALLOC_NUM_SIZE_CLASSES));

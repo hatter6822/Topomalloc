@@ -156,11 +156,27 @@ impl RequestFlags {
     /// default arena, `v > 0` ⇒ `ArenaId(v - 1)`.
     #[inline]
     pub const fn arena(self) -> ArenaId {
+        match self.explicit_arena() {
+            Some(a) => a,
+            None => ArenaId::DEFAULT,
+        }
+    }
+
+    /// The arena the flag word names **explicitly**, or `None` when the field is
+    /// absent (plan 06 W9). The distinction matters for routing: an absent field
+    /// means "route by the caller's choice" (the default arena for the plain C
+    /// API, the handle argument for `topo_mallocx_arena`), while an explicit
+    /// field is a binding request the serving engine re-validates — naming arena
+    /// `X` while routed to arena `Y` fails deterministically (§10.4). Note that
+    /// "explicitly the default arena" (`TOPO_ARENA(0)`) is representable and
+    /// distinct from an absent field.
+    #[inline]
+    pub const fn explicit_arena(self) -> Option<ArenaId> {
         let v = (self.0 & Self::ARENA_MASK) >> Self::ARENA_SHIFT;
         if v == 0 {
-            ArenaId::DEFAULT
+            None
         } else {
-            ArenaId(v - 1)
+            Some(ArenaId(v - 1))
         }
     }
 
@@ -344,6 +360,22 @@ mod tests {
         for h in [0u8, 1, 7, 128, 255] {
             assert_eq!(RequestFlags::NONE.with_hotness(h).hints().hotness, h);
         }
+    }
+
+    #[test]
+    fn explicit_arena_distinguishes_absent_from_default() {
+        // Absent field: no explicit arena; `arena()` resolves to the default.
+        assert_eq!(RequestFlags::NONE.explicit_arena(), None);
+        assert_eq!(RequestFlags::NONE.arena(), ArenaId::DEFAULT);
+        // `TOPO_ARENA(0)` is *explicitly* the default arena — representable and
+        // distinct from absence (W9 routing relies on this).
+        let f = RequestFlags::NONE.with_arena(0).unwrap();
+        assert_eq!(f.explicit_arena(), Some(ArenaId::DEFAULT));
+        assert_eq!(f.arena(), ArenaId::DEFAULT);
+        // A non-default explicit arena round-trips through both accessors.
+        let f = RequestFlags::NONE.with_arena(7).unwrap();
+        assert_eq!(f.explicit_arena(), Some(ArenaId(7)));
+        assert_eq!(f.arena(), ArenaId(7));
     }
 
     #[test]

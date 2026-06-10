@@ -34,10 +34,10 @@ capability microkernel co-equal behind one backing-provider seam.
 
 | Attribute | Value |
 |-----------|-------|
-| Version | `v0.1.0` |
+| Version | `v0.2.0` |
 | Rust toolchain | `1.94.1` stable (pinned in `rust-toolchain.toml`) |
 | Lean toolchain | `v4.28.0` (pinned in `lean-toolchain`) |
-| Milestone | M0 closed; **M1 (central-path allocator) under way** |
+| Milestone | M0 closed; **M1 (central-path allocator) under way**; W9 arenas landed |
 | Cross targets | x86-64 + AArch64 (co-primary in CI) |
 | Lean model | sorry-free; single-core + SMP theorem sets complete |
 
@@ -45,8 +45,14 @@ The public API runs over the real central-path allocator: classify → central
 free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`,
 errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++
 operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the
-seLe4n simulator (G-sim). Front-end caches (M2) and the remaining M1 pieces
-land per the plan.
+seLe4n simulator (G-sim). **Capability-backed arenas (plan 06 W9) are live**:
+explicit arenas are both policy domains and authority domains — rights, an
+information-flow label, and an exact byte quota (ambient/trivial on POSIX,
+real on seLe4n) — with attenuation-only delegation, the full §22.3/§36.13
+lifecycle (create/configure/reset/destroy with the ordered
+unmap→revoke→recycle revocation protocol), per-arena stats, and the
+`topo_arena_*`/`topo_mallocx_arena` C API. Front-end caches (M2) and the
+remaining M1 pieces land per the plan.
 
 ## Quick start
 
@@ -72,6 +78,8 @@ command list and the Definition of Done.
 │ Front-end: per-CPU (RSEQ / pinned-core) or thread cache          │  topo-core + topo-arch
 ├──────────────────────────────────────────────────────────────────┤
 │ Middle-end: transfer caches + central free lists                 │  topo-core
+├──────────────────────────────────────────────────────────────────┤
+│ Arena policy/authority domains: rights + label + quota + lifecycle│  topo-core
 ├──────────────────────────────────────────────────────────────────┤
 │ Back-end: extent manager, pagemap, hugepage-aware backing        │  topo-core
 ├──────────────────────────────────────────────────────────────────┤
@@ -127,6 +135,7 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 - Pagemap differential (Lean model ↔ Rust radix)
 - Provider state machine differential (§36.6)
 - Extent state machine differential (§20.1)
+- Arena lifecycle differential (§22.3/§36.13, W9)
 
 **Selected headline theorems:**
 

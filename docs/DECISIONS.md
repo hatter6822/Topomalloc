@@ -771,3 +771,92 @@ severity order:
   non-trivial flag word), and the full `malloc(64)+free` round-trip on the
   M1 central path ≈ **131 ns** — the per-op central+span lock cost the
   M2 caches and M3 RSEQ path (≈ 12.5 ns per cached op, W7) exist to remove.
+
+## W9 — capability-backed arena policy & authority domains (plan 06)
+
+W9 lands the full arena pillar — descriptor, lifecycle, delegation,
+revocation, NUMA policy — over the M1 central-path engine, ambient on POSIX
+and structurally ready for seLe4n (D2). The ratified design choices:
+
+* **Per-arena engines; isolation by construction (§22.7).** An arena owns a
+  complete `topo_core::Allocator` — its own central free lists, span pool,
+  and two backing regions from its own provider instances — behind one
+  shared pagemap and one safe metadata arena (§22.4). No extent, span, or
+  central-list entry can be shared between arenas *by type structure*, so
+  the §22.7 isolation invariant is not a filter discipline but a
+  construction property; `ArenaSet::check_invariants` (the executable B.5
+  oracle) additionally proves pairwise region disjointness, quota-chain
+  soundness, exactness (`used == live_bytes`), and no dangling delegation.
+* **The lifecycle is a Lean-pinned state machine.** `ArenaState`
+  (`Initializing/Active/Draining/Resetting/Destroyed/ErrorQuarantined`) and
+  its eight legal edges live in `lean/TopoMalloc/ArenaLifecycle.lean` with
+  the safety spines proved (`only_draining_reaches_destroyed`,
+  `quarantine_only_retries_draining`, `destroyed_is_terminal`,
+  `allowsAlloc_iff_active`); the `arenaLifecycleGate` in `Check.lean` and
+  the Rust `arena_lifecycle_matches_lean` differential pin the two relations
+  equal — the same discipline as `ProviderState` (§36.6) and `ExtentState`
+  (§20.1).
+* **The gate is a SeqCst rendezvous the default arena never pays.** Every
+  non-default operation raises a per-slot in-flight count and then checks
+  `Active` + id (all `SeqCst`); teardown flips the state and waits for the
+  count to drain. The Dekker argument over the single SeqCst order makes
+  "engine torn down under a live operation" impossible. The default arena
+  (id 0) is never resettable/destroyable (§22.5, F-006), so the plain
+  `malloc` path skips the gate entirely — W9 adds zero cost to the
+  default-arena hot path.
+* **Quota is engine-coupled and exact (the Lean coupled steps).** The
+  engine charges/uncharges the quota cell at the *exact* allocate/free
+  success points — the runtime form of the bridge's coupled
+  `allocStep`/`freeStep` — so `used` equals live usable bytes
+  (`ArenaQuotaExact`) and a double free can never credit quota. Admission is
+  one CAS on a `committed` aggregate with the ordering discipline
+  `committed ≥ used + delegated_out` at every instant, giving
+  `used + delegated_out ≤ limit` always, lock-free. Delegations reserve the
+  child's whole limit from the parent's **remaining** quota (`§36.4`
+  "remaining", strictly stronger than the Lean `DelegatesFrom.quota`'s
+  static bound, which the runtime therefore also satisfies), so by induction
+  a delegation tree can never jointly exceed its root.
+* **CapRights extended to six, both sides.** The Lean `CapRights` gained
+  `purge` and `delegate` (mechanical `le`/`le_refl`/`le_trans` extension) so
+  the §36.4 example attenuations are expressible; the Rust mirror is pinned
+  by `cap_rights_match_lean_model` (exhaustive 64×64 preorder check). Quota
+  *enlargement* is deliberately not a right: limits only attenuate, so the
+  §36.4 rule holds by construction. Authority not granted at mint cannot be
+  conjured later — an arena without `DESTROY` is permanent by design
+  (documented loudly in the header).
+* **Ids are monotone and never reused** — B.5's strongest reading: a stale
+  id can never alias a new arena, so "no such arena" is one deterministic
+  `EINVAL` forever (the W8 audit rule extended). Slots recycle behind the
+  monotone id plus a bumped generation (the span-descriptor discipline one
+  level up).
+* **Destroy is the §36.13 protocol, step-isolated and retryable.** Subtree
+  pre-pass to `Draining` (no new allocations/delegations anywhere below the
+  root), then leaves-first per arena: cache drain (the `ArenaCacheDrain`
+  seam with **invalidate** semantics — entries are discarded, never freed
+  back, because the teardown reclaims backing wholesale and the gate would
+  reject the frees) → engine `reset_all` (forced span deactivation via the
+  new `CentralCache::force_deactivate_span`, wholesale large `free_all` by
+  pagemap identity; pagemap entries retired so stale frees classify foreign
+  and are *rejected*) → `unmap_backing` (whole-region decommit; the extent
+  managers **seal** one-way so a use-after-teardown allocation fails
+  cleanly) → scrub iff the recycle label differs from the arena's (the
+  W9-6c skip rule; recorded in stats either way) → `revoke_backing`
+  (`revoke_descendants`; the POSIX no-op with the identical structure plan
+  09 drops into) → engine drop (providers release = §36.6 recycle) →
+  `Destroyed` + generation++ + id retirement. Every step is idempotent; any
+  failure parks the arena in `ErrorQuarantined` and a later `destroy`
+  re-runs the protocol. Failure injection (a decommit that fails on demand)
+  tests the quarantine and the retry.
+* **The trace grammar gained the lifecycle verbs.**
+  `ARENA_RESET`/`ARENA_DESTROY` are emitted by `topo_core::trace`, parsed by
+  `topo-test-support`, and replayed by both the host `LiveModel` and the
+  Lean `ExecModel` — whose live set is now arena-attributed so the events
+  discard exactly one arena's objects and a stale free after a reset is
+  flagged (`sampleStaleFreeTrace`); `apply_preserves_disjoint` was
+  re-proved over the attributed model.
+* **errno mapping (§36.14 → POSIX).** `EINVAL` (no such arena / bad
+  config), `EPERM` (authority/label/default-arena protection), `EDQUOT`
+  (quota), `EBUSY` (lifecycle state), `EAGAIN` (could not quiesce),
+  `ENOMEM` (capacity/backing). Lifecycle functions return the code *and*
+  set `errno`; `topo_mallocx_arena` follows the null+errno allocation
+  protocol with a deterministic pre-attempt error split.

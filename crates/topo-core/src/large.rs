@@ -424,6 +424,109 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         unsafe { self.free_with(ptr, &NoRegionCache) }
     }
 
+    /// Free **every** live large allocation — the arena reset/destroy teardown
+    /// (§22.5/§36.13, plan 06 W9-4c/W9-6b). Returns `(count, bytes)` discarded
+    /// so the caller can reconcile its accounting (§8.6).
+    ///
+    /// Liveness is decided by the same authority `free_with` uses: a slot is
+    /// live iff the pagemap still maps its recorded base address to *this
+    /// slot's* descriptor. A freed slot's stale `base` either no longer
+    /// resolves (entry retired) or resolves to the *newer* descriptor now
+    /// occupying that address — both correctly classify it dead, so a slot is
+    /// never double-released.
+    ///
+    /// # Safety
+    ///
+    /// Only legal during an arena-lifecycle teardown with the arena quiescent
+    /// (the W9 gate): outstanding pointers to these allocations become invalid,
+    /// exactly as the §22.5 reset contract states, and no thread may be
+    /// concurrently allocating or freeing through this allocator.
+    ///
+    /// SPEC-transition: arena reset (§22.5) / arena destroy drain (§36.13), `large free` per slot (§18.5)
+    pub unsafe fn free_all(&self) -> (usize, usize) {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        // Per-slot lock cycle, mirroring `free_with`: resolve + retire under the
+        // pool lock, return the backing outside it (§27.2 — the provider call is
+        // the slow, lowest-class step and is never made under the pool lock).
+        let mut idx = 0u32;
+        loop {
+            self.lock.acquire();
+            // SAFETY: lock held ⇒ exclusive access to the pool.
+            let pool = unsafe { &mut *self.pool.get() };
+            if idx >= pool.high_water {
+                self.lock.release();
+                break;
+            }
+            let slot = pool.slot_ptr(idx);
+            // SAFETY: `idx < high_water` ⇒ the slot's descriptor was initialised
+            // (by `new` or a recycle); descriptors live in never-freed metadata.
+            let base = unsafe { (*slot).desc.base() };
+            let live = match self.pagemap.lookup(base).large_ptr() {
+                // SAFETY: as above — reading the descriptor address only.
+                Some(p) => core::ptr::eq(p, unsafe { &raw const (*slot).desc }),
+                None => false,
+            };
+            if !live {
+                self.lock.release();
+                idx += 1;
+                continue;
+            }
+            // The slot is live: retire + release exactly as `free_with`'s tail.
+            // SAFETY: `slot` is a live pool slot (it is in the pagemap).
+            let (backing, region) = unsafe {
+                let region = Region {
+                    base: (*slot).desc.base() as *mut u8,
+                    len: (*slot).desc.usable_size(),
+                };
+                let backing = if (*slot).has_extent != 0 {
+                    Some(ExtentRef {
+                        id: ExtentId((*slot).backing_id),
+                        generation: (*slot).backing_gen,
+                    })
+                } else {
+                    None
+                };
+                // Retire the pagemap entry BEFORE the slot can be recycled
+                // (§17.2 P-Map-006), as in `free_with`.
+                self.pagemap.retire_large(&(*slot).desc);
+                (backing, region)
+            };
+            pool.release(idx);
+            self.lock.release();
+
+            count += 1;
+            bytes += region.len;
+            self.return_backing(backing, region, &NoRegionCache);
+            idx += 1;
+        }
+        (count, bytes)
+    }
+
+    /// **Teardown passthrough (W9-6c):** decommit + seal this allocator's whole
+    /// backing region; see [`ExtentManager::unmap_all`].
+    pub fn unmap_all(&self) -> Result<(), ExtentError> {
+        self.extents.unmap_all()
+    }
+
+    /// **Teardown passthrough (W9-6c):** forcibly purge this allocator's whole
+    /// backing region; see [`ExtentManager::scrub_all`].
+    pub fn scrub_all(&self) -> Result<(), ExtentError> {
+        self.extents.scrub_all()
+    }
+
+    /// **Teardown passthrough (W9-6d):** revoke derived capabilities over this
+    /// allocator's whole backing region; see [`ExtentManager::revoke_all`].
+    pub fn revoke_all(&self) -> Result<(), ExtentError> {
+        self.extents.revoke_all()
+    }
+
+    /// The reserved region as a half-open address range (the §22.7 isolation
+    /// oracle's input); see [`ExtentManager::region_range`].
+    pub fn region_range(&self) -> (usize, usize) {
+        self.extents.region_range()
+    }
+
     /// The usable size of the large allocation at base `ptr`, or `None` if `ptr` is
     /// not a live large allocation of this allocator (§25.4 `usable_size`).
     pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {

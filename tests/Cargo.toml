@@ -22,7 +22,9 @@ default = []
 sele4n-sim = ["dep:topo-backend-sele4n", "topo-abi/sele4n-sim"]
 
 [dependencies]
-topo-core = { path = "../crates/topo-core" }
+# `std` brings in the real thread-cache layer (the no_std build stubs it),
+# which the W9-4b cache-drain acceptance test drives.
+topo-core = { path = "../crates/topo-core", features = ["std"] }
 topo-abi = { path = "../crates/topo-abi" }
 topo-backend-posix = { path = "../crates/topo-backend-posix" }
 topo-backend-sele4n = { path = "../crates/topo-backend-sele4n", optional = true }
@@ -32,6 +34,9 @@ topo-test-support = { path = "../crates/topo-test-support" }
 
 [dev-dependencies]
 proptest = "1"
+# JSON validation for the W9 arena-stats integration test (already a
+# topo-stats dev-dependency; same vetted version).
+serde_json = "1"
 
 [lints]
 workspace = true

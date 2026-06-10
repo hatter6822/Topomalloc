@@ -890,6 +890,69 @@ impl CentralCache {
         span.set_state(SpanState::Released);
         pagemap.release_span(span);
     }
+
+    /// **Forcibly** deactivate a span that may still hold live objects — the
+    /// arena reset/destroy teardown path (§22.5/§36.13, plan 06 W9-4c/W9-6b).
+    /// Identical list/pagemap surgery to [`deactivate_span`](Self::deactivate_span),
+    /// but instead of asserting emptiness it *discards* the span's outstanding
+    /// objects (the §22.5 contract: the caller accepts that outstanding pointers
+    /// become invalid). Returns `(live, central_free)` as observed under the
+    /// locks, so the caller can reconcile the discarded bytes into its
+    /// accounting (§8.6).
+    ///
+    /// # Caller contract
+    ///
+    /// Only legal during an arena-lifecycle teardown with the arena quiescent
+    /// (the W9 gate: state left `Active` and the in-flight rendezvous drained),
+    /// so no thread can be allocating from or freeing into the span. Outside
+    /// that window this is exactly the "releasing a non-empty span recycles
+    /// live memory" catastrophe `deactivate_span` panics on — which is why this
+    /// is a separate, loudly named entry point and not a flag on the safe one.
+    ///
+    /// SPEC-transition: arena reset (§22.5) / arena destroy drain (§36.13), span `Active -> Released` (§7.3)
+    pub fn force_deactivate_span(&self, span: &SpanDescriptor, pagemap: &PageMap) -> (u32, u32) {
+        let sc = span.size_class();
+        let bin = self
+            .bins
+            .get(sc.index())
+            .expect("force_deactivate_span: invalid size class");
+        let _guard = bin.lock();
+
+        debug_assert_eq!(
+            span.state(),
+            SpanState::Active,
+            "force_deactivate_span: span is not Active (state={:?}); \
+             double-deactivation or deactivation of a released span",
+            span.state()
+        );
+
+        // Capture the partition, then discard it, under both locks (the central
+        // lock serializes against insert/remove; the span lock against the
+        // accounting) — same TOCTOU discipline as deactivate_span.
+        let (live, free_before) = {
+            let sg = span.lock();
+            let live = sg.live_count();
+            let free = sg.central_free_count();
+            sg.deactivate();
+            (live, free)
+        };
+
+        // Remove from whichever list the span is in.
+        if !bin.remove_partial(span as *const SpanDescriptor) {
+            bin.remove_empty(span as *const SpanDescriptor);
+        }
+        bin.span_count.fetch_sub(1, Ordering::Relaxed);
+
+        if free_before > 0 {
+            bin.total_central_free
+                .fetch_sub(free_before as u64, Ordering::Relaxed);
+        }
+
+        // W3-6: transition pagemap entries.
+        span.set_state(SpanState::Released);
+        pagemap.release_span(span);
+        (live, free_before)
+    }
 }
 
 impl Default for CentralCache {

@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT
-//! Public ABI surface (plan 06 W8): the standard C entry points
+//! Public ABI surface (plan 06 W8/W9): the standard C entry points
 //! (`topomalloc_*`, §10.1), the C23 sized-free family, the extended
-//! `topo_*x` API with validated flags (§10.3/§10.4), the Rust
-//! [`GlobalAlloc`] adapter (D1), and the runtime backend selector.
+//! `topo_*x` API with validated flags (§10.3/§10.4), the capability-backed
+//! arena API (`topo_arena_*`/`topo_mallocx_arena`, §22/§36.4/§36.14), the
+//! Rust [`GlobalAlloc`] adapter (D1), and the runtime backend selector.
 //!
 //! From W8 the entry points run over the **M1 central-path allocator**
 //! ([`topo_core::Allocator`]): classify → central free lists / extent-backed
 //! large path, with real `free`, `realloc`, `malloc_usable_size`, errno
-//! semantics (W8-1b), and the configurable zero-size policy (W8-4). The M0
-//! bump skeleton remains only as a test fixture in `topo-core`.
+//! semantics (W8-1b), and the configurable zero-size policy (W8-4). From W9
+//! the process-wide state is an [`ArenaSet`] — a registry of per-arena
+//! engines — and every entry point routes through it: allocations by the
+//! requested arena (the default arena for the plain C API), frees and
+//! reallocs by the pointer's owning arena. The M0 bump skeleton remains only
+//! as a test fixture in `topo-core`.
 //!
 //! **Default build = MIT, POSIX-only.** Enabling the optional `sele4n-sim`
 //! feature additionally links the GPL seLe4n backend and produces a
@@ -31,15 +36,24 @@ use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::{
-    Allocator, AllocatorConfig, AllocatorStats, ArenaId, FreeOutcome, InvalidFree, MetaArena,
-    PageMap, RequestFlags,
+    AllocatorConfig, AllocatorStats, ArenaConfig, ArenaError, ArenaId, ArenaSet, ArenaSnapshot,
+    ArenaState, BackendError, DelegationSpec, FreeOutcome, InvalidFree, MetaArena, PageMap,
+    ProviderFactory, RequestFlags,
 };
 
+mod arena_api;
 mod c_api;
 mod errno_shim;
 mod extended;
 mod policy;
 
+pub use arena_api::{
+    topo_arena_configure, topo_arena_create, topo_arena_delegate, topo_arena_destroy,
+    topo_arena_reset, topo_mallocx_arena, TopoArenaConfig, TOPO_ARENA_RIGHTS_ALL,
+    TOPO_ARENA_RIGHT_ALLOC, TOPO_ARENA_RIGHT_DELEGATE, TOPO_ARENA_RIGHT_DESTROY,
+    TOPO_ARENA_RIGHT_FREE, TOPO_ARENA_RIGHT_PURGE, TOPO_ARENA_RIGHT_STATS, TOPO_NUMA_ARENA_POLICY,
+    TOPO_NUMA_BIND, TOPO_NUMA_INTERLEAVE, TOPO_NUMA_LOCAL, TOPO_NUMA_OS_DEFAULT,
+};
 pub use c_api::{
     topomalloc_aligned_alloc, topomalloc_backend, topomalloc_calloc, topomalloc_free,
     topomalloc_free_aligned_sized, topomalloc_free_sized, topomalloc_malloc,
@@ -73,15 +87,64 @@ const _: () = assert!(
 #[cfg(feature = "sele4n-sim")]
 const SIM_META_BYTES: usize = 4 * 1024 * 1024;
 
-/// The process-wide allocator over whichever backend was selected at runtime.
-/// Enum dispatch (not `dyn`) keeps the default build free of the GPL backend
-/// type.
+/// Concurrently live arenas the process-wide registry supports (the default
+/// arena plus explicit/delegated arenas, plan 06 W9). Each explicit arena
+/// reserves its own (virtual) regions, so the bound is address space and
+/// metadata, not RSS.
+#[cfg(target_pointer_width = "64")]
+const ARENA_CAPACITY: usize = 64;
+/// On 32-bit targets address space is the scarce resource; keep the registry
+/// small.
+#[cfg(not(target_pointer_width = "64"))]
+const ARENA_CAPACITY: usize = 8;
+
+/// The simulator charges its untyped pool eagerly per reservation, so its
+/// registry stays small regardless of pointer width.
+#[cfg(feature = "sele4n-sim")]
+const SIM_ARENA_CAPACITY: usize = 8;
+
+/// [`ProviderFactory`] for the POSIX backend: every arena region gets an
+/// independent ambient-authority mapper (the degenerate §36.6 case, D2).
+pub struct PosixFactory;
+
+impl ProviderFactory for PosixFactory {
+    type Provider = PosixBackingProvider;
+    fn make_provider(&self, _arena: ArenaId) -> Result<PosixBackingProvider, BackendError> {
+        Ok(PosixBackingProvider::new())
+    }
+}
+
+/// [`ProviderFactory`] for the seLe4n host simulator: each region draws from
+/// its own authorized-untyped pool sized for the small engine geometry. Plan
+/// 09 replaces this with per-arena authority carved from the resource
+/// server's inventory.
+#[cfg(feature = "sele4n-sim")]
+pub struct SimFactory;
+
+#[cfg(feature = "sele4n-sim")]
+impl ProviderFactory for SimFactory {
+    type Provider = topo_backend_sele4n::Sele4nSim;
+    fn make_provider(
+        &self,
+        _arena: ArenaId,
+    ) -> Result<topo_backend_sele4n::Sele4nSim, BackendError> {
+        // Large enough for either region of `AllocatorConfig::small()`.
+        let cfg = AllocatorConfig::small();
+        let pool = cfg.span_region_bytes.max(cfg.large_region_bytes);
+        Ok(topo_backend_sele4n::Sele4nSim::new(pool))
+    }
+}
+
+/// The process-wide arena registry over whichever backend was selected at
+/// runtime (plan 06 W9: every entry point routes through the registry's
+/// owning-arena dispatch). Enum dispatch (not `dyn`) keeps the default build
+/// free of the GPL backend type.
 pub enum AnyAllocator {
     /// POSIX backend (default).
-    Posix(Allocator<'static, PosixBackingProvider>),
+    Posix(ArenaSet<'static, PosixFactory>),
     /// seLe4n host simulator (only when built with `sele4n-sim`).
     #[cfg(feature = "sele4n-sim")]
-    Sim(Allocator<'static, topo_backend_sele4n::Sele4nSim>),
+    Sim(ArenaSet<'static, SimFactory>),
 }
 
 macro_rules! dispatch {
@@ -148,16 +211,96 @@ impl AnyAllocator {
         dispatch!(self, a => a.recognizes(ptr))
     }
 
-    /// A statistics snapshot of the engine (§31.1; map into the Appendix-D
-    /// JSON with `topo_stats::Stats::record_allocator`).
+    /// A statistics snapshot of the **default arena's** engine (§31.1; map
+    /// into the Appendix-D JSON with `topo_stats::Stats::record_allocator`).
+    /// Per-arena snapshots come from [`snapshot_arena`](Self::snapshot_arena)
+    /// / [`snapshot_arenas`](Self::snapshot_arenas).
     pub fn stats(&self) -> AllocatorStats {
-        dispatch!(self, a => a.stats())
+        match self.snapshot_arena(ArenaId::DEFAULT) {
+            Ok(snap) => snap.engine,
+            Err(_) => AllocatorStats::default(), // default arena always grants STATS
+        }
     }
 
     /// The active backend's name (`"posix"` / `"sele4n-sim"`), proving which
     /// provider the runtime flag selected (W0-14b).
     pub fn backend_name(&self) -> &'static str {
-        dispatch!(self, a => a.backend_name())
+        match self {
+            AnyAllocator::Posix(_) => "posix",
+            #[cfg(feature = "sele4n-sim")]
+            AnyAllocator::Sim(_) => "sele4n-sim",
+        }
+    }
+
+    // -- the W9 arena surface (enum-dispatched ArenaSet passthroughs) ----------
+
+    /// Allocate from an explicit arena (`topo_mallocx_arena`, §36.14).
+    pub fn allocate_in(
+        &self,
+        arena: ArenaId,
+        size: usize,
+        align: usize,
+        flags: RequestFlags,
+    ) -> *mut u8 {
+        dispatch!(self, a => a.allocate_in(arena, size, align, flags))
+    }
+
+    /// Create an explicit arena (§22.4, F-005).
+    pub fn arena_create(&self, cfg: &ArenaConfig) -> Result<ArenaId, ArenaError> {
+        dispatch!(self, a => a.create(cfg))
+    }
+
+    /// Delegate an attenuated child arena (§36.4, W9-5).
+    pub fn arena_delegate(
+        &self,
+        parent: ArenaId,
+        spec: &DelegationSpec,
+    ) -> Result<ArenaId, ArenaError> {
+        dispatch!(self, a => a.delegate(parent, spec))
+    }
+
+    /// Reconfigure an arena's NUMA policy (§15.5, F-005 "configure").
+    pub fn arena_configure(
+        &self,
+        id: ArenaId,
+        numa: topo_core::NumaPolicy,
+    ) -> Result<(), ArenaError> {
+        dispatch!(self, a => a.configure(id, numa))
+    }
+
+    /// Reset an explicit arena (§22.5).
+    pub fn arena_reset(&self, id: ArenaId) -> Result<(), ArenaError> {
+        dispatch!(self, a => a.reset(id))
+    }
+
+    /// Destroy an explicit arena via the §36.13 revocation protocol (§22.6).
+    pub fn arena_destroy(&self, id: ArenaId) -> Result<(), ArenaError> {
+        dispatch!(self, a => a.destroy(id))
+    }
+
+    /// The lifecycle state of arena `id`, if live.
+    pub fn arena_state(&self, id: ArenaId) -> Option<ArenaState> {
+        dispatch!(self, a => a.arena_state(id))
+    }
+
+    /// The rights arena `id`'s capability grants, if live.
+    pub fn arena_rights(&self, id: ArenaId) -> Option<topo_core::CapRights> {
+        dispatch!(self, a => a.rights_of(id))
+    }
+
+    /// A per-arena snapshot (requires the arena's `STATS` right, §36.4).
+    pub fn snapshot_arena(&self, id: ArenaId) -> Result<ArenaSnapshot, ArenaError> {
+        dispatch!(self, a => a.snapshot(id))
+    }
+
+    /// Snapshot every live arena (the operator/aggregation surface, plan 07).
+    pub fn snapshot_arenas(&self, visit: &mut dyn FnMut(ArenaSnapshot)) {
+        dispatch!(self, a => a.snapshot_all(visit))
+    }
+
+    /// The executable B.5 arena oracle (tests / debug).
+    pub fn check_invariants(&self) -> bool {
+        dispatch!(self, a => a.check_invariants())
     }
 }
 
@@ -179,22 +322,27 @@ pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
                     .ok()?,
             ));
             let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
-            let a = Allocator::new(
-                PosixBackingProvider::new(),
-                PosixBackingProvider::new(),
+            // The default arena: full engine geometry, ambient authority
+            // (all rights, unlimited quota, PUBLIC label — the trivial POSIX
+            // values of the §36.4 capability fields, W9-1).
+            let default_cfg = ArenaConfig {
+                allocator: AllocatorConfig::default(),
+                ..ArenaConfig::default()
+            };
+            let set = ArenaSet::new(
+                PosixFactory,
                 meta,
                 meta,
                 pagemap,
-                ArenaId::DEFAULT,
-                AllocatorConfig::default(),
+                &default_cfg,
+                ARENA_CAPACITY,
             )
             .ok()?;
-            Some(AnyAllocator::Posix(a))
+            Some(AnyAllocator::Posix(set))
         }
         #[cfg(feature = "sele4n-sim")]
         "sele4n-sim" => {
             use topo_backend_sele4n::Sele4nSim;
-            let cfg = AllocatorConfig::small();
             let meta: &'static MetaArena<Sele4nSim> = Box::leak(Box::new(
                 MetaArena::reserve(
                     Sele4nSim::new(SIM_META_BYTES),
@@ -204,17 +352,23 @@ pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
                 .ok()?,
             ));
             let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
-            let a = Allocator::new(
-                Sele4nSim::new(cfg.span_region_bytes),
-                Sele4nSim::new(cfg.large_region_bytes),
+            // The simulator's pools are charged eagerly: the small geometry
+            // for the default arena, and a small registry (G-sim runs the
+            // identical vertical slice over this set).
+            let default_cfg = ArenaConfig {
+                allocator: AllocatorConfig::small(),
+                ..ArenaConfig::default()
+            };
+            let set = ArenaSet::new(
+                SimFactory,
                 meta,
                 meta,
                 pagemap,
-                ArenaId::DEFAULT,
-                cfg,
+                &default_cfg,
+                SIM_ARENA_CAPACITY,
             )
             .ok()?;
-            Some(AnyAllocator::Sim(a))
+            Some(AnyAllocator::Sim(set))
         }
         _ => None,
     }

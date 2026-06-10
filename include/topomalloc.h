@@ -104,10 +104,11 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * Extended API (§10.3/§10.4 — W8-6)
  * --------------------------------------------------------------------- */
 
-/* Handle/flag types (§10.3). Arena handles become meaningful with the arena
- * API (plan 06 W9, M4); at M1 only the default arena (id 0) exists, and
- * naming any other is a deterministic EINVAL. topo_tcache_t is declared for
- * the §10.3 surface but has no consumer until explicit-tcache routing lands
+/* Handle/flag types (§10.3). Arena ids come from topo_arena_create /
+ * topo_arena_delegate (W9): id 0 is the always-present default arena; ids
+ * are allocated monotonically and never reused after destroy, so a stale id
+ * is one deterministic EINVAL forever. topo_tcache_t is declared for the
+ * §10.3 surface but has no consumer until explicit-tcache routing lands
  * (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is
  * deferred to its subsystem rather than frozen as a guess (reserved flag
  * bits hold the space). */
@@ -177,6 +178,95 @@ void topo_sdallocx(void *ptr, size_t size, topo_flags_t flags);
  * the allocation path's formula); 0 on an invalid flag word or
  * unsatisfiable size. Pure. */
 size_t topo_nallocx(size_t size, topo_flags_t flags);
+
+/* ------------------------------------------------------------------------
+ * Arena API (§22, §36.4, §36.14 — plan 06 W9)
+ *
+ * An arena is both a policy domain and a capability-controlled resource
+ * domain (D2): it carries an authority (rights word), an information-flow
+ * label, and a byte quota — trivial ambient values on POSIX, real on seLe4n.
+ * The lifecycle functions return 0 on success or a positive errno value
+ * (also set as errno):
+ *   EINVAL  no such arena / invalid configuration
+ *   EPERM   missing capability right, label violation, or the protected
+ *           default arena
+ *   EDQUOT  delegation exceeds the parent's remaining quota
+ *   EBUSY   the arena's lifecycle state forbids the operation (draining /
+ *           resetting / quarantined)
+ *   EAGAIN  could not quiesce in-flight operations; retry
+ *   ENOMEM  registry/backing exhaustion
+ * --------------------------------------------------------------------- */
+
+/* Capability rights (§36.4). 0 in topo_arena_config_t.rights means "all
+ * rights" for create and "the parent's rights" for delegate. Rights are
+ * fixed at creation: authority not granted at mint cannot be conjured later
+ * (an arena without TOPO_ARENA_RIGHT_DESTROY can never be reset/destroyed
+ * and holds its quota until process exit). */
+#define TOPO_ARENA_RIGHT_ALLOC ((uint32_t) 1 << 0)
+#define TOPO_ARENA_RIGHT_FREE ((uint32_t) 1 << 1)
+#define TOPO_ARENA_RIGHT_STATS ((uint32_t) 1 << 2)
+#define TOPO_ARENA_RIGHT_PURGE ((uint32_t) 1 << 3)
+#define TOPO_ARENA_RIGHT_DESTROY ((uint32_t) 1 << 4)
+#define TOPO_ARENA_RIGHT_DELEGATE ((uint32_t) 1 << 5)
+#define TOPO_ARENA_RIGHTS_ALL ((uint32_t) 0x3f)
+
+/* NUMA placement modes (§15.5). */
+#define TOPO_NUMA_OS_DEFAULT ((uint32_t) 0)
+#define TOPO_NUMA_LOCAL ((uint32_t) 1)
+#define TOPO_NUMA_INTERLEAVE ((uint32_t) 2)
+#define TOPO_NUMA_BIND ((uint32_t) 3)
+#define TOPO_NUMA_ARENA_POLICY ((uint32_t) 4)
+
+/* Arena configuration for create/delegate. Zero-initialization ({0}) is the
+ * ambient default: unnamed, unlimited quota (0 = unlimited; delegation
+ * requires an explicit bound), all/parent rights, PUBLIC label (0),
+ * OS-default NUMA placement. */
+typedef struct topo_arena_config {
+    const char *name;   /* optional NUL-terminated name, <= 32 bytes */
+    uint64_t quota_bytes;
+    uint32_t rights;    /* TOPO_ARENA_RIGHT_* bits */
+    uint32_t numa_mode; /* TOPO_NUMA_* */
+    uint32_t numa_node; /* target node for TOPO_NUMA_BIND */
+    uint32_t label;     /* information-flow label (§36.12); 0 = PUBLIC */
+} topo_arena_config_t;
+
+/* Create an explicit arena (§22.4, F-005). cfg may be NULL for the default
+ * configuration; *out_id receives the new id only on success. */
+int topo_arena_create(const topo_arena_config_t *cfg, topo_arena_t *out_id);
+
+/* Delegate an attenuated child arena (§36.4): the child's rights must be a
+ * subset of the parent's, its quota (required nonzero) is reserved from the
+ * parent's remaining quota, and its label must equal the parent's. Requires
+ * the parent's DELEGATE right and Active state. */
+int topo_arena_delegate(topo_arena_t parent, const topo_arena_config_t *cfg,
+                        topo_arena_t *out_id);
+
+/* Update the arena's NUMA placement mode (§15.5) — the mutable policy
+ * subset; identity/authority fields are immutable after creation. Requires
+ * the PURGE right. */
+int topo_arena_configure(topo_arena_t id, uint32_t numa_mode,
+                         uint32_t numa_node);
+
+/* Reset the arena (§22.5): every outstanding allocation from it is
+ * discarded and every outstanding pointer into it becomes invalid (later
+ * frees of them are rejected, not honored). The arena remains active and
+ * reusable. The default arena is protected (EPERM). Requires the DESTROY
+ * right. */
+int topo_arena_reset(topo_arena_t id);
+
+/* Destroy the arena (§22.6/§36.13): reset plus the ordered revocation
+ * protocol (drain -> unmap -> scrub if required -> revoke -> recycle), then
+ * the id is retired forever. Live delegated children are destroyed first.
+ * On a partial failure the arena is quarantined — never reported destroyed
+ * — and a later topo_arena_destroy retries the protocol. The default arena
+ * is protected (EPERM). Requires the DESTROY right. */
+int topo_arena_destroy(topo_arena_t id);
+
+/* Allocate from an explicit arena (§36.14) — the entry point for arena ids
+ * beyond the TOPO_ARENA flag field. The flag word may not name a different
+ * arena. NULL + EINVAL for an unknown id or invalid flags, EBUSY for an
+ * inactive arena, EPERM without the ALLOC right, ENOMEM for quota/OOM. */
+void *topo_mallocx_arena(topo_arena_t arena, size_t size, topo_flags_t flags);
 
 /* ------------------------------------------------------------------------
  * Identification

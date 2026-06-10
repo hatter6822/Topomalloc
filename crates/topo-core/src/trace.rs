@@ -102,6 +102,20 @@ pub fn emit_release<W: Write>(w: &mut W, base: usize, len: usize, state: &str) -
     writeln!(w, "RELEASE {base:#x}:{len} {state}")
 }
 
+/// Emit an `ARENA_RESET` line (§22.5, plan 06 W9): every outstanding object of
+/// `arena` was discarded wholesale — replayers drop the arena's whole live set
+/// (the trace face of the Lean `arenaReset` transition).
+pub fn emit_arena_reset<W: Write>(w: &mut W, arena: u32) -> fmt::Result {
+    writeln!(w, "ARENA_RESET {arena}")
+}
+
+/// Emit an `ARENA_DESTROY` line (§22.6/§36.13, W9): the live-set effect equals a
+/// reset; the descriptor/backing teardown is below the live-set oracle's
+/// abstraction (the trace face of `arenaDestroy`).
+pub fn emit_arena_destroy<W: Write>(w: &mut W, arena: u32) -> fmt::Result {
+    writeln!(w, "ARENA_DESTROY {arena}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +157,15 @@ mod tests {
              SPAN_ALLOC 0 1 8 1 -\n\
              RELEASE 0x2000:4096 released\n"
         );
+    }
+
+    #[test]
+    fn arena_lifecycle_lines_match_grammar() {
+        // W9 (§22.5/§22.6): the lifecycle verbs the Lean oracle and the host
+        // replayer consume — byte-exact, like every other emitter test.
+        let mut s = std::string::String::new();
+        emit_arena_reset(&mut s, 7).unwrap();
+        emit_arena_destroy(&mut s, 7).unwrap();
+        assert_eq!(s, "ARENA_RESET 7\nARENA_DESTROY 7\n");
     }
 }

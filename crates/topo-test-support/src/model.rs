@@ -30,13 +30,16 @@ fn ranges_overlap(a: u64, a_size: u64, b: u64, b_size: u64) -> bool {
     a < b.saturating_add(b_size) && b < a.saturating_add(a_size)
 }
 
-/// The live-object model: each live object is the range `[base, base+usable_size)`,
-/// keyed by base. `ALLOC` adds a range, rejecting any overlap with a live one; `FREE`
-/// removes the range at that base; null is ignored on both sides (`malloc` failure /
-/// `free(NULL)`).
+/// The live-object model: each live object is the range `[base, base+usable_size)`
+/// plus its owning arena, keyed by base. `ALLOC` adds a range, rejecting any overlap
+/// with a live one; `FREE` removes the range at that base; null is ignored on both
+/// sides (`malloc` failure / `free(NULL)`); `ARENA_RESET`/`ARENA_DESTROY` (plan 06
+/// W9, §22.5/§22.6) discard every live object of the named arena wholesale — kept in
+/// lockstep with the Lean `ExecModel.apply` (the trace face of `arenaReset`).
 #[derive(Default)]
 pub struct LiveModel {
-    live: BTreeMap<u64, u64>,
+    /// base → (usable_size, arena).
+    live: BTreeMap<u64, (u64, u64)>,
 }
 
 impl LiveModel {
@@ -50,20 +53,23 @@ impl LiveModel {
     pub fn apply(&mut self, rec: &TraceRecord) -> Result<(), ModelError> {
         match rec {
             TraceRecord::Alloc {
-                ptr, usable_size, ..
+                ptr,
+                usable_size,
+                arena,
+                ..
             } => {
-                let (ptr, size) = (*ptr, *usable_size);
+                let (ptr, size, arena) = (*ptr, *usable_size, *arena);
                 if ptr == 0 {
                     return Ok(()); // allocation failed; nothing becomes live
                 }
                 if self
                     .live
                     .iter()
-                    .any(|(&b, &s)| ranges_overlap(ptr, size, b, s))
+                    .any(|(&b, &(s, _))| ranges_overlap(ptr, size, b, s))
                 {
                     return Err(ModelError::Overlap(ptr));
                 }
-                self.live.insert(ptr, size);
+                self.live.insert(ptr, (size, arena));
                 Ok(())
             }
             TraceRecord::Free { ptr, .. } => {
@@ -74,6 +80,14 @@ impl LiveModel {
                 if self.live.remove(&ptr).is_none() {
                     return Err(ModelError::FreeOfUnknown(ptr));
                 }
+                Ok(())
+            }
+            // The W9 lifecycle events: the target arena's whole live set is
+            // discarded (every other arena's objects are untouched — the
+            // `arena_reset_invalidates_only_target_arena` shape); a later FREE
+            // of a discarded pointer is a stale free and is flagged.
+            TraceRecord::ArenaReset { arena } | TraceRecord::ArenaDestroy { arena } => {
+                self.live.retain(|_, &mut (_, a)| a != *arena);
                 Ok(())
             }
             // Middle/back-end events (REFILL/FLUSH/SPAN_ALLOC/RELEASE) do not
@@ -171,6 +185,43 @@ mod tests {
         let mut m = LiveModel::new();
         m.apply(&alloc(0)).unwrap();
         m.apply(&free(0)).unwrap();
+        assert_eq!(m.live_count(), 0);
+    }
+
+    fn alloc_in(ptr: u64, arena: u64) -> TraceRecord {
+        TraceRecord::Alloc {
+            request_id: 0,
+            size: 8,
+            align: 8,
+            arena,
+            flags: 0,
+            ptr,
+            usable_size: 16,
+            sc: Some(0),
+            span: Some(0),
+        }
+    }
+
+    #[test]
+    fn arena_reset_discards_exactly_the_target_arena() {
+        // W9 (§22.5): the reset removes every object of the named arena and
+        // nothing else; a later free of a discarded pointer is a stale free —
+        // the same semantics the Lean `sampleStaleFreeTrace` example pins.
+        let mut m = LiveModel::new();
+        m.apply(&alloc_in(0x1000, 7)).unwrap();
+        m.apply(&alloc_in(0x2000, 7)).unwrap();
+        m.apply(&alloc_in(0x3000, 0)).unwrap();
+        m.apply(&TraceRecord::ArenaReset { arena: 7 }).unwrap();
+        assert_eq!(m.live_count(), 1, "only the default-arena object survives");
+        assert_eq!(
+            m.apply(&free(0x1000)),
+            Err(ModelError::FreeOfUnknown(0x1000)),
+            "a stale free after the reset is flagged"
+        );
+        m.apply(&free(0x3000)).unwrap();
+        // The reset arena's addresses are reusable afterwards (no overlap).
+        m.apply(&alloc_in(0x1000, 7)).unwrap();
+        m.apply(&TraceRecord::ArenaDestroy { arena: 7 }).unwrap();
         assert_eq!(m.live_count(), 0);
     }
 }

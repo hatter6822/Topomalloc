@@ -14,11 +14,11 @@ license = "MIT"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.1.0" }
-topo-backend-posix = { path = "../topo-backend-posix", version = "0.1.0" }
+topo-core = { path = "../topo-core", version = "0.2.0" }
+topo-backend-posix = { path = "../topo-backend-posix", version = "0.2.0" }
 # GPL backend is optional and OFF by default; enabling `sele4n-sim` produces a
 # GPL-3.0-or-later artifact (libtopomalloc-sele4n, §36.3.2). See NOTICE.
-topo-backend-sele4n = { path = "../topo-backend-sele4n", version = "0.1.0", optional = true }
+topo-backend-sele4n = { path = "../topo-backend-sele4n", version = "0.2.0", optional = true }
 
 # errno + allocation-free getenv for the §10.1 errno protocol and the W8-4
 # zero-size policy (unix only; the same MIT/Apache-2.0 dep topo-backend-posix

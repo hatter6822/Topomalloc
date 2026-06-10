@@ -48,6 +48,7 @@ use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arena::ArenaQuota;
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
 use crate::central::{CentralCache, RemoveResult};
@@ -206,6 +207,16 @@ pub enum FreeOutcome {
     /// (a double free, or a stale free racing the span's teardown); no state
     /// was corrupted. Debug builds abort inside the central list instead.
     DoubleFree,
+    /// Produced by the **arena layer** (plan 06 W9), never by the engine: the
+    /// owning arena is not `Active` (resetting, draining, or quarantined), so
+    /// the free was rejected without touching any state — the §36.13
+    /// "quarantine or reject stale frees" choice, realized as reject (the
+    /// reset/destroy teardown reclaims the object wholesale).
+    ArenaInactive,
+    /// Produced by the **arena layer** (plan 06 W9), never by the engine: the
+    /// owning arena's capability does not grant the `FREE` right (§36.4); no
+    /// state was touched.
+    Denied,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +255,25 @@ pub struct AllocatorStats {
     pub live_spans: u64,
     /// Medium/large allocations currently live.
     pub live_large: u64,
+}
+
+/// What an [`Allocator::reset_all`] teardown discarded (§22.5/§36.13 — the
+/// reset/destroy accounting surface, reconciled into the arena's stats).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResetReport {
+    /// Live spans force-deactivated and returned.
+    pub spans_discarded: u64,
+    /// Live small objects those spans still held (their owners' pointers are
+    /// now invalid — the §22.5 contract).
+    pub objects_discarded: u64,
+    /// Live medium/large allocations freed wholesale.
+    pub larges_discarded: u64,
+    /// Total usable bytes the discarded objects/allocations held.
+    pub bytes_discarded: u64,
+    /// Backing extents that could not be returned to the backend (the manager
+    /// remains well-formed, W4-5). Nonzero ⇒ the arena layer quarantines the
+    /// arena instead of completing the reset/destroy (W9-6e).
+    pub backing_failures: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +511,13 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Cumulative usable bytes ever returned. `live = allocated - freed` by
     /// construction, so the §8.6 application-side identity cannot drift.
     freed_bytes: AtomicU64,
+    /// The owning arena's quota cell (plan 06 W9, §36.4), charged/uncharged at
+    /// the exact success points of `allocate`/`free` — the runtime mirror of
+    /// the Lean **coupled** `allocStep`/`freeStep` (`SeLe4n/Refinement.lean`):
+    /// the malloc and the quota accounting are one step, so `used` equals live
+    /// usable bytes exactly (`ArenaQuotaExact`). `None` (no quota — the M1
+    /// single-engine construction) charges nothing.
+    quota: Option<&'a ArenaQuota>,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, and `pagemap` carry their own
@@ -545,7 +582,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_lock: BackendLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
+            quota: None,
         })
+    }
+
+    /// Install the owning arena's quota cell (plan 06 W9, §36.4). Called once by
+    /// the arena layer **before the engine is published** (no concurrent
+    /// operations exist yet — `&mut self` enforces exclusivity), so every
+    /// allocation this engine ever serves is quota-coupled.
+    pub fn set_quota(&mut self, quota: &'a ArenaQuota) {
+        self.quota = Some(quota);
     }
 
     /// The backend name of the providers (W0-14b).
@@ -582,29 +628,54 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let Some(req) = classify(size, align, flags.raw()) else {
             return ptr::null_mut();
         };
-        // M1: a single default arena. An explicit-arena request for anything
-        // else fails deterministically (§10.4) until W9 lands real arenas.
-        if req.arena != self.arena {
-            return ptr::null_mut();
+        // An **explicitly** named arena must be this engine's (§10.4: mandatory
+        // flags are never silently ignored). An absent field means the caller's
+        // routing already chose this engine (the arena layer or the default
+        // path, plan 06 W9), so it is not re-checked here.
+        if let Some(explicit) = req.flags.explicit_arena() {
+            if explicit != self.arena {
+                return ptr::null_mut();
+            }
         }
-        let (p, usable) = match req.kind {
-            RequestKind::Small { sc, usable } => (self.alloc_small(sc), usable),
+        // The usable size is a pure function of the request (the same formula
+        // `predicted_usable_size` exposes), computed up front so the quota
+        // charge gates the attempt — the coupled allocStep (§36.4/§36.17):
+        // charge first (refused ⇒ fail without consuming any backend resource),
+        // attempt, uncharge on failure. `used ≤ quota` therefore holds at every
+        // instant, and `used == live bytes` at every success point.
+        let usable = match req.kind {
+            RequestKind::Small { usable, .. } => usable,
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                let Some(bytes) = medium_large_usable(size) else {
-                    return ptr::null_mut();
-                };
-                (self.large.allocate(bytes, req.align), bytes)
+                match medium_large_usable(size) {
+                    Some(bytes) => bytes,
+                    None => return ptr::null_mut(),
+                }
             }
         };
-        if !p.is_null() {
-            self.allocated_bytes
-                .fetch_add(usable as u64, Ordering::Relaxed);
-            if req.flags.hints().zero {
-                // SAFETY: `p` is a live allocation with at least `usable`
-                // writable bytes (the class's usable size, or the page-rounded
-                // extent length).
-                unsafe { ptr::write_bytes(p, 0, usable) };
+        if let Some(q) = self.quota {
+            if !q.try_charge(usable as u64) {
+                return ptr::null_mut(); // quota exceeded (§36.4) — ENOMEM at the ABI
             }
+        }
+        let p = match req.kind {
+            RequestKind::Small { sc, .. } => self.alloc_small(sc),
+            RequestKind::Medium { .. } | RequestKind::Large { .. } => {
+                self.large.allocate(usable, req.align)
+            }
+        };
+        if p.is_null() {
+            if let Some(q) = self.quota {
+                q.uncharge(usable as u64); // failed attempt: exact rollback
+            }
+            return ptr::null_mut();
+        }
+        self.allocated_bytes
+            .fetch_add(usable as u64, Ordering::Relaxed);
+        if req.flags.hints().zero {
+            // SAFETY: `p` is a live allocation with at least `usable`
+            // writable bytes (the class's usable size, or the page-rounded
+            // extent length).
+            unsafe { ptr::write_bytes(p, 0, usable) };
         }
         p
     }
@@ -852,10 +923,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 let r = self.central.insert_batch(span, &[idx], 1);
                 if r.inserted == 0 {
                     // Already central-free (double free) or the span raced
-                    // its teardown; nothing was mutated (W8 hardening).
+                    // its teardown; nothing was mutated (W8 hardening) — and
+                    // crucially nothing is uncharged, so a double free cannot
+                    // corrupt the quota (the Lean freeStep credit is restricted
+                    // to a live slot, §36.17).
                     return FreeOutcome::DoubleFree;
                 }
                 self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
+                if let Some(q) = self.quota {
+                    q.uncharge(usable as u64); // the coupled freeStep (§36.17)
+                }
                 if r.span_empty {
                     self.retire_span(span);
                 }
@@ -873,6 +950,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // contract, forwarded unchanged.
                 if unsafe { self.large.free(ptr) } {
                     self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
+                    if let Some(q) = self.quota {
+                        // Exact: the carve is exact-length, so this usable is
+                        // byte-identical to the charge (the coupled freeStep).
+                        q.uncharge(usable as u64);
+                    }
                     FreeOutcome::Freed
                 } else {
                     FreeOutcome::DoubleFree
@@ -897,10 +979,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     fn retire_span(&self, span: &SpanDescriptor) {
         self.central.deactivate_span(span, self.pagemap);
         self.pagemap.retire_span(span);
+        // A failed extent free leaves the manager well-formed (W4-5).
+        let _ = self.release_span_slot(span);
+    }
 
+    /// The tail of a span retirement, shared by [`retire_span`] and the arena
+    /// teardown ([`reset_all`](Self::reset_all)): release the pool slot and
+    /// return the backing extent. The caller has already deactivated the span
+    /// and retired its pagemap entries (the load-bearing order: pagemap first,
+    /// extent last — P-Map-001).
+    fn release_span_slot(&self, span: &SpanDescriptor) -> Result<(), ExtentError> {
         let Some(idx) = self.spans.index_of(span as *const SpanDescriptor) else {
-            debug_assert!(false, "retire_span: span not from this allocator's pool");
-            return;
+            debug_assert!(
+                false,
+                "release_span_slot: span not from this allocator's pool"
+            );
+            return Err(ExtentError::Stale);
         };
         let slot = self.spans.slot_ptr(idx);
         // Capture the backing and release the slot under the lock; the
@@ -921,8 +1015,123 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             ext
         };
         self.span_lock.release();
-        // A failed extent free leaves the manager well-formed (W4-5).
-        let _ = self.span_extents.free(ext);
+        self.span_extents.free(ext)
+    }
+
+    // -- arena lifecycle teardown (plan 06 W9-4c/W9-6, §22.5/§36.13) -----------
+
+    /// Discard **every** outstanding allocation of this engine — the arena
+    /// reset/destroy teardown (§22.5/§36.13). Live spans are force-deactivated
+    /// (central lists drained, pagemap entries retired, extents returned per
+    /// the retain policy) and live medium/large allocations freed wholesale.
+    /// Afterwards the engine is structurally valid and empty: `live_bytes == 0`,
+    /// the quota's `used` is exactly zero (the Lean `arenaReset` postcondition —
+    /// every slot relabelled to a non-live owner ⇒ `arenaLiveBytes = 0`,
+    /// `ArenaQuotaExact` ⇒ `used = 0`), and stale pointers classify as
+    /// foreign/released and are rejected (§36.13 "reject stale frees").
+    ///
+    /// Returns a [`ResetReport`]; `backing_failures > 0` means some extent
+    /// could not be returned to the backend (the manager stays well-formed,
+    /// W4-5) — the arena layer maps that to `ERROR_QUARANTINED` (W9-6e).
+    ///
+    /// # Safety
+    ///
+    /// The engine must be **quiescent**: no concurrent operation on this
+    /// allocator for the whole call (the arena layer's gate guarantees it —
+    /// state left `Active` and the in-flight rendezvous drained). The caller
+    /// accepts that every outstanding pointer into this engine becomes invalid
+    /// (§22.5's documented contract).
+    ///
+    /// SPEC-transition: arena reset (§22.5) / arena destroy drain (§36.13)
+    pub unsafe fn reset_all(&self) -> ResetReport {
+        let mut report = ResetReport::default();
+
+        // 1. Discard every live span. Quiescence makes the pool walk stable: a
+        //    slot is live iff its descriptor is `Active` (free-stack slots were
+        //    set `Released` by their deactivation; never-used slots lie beyond
+        //    `high_water`).
+        self.span_lock.acquire();
+        // SAFETY: span lock held ⇒ exclusive pool head-state access.
+        let high_water = unsafe { (*self.spans.inner.get()).high_water };
+        self.span_lock.release();
+        for idx in 0..high_water {
+            let slot = self.spans.slot_ptr(idx);
+            // SAFETY: `idx < high_water` ⇒ the slot's descriptor was initialized
+            // (SpanDescriptor::new or recycle); descriptors live in never-freed
+            // metadata, and quiescence keeps the slot stable for this walk.
+            let span = unsafe { &(*slot).desc };
+            if span.state() != crate::span::SpanState::Active {
+                continue;
+            }
+            let usable = size_class::usable_size(span.size_class());
+            let (live, _central_free) = self.central.force_deactivate_span(span, self.pagemap);
+            self.pagemap.retire_span(span);
+            // Account the discarded live objects as freed, keeping the §8.6
+            // identity exact: post-reset `live = allocated - freed = 0`.
+            let bytes = (live as u64) * (usable as u64);
+            self.freed_bytes.fetch_add(bytes, Ordering::Relaxed);
+            report.spans_discarded += 1;
+            report.objects_discarded += live as u64;
+            report.bytes_discarded += bytes;
+            if self.release_span_slot(span).is_err() {
+                report.backing_failures += 1;
+            }
+        }
+
+        // 2. Discard every live medium/large allocation.
+        // SAFETY: quiescence (this method's own contract) and the §22.5
+        // pointer-invalidation contract are exactly `free_all`'s requirements.
+        let (larges, large_bytes) = unsafe { self.large.free_all() };
+        self.freed_bytes
+            .fetch_add(large_bytes as u64, Ordering::Relaxed);
+        report.larges_discarded = larges as u64;
+        report.bytes_discarded += large_bytes as u64;
+
+        // 3. Quota: every live byte is gone, so `used` resets to exactly zero
+        //    (wholesale — the per-object uncharges were deliberately skipped
+        //    above; doing both would double-credit).
+        if let Some(q) = self.quota {
+            q.reset_used();
+        }
+        report
+    }
+
+    /// **Destroy step W9-6c (§36.13 "unmap client VSpace windows"):** decommit
+    /// both backing regions through the provider and seal the extent managers
+    /// (further allocation refused). Requires [`reset_all`](Self::reset_all)
+    /// first (no extent may be `Active`). Idempotent, so a quarantined destroy
+    /// re-runs it safely (W9-6e).
+    pub fn unmap_backing(&self) -> Result<(), ExtentError> {
+        self.span_extents.unmap_all()?;
+        self.large.unmap_all()
+    }
+
+    /// **Destroy step W9-6c (§36.13 "scrub dirty pages"):** forcibly purge both
+    /// regions' contents so no bytes survive into a different information-flow
+    /// label (§36.12). The *caller* decides whether the label policy requires
+    /// it (skippable only when the reuse label equals the arena's, W9-6c) and
+    /// records the decision. Idempotent.
+    pub fn scrub_backing(&self) -> Result<(), ExtentError> {
+        self.span_extents.scrub_all()?;
+        self.large.scrub_all()
+    }
+
+    /// **Destroy step W9-6d (§36.13 "revoke derived frame and mapping
+    /// capabilities"):** revoke every capability derived from both regions'
+    /// backing — a no-op on POSIX (single ambient authority), real on seLe4n
+    /// (plan 09). Must complete before the backing is recycled (§36.6); the
+    /// recycle itself is the providers' `release` when the engine drops.
+    /// Idempotent.
+    pub fn revoke_backing(&self) -> Result<(), ExtentError> {
+        self.span_extents.revoke_all()?;
+        self.large.revoke_all()
+    }
+
+    /// Both backing regions as half-open address ranges `[(span), (large)]` —
+    /// the §22.7 isolation oracle's input (distinct arenas' regions must be
+    /// pairwise disjoint; checked by the arena layer's `check_invariants`).
+    pub fn backing_regions(&self) -> [(usize, usize); 2] {
+        [self.span_extents.region_range(), self.large.region_range()]
     }
 
     // -- introspection --------------------------------------------------------
@@ -1883,5 +2092,109 @@ mod tests {
             predicted_usable_size(usize::MAX - 5, 16, RequestFlags::NONE),
             None
         );
+    }
+
+    /// W9-4c: `reset_all` discards every outstanding allocation — live small
+    /// objects across several classes, mediums, larges, with some already
+    /// freed — leaving an empty, well-formed, *reusable* engine whose §8.6
+    /// identity reads zero live bytes, and whose pagemap rejects every stale
+    /// pointer.
+    #[test]
+    fn reset_all_discards_everything_and_engine_stays_usable() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let mut live = Vec::new();
+        for size in [
+            8usize,
+            100,
+            1024,
+            4096,
+            SMALL_MAX,
+            SMALL_MAX + 1,
+            HUGE_THRESHOLD,
+        ] {
+            for _ in 0..3 {
+                let p = a.allocate(size, 16, RequestFlags::NONE);
+                assert!(!p.is_null());
+                live.push(p);
+            }
+        }
+        // Free a few so the teardown sees mixed span occupancy.
+        for _ in 0..4 {
+            let p = live.pop().unwrap();
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        let before = a.stats();
+        assert!(before.live_bytes > 0);
+        assert!(a.live_span_count() > 0 && a.live_large_count() > 0);
+
+        // SAFETY: the test is single-threaded (quiescent), and every pointer
+        // in `live` is deliberately abandoned to the reset (§22.5 contract).
+        let report = unsafe { a.reset_all() };
+        assert_eq!(report.backing_failures, 0);
+        assert!(report.spans_discarded > 0);
+        assert!(report.larges_discarded > 0);
+        assert!(report.objects_discarded > 0);
+
+        let after = a.stats();
+        assert_eq!(after.live_bytes, 0, "§22.5: no live objects in accounting");
+        assert_eq!(a.live_span_count(), 0);
+        assert_eq!(a.live_large_count(), 0);
+        assert_eq!(after.central_free_bytes, 0, "central lists drained");
+        assert!(a.check_invariants(), "W4-5 invariants green post-reset");
+
+        // Every outstanding pointer is invalid and rejected, never acted on.
+        for &p in &live {
+            assert!(!a.owns(p));
+            assert_eq!(a.usable_size(p), None);
+            assert!(matches!(tfree(&a, p), FreeOutcome::Invalid(_)));
+        }
+
+        // The engine remains fully usable: a fresh allocate/free cycle works
+        // and the conservation identities still hold.
+        let p = a.allocate(100, 16, RequestFlags::NONE);
+        assert!(!p.is_null());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W9-6c: `unmap_backing` requires an empty engine (no Active extents) and
+    /// seals both managers — allocation afterwards fails cleanly instead of
+    /// handing out memory whose backing is mid-revocation; the scrub and
+    /// revoke steps stay idempotent for the W9-6e retry.
+    #[test]
+    fn unmap_backing_requires_empty_then_seals() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.allocate(64, 16, RequestFlags::NONE);
+        assert!(!p.is_null());
+        // A live span means an Active extent: the unmap step must refuse.
+        assert!(
+            a.unmap_backing().is_err(),
+            "unmap with live extents refused"
+        );
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+
+        // SAFETY: single-threaded; no outstanding pointers remain.
+        let report = unsafe { a.reset_all() };
+        assert_eq!(report.backing_failures, 0);
+
+        a.unmap_backing().expect("unmap of an empty engine");
+        a.scrub_backing().expect("scrub after unmap");
+        a.revoke_backing().expect("revoke after scrub");
+        // Idempotent: a quarantined destroy re-runs the protocol (W9-6e).
+        a.unmap_backing().expect("unmap is idempotent");
+        a.scrub_backing().expect("scrub is idempotent");
+        a.revoke_backing().expect("revoke is idempotent");
+
+        // Sealed: the engine refuses new allocations of every family.
+        assert!(a.allocate(64, 16, RequestFlags::NONE).is_null());
+        assert!(a.allocate(HUGE_THRESHOLD, 16, RequestFlags::NONE).is_null());
+        assert!(a.check_invariants());
     }
 }

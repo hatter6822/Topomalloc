@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Front-end caches (M2) and the remaining M1 pieces land per the plan.
+**Current Status:** M0 closed; M1 (central-path allocator) under way; W9 capability-backed arenas landed. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Explicit arenas are policy **and** authority domains (rights/label/quota, attenuation-only delegation, the §22.3/§36.13 lifecycle with the ordered revocation protocol), routed per-arena through the `ArenaSet` registry and exposed via `topo_arena_*`/`topo_mallocx_arena`. Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Essential Build Commands
 
@@ -148,20 +148,21 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 
 ## Current Development Status
 
-**Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next.
+**Milestone:** M0 closed; M1 (central-path allocator) under way; **W9 capability-backed arenas landed** (plan 06). M2 (front-end caches) is next.
 
 **Test counts:**
-- Rust: ~435 tests across 12 crates (`cargo test --workspace`)
-- Lean: 79 build jobs including proof-checking every module (`lake build`) + 5 executable gates (`lake exe check`)
+- Rust: ~474 tests across 12 crates (`cargo test --workspace`; more under `--features sele4n-sim`)
+- Lean: 81 build jobs including proof-checking every module (`lake build`) + 6 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 4 targets (`fuzz/fuzz_targets/`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
-- Trace oracle OK (§33.7 replay)
+- Trace oracle OK (§33.7 replay, incl. the W9 `ARENA_RESET`/`ARENA_DESTROY` events)
 - Pagemap differential OK (W3-3d)
 - Provider state machine OK (§36.6, W4-1)
 - Extent state machine OK (§20.1, W4-2d)
+- Arena lifecycle OK (§22.3/§36.13, W9-2 — pins Rust `ArenaState`)
 
 ## Workspace & Crate Structure
 
@@ -191,6 +192,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Module | Charter |
 |--------|---------|
 | `TopoMalloc/Types.lean` | `Range` geometry, `Owner` (all SPEC owners), IDs |
+| `TopoMalloc/ArenaLifecycle.lean` | §22.3/§36.13 arena lifecycle state machine (pinned 1:1 to Rust `ArenaState`, W9-2) |
 | `TopoMalloc/SizeClass.lean` | `SizeClassRow` predicate; `Params`/`buildTable`; §9.4/§9.5 proofs |
 | `TopoMalloc/Generated/SizeClasses.lean` | **generated** tuned table (72 classes to 32 KiB) — single source (DD-1) |
 | `TopoMalloc/State.lean` | abstract `State`, ownership map, `setOwner` frame primitive |
@@ -201,7 +203,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | `TopoMalloc/Boundaries.lean` | trust-boundary scaffolding for the RSEQ hardware boundary |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family (SizeClass, Malloc, Free, Realloc, Cache, Central, Span, Pagemap, PagemapExec, Release, Extent, Arena, Allocate, Demo) |
 | `TopoMalloc/Exec.lean` | executable model + §33.7 text-grammar trace replay |
-| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent differentials |
+| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent/arena-lifecycle differentials |
 
 ### seLe4n bridge (GPL-3.0-or-later)
 

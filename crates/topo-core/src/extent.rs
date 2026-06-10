@@ -1107,6 +1107,32 @@ impl ExtentMap {
         self.put(id.0, s);
     }
 
+    /// Mark **every** backed free extent decommitted (`Dirty`/`Muzzy` →
+    /// [`Released`](ExtentState::Released)) — the bookkeeping half of the arena
+    /// teardown's whole-region unmap (§36.13, plan 06 W9-6c). `Reserved` and
+    /// `Released` extents are already unbacked and are left as they are.
+    /// Returns `false` (mutating nothing) if any [`Active`](ExtentState::Active)
+    /// extent exists: unmapping a range that may hold a live object is the
+    /// M-004 violation this precondition exists to exclude.
+    fn decommit_all_free(&mut self) -> bool {
+        if self.state_bytes().active != 0 {
+            return false;
+        }
+        let mut i = self.addr_head;
+        while i != NIL {
+            let s = self.get(i);
+            let state = ExtentState::from_u8(s.state);
+            if state.is_backed() {
+                // Active is excluded above, so this is Dirty or Muzzy — both have
+                // the legal §20.1 edge to Released.
+                self.mark_decommitted(ExtentId(i), ExtentState::Released);
+            }
+            i = s.addr_next;
+        }
+        debug_assert!(self.check_invariants());
+        true
+    }
+
     // --- invariants (W4-5 oracle) --------------------------------------------
 
     /// Whether the back-end is well-formed: the address list tiles the region
@@ -1348,6 +1374,11 @@ pub struct ExtentManager<P: TopoBackingProvider> {
     retain: RetainPolicy,
     lock: BackendLock,
     map: UnsafeCell<ExtentMap>,
+    /// Set by [`unmap_all`](Self::unmap_all) (the arena-destroy teardown,
+    /// §36.13): a sealed manager refuses new allocations and recommits, so a
+    /// use-after-teardown bug fails cleanly instead of handing out memory whose
+    /// backing is mid-revocation. One-way; never cleared.
+    sealed: AtomicBool,
 }
 
 // SAFETY: every access to `map` goes through `lock` (the §27.2 backend lock),
@@ -1415,6 +1446,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
                     retain: RetainPolicy::from_profile(),
                     lock: BackendLock::new(),
                     map: UnsafeCell::new(map),
+                    sealed: AtomicBool::new(false),
                 })
             }
             None => {
@@ -1529,6 +1561,9 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         if size == 0 || !align.is_power_of_two() {
             return Err(ExtentError::InvalidRequest);
         }
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(ExtentError::InvalidRequest); // mid/post-teardown (§36.13)
+        }
         let needed = align_up(size, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
         let g = self.lock();
         let id = g
@@ -1637,6 +1672,9 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     ///
     /// SPEC-transition: `extent_commit` (provider `* -> AllocatorCommitted`, §36.6)
     pub fn commit(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(ExtentError::InvalidRequest); // mid/post-teardown (§36.13)
+        }
         let g = self.lock();
         let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
         let uncommitted = e.len - e.committed_len;
@@ -1649,6 +1687,96 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         }
         debug_assert!(g.map.check_invariants());
         Ok(())
+    }
+
+    // --- arena-teardown surface (§36.13, plan 06 W9-6c/d) ---------------------
+    //
+    // The three whole-region steps the arena destroy protocol drives, in the
+    // §36.13 order **unmap → scrub-if-needed → revoke** (the caller owns the
+    // ordering; each step here is independently idempotent so a quarantined
+    // destroy can re-run the whole sequence, W9-6e). All three require that no
+    // extent is `Active` — the caller has already discarded every span/large
+    // through the normal free path — because unmapping/purging a range that may
+    // hold a live object is exactly the M-004 violation the state machine
+    // exists to exclude. The final *recycle* step (§36.6 `Revoked →
+    // RecyclableUntyped`) is the provider `release` of the whole reservation,
+    // performed by this manager's `Drop` when the arena slot drops its engine.
+
+    /// The reserved region as a half-open address range (for the §22.7
+    /// arena-isolation oracle: distinct arenas' regions must be disjoint).
+    pub fn region_range(&self) -> (usize, usize) {
+        self.region.addr_range()
+    }
+
+    /// Whether this manager has been sealed by [`unmap_all`](Self::unmap_all).
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::Acquire)
+    }
+
+    /// **Teardown step: unmap (§36.13 "unmap client VSpace windows", W9-6c).**
+    /// Decommit the whole region's backing through the provider and mark every
+    /// backed free extent [`Released`](ExtentState::Released). Fails with
+    /// [`ExtentError::NotFree`] — mutating nothing — if any extent is still
+    /// [`Active`](ExtentState::Active). **Seals** the manager first (one-way):
+    /// from here on `alloc`/`commit` fail cleanly, so a racing use-after-teardown
+    /// bug cannot hand out memory whose backing is mid-revocation. Idempotent.
+    ///
+    /// SPEC-transition: provider `Allocator* -> Unmapped` (§36.6), whole region
+    pub fn unmap_all(&self) -> Result<(), ExtentError> {
+        let g = self.lock();
+        if g.map.state_bytes().active != 0 {
+            return Err(ExtentError::NotFree); // M-004: live extents remain
+        }
+        // Seal before the provider call: a failure below leaves the manager
+        // sealed (conservative — retry by re-running the protocol, W9-6e).
+        self.sealed.store(true, Ordering::Release);
+        self.provider
+            .decommit(self.region, 0, self.region.len)
+            .map_err(ExtentError::Backend)?;
+        let ok = g.map.decommit_all_free();
+        debug_assert!(ok, "active extents appeared under the backend lock");
+        Ok(())
+    }
+
+    /// **Teardown step: scrub (§36.13 "scrub dirty pages if cross-label reuse is
+    /// possible", W9-6c → plan 08 W18-6).** Forcibly purge the whole region's
+    /// contents through the provider, so no old bytes survive into a different
+    /// information-flow label (§36.12). Fails with [`ExtentError::NotFree`] if
+    /// any extent is still [`Active`](ExtentState::Active). Idempotent; the
+    /// caller records whether the scrub ran or was label-skipped (W9-6c).
+    ///
+    /// SPEC-transition: provider scrub `AllocatorDirty -> AllocatorMuzzyOrScrubbed` (§36.6/§36.7), whole region
+    pub fn scrub_all(&self) -> Result<(), ExtentError> {
+        let g = self.lock();
+        if g.map.state_bytes().active != 0 {
+            return Err(ExtentError::NotFree);
+        }
+        // `g` stays held across the provider call (the `free`/`decommit`
+        // pattern), so no allocation can be carved between the check and the purge.
+        self.provider
+            .purge_forced(self.region, 0, self.region.len)
+            .map_err(ExtentError::Backend)
+    }
+
+    /// **Teardown step: revoke (§36.13 "revoke derived frame and mapping
+    /// capabilities", W9-6d).** Revoke every capability derived from this
+    /// region's backing through the provider — a no-op on POSIX (single ambient
+    /// authority), real revocation on seLe4n (plan 09). Must run **before** the
+    /// backing is recycled to a pool that can serve another authority domain
+    /// (§36.6); the recycle itself is the provider `release` in this manager's
+    /// `Drop`. Fails with [`ExtentError::NotFree`] if any extent is still
+    /// [`Active`](ExtentState::Active). Idempotent.
+    ///
+    /// SPEC-transition: provider `Unmapped -> Revoked` (§36.6), whole region
+    pub fn revoke_all(&self) -> Result<(), ExtentError> {
+        let g = self.lock();
+        if g.map.state_bytes().active != 0 {
+            return Err(ExtentError::NotFree);
+        }
+        // `g` stays held across the provider call; see `scrub_all`.
+        self.provider
+            .revoke_descendants(self.arena, self.region)
+            .map_err(ExtentError::Backend)
     }
 
     /// Decommit a **free** extent's backing (§18.3, M-004): the extent becomes

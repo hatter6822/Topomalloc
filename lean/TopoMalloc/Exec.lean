@@ -24,9 +24,11 @@ namespace TopoMalloc
 /-- One event of the §33.7 trace grammar (only the fields the live-set oracle reads
 are retained; the rest are summarised). -/
 inductive TraceEvent where
-  /-- `ALLOC … -> ptr usable_size …` (`ptr = 0` means the allocation failed). The
-  `size` is the reported usable size — the oracle checks the `[ptr, ptr+size)` range. -/
-  | alloc (ptr size : Nat)
+  /-- `ALLOC … arena … -> ptr usable_size …` (`ptr = 0` means the allocation failed).
+  The `size` is the reported usable size — the oracle checks the `[ptr, ptr+size)`
+  range; the `arena` attributes the object so the W9 lifecycle events can discard
+  exactly one arena's live set. -/
+  | alloc (ptr size arena : Nat)
   /-- `FREE ptr …` (`ptr = 0` is `free(NULL)`, a no-op). -/
   | free (ptr : Nat)
   /-- `REFILL cpu sc count source`. -/
@@ -37,6 +39,12 @@ inductive TraceEvent where
   | spanAlloc (arena sc span pages : Nat) (hugepage : Option Nat)
   /-- `RELEASE base:len state`. -/
   | release (base len : Nat)
+  /-- `ARENA_RESET arena` (§22.5, plan 06 W9): every live object of `arena` is
+  discarded wholesale — the trace face of the `arenaReset` transition. -/
+  | arenaReset (arena : Nat)
+  /-- `ARENA_DESTROY arena` (§22.6/§36.13, W9): the live-set effect equals a reset
+  (descriptor/backing removal is below this oracle's abstraction). -/
+  | arenaDestroy (arena : Nat)
   deriving Repr, DecidableEq
 
 /-- A well-formedness violation detected during replay. -/
@@ -62,45 +70,61 @@ def rangeDisjointB (a b : Nat × Nat) : Bool := Nat.ble (a.1 + a.2) b.1 || Nat.b
 theorem rangeDisjointB_iff {a b : Nat × Nat} : rangeDisjointB a b = true ↔ rangeDisjoint a b := by
   simp [rangeDisjointB, rangeDisjoint, Nat.ble_eq, Bool.or_eq_true]
 
-/-- The executable model: the currently-live objects, each as a `(base, len)` range. -/
+/-- One live object: its `(base, len)` range plus the arena it belongs to (the W9
+attribution the lifecycle events discard by). -/
+abbrev LiveEntry := (Nat × Nat) × Nat
+
+/-- Disjointness of two live entries is disjointness of their ranges (the arena
+attribution carries no geometry). -/
+def entryDisjoint (a b : LiveEntry) : Prop := rangeDisjoint a.1 b.1
+
+/-- The executable model: the currently-live objects, each as a `(range, arena)`. -/
 structure ExecModel where
-  live : List (Nat × Nat)
+  live : List LiveEntry
   deriving Repr, DecidableEq
 
 /-- The empty model (no live objects). -/
 def ExecModel.empty : ExecModel := ⟨[]⟩
 
-/-- Apply one trace event, checking the cardinal invariants — now at **range
+/-- Apply one trace event, checking the cardinal invariants — at **range
 granularity**: an allocation whose `(ptr, usable_size)` range overlaps any live object is
-rejected (§8.3, two live objects may not overlap), and a free must name a live base. -/
+rejected (§8.3, two live objects may not overlap), and a free must name a live base. The
+W9 lifecycle events (`ARENA_RESET`/`ARENA_DESTROY`) discard every live object of the
+named arena wholesale — the live-set face of the `arenaReset`/`arenaDestroy` transitions
+(every slot of the target arena leaves `live`; every other arena's slots are untouched,
+the `arena_reset_invalidates_only_target_arena` shape). -/
 def ExecModel.apply (m : ExecModel) : TraceEvent → Except ExecError ExecModel
-  | .alloc ptr size =>
+  | .alloc ptr size arena =>
       if ptr = 0 then .ok m
-      else if m.live.all (fun q => rangeDisjointB (ptr, size) q) then .ok ⟨(ptr, size) :: m.live⟩
+      else if m.live.all (fun q => rangeDisjointB (ptr, size) q.1) then
+        .ok ⟨((ptr, size), arena) :: m.live⟩
       else .error (.overlap ptr)
   | .free ptr =>
       if ptr = 0 then .ok m
-      else if m.live.any (fun q => decide (q.1 = ptr)) then
-        .ok ⟨m.live.filter (fun q => decide (q.1 ≠ ptr))⟩
+      else if m.live.any (fun q => decide (q.1.1 = ptr)) then
+        .ok ⟨m.live.filter (fun q => decide (q.1.1 ≠ ptr))⟩
       else .error (.freeOfUnknown ptr)
+  | .arenaReset arena => .ok ⟨m.live.filter (fun q => decide (q.2 ≠ arena))⟩
+  | .arenaDestroy arena => .ok ⟨m.live.filter (fun q => decide (q.2 ≠ arena))⟩
   | _ => .ok m
 
 /-- The boundary invariant the oracle checks: live objects are pairwise range-disjoint. -/
-def ExecModel.WellFormed (m : ExecModel) : Prop := m.live.Pairwise rangeDisjoint
+def ExecModel.WellFormed (m : ExecModel) : Prop := m.live.Pairwise entryDisjoint
 
 /-- A successful step preserves the boundary invariant (live range-disjointness). -/
 theorem ExecModel.apply_preserves_disjoint {m m' : ExecModel} {e : TraceEvent}
     (hwf : m.WellFormed) (h : m.apply e = .ok m') : m'.WellFormed := by
   unfold ExecModel.WellFormed at *
   cases e with
-  | alloc ptr size =>
+  | alloc ptr size arena =>
     simp only [ExecModel.apply] at h
     by_cases hz : ptr = 0
     · rw [if_pos hz] at h; injection h with h; subst h; exact hwf
     · rw [if_neg hz] at h
-      by_cases hd : m.live.all (fun q => rangeDisjointB (ptr, size) q)
+      by_cases hd : m.live.all (fun q => rangeDisjointB (ptr, size) q.1)
       · rw [if_pos hd] at h; injection h with h; subst h
         refine List.pairwise_cons.mpr ⟨fun q hq => ?_, hwf⟩
+        unfold entryDisjoint
         rw [← rangeDisjointB_iff]; exact (List.all_eq_true.mp hd) q hq
       · rw [if_neg hd] at h; exact absurd h (by simp)
   | free ptr =>
@@ -108,10 +132,16 @@ theorem ExecModel.apply_preserves_disjoint {m m' : ExecModel} {e : TraceEvent}
     by_cases hz : ptr = 0
     · rw [if_pos hz] at h; injection h with h; subst h; exact hwf
     · rw [if_neg hz] at h
-      by_cases hm : m.live.any (fun q => decide (q.1 = ptr))
+      by_cases hm : m.live.any (fun q => decide (q.1.1 = ptr))
       · rw [if_pos hm] at h; injection h with h; subst h
         exact hwf.sublist List.filter_sublist
       · rw [if_neg hm] at h; exact absurd h (by simp)
+  | arenaReset arena =>
+    simp only [ExecModel.apply] at h; injection h with h; subst h
+    exact hwf.sublist List.filter_sublist
+  | arenaDestroy arena =>
+    simp only [ExecModel.apply] at h; injection h with h; subst h
+    exact hwf.sublist List.filter_sublist
   | refill _ _ _ => simp only [ExecModel.apply] at h; injection h with h; subst h; exact hwf
   | flush _ _ _ => simp only [ExecModel.apply] at h; injection h with h; subst h; exact hwf
   | spanAlloc _ _ _ _ _ => simp only [ExecModel.apply] at h; injection h with h; subst h; exact hwf
@@ -159,18 +189,25 @@ def parseTraceLine (line : String) : LineParse :=
     else match first, rest with
       -- ALLOC request_id size align arena flags -> ptr usable_size sc span
       | "ALLOC", _ =>
-        match rest.dropWhile (· ≠ "->") with
-        | _ :: ptr :: usize :: _ =>
-          match parseAddr ptr, parseAddr usize with
-          | some p, some sz => .event (.alloc p sz)
-          | _, _ => .malformed
-        | _ => .malformed
+        match rest, rest.dropWhile (· ≠ "->") with
+        | _ :: _ :: _ :: arena :: _, _ :: ptr :: usize :: _ =>
+          match parseAddr ptr, parseAddr usize, parseAddr arena with
+          | some p, some sz, some a => .event (.alloc p sz a)
+          | _, _, _ => .malformed
+        | _, _ => .malformed
       | "FREE", ptr :: _ => match parseAddr ptr with | some p => .event (.free p) | none => .malformed
       | "FREE", [] => .malformed
       | "REFILL", _ => .event (.refill 0 0 0)
       | "FLUSH", _ => .event (.flush 0 0 0)
       | "SPAN_ALLOC", _ => .event (.spanAlloc 0 0 0 0 none)
       | "RELEASE", _ => .event (.release 0 0)
+      -- ARENA_RESET arena / ARENA_DESTROY arena (§22.5/§22.6, W9)
+      | "ARENA_RESET", arena :: _ =>
+        match parseAddr arena with | some a => .event (.arenaReset a) | none => .malformed
+      | "ARENA_RESET", [] => .malformed
+      | "ARENA_DESTROY", arena :: _ =>
+        match parseAddr arena with | some a => .event (.arenaDestroy a) | none => .malformed
+      | "ARENA_DESTROY", [] => .malformed
       | _, _ => .malformed
 
 /-- Replay a whole *text* trace (blank lines and `#` comments skipped), parsing each line
@@ -223,19 +260,28 @@ theorem replay_disjoint {events : List TraceEvent} {m : ExecModel}
 /- W1-10 acceptance: replay a recorded trace, and flag an injected violation. -/
 
 /-- A well-formed recorded trace (two disjoint allocations, freed in turn, plus
-middle/back-end events that do not disturb the live set). -/
+middle/back-end events that do not disturb the live set, and a W9 arena reset that
+discards exactly the explicit arena's surviving object). -/
 def sampleGoodTrace : List TraceEvent :=
-  [.alloc 0x1000 16, .alloc 0x2000 16, .refill 3 1 32, .free 0x1000, .release 0x3000 4096, .free 0x2000]
+  [.alloc 0x1000 16 0, .alloc 0x2000 16 0, .refill 3 1 32, .free 0x1000,
+   .release 0x3000 4096, .free 0x2000,
+   .alloc 0x5000 32 7, .alloc 0x6000 32 0, .arenaReset 7, .free 0x6000]
 
 /-- The same trace with an injected double-free of `0x1000`. -/
 def sampleBadTrace : List TraceEvent :=
-  [.alloc 0x1000 16, .free 0x1000, .free 0x1000]
+  [.alloc 0x1000 16 0, .free 0x1000, .free 0x1000]
 
 /-- A trace where the second allocation's range *overlaps* the first ([0x1000,0x1020) vs
 [0x1010,0x1020)) — distinct base addresses, yet a live-disjointness violation that the
 range check (not an address check) catches. -/
 def sampleOverlapTrace : List TraceEvent :=
-  [.alloc 0x1000 32, .alloc 0x1010 16]
+  [.alloc 0x1000 32 0, .alloc 0x1010 16 0]
+
+/-- A free of an object the preceding `ARENA_RESET` already discarded: a **stale free**
+(§22.5/§36.13 "reject stale frees") — the oracle flags it, mirroring the runtime's
+rejection. -/
+def sampleStaleFreeTrace : List TraceEvent :=
+  [.alloc 0x1000 16 4, .arenaReset 4, .free 0x1000]
 
 example : replay sampleGoodTrace = .ok ⟨[]⟩ := by rfl
 
@@ -245,15 +291,21 @@ example : replay sampleBadTrace = .error (3, .freeOfUnknown 0x1000) := by rfl
 /-- The overlapping allocation is flagged at line 2 — even though no two bases are equal. -/
 example : replay sampleOverlapTrace = .error (2, .overlap 0x1010) := by rfl
 
+/-- The stale free after an arena reset is flagged: the reset discarded the object. -/
+example : replay sampleStaleFreeTrace = .error (3, .freeOfUnknown 0x1000) := by rfl
+
 /-- A recorded trace in the **exact §33.7 text grammar** the Rust emitter (`topo_core::trace`)
-produces. `lake exe check` replays it through the Lean oracle (the differential loop with the
-Rust host replayer). The text parsing is evaluated, not kernel-reduced. -/
+produces — including the W9 `ARENA_RESET`, whose wholesale discard the good trace relies on
+to end empty. `lake exe check` replays it through the Lean oracle (the differential loop
+with the Rust host replayer). The text parsing is evaluated, not kernel-reduced. -/
 def sampleText : String :=
   "ALLOC 0 24 16 0 0 -> 0x1000 32 1 5\n\
    ALLOC 1 24 16 0 0 -> 0x2000 32 1 5\n\
    REFILL 3 1 32 central\n\
    FREE 0x1000 32 -> 1 5\n\
-   FREE 0x2000 32 -> 1 5\n"
+   FREE 0x2000 32 -> 1 5\n\
+   ALLOC 2 24 16 7 0 -> 0x5000 32 1 6\n\
+   ARENA_RESET 7\n"
 
 /-- The same text grammar with an injected double-free, for the negative replay check. -/
 def sampleTextBad : String :=

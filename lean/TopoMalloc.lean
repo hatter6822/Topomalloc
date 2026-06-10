@@ -4,6 +4,7 @@ Root module of the TopoMalloc formal model (plan 02). Importing it brings in the
 whole model:
 
 * the core types (§33.2) and the size-class model + §9.4/§9.5 proofs (W1-4);
+* the §22.3/§36.13 arena lifecycle state machine (`ArenaState`, plan 06 W9-2/W9-6);
 * the §20.1 extent physical-backing state machine (`ExtentState`, plan 04 W4-2d);
 * the abstract `State`, the fourteen-clause `WellFormed` predicate (§33.3, W1-3),
   the total transitions (§33.4 subjects, W1-5), and the RSEQ contract (§33.5, W1-7);
@@ -16,6 +17,7 @@ whole model:
   hardware/RSEQ, host/Rust, and progress refinements that are discharged elsewhere.
 -/
 import TopoMalloc.Types
+import TopoMalloc.ArenaLifecycle
 import TopoMalloc.ExtentState
 import TopoMalloc.SizeClass
 import TopoMalloc.Generated.SizeClasses
