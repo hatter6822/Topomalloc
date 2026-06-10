@@ -7,6 +7,7 @@ of Done, addendum 2).
 import TopoMalloc.Theorems.SizeClass
 import TopoMalloc.Theorems.Malloc
 import TopoMalloc.Theorems.Free
+import TopoMalloc.Theorems.Realloc
 import TopoMalloc.Theorems.Cache
 import TopoMalloc.Theorems.Central
 import TopoMalloc.Theorems.Span

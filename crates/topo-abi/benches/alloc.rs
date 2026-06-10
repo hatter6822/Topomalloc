@@ -5,10 +5,10 @@
 //! plan 08 W21-6). These exist so the harness is wired from M0.
 #![allow(missing_docs)] // criterion's generated harness fns have no public API
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use topo_abi::new_allocator_named;
-use topo_core::{classify, size_class, RequestFlags, MIN_ALIGN};
+use topo_abi::{topomalloc_free, topomalloc_malloc};
+use topo_core::{classify, size_class, RequestFlags};
 
 fn bench_size_class(c: &mut Criterion) {
     c.bench_function("size_class(64,16)", |b| {
@@ -35,19 +35,17 @@ fn bench_classify_flags(c: &mut Criterion) {
     });
 }
 
-fn bench_malloc(c: &mut Criterion) {
-    // The M0 skeleton leaks on free, so a single shared heap would be exhausted by
-    // a long run and we'd end up timing the OOM/null path. Measure each `malloc`
-    // against a freshly reserved local heap instead: the bump allocator's cost is
-    // independent of how full it is, so one allocation per fresh heap is
-    // representative and never starves. A reclaiming steady-state bench arrives
-    // with plan 08 W21-6.
-    c.bench_function("malloc(64) [fresh skeleton]", |b| {
-        b.iter_batched_ref(
-            || new_allocator_named("posix", 16 * 1024).expect("reserve skeleton heap"),
-            |a| black_box(a.malloc(black_box(64), MIN_ALIGN)),
-            BatchSize::NumIterations(256),
-        )
+fn bench_malloc_free(c: &mut Criterion) {
+    // The W8 engine reclaims on free, so the natural steady-state benchmark is
+    // a malloc/free round-trip against the process-wide allocator (the M1
+    // central path under its locks; the M2/M3 caches will drop this number).
+    c.bench_function("malloc(64)+free [central path]", |b| {
+        b.iter(|| {
+            let p = topomalloc_malloc(black_box(64));
+            // SAFETY: `p` was just returned by `topomalloc_malloc` and is
+            // owned by this iteration; freed exactly once.
+            unsafe { topomalloc_free(black_box(p)) };
+        })
     });
 }
 
@@ -56,6 +54,6 @@ criterion_group!(
     bench_size_class,
     bench_classify,
     bench_classify_flags,
-    bench_malloc
+    bench_malloc_free
 );
 criterion_main!(benches);

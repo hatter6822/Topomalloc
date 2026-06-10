@@ -228,6 +228,16 @@ def malloc (s : State) (b : BlockId) : State := s.setOwner b Owner.live
 SPEC-transition: object `Live → FreeInLocalCache`/`CentralFree` (§7.2). -/
 def free (s : State) (b : BlockId) (o : Owner) : State := s.setOwner b o
 
+/-- `reallocMove`: the move path of `realloc` (§25.4, plan 06 W8-1a/W15-2) —
+allocate the new slot **first**, then release the original to a free owner.
+The order *is* the definition: there is no intermediate state in which the
+original is gone but the new object does not yet exist, which is what makes a
+failed realloc trivially preserve the original (the failure path performs no
+transition at all — the state is still `s`).
+SPEC-transition: realloc move = `free ∘ malloc` composition (§25.4). -/
+def reallocMove (s : State) (bNew bOld : BlockId) (o : Owner) : State :=
+  free (malloc s bNew) bOld o
+
 /-- `cache_refill`: pull a batch from the central/transfer list into the per-CPU
 cache. SPEC-transition: object `CentralFree → FreeInLocalCache` (§11.5/§14.3). -/
 def cacheRefill (s : State) (batch : List BlockId) (cpu : CpuId) (sc : SizeClassId) : State :=

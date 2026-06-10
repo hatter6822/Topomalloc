@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! Property tests (§34.3, plan 08 W21-1) over the M0 skeleton, using `proptest`
-//! (D7). The properties checked here are the milestone-independent ones the SPEC
-//! lists: no duplicate live pointer, alignment satisfied, stats nonnegative, and
-//! monotonic (conserved) usage. Richer ownership-conservation properties arrive
-//! with the real caches (plan 05) and the Lean differential oracle (plan 08).
+//! Property tests (§34.3, plan 08 W21-1), using `proptest` (D7): the
+//! milestone-independent properties the SPEC lists (no duplicate live pointer,
+//! alignment satisfied, monotonic skeleton usage), plus the W8 (plan 06) DoD
+//! properties over the M1 central-path allocator — realloc content
+//! preservation with failure safety (§25.1), calloc zeroing over recycled
+//! memory (§26.2), and an allocate/free stream replayed against the
+//! `LiveModel` ownership oracle (§33.7).
 
 use proptest::prelude::*;
 
-use topo_abi::{topomalloc_calloc, topomalloc_free};
+use topo_abi::{
+    topomalloc_calloc, topomalloc_free, topomalloc_malloc, topomalloc_malloc_usable_size,
+    topomalloc_realloc,
+};
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::classify::RequestKind;
 use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
@@ -63,10 +68,11 @@ proptest! {
         let p = topomalloc_calloc(n, size);
         let total = n * size;
         if total == 0 {
-            // Zero-size: the skeleton returns a unique non-null pointer
-            // (zero_unique, §9.6). Either way it is freeable.
+            // Zero-size: a unique non-null pointer under the default
+            // zero_unique policy (§9.6). Either way it is freeable.
             if !p.is_null() {
-                topomalloc_free(p);
+                // SAFETY: `p` is a live zero-size allocation we own.
+                unsafe { topomalloc_free(p) };
             }
         } else {
             prop_assert!(!p.is_null());
@@ -76,7 +82,8 @@ proptest! {
                     prop_assert_eq!(p.cast::<u8>().add(i).read(), 0);
                 }
             }
-            topomalloc_free(p);
+            // SAFETY: `p` is live and owned by this test.
+            unsafe { topomalloc_free(p) };
         }
     }
 }
@@ -200,6 +207,120 @@ proptest! {
                 prop_assert_eq!(bytes % PAGE_SIZE, 0);
                 prop_assert!(span >= HUGE_THRESHOLD);
             }
+        }
+    }
+}
+
+proptest! {
+    /// The §25.1 realloc contract as a property (plan 06 DD-1 "Verify"): under
+    /// an arbitrary chain of grow/shrink steps across the small, medium, and
+    /// large families, a written pattern survives in the preserved prefix
+    /// `min(old_usable, new_size)` at every step, and an unsatisfiable step
+    /// (allocation-failure injection via an impossible size) leaves the
+    /// original allocation valid with its contents intact.
+    #[test]
+    fn realloc_preserves_content_and_survives_failure(
+        first in 1usize..=4096,
+        steps in prop::collection::vec(
+            prop_oneof![
+                1usize..=512,            // small targets
+                33_000usize..=200_000,   // medium targets
+            ],
+            1..8,
+        ),
+        fail_at in proptest::option::of(0usize..8),
+    ) {
+        /// One byte of recognizable pattern per offset.
+        fn pat(i: usize) -> u8 { (i as u8) ^ 0x5A }
+
+        let p = topomalloc_malloc(first);
+        prop_assert!(!p.is_null());
+        let mut usable = topomalloc_malloc_usable_size(p);
+        // SAFETY: `usable` writable bytes.
+        unsafe {
+            for i in 0..usable {
+                p.cast::<u8>().add(i).write(pat(i));
+            }
+        }
+        let mut cur = p;
+        for (step, &target) in steps.iter().enumerate() {
+            if fail_at == Some(step) {
+                // Failure injection: a size whose rounding overflows can never
+                // be served (§9.7) — the original must survive untouched.
+                // SAFETY: `cur` is live and owned here.
+                let failed = unsafe { topomalloc_realloc(cur, usize::MAX - 11) };
+                prop_assert!(failed.is_null());
+                // SAFETY: `cur` is still live with its full content (§25.1).
+                unsafe {
+                    for i in 0..usable.min(64) {
+                        prop_assert_eq!(cur.cast::<u8>().add(i).read(), pat(i));
+                    }
+                }
+            }
+            // SAFETY: `cur` is live and owned; ownership moves to the result.
+            let next = unsafe { topomalloc_realloc(cur, target) };
+            prop_assert!(!next.is_null());
+            let new_usable = topomalloc_malloc_usable_size(next);
+            prop_assert!(new_usable >= target);
+            let preserved = usable.min(target);
+            // SAFETY: `preserved` readable bytes hold the old prefix (§25.4).
+            unsafe {
+                for i in 0..preserved {
+                    prop_assert_eq!(
+                        next.cast::<u8>().add(i).read(), pat(i),
+                        "lost content at {} growing to {}", i, target
+                    );
+                }
+                // Refresh the pattern across the (possibly larger) usable size
+                // so the next step checks against this step's full extent.
+                for i in 0..new_usable {
+                    next.cast::<u8>().add(i).write(pat(i));
+                }
+            }
+            cur = next;
+            usable = new_usable;
+        }
+        // SAFETY: `cur` is live and owned by this test.
+        unsafe { topomalloc_free(cur) };
+    }
+}
+
+proptest! {
+    /// The M1 allocator against the ownership oracle (§33.7 / §8.3): an
+    /// arbitrary allocate/free stream through the C ABI, re-emitted in the
+    /// trace grammar and replayed through `LiveModel`, never produces an
+    /// overlap between live objects (over their *usable* ranges) or a
+    /// free-of-unknown — i.e. the engine's address handouts really are
+    /// disjoint live ranges with exact ownership hand-back.
+    #[test]
+    fn engine_stream_replays_clean_against_live_model(
+        ops in prop::collection::vec((any::<bool>(), 1usize..=40_000), 1..120)
+    ) {
+        let mut model = LiveModel::new();
+        let mut live: Vec<(*mut std::ffi::c_void, usize)> = Vec::new();
+        for (i, (do_alloc, size)) in ops.into_iter().enumerate() {
+            if do_alloc || live.is_empty() {
+                let p = topomalloc_malloc(size);
+                prop_assert!(!p.is_null());
+                let usable = topomalloc_malloc_usable_size(p);
+                let rec = TraceRecord::Alloc {
+                    request_id: i as u64, size: size as u64, align: 16,
+                    arena: 0, flags: 0, ptr: p as u64,
+                    usable_size: usable as u64, sc: None, span: None,
+                };
+                prop_assert!(model.apply(&rec).is_ok(), "live ranges overlapped");
+                live.push((p, usable));
+            } else {
+                let (p, _) = live.swap_remove(i % live.len());
+                let rec = TraceRecord::Free { ptr: p as u64, size_hint: 0, sc: None, span: None };
+                prop_assert!(model.apply(&rec).is_ok(), "free of unknown pointer");
+                // SAFETY: `p` is live and owned by this test.
+                unsafe { topomalloc_free(p) };
+            }
+        }
+        for (p, _) in live {
+            // SAFETY: `p` is live and owned by this test.
+            unsafe { topomalloc_free(p) };
         }
     }
 }

@@ -1,7 +1,8 @@
 # Plan 06 — Public API, Reallocation & Arenas
 
 **Workstreams:** W8 (public API/ABI), W15 (realloc/aligned/calloc), W9 (capability-backed arenas), W10
-(extent hooks) · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
+(extent hooks) · **Status:** rev 2.2 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
+realloc core · **Overview:** [README.md](README.md)
 **SPEC anchors:** §10, §25, §26, §9.6/§9.7, §22, §36.4, §36.13, §23, §35.2/§35.3; F-001..F-010, §15.5.
 **Upstream deps:** [03](03-core-allocator.md) (classify, pagemap, central), [04](04-backend-hugepages-release.md)
 (provider, extents), [05](05-caches-concurrency-fastpath.md) (front-end). **Downstream:** every consumer;
@@ -43,17 +44,43 @@ struct Arena {
 list under the global lock; it does *not* depend on W6** — W6 is wired in as the fast path at M2 (plan 05
 W16-4 owns the transition). **Enables:** every consumer + tests.
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W8-1a | C core `malloc/free/calloc/realloc` over the central path (M1). | M | | ABI tests pass single-threaded. |
-| W8-1b | errno semantics: `ENOMEM` on failure, `free` preserves `errno`, realloc-failure preserves the original (§10.1). | S | ∥ | errno tests. |
-| W8-2 | Aligned/POSIX: `posix_memalign`, `aligned_alloc`, `memalign`, `malloc_usable_size` (F-003/F-008). | M | ∥ | alignment + usable-size tests; never silently ignore alignment (§10.4). |
-| W8-3 | C23: `free_sized`, `free_aligned_sized`, `reallocarray` (overflow-checked); sized-delete-style hint use + sample-check mismatch. | S | ∥ | mismatched size sample-checked in hardened/debug (plan 08 W18-2). |
-| W8-4 | Zero-size policy (§9.6/F-004): `compat.zero_unique`/`zero_null`, `free(NULL)` no-op; documented + configurable. | S | ∥ | behavior consistent + configurable. |
-| W8-5 | C++ operators (§10.2): new/new[]/aligned/sized/nothrow overloads; map errors to `bad_alloc` per API. | M | | C++ link test; sized delete used when valid. |
-| W8-6 | Extended C API (§10.3/§10.4): `topo_mallocx/rallocx/xallocx/dallocx/sdallocx/nallocx` + flags; validate flag combos. | M | ∥ | invalid combos fail deterministically; mandatory flags honored. |
-| W8-7 | Rust `GlobalAlloc`/allocator-api adapter (D1). | S | ∥ | a Rust program uses TopoMalloc as `#[global_allocator]`. |
-| W8-8 | Generated `include/topomalloc.h` + header/ABI compatibility test. | S | ∥ | header compiles under C and C++; ABI test pins struct/opaque-handle layout (§35.3). |
+> **▸ Implementation status.** W8 is **landed**. The M1 engine
+> ([`topo_core::Allocator`](../../crates/topo-core/src/allocator.rs)) composes classify → central list /
+> large path with real free/realloc/usable-size; the full C surface, errno protocol, zero-size policy,
+> extended `topo_*x` API, and the upgraded `GlobalAlloc` live in
+> [`topo-abi`](../../crates/topo-abi/src/); the C++ operators are the opt-in
+> [`topomalloc_new_delete.hpp`](../../include/topomalloc_new_delete.hpp) header. Verified by per-crate unit
+> tests, the cross-crate [`abi.rs`](../../tests/tests/abi.rs) suite, realloc/oracle property tests, the
+> engine dual-backend G-sim equivalence, dual C11/C++17 ABI harnesses + an `nm` symbol↔header cross-check
+> (`xtask abi-test`), and the Lean `reallocMove` theorems. W8 review also hardened the central free path
+> (stale/double frees across span deactivation are rejected without accounting corruption, with a
+> release-mode CI pass to prove it). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W8) and
+> [docs/ABI.md](../../docs/ABI.md).
+>
+> **▸ Self-audit pass (closed).** A deliberate second pass over W8 fixed two found defects
+> (the sized-free fit check; the unsound-as-safe metadata-arena helper, replaced by the
+> provider-owning `MetaArena`), added the freed-object liveness probes + the `recognizes`
+> mixed-allocator predicate, made "no such arena" one deterministic `EINVAL`, widened the
+> errno platform matrix with a graceful fallback, wired the engine's stats into
+> `topo-stats`/`topo-control` (incl. `topo.compat.zero_size`, with the policy state moved
+> into `topo_core::compat`), and closed the verification gaps: a loom model of the span
+> retirement exclusivity, Miri over the engine/central suites, a `malloc_api` fuzz target,
+> an executed `sele4n-sim` named-selector path, `_Static_assert` struct pinning in the C
+> harness, `new_handler`/`bad_alloc`/concurrency coverage in the C++ harness, and recorded
+> criterion numbers (≈131 ns malloc+free on the M1 central path). Full detail:
+> [docs/DECISIONS.md](../../docs/DECISIONS.md) "W8 self-audit completions".
+
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W8-1a | C core `malloc/free/calloc/realloc` over the central path (M1). | M | | ABI tests pass single-threaded. | **DONE** — `topo_core::Allocator` + `topo-abi::c_api`; multi-threaded ABI test included |
+| W8-1b | errno semantics: `ENOMEM` on failure, `free` preserves `errno`, realloc-failure preserves the original (§10.1). | S | ∥ | errno tests. | **DONE** — `errno_shim` protocol combinators + EINVAL validation; errno tests in-crate and cross-crate |
+| W8-2 | Aligned/POSIX: `posix_memalign`, `aligned_alloc`, `memalign`, `malloc_usable_size` (F-003/F-008). | M | ∥ | alignment + usable-size tests; never silently ignore alignment (§10.4). | **DONE** — over-aligned requests route to the extent path, never a shared slab |
+| W8-3 | C23: `free_sized`, `free_aligned_sized`, `reallocarray` (overflow-checked); sized-delete-style hint use + sample-check mismatch. | S | ∥ | mismatched size sample-checked in hardened/debug (plan 08 W18-2). | **DONE** — full cross-check in debug/`debug-checks` (aborts loudly); hint never trusted for the free, so performance mode is corruption-proof; W18-2 owns production sampling |
+| W8-4 | Zero-size policy (§9.6/F-004): `compat.zero_unique`/`zero_null`, `free(NULL)` no-op; documented + configurable. | S | ∥ | behavior consistent + configurable. | **DONE** — `topo-abi::policy`; env (`TOPOMALLOC_ZERO_SIZE`) + programmatic; allocation-free env read |
+| W8-5 | C++ operators (§10.2): new/new[]/aligned/sized/nothrow overloads; map errors to `bad_alloc` per API. | M | | C++ link test; sized delete used when valid. | **DONE** — opt-in `topomalloc_new_delete.hpp` (all 12+ forms, `new_handler` loop, `bad_alloc`/nothrow split); C++17 harness in `xtask abi-test` |
+| W8-6 | Extended C API (§10.3/§10.4): `topo_mallocx/rallocx/xallocx/dallocx/sdallocx/nallocx` + flags; validate flag combos. | M | ∥ | invalid combos fail deterministically; mandatory flags honored. | **DONE** — public u64 flag word, totally validated; layout pinned numerically on the Rust and C sides |
+| W8-7 | Rust `GlobalAlloc`/allocator-api adapter (D1). | S | ∥ | a Rust program uses TopoMalloc as `#[global_allocator]`. | **DONE** — real free + `alloc_zeroed`/`realloc`; bootstrap-window `System` pointers routed home; the gated `global_allocator` example exercises it (the allocator-api trait is nightly-only and deferred until it stabilizes, D1 names `GlobalAlloc` as the adapter) |
+| W8-8 | Generated `include/topomalloc.h` + header/ABI compatibility test. | S | ∥ | header compiles under C and C++; ABI test pins struct/opaque-handle layout (§35.3). | **DONE** — dual C11/C++17 `-Werror` harnesses calling every entry point + `nm` symbol↔header set-equality check; "generated" realized as machine-verified equivalence (DECISIONS W8) |
 
 ---
 
@@ -64,9 +91,9 @@ W16-4 owns the transition). **Enables:** every consumer + tests.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W15-1 | realloc semantics (§25.1): `realloc(NULL,n)`, `realloc(p,0)` policy, content preservation, failure keeps the original. | M | | property test: content preserved; failure safety. |
-| W15-2 | Move realloc (§25.4): allocate-before-free, copy `min(old_usable,new)`, alignment/arena preserved, profiled as realloc when sampled. | M | | old object preserved on OOM. |
-| W15-3a | In-place **grow** (§25.2): same-size-class fast path now; extent-merge growth for medium/large at M5. | M | ∥ | same-class grow is in-place; large via plan 04 extents. |
+| W15-1 | realloc semantics (§25.1): `realloc(NULL,n)`, `realloc(p,0)` policy, content preservation, failure keeps the original. | M | | property test: content preserved; failure safety. **Basics shipped with W8-1a** (contract + dispatch + property tests); W15 owns the remaining depth. |
+| W15-2 | Move realloc (§25.4): allocate-before-free, copy `min(old_usable,new)`, alignment/arena preserved, profiled as realloc when sampled. | M | | old object preserved on OOM. **Move path shipped with W8-1a** (+ Lean `reallocMove` theorems); realloc-profiling lands with plan 07 sampling. |
+| W15-3a | In-place **grow** (§25.2): same-size-class fast path now; extent-merge growth for medium/large at M5. | M | ∥ | same-class grow is in-place; large via plan 04 extents. **Same-class + within-extent fast paths shipped with W8-1a**; extent-merge growth at M5. |
 | W15-3b | In-place **shrink** (§25.3): same-class; large tail-page split/return; no unusable tiny fragments unless policy permits. | M | ∥ | shrink returns tail safely. |
 | W15-4 | Aligned-allocation validation (§25.5) + over-aligned routing (§9.3, plan 03 W2-3b). | S | ∥ | power-of-two/min checks; over-aligned never offset-adjusts a shared slab. |
 | W15-5 | calloc zeroing (§26.2/§26.3) + overflow+rounding guard (§26.1, with plan 03 W2-4). | M | | zeroed result; zero-state metadata invalidated on reuse; overflow safe. |

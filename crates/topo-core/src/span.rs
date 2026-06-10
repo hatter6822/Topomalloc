@@ -808,6 +808,18 @@ impl SpanDescriptor {
 
     // --- accounting: lock-free approximate reads (stats / classification) ---
 
+    /// Whether object `i` is currently **central-free** (its free-bitmap bit is
+    /// set) — a lock-free advisory probe for the W8 liveness checks
+    /// (`Allocator::{owns, usable_size, realloc}`): exact when the caller owns
+    /// the object or the span is quiescent; under a racing alloc/free of the
+    /// same object (caller UB) either answer is acceptable. The authoritative
+    /// check remains `central_insert` under the span lock (§8.5/W5-3b) — this
+    /// never substitutes for it on the free path.
+    #[inline]
+    pub fn is_central_free(&self, i: usize) -> bool {
+        self.free_bitmap.contains(i)
+    }
+
     /// Objects currently owned by the application (lock-free approximate read).
     #[inline]
     pub fn live_count(&self) -> u32 {

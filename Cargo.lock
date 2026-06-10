@@ -756,6 +756,7 @@ name = "topo-abi"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "topo-backend-posix",
  "topo-backend-sele4n",
  "topo-core",
@@ -818,6 +819,7 @@ dependencies = [
 name = "topo-tests"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "proptest",
  "topo-abi",
  "topo-backend-posix",

@@ -20,6 +20,12 @@ topo-backend-posix = { path = "../topo-backend-posix", version = "0.1.0" }
 # GPL-3.0-or-later artifact (libtopomalloc-sele4n, §36.3.2). See NOTICE.
 topo-backend-sele4n = { path = "../topo-backend-sele4n", version = "0.1.0", optional = true }
 
+# errno + allocation-free getenv for the §10.1 errno protocol and the W8-4
+# zero-size policy (unix only; the same MIT/Apache-2.0 dep topo-backend-posix
+# uses). Non-unix hosts compile the no-op errno shim instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 sele4n-sim = ["dep:topo-backend-sele4n"]

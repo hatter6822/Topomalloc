@@ -6,10 +6,12 @@ allocator. Rust core (`no_std`-capable hot path) + per-arch assembly + a Lean 4
 model, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n)
 capability microkernel co-equal behind one backing-provider seam.
 
-> **Status: milestone M0 — the walking skeleton.** Every tool in the pipeline is
-> wired and runs end to end: the Cargo workspace, the size-class single source of
-> truth, the Lean model, both backends, and the trace/replay differential spine.
-> The real allocator is built milestone by milestone on top (see the plan).
+> **Status: M0 closed; M1 under way.** The public API (plan 06 W8) now runs over
+> the real central-path allocator: classify → central free lists / extent-backed
+> large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics,
+> the C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the
+> Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator
+> (G-sim). Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Quick start
 

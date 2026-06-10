@@ -1,18 +1,34 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * topomalloc.h — the public C API surface (§10, plan 06).
+ * topomalloc.h — the public C API surface (SPEC §10, plan 06 W8).
  *
- * M0 exports the prefixed `topomalloc_*` entry points. The symbols are
- * deliberately prefixed so linking libtopomalloc never hijacks the process
- * `malloc`; interposition/override deployment that replaces the system
- * allocator is a separate, opt-in step (plan 10, §35.1). The full standard and
- * extended C API (realloc, posix_memalign, malloc_usable_size, C23 sized free,
- * ...) and the seLe4n header (topomalloc_sele4n.h) arrive with plans 06/09.
+ * Every symbol is *prefixed* (`topomalloc_*` / `topo_*`), so linking
+ * libtopomalloc never hijacks the process `malloc`; the interposition/
+ * override deployment that replaces the system allocator is a separate,
+ * opt-in step (plan 10, §35.1). The C++ operator replacements follow the
+ * same rule: include <topomalloc_new_delete.hpp> in exactly one translation
+ * unit to opt in (W8-5).
+ *
+ * ABI series: 0.x — unstable (see docs/ABI.md). The struct/flag layouts
+ * below are pinned by the two-sided ABI tests (tests/c/abi_smoke.c,
+ * tests/cpp/abi_smoke.cpp, and the Rust unit tests) and freeze at 1.0
+ * (§35.3).
+ *
+ * errno discipline (§10.1): allocation failure sets ENOMEM; argument-
+ * validation failure sets EINVAL; the free family never modifies errno;
+ * posix_memalign reports through its return value only.
+ *
+ * Zero-size policy (§9.6): malloc(0)-style requests return a unique
+ * freeable pointer by default; set TOPOMALLOC_ZERO_SIZE=null in the
+ * environment to get NULL instead (errno untouched — not a failure).
+ * free(NULL) is always a no-op; realloc(p, 0) always frees p and returns
+ * NULL.
  */
 #ifndef TOPOMALLOC_H
 #define TOPOMALLOC_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "topomalloc_tables.h"
 
@@ -20,20 +36,154 @@
 extern "C" {
 #endif
 
-/* Allocate `size` bytes (16-byte aligned). Returns NULL on OOM or overflow. */
+/* ------------------------------------------------------------------------
+ * Standard C core (§10.1)
+ * --------------------------------------------------------------------- */
+
+/* Allocate `size` bytes (16-byte aligned). NULL + ENOMEM on OOM/overflow. */
 void *topomalloc_malloc(size_t size);
 
-/* Free a pointer returned by a topomalloc_* allocator. free(NULL) is a no-op. */
+/* Free a pointer returned by any topomalloc_ or topo_ allocation entry.
+ * free(NULL) is a no-op; invalid (foreign/interior/already-free) pointers
+ * are detected and ignored without state change (§35.2); errno is never
+ * modified. */
 void topomalloc_free(void *ptr);
 
-/* Allocate `n * size` zeroed bytes. Returns NULL on overflow (never wraps). */
+/* Allocate `n * size` zeroed bytes. NULL + ENOMEM on overflow of the product
+ * or of any subsequent rounding (§26.1) — never wraps. The whole usable size
+ * is zeroed (§26.2). */
 void *topomalloc_calloc(size_t n, size_t size);
 
-/* Allocate `size` bytes aligned to `alignment`. `alignment` must be a power of
- * two and `size` an integer multiple of it (SPEC 25.5); otherwise NULL. */
+/* Standard realloc semantics (§25.1): realloc(NULL, n) == malloc(n);
+ * realloc(p, 0) frees p and returns NULL; on success the result carries
+ * min(old_usable, size) bytes of old content; ON FAILURE (NULL + ENOMEM)
+ * THE ORIGINAL ALLOCATION REMAINS VALID. Invalid p: NULL + EINVAL, no state
+ * change. */
+void *topomalloc_realloc(void *ptr, size_t size);
+
+/* realloc(ptr, n * size) with the multiplication overflow-checked (BSD/
+ * glibc): NULL + ENOMEM on overflow, original untouched. */
+void *topomalloc_reallocarray(void *ptr, size_t n, size_t size);
+
+/* ------------------------------------------------------------------------
+ * Aligned / POSIX (§10.1, §25.5 — W8-2)
+ * --------------------------------------------------------------------- */
+
+/* Allocate `size` bytes aligned to `alignment`. `alignment` must be a power
+ * of two and `size` an integer multiple of it (SPEC §25.5); otherwise NULL +
+ * EINVAL. Alignment is never silently ignored (§10.4). */
 void *topomalloc_aligned_alloc(size_t alignment, size_t size);
 
-/* The NUL-terminated TopoMalloc version string (matches stats topomalloc_version). */
+/* POSIX: *memptr receives `size` bytes aligned to `alignment` (a power of
+ * two multiple of sizeof(void*)). Returns 0, EINVAL, or ENOMEM; never
+ * modifies errno; writes *memptr only on success. */
+int topomalloc_posix_memalign(void **memptr, size_t alignment, size_t size);
+
+/* Obsolete compatibility allocator: power-of-two `alignment`, any size. */
+void *topomalloc_memalign(size_t alignment, size_t size);
+
+/* The number of usable bytes in the allocation at `ptr` (>= the requested
+ * size). 0 for NULL or a pointer this allocator does not own. */
+size_t topomalloc_malloc_usable_size(void *ptr);
+
+/* ------------------------------------------------------------------------
+ * C23 sized deallocation (§10.1 — W8-3)
+ * --------------------------------------------------------------------- */
+
+/* free(ptr) where `size` must equal the size the allocation was last made
+ * with (malloc/realloc). A mismatch is undefined behavior that debug/
+ * hardened builds abort on; the hint is never trusted for the free itself,
+ * so it cannot corrupt state in any build. free_sized(NULL, n) is a no-op. */
+void topomalloc_free_sized(void *ptr, size_t size);
+
+/* The aligned-allocation counterpart: `alignment` and `size` must match the
+ * original aligned request. */
+void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
+
+/* ------------------------------------------------------------------------
+ * Extended API (§10.3/§10.4 — W8-6)
+ * --------------------------------------------------------------------- */
+
+/* Handle/flag types (§10.3). Arena handles become meaningful with the arena
+ * API (plan 06 W9, M4); at M1 only the default arena (id 0) exists, and
+ * naming any other is a deterministic EINVAL. topo_tcache_t is declared for
+ * the §10.3 surface but has no consumer until explicit-tcache routing lands
+ * (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is
+ * deferred to its subsystem rather than frozen as a guess (reserved flag
+ * bits hold the space). */
+typedef uint32_t topo_arena_t;
+typedef uint32_t topo_tcache_t;
+typedef uint64_t topo_flags_t;
+
+/* The topo_flags_t layout (validated; reserved bits MUST be zero — §10.4):
+ *   bits 0–5   lg(alignment), 0 = natural        TOPO_ALIGN_LG(la)
+ *   bit  6     zero returned memory              TOPO_ZERO
+ *   bit  7     bypass local caches               TOPO_TCACHE_NONE
+ *   bit  8     guard allocation                  TOPO_GUARDED
+ *   bit  9     avoid hugepages                   TOPO_NO_HUGEPAGE
+ *   bit 10     prefer hugepages                  TOPO_PREFER_HUGEPAGE
+ *   bits 11–12 lifetime hint                     TOPO_LIFETIME_*
+ *   bits 13–20 hotness 0..=255                   TOPO_HOT(h) / TOPO_COLD
+ *   bits 21–52 arena id + 1, 0 = default         TOPO_ARENA(id)
+ *   bits 53–63 reserved (must be zero)
+ * Invalid words fail deterministically (NULL/0 + EINVAL); advisory hints are
+ * validated and threaded to the placement subsystems as they land.
+ *
+ * TOPO_ALIGN_LG(la): an out-of-range `la` (>= 64, including negative values
+ * via the unsigned conversion) encodes a reserved-bit word, so the request
+ * fails with EINVAL instead of silently using a different alignment (§10.4).
+ * Note `la` is evaluated twice; do not pass an expression with side
+ * effects. */
+#define TOPO_ALIGN_LG(la)                                                    \
+    (((topo_flags_t) (la)) < 64u ? ((topo_flags_t) (la) & 0x3fu)             \
+                                 : ((topo_flags_t) 1 << 63))
+#define TOPO_ZERO ((topo_flags_t) 1 << 6)
+#define TOPO_TCACHE_NONE ((topo_flags_t) 1 << 7)
+#define TOPO_GUARDED ((topo_flags_t) 1 << 8)
+#define TOPO_NO_HUGEPAGE ((topo_flags_t) 1 << 9)
+#define TOPO_PREFER_HUGEPAGE ((topo_flags_t) 1 << 10)
+#define TOPO_LIFETIME_SHORT ((topo_flags_t) 1 << 11)
+#define TOPO_LIFETIME_MEDIUM ((topo_flags_t) 2 << 11)
+#define TOPO_LIFETIME_LONG ((topo_flags_t) 3 << 11)
+#define TOPO_HOT(h) ((topo_flags_t) ((h) & 0xffu) << 13)
+#define TOPO_COLD TOPO_HOT(0)
+#define TOPO_ARENA(id) (((topo_flags_t) (id) + 1) << 21)
+
+/* Allocate with extended flags. NULL + EINVAL on an invalid flag word;
+ * NULL + ENOMEM on allocation failure. */
+void *topo_mallocx(size_t size, topo_flags_t flags);
+
+/* Reallocate with flags under the §25 contract (failure leaves the original
+ * valid). TOPO_ZERO zeroes bytes beyond the preserved prefix; size == 0
+ * follows the public realloc(p, 0) policy (free + NULL, errno untouched);
+ * an invalid flag word is NULL + EINVAL and frees nothing. */
+void *topo_rallocx(void *ptr, size_t size, topo_flags_t flags);
+
+/* Resize in place only, to at least `size` (best effort toward size+extra);
+ * returns the allocation's real usable size — success iff result >= size.
+ * Never moves or frees. At M1 in-place growth beyond the current usable
+ * size is not possible (extent-merge growth lands at M5). */
+size_t topo_xallocx(void *ptr, size_t size, size_t extra, topo_flags_t flags);
+
+/* Free with flags (advisory on this path; validated, never trusted). */
+void topo_dallocx(void *ptr, topo_flags_t flags);
+
+/* Sized free with flags: the extended counterpart of free_sized /
+ * free_aligned_sized, with the same debug/hardened cross-checks. */
+void topo_sdallocx(void *ptr, size_t size, topo_flags_t flags);
+
+/* The usable size topo_mallocx(size, flags) would return, without
+ * allocating — exact for over-aligned requests too (the prediction shares
+ * the allocation path's formula); 0 on an invalid flag word or
+ * unsatisfiable size. Pure. */
+size_t topo_nallocx(size_t size, topo_flags_t flags);
+
+/* ------------------------------------------------------------------------
+ * Identification
+ * --------------------------------------------------------------------- */
+
+/* The NUL-terminated TopoMalloc version string (matches stats
+ * topomalloc_version). */
 const char *topomalloc_version(void);
 
 /* The active backing-provider name ("posix" or "sele4n-sim"). */

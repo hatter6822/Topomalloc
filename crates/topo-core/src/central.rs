@@ -665,6 +665,25 @@ impl CentralCache {
         let _guard = bin.lock();
         let sg = span.lock();
 
+        // W8 free-path hardening: a span that is no longer `Active` was
+        // deactivated (its bitmap cleared) by the thread that emptied it. A
+        // stale/double free racing past that point would otherwise "insert"
+        // into the cleared bitmap and then underflow `live_count` (0 - 1) —
+        // silent accounting corruption in release mode. `deactivate_span`
+        // writes the state under this same bin lock, so the check is race-free
+        // (C-004); the stale free is rejected with nothing inserted.
+        if span.state() != SpanState::Active {
+            debug_assert!(
+                false,
+                "insert_batch: span {} is not Active (stale/double free raced deactivation)",
+                span.id().0
+            );
+            return InsertResult {
+                inserted: 0,
+                span_empty: false,
+            };
+        }
+
         // Insert objects into the bitmap (§8.5: bitmap + count move together).
         let max = count.min(indices.len());
         let mut inserted = 0u32;
@@ -727,7 +746,14 @@ impl CentralCache {
 
         let mut caller_must_deactivate = false;
 
-        if is_empty {
+        // The empty-span transition is owned by the insert that *made* the span
+        // empty (`inserted > 0`). A racing stale/double free of an already-empty
+        // span inserts nothing (every bit is already set), and MUST NOT re-link
+        // the span or claim the deactivation: the span became empty exactly once,
+        // so exactly one caller — the one whose insert completed it — is told to
+        // deactivate (W5-5 exclusivity; a second deactivator would corrupt
+        // `span_count` and re-release retired pagemap entries).
+        if is_empty && inserted > 0 {
             // C-003: the span is empty. Remove from partial list if present.
             bin.remove_partial(span as *const SpanDescriptor);
 
@@ -1804,5 +1830,153 @@ mod tests {
         for span in &spans {
             assert!(span.conservation_holds_central_only());
         }
+    }
+
+    /// W8 free-path hardening: an insert into a span that was already
+    /// deactivated (a stale/double free racing past the empty-span teardown)
+    /// is rejected loudly in debug builds — the state guard fires before any
+    /// bitmap or count mutation.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not Active")]
+    fn stale_free_into_deactivated_span_panics_in_debug() {
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+        let all = drain_all(&cache, sc);
+        cache.insert_batch(&span, &all, all.len());
+        cache.deactivate_span(&span, &pm); // span is empty: legal teardown
+
+        // The stale free: the span is `Released` now. The state guard rejects it.
+        cache.insert_batch(&span, &[0], 1);
+    }
+
+    /// W8 free-path hardening (release semantics): the same stale free inserts
+    /// nothing and leaves the deactivated span untouched — no `live_count`
+    /// underflow, no re-link, no second deactivation claim.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn stale_free_into_deactivated_span_is_ignored_in_release() {
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+        let all = drain_all(&cache, sc);
+        cache.insert_batch(&span, &all, all.len());
+        cache.deactivate_span(&span, &pm);
+
+        let r = cache.insert_batch(&span, &[0], 1);
+        assert_eq!(r.inserted, 0, "stale free must insert nothing");
+        assert!(!r.span_empty, "stale free must not claim the deactivation");
+        // The span's teardown state is untouched.
+        assert_eq!(span.state(), SpanState::Released);
+        assert_eq!(span.live_count(), 0);
+        assert_eq!(span.central_free_count(), 0);
+        let bin = cache.bin(sc).unwrap();
+        assert_eq!(bin.span_count(), 0);
+        assert_eq!(bin.partial_count(), 0);
+    }
+
+    /// W8 free-path hardening (release semantics): a double free of an object
+    /// in an *already-empty* span inserts nothing (`inserted == 0`) and must
+    /// not eject the span from the empty cache or claim the deactivation —
+    /// only the insert that *made* the span empty owns that transition (W5-5
+    /// exclusivity). In debug builds the same call panics at the per-index
+    /// double-insert assert, which `double_free_is_rejected_loudly_in_debug`
+    /// covers.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn double_free_into_empty_span_does_not_claim_deactivation() {
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let row = size_class::row(sc);
+        let span_bytes = row.slab_pages as usize * PAGE_SIZE;
+        let a = make_span(1, sc, 0x4000_0000, &m);
+        let b = make_span(2, sc, 0x4000_0000 + span_bytes, &m);
+
+        cache.activate_span(&a, &pm, &m).unwrap();
+        cache.activate_span(&b, &pm, &m).unwrap();
+
+        // Drain both spans, tracking which indices came from which span.
+        let mut from_a = Vec::new();
+        let mut from_b = Vec::new();
+        while let RemoveResult::Ok(batch) = cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            MAX_BATCH_LEN,
+        ) {
+            let dst = if core::ptr::eq(batch.span(), &a) {
+                &mut from_a
+            } else {
+                &mut from_b
+            };
+            dst.extend_from_slice(batch.indices());
+        }
+        assert_eq!(
+            from_a.len() + from_b.len(),
+            2 * row.objects_per_slab as usize
+        );
+
+        // Empty A first: it lands in the (size-1) empty cache, span_empty=false.
+        let ra = cache.insert_batch(&a, &from_a, from_a.len());
+        assert!(!ra.span_empty);
+        // Empty B: the cache is full, so the emptier is told to deactivate.
+        let rb = cache.insert_batch(&b, &from_b, from_b.len());
+        assert!(rb.span_empty, "the emptying insert owns the deactivation");
+
+        // A double free into B (already empty, still Active, unlinked): nothing
+        // inserted, and crucially span_empty=false — B's deactivation belongs to
+        // the caller above, exactly once.
+        let dup = cache.insert_batch(&b, &[from_b[0]], 1);
+        assert_eq!(dup.inserted, 0);
+        assert!(!dup.span_empty);
+
+        // A double free into the *cached* A must not eject it either.
+        let dup_a = cache.insert_batch(&a, &[from_a[0]], 1);
+        assert_eq!(dup_a.inserted, 0);
+        assert!(!dup_a.span_empty);
+        let bin = cache.bin(sc).unwrap();
+        assert_eq!(bin.empty_count(), 1, "A stays in the empty cache");
+
+        // The single legal teardown of B proceeds normally.
+        cache.deactivate_span(&b, &pm);
+        assert_eq!(bin.span_count(), 1, "only A remains tracked");
+
+        // A is still reusable straight from the empty cache.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 1) {
+            RemoveResult::Ok(batch) => assert!(core::ptr::eq(batch.span(), &a)),
+            RemoveResult::NeedSpan => panic!("cached empty span A must be reusable"),
+        }
+    }
+
+    /// In debug builds, a double free (an index whose bit is already set) is
+    /// caught loudly by the per-index assert — the W18-2 (plan 08) debug
+    /// behaviour the M1 free path relies on.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "rejected")]
+    fn double_free_is_rejected_loudly_in_debug() {
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+
+        cache.activate_span(&span, &pm, &m).unwrap();
+        let all = drain_all(&cache, sc);
+        // Return object 0 twice: the second insert's bit is already set.
+        cache.insert_batch(&span, &[all[0]], 1);
+        cache.insert_batch(&span, &[all[0]], 1);
     }
 }

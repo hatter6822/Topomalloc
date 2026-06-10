@@ -66,6 +66,10 @@ struct LargeSlot {
     free_next: u32,
 }
 
+/// Byte size of one large-descriptor slot, exposed so sizing helpers can pin
+/// their per-slot bound at compile time (W8; see `extent::EXTENT_SLOT_BYTES`).
+pub(crate) const LARGE_SLOT_BYTES: usize = core::mem::size_of::<LargeSlot>();
+
 /// The metadata-backed, recycling descriptor pool.
 struct LargePool {
     slots: NonNull<LargeSlot>,
@@ -242,6 +246,12 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.extents.check_invariants()
     }
 
+    /// The §20.1 physical-state byte breakdown of the large region (delegates
+    /// to the extent manager) — the W8 stats-reconciliation input (§8.6).
+    pub fn state_bytes(&self) -> crate::extent::StateBytes {
+        self.extents.state_bytes()
+    }
+
     /// The backend name (the provider's).
     pub fn backend_name(&self) -> &'static str {
         self.extents.backend_name()
@@ -325,8 +335,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// allocator (and is now freed), `false` otherwise (null, foreign, or not a
     /// large pointer) — never acting on a non-owned pointer.
     ///
+    /// # Safety
+    ///
+    /// `ptr` must be null, a live allocation of this allocator that the caller
+    /// still owns, or memory never returned by it (rejected harmlessly). What
+    /// the pagemap lookup cannot detect — and what this contract excludes — is
+    /// a *stale* pointer whose address has been recycled into a different live
+    /// large allocation: freeing it would release another owner's object
+    /// (the same contract as [`Allocator::free`](crate::Allocator::free), W8).
+    ///
     /// SPEC-transition: `large free` (pagemap clear §17.2 + extent free §18.3)
-    pub fn free_with(&self, ptr: *mut u8, hook: &dyn RegionCacheHook) -> bool {
+    pub unsafe fn free_with(&self, ptr: *mut u8, hook: &dyn RegionCacheHook) -> bool {
         if ptr.is_null() {
             return false;
         }
@@ -396,8 +415,13 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     }
 
     /// Free with the default region cache.
-    pub fn free(&self, ptr: *mut u8) -> bool {
-        self.free_with(ptr, &NoRegionCache)
+    ///
+    /// # Safety
+    ///
+    /// As [`free_with`](Self::free_with).
+    pub unsafe fn free(&self, ptr: *mut u8) -> bool {
+        // SAFETY: identical contract, forwarded.
+        unsafe { self.free_with(ptr, &NoRegionCache) }
     }
 
     /// The usable size of the large allocation at base `ptr`, or `None` if `ptr` is
@@ -456,6 +480,22 @@ mod tests {
     use crate::bootstrap::BumpArena;
     use crate::generated::tables::PAGE_SIZE;
     use topo_backend_posix_in_test::PosixBackingProvider;
+
+    /// Test wrappers: every pointer the tests free here is one they just
+    /// received and still own, null, or a never-owned probe the entry point is
+    /// specified to reject — exactly the `free`/`free_with` safety contracts.
+    fn tfree<P: TopoBackingProvider>(la: &LargeAllocator<'_, P>, p: *mut u8) -> bool {
+        // SAFETY: the caller-ownership contract above.
+        unsafe { la.free(p) }
+    }
+    fn tfree_with<P: TopoBackingProvider>(
+        la: &LargeAllocator<'_, P>,
+        p: *mut u8,
+        hook: &dyn RegionCacheHook,
+    ) -> bool {
+        // SAFETY: as `tfree`.
+        unsafe { la.free_with(p, hook) }
+    }
 
     const PAGE: usize = PAGE_SIZE;
 
@@ -627,7 +667,7 @@ mod tests {
             p.write(0xab);
             assert_eq!(p.read(), 0xab);
         }
-        assert!(la.free(p), "free of a live large allocation succeeds");
+        assert!(tfree(&la, p), "free of a live large allocation succeeds");
         assert_eq!(la.live_count(), 0);
         // After free the pointer no longer classifies as a live large allocation.
         assert_eq!(la.usable_size(p), None);
@@ -637,13 +677,16 @@ mod tests {
     #[test]
     fn free_of_foreign_or_null_pointer_is_rejected() {
         let la = large(16, 8);
-        assert!(!la.free(ptr::null_mut()), "free(NULL) is a no-op");
+        assert!(!tfree(&la, ptr::null_mut()), "free(NULL) is a no-op");
         let mut x = 0u8;
-        assert!(!la.free(&mut x as *mut u8), "foreign pointer is not freed");
+        assert!(
+            !tfree(&la, &mut x as *mut u8),
+            "foreign pointer is not freed"
+        );
         let p = la.allocate(2 * PAGE, PAGE);
-        assert!(la.free(p));
+        assert!(tfree(&la, p));
         // Double free: the pointer no longer classifies as large.
-        assert!(!la.free(p), "double free is rejected");
+        assert!(!tfree(&la, p), "double free is rejected");
         assert!(la.check_invariants());
     }
 
@@ -658,7 +701,7 @@ mod tests {
         assert!(!p.is_null());
         // SAFETY: `p .. p + 3*PAGE` is the live allocation; `p + PAGE` is interior.
         let interior = unsafe { p.add(PAGE) };
-        assert!(!la.free(interior), "interior free is rejected");
+        assert!(!tfree(&la, interior), "interior free is rejected");
         assert_eq!(
             la.live_count(),
             1,
@@ -666,7 +709,7 @@ mod tests {
         );
         assert_eq!(la.usable_size(p), Some(3 * PAGE), "allocation intact");
         // The base pointer still frees correctly.
-        assert!(la.free(p), "base free succeeds");
+        assert!(tfree(&la, p), "base free succeeds");
         assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
     }
@@ -679,7 +722,7 @@ mod tests {
         for _ in 0..200 {
             let p = la.allocate(2 * PAGE, PAGE);
             assert!(!p.is_null(), "recycled descriptor + extent reused");
-            assert!(la.free(p));
+            assert!(tfree(&la, p));
         }
         assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
@@ -719,10 +762,10 @@ mod tests {
             la.check_invariants(),
             "rolled-back allocation left us well-formed"
         );
-        assert!(la.free(a));
+        assert!(tfree(&la, a));
         let d = la.allocate(2 * PAGE, PAGE);
         assert!(!d.is_null(), "a freed slot is reusable");
-        assert!(la.free(b) && la.free(d));
+        assert!(tfree(&la, b) && tfree(&la, d));
         assert!(la.check_invariants());
     }
 
@@ -739,7 +782,7 @@ mod tests {
                         if !p.is_null() {
                             // SAFETY: committed for its whole length.
                             unsafe { p.write(0x5a) };
-                            assert!(la.free(p));
+                            assert!(tfree(&la, p));
                         }
                     }
                 });
@@ -788,7 +831,7 @@ mod tests {
                 s.spawn(move || {
                     barrier.wait(); // release all freers together to widen the race
                     for &p in ptrs.iter() {
-                        if la.free(p as *mut u8) {
+                        if tfree(&la, p as *mut u8) {
                             wins.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -824,7 +867,7 @@ mod tests {
         distinct.dedup();
         assert_eq!(distinct.len(), PTRS, "no two reused slots alias");
         for p in reuse {
-            assert!(la.free(p as *mut u8));
+            assert!(tfree(&la, p as *mut u8));
         }
         assert!(la.check_invariants());
     }
@@ -852,7 +895,7 @@ mod tests {
             assert_eq!(p.read(), 0x77);
         }
         // Free: offered back to the cache (`try_cache`), not freed through the extents.
-        assert!(la.free_with(p, &cache));
+        assert!(tfree_with(&la, p, &cache));
         assert_eq!(
             cache.returns.get(),
             1,
@@ -886,14 +929,14 @@ mod tests {
         assert_eq!(la.live_count(), 2);
 
         // Free the extent-backed one first: routed to the extents, never to the cache.
-        assert!(la.free_with(backed, &cache));
+        assert!(tfree_with(&la, backed, &cache));
         assert_eq!(
             cache.returns.get(),
             0,
             "an extent-backed free must not touch the cache"
         );
         // Free the cache-served one: routed back to the cache exactly once.
-        assert!(la.free_with(served, &cache));
+        assert!(tfree_with(&la, served, &cache));
         assert_eq!(
             cache.returns.get(),
             1,

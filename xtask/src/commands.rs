@@ -371,6 +371,14 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
 
     // Tests, including the seLe4n simulator vertical slice (G-sim).
     r.run("test host", "cargo", &["test", "--workspace"]);
+    // The W8 free-path hardening has *release-only* semantics (stale/double
+    // frees are silently rejected where debug builds abort); run the core
+    // suite in release so those `cfg(not(debug_assertions))` tests execute.
+    r.run(
+        "test release semantics (topo-core)",
+        "cargo",
+        &["test", "-p", "topo-core", "--release", "--lib"],
+    );
     // Hardened pass (G-core): the `debug-checks` profile compiles in the §17.3 /
     // Appendix-B invariant checks, so the corruption-resistant classification and
     // descriptor-integrity tests actually run.
@@ -873,7 +881,10 @@ fn check_license_boundary(root: &Path) -> bool {
     }
 }
 
-/// Build the staticlib, then compile + link + run the C ABI harness (§34.1).
+/// Build the staticlib, then compile + link + run the C **and** C++ ABI
+/// harnesses (§34.1, plan 06 W8-8: the header must compile under both), and
+/// cross-check the exported symbol set against the header declarations
+/// (§35.3 ABI pinning).
 fn abi_test_steps(r: &mut Runner<'_>, root: &Path) {
     let cc = if have("cc") {
         "cc"
@@ -890,12 +901,24 @@ fn abi_test_steps(r: &mut Runner<'_>, root: &Path) {
     ) {
         return;
     }
+
+    // W8-8: the header and the binary may not drift — every exported
+    // `topomalloc_*`/`topo_*` function must be declared, and vice versa.
+    r.record(
+        "header ↔ symbol cross-check (W8-8)",
+        check_abi_symbols(root),
+    );
+
     let out = root.join("target/debug/abi_smoke");
     let out_str = out.to_string_lossy().into_owned();
     let ok = r.run(
         "compile + link C ABI harness",
         cc,
         &[
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
             "tests/c/abi_smoke.c",
             "-I",
             "include",
@@ -909,6 +932,136 @@ fn abi_test_steps(r: &mut Runner<'_>, root: &Path) {
     );
     if ok {
         r.run("run C ABI harness", out_str.as_str(), &[]);
+    }
+
+    // C++ harness (W8-5 operators + W8-8 "compiles under C++").
+    let cxx = if have("c++") {
+        "c++"
+    } else if have("g++") {
+        "g++"
+    } else {
+        r.note("no C++ compiler (c++/g++) found; skipping C++ ABI test (CI installs one).");
+        return;
+    };
+    let out_cpp = root.join("target/debug/abi_smoke_cpp");
+    let out_cpp_str = out_cpp.to_string_lossy().into_owned();
+    let ok = r.run(
+        "compile + link C++ ABI harness",
+        cxx,
+        &[
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "tests/cpp/abi_smoke.cpp",
+            "-I",
+            "include",
+            "-o",
+            out_cpp_str.as_str(),
+            "target/debug/libtopo_abi.a",
+            "-lpthread",
+            "-ldl",
+            "-lm",
+        ],
+    );
+    if ok {
+        r.run("run C++ ABI harness", out_cpp_str.as_str(), &[]);
+    }
+}
+
+/// Function names declared in `include/topomalloc.h` (pure; tested): every
+/// lowercase `topomalloc_*`/`topo_*` identifier immediately followed by `(`
+/// is a declaration; macros are uppercase and typedefs are not followed by a
+/// parenthesis, so neither matches.
+fn header_function_names(header: &str) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let bytes = header.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        // Identifier start (not mid-identifier).
+        if bytes[i].is_ascii_lowercase() && (i == 0 || !is_ident(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident(bytes[i]) {
+                i += 1;
+            }
+            let ident = &header[start..i];
+            if (ident.starts_with("topomalloc_") || ident.starts_with("topo_"))
+                && bytes.get(i) == Some(&b'(')
+            {
+                names.insert(ident.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
+/// W8-8 ABI pinning: the set of exported `topomalloc_*`/`topo_*` text symbols
+/// in the staticlib must equal the set of functions the public header
+/// declares — a symbol without a declaration (or vice versa) is ABI drift.
+fn check_abi_symbols(root: &Path) -> bool {
+    if !have("nm") {
+        println!("  · ABI symbols: nm not found; skipping the cross-check (CI runs it)");
+        return true;
+    }
+    let header = match std::fs::read_to_string(root.join("include/topomalloc.h")) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("  ✗ ABI symbols: cannot read include/topomalloc.h: {e}");
+            return false;
+        }
+    };
+    let declared = header_function_names(&header);
+
+    let output = Command::new("nm")
+        .args(["-g", "--defined-only", "target/debug/libtopo_abi.a"])
+        .current_dir(root)
+        .output();
+    let out = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            eprintln!(
+                "  ✗ ABI symbols: nm failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!("  ✗ ABI symbols: could not run nm: {e}");
+            return false;
+        }
+    };
+    let exported: std::collections::BTreeSet<String> = out
+        .lines()
+        .filter_map(|l| {
+            // `<addr> T <name>` — exported text symbols only.
+            let mut parts = l.split_whitespace();
+            let _addr = parts.next()?;
+            let kind = parts.next()?;
+            let name = parts.next()?;
+            (kind == "T" && (name.starts_with("topomalloc_") || name.starts_with("topo_")))
+                .then(|| name.to_string())
+        })
+        .collect();
+
+    let undeclared: Vec<_> = exported.difference(&declared).collect();
+    let unexported: Vec<_> = declared.difference(&exported).collect();
+    if undeclared.is_empty() && unexported.is_empty() {
+        println!(
+            "  · ABI symbols: {} exported topomalloc_*/topo_* functions all declared in the header",
+            exported.len()
+        );
+        true
+    } else {
+        for s in undeclared {
+            eprintln!("  ✗ exported but not declared in include/topomalloc.h: {s}");
+        }
+        for s in unexported {
+            eprintln!("  ✗ declared in include/topomalloc.h but not exported: {s}");
+        }
+        false
     }
 }
 
@@ -1018,6 +1171,30 @@ mod tests {
             lean_style_issues("def x := 1"),
             vec![(0, "missing final newline")]
         );
+    }
+
+    #[test]
+    fn header_function_name_extraction() {
+        let header = r#"
+            void *topomalloc_malloc(size_t size);
+            void  topomalloc_free(void *ptr);
+            size_t topo_nallocx(size_t size, topo_flags_t flags);
+            typedef uint64_t topo_flags_t;          /* type, not a function */
+            typedef uint32_t topo_arena_t;
+            #define TOPO_ALIGN_LG(la) ((la) & 0x3f) /* macro: uppercase */
+            int topomalloc_posix_memalign(void **memptr, size_t a, size_t s);
+        "#;
+        let names = header_function_names(header);
+        assert!(names.contains("topomalloc_malloc"));
+        assert!(names.contains("topomalloc_free"));
+        assert!(names.contains("topo_nallocx"));
+        assert!(names.contains("topomalloc_posix_memalign"));
+        assert!(
+            !names.contains("topo_flags_t"),
+            "typedefs are not functions"
+        );
+        assert!(!names.contains("topo_arena_t"));
+        assert_eq!(names.len(), 4);
     }
 
     #[test]

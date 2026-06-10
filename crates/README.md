@@ -9,8 +9,8 @@ supports it (arch, stats, control, test-support).
 
 | Crate | Role | License | Plan |
 |-------|------|---------|------|
-| `topo-core` | classifier, size classes, the seam, metadata/pagemap/bootstrap + pointer classification, the back-end extent manager, the M0 skeleton allocator | MIT | 03, 04, 05 |
-| `topo-abi` | C ABI exports + Rust `GlobalAlloc` adapter | MIT | 06 |
+| `topo-core` | classifier, size classes, the seam, metadata/pagemap/bootstrap + pointer classification, the back-end extent manager, the **M1 central-path allocator** (`Allocator`), the M0 skeleton (test fixture) | MIT | 03, 04, 05, 06 |
+| `topo-abi` | the full prefixed C API (§10.1–§10.4: core, aligned/POSIX, C23 sized free, `topo_*x` + flags), errno protocol, zero-size policy, Rust `GlobalAlloc` adapter | MIT | 06 |
 | `topo-backend-posix` | `PosixBackingProvider` (single-authority case) | MIT | 04 |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later | 09 |
 | `topo-arch` | per-arch RSEQ / restartable sections | MIT | 05 |
