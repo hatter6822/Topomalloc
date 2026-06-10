@@ -284,6 +284,24 @@ fn extended_api_mallocx_family() {
     let r = topo_mallocx(64, 0);
     // SAFETY: `r` is live and freed exactly once.
     unsafe { topo_dallocx(r, 0) };
+
+    // PR #11 review: nallocx is exact for over-aligned requests too (the
+    // span-rounding vs carve-rounding divergence).
+    for la in [14u32, 16, 18] {
+        let predicted = topo_nallocx(100, topo_align_lg(la));
+        let p = topo_mallocx(100, topo_align_lg(la));
+        assert!(!p.is_null());
+        assert_eq!(p as usize % (1usize << la), 0);
+        assert_eq!(topomalloc_malloc_usable_size(p), predicted, "lg={la}");
+        free(p);
+    }
+    // rallocx(p, 0): the public realloc(p, 0) policy — free and NULL.
+    let z = topo_mallocx(64, 0);
+    // SAFETY: `z` is live; rallocx(z, 0) frees it.
+    unsafe { assert!(topo_rallocx(z, 0, 0).is_null()) };
+    // Out-of-range TOPO_ALIGN_LG is a deterministic EINVAL.
+    assert!(topo_mallocx(64, topo_align_lg(64)).is_null());
+    expect_errno(EINVAL);
 }
 
 #[test]

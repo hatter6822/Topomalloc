@@ -127,8 +127,16 @@ typedef uint64_t topo_flags_t;
  *   bits 21–52 arena id + 1, 0 = default         TOPO_ARENA(id)
  *   bits 53–63 reserved (must be zero)
  * Invalid words fail deterministically (NULL/0 + EINVAL); advisory hints are
- * validated and threaded to the placement subsystems as they land. */
-#define TOPO_ALIGN_LG(la) ((topo_flags_t) ((la) & 0x3fu))
+ * validated and threaded to the placement subsystems as they land.
+ *
+ * TOPO_ALIGN_LG(la): an out-of-range `la` (>= 64, including negative values
+ * via the unsigned conversion) encodes a reserved-bit word, so the request
+ * fails with EINVAL instead of silently using a different alignment (§10.4).
+ * Note `la` is evaluated twice; do not pass an expression with side
+ * effects. */
+#define TOPO_ALIGN_LG(la)                                                    \
+    (((topo_flags_t) (la)) < 64u ? ((topo_flags_t) (la) & 0x3fu)             \
+                                 : ((topo_flags_t) 1 << 63))
 #define TOPO_ZERO ((topo_flags_t) 1 << 6)
 #define TOPO_TCACHE_NONE ((topo_flags_t) 1 << 7)
 #define TOPO_GUARDED ((topo_flags_t) 1 << 8)
@@ -146,7 +154,9 @@ typedef uint64_t topo_flags_t;
 void *topo_mallocx(size_t size, topo_flags_t flags);
 
 /* Reallocate with flags under the §25 contract (failure leaves the original
- * valid). TOPO_ZERO zeroes bytes beyond the preserved prefix. */
+ * valid). TOPO_ZERO zeroes bytes beyond the preserved prefix; size == 0
+ * follows the public realloc(p, 0) policy (free + NULL, errno untouched);
+ * an invalid flag word is NULL + EINVAL and frees nothing. */
 void *topo_rallocx(void *ptr, size_t size, topo_flags_t flags);
 
 /* Resize in place only, to at least `size` (best effort toward size+extra);
@@ -163,7 +173,9 @@ void topo_dallocx(void *ptr, topo_flags_t flags);
 void topo_sdallocx(void *ptr, size_t size, topo_flags_t flags);
 
 /* The usable size topo_mallocx(size, flags) would return, without
- * allocating; 0 on an invalid flag word or unsatisfiable size. Pure. */
+ * allocating — exact for over-aligned requests too (the prediction shares
+ * the allocation path's formula); 0 on an invalid flag word or
+ * unsatisfiable size. Pure. */
 size_t topo_nallocx(size_t size, topo_flags_t flags);
 
 /* ------------------------------------------------------------------------

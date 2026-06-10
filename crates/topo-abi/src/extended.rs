@@ -36,13 +36,14 @@
 //! are *advisory* (§10.4 allows documented advisory flags to be no-ops, not
 //! mandatory ones).
 //!
+//! [`classify`]: topo_core::classify
 //! [`Request::flags`]: topo_core::Request
 
 use core::ffi::c_void;
 use core::ptr;
 
 use topo_core::flags::Lifetime;
-use topo_core::{classify, ArenaId, HugepagePolicy, RequestFlags, RequestKind, MIN_ALIGN};
+use topo_core::{predicted_usable_size, ArenaId, HugepagePolicy, RequestFlags, MIN_ALIGN};
 
 use crate::c_api;
 use crate::errno_shim::{alloc_protocol, preserving_errno, set_errno, EINVAL, ENOMEM};
@@ -92,14 +93,18 @@ const RESERVED_MASK: u64 = !KNOWN_MASK;
 
 /// `TOPO_ALIGN_LG(la)`: request `1 << la` alignment (`la == 0` ⇒ natural).
 ///
-/// `la` must be below the pointer width (`la <= 63` is encodable; the decoder
-/// additionally rejects `la >= usize::BITS` on narrower targets). An
-/// out-of-range `la` is a caller bug: debug builds assert, and the masked
-/// encoding it would otherwise produce names a *different* alignment — never
-/// pass one (§10.4: alignment is mandatory and must not degrade silently).
+/// An out-of-range `la` (≥ 64) encodes to a **reserved-bit word**, so every
+/// entry point rejects it deterministically with `EINVAL` — alignment is
+/// mandatory and must never degrade silently (§10.4). Masking it to a
+/// different (smaller) alignment, as a naive 6-bit truncation would, was a
+/// PR #11 review finding. (`la` in `usize::BITS..64` on narrower targets is
+/// caught by the decoder's representability check instead.)
 pub const fn topo_align_lg(la: u32) -> u64 {
-    debug_assert!(la < 64, "TOPO_ALIGN_LG: la out of the 6-bit field");
-    (la as u64) & TOPO_ALIGN_LG_MASK
+    if la < 64 {
+        la as u64
+    } else {
+        1 << 63 // reserved bit ⇒ deterministic EINVAL at every entry point
+    }
 }
 
 /// `TOPO_HOT(h)`: hotness hint `0..=255` (`TOPO_COLD` ≡ `TOPO_HOT(0)`).
@@ -200,8 +205,9 @@ pub extern "C" fn topo_mallocx(size: usize, flags: u64) -> *mut c_void {
 /// reallocate under the §25 contract — on failure (`NULL`) the original
 /// allocation is untouched. `TOPO_ALIGN_LG` is honored on the result;
 /// `TOPO_ZERO` zeroes any bytes beyond the preserved prefix. A null `ptr`
-/// behaves as `topo_mallocx`; an invalid `ptr` or flag word is `NULL` +
-/// `EINVAL` with no state change.
+/// behaves as `topo_mallocx`; `size == 0` follows the public
+/// `realloc(p, 0)` policy (free and return `NULL`, errno untouched); an
+/// invalid `ptr` or flag word is `NULL` + `EINVAL` with no state change.
 ///
 /// # Safety
 ///
@@ -215,6 +221,15 @@ pub unsafe extern "C" fn topo_rallocx(ptr: *mut c_void, size: usize, flags: u64)
     };
     if ptr.is_null() {
         return topo_mallocx(size, flags);
+    }
+    if size == 0 {
+        // The public realloc(p != NULL, 0) policy (§25.1 / docs/ABI.md):
+        // free and return NULL with errno untouched — not the engine's
+        // internal zero-as-one rule (PR #11 review). The flag word was
+        // already validated above, so an invalid word never frees.
+        // SAFETY: this entry point's contract covers the free of `ptr`.
+        unsafe { c_api::topomalloc_free(ptr) };
+        return ptr::null_mut();
     }
     let Some(a) = global() else {
         set_errno(ENOMEM);
@@ -329,6 +344,11 @@ pub unsafe extern "C" fn topo_sdallocx(ptr: *mut c_void, size: usize, flags: u64
 /// size `topo_mallocx(size, flags)` would return, without allocating. `0` for
 /// an invalid flag word, an unsatisfiable request (overflow), or a zero size
 /// under the `zero_null` policy. Pure: never touches `errno` or any state.
+///
+/// Computed by [`predicted_usable_size`] — the same formula the allocation
+/// path uses — so the prediction holds for over-aligned requests too, where
+/// the carved length (size-rounded) is smaller than classify's
+/// `max(size, align)` span (PR #11 review).
 #[no_mangle]
 pub extern "C" fn topo_nallocx(size: usize, flags: u64) -> usize {
     let Some((align, f)) = decode_flags(flags) else {
@@ -337,11 +357,7 @@ pub extern "C" fn topo_nallocx(size: usize, flags: u64) -> usize {
     if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
         return 0;
     }
-    match classify(size, align.max(MIN_ALIGN), f.raw()).map(|r| r.kind) {
-        Some(RequestKind::Small { usable, .. }) => usable,
-        Some(RequestKind::Medium { bytes } | RequestKind::Large { bytes }) => bytes,
-        None => 0,
-    }
+    predicted_usable_size(size, align.max(MIN_ALIGN), f).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -386,6 +402,11 @@ mod tests {
         assert_eq!(TOPO_LIFETIME_MEDIUM, 0x1000);
         assert_eq!(TOPO_LIFETIME_LONG, 0x1800);
         assert_eq!(topo_align_lg(12), 12);
+        // Out-of-range lg-alignment encodes a reserved bit, never a different
+        // alignment (PR #11 review) — every entry point then EINVALs.
+        assert_eq!(topo_align_lg(64), 1 << 63);
+        assert_eq!(topo_align_lg(u32::MAX), 1 << 63);
+        assert!(decode_flags(topo_align_lg(64)).is_none());
         assert_eq!(topo_hot(255), 255 << 13);
         assert_eq!(topo_arena(0), 1 << 21);
         assert_eq!(topo_arena(41), 42 << 21);
@@ -470,6 +491,32 @@ mod tests {
     }
 
     #[test]
+    fn rallocx_zero_size_follows_the_public_realloc_policy() {
+        // rallocx(p != NULL, 0) frees and returns NULL with errno untouched
+        // (PR #11 review) — the same §25.1 policy as topomalloc_realloc, not
+        // the engine's internal zero-as-one rule.
+        let p = topo_mallocx(64, 0);
+        assert!(!p.is_null());
+        set_errno(5);
+        assert!(trallocx(p, 0, 0).is_null());
+        assert_eq!(get_errno(), 5, "freeing via rallocx(p, 0) is not an error");
+        // The object was genuinely freed: the same class slot is vended again.
+        let q = topo_mallocx(64, 0);
+        assert_eq!(q, p, "rallocx(p, 0) must actually free");
+        tdallocx(q, 0);
+
+        // An *invalid flag word* with size 0 must NOT free: validation comes
+        // first, deterministically (§10.4).
+        let r = topo_mallocx(64, 0);
+        set_errno(0);
+        assert!(trallocx(r, 0, 1 << 60).is_null());
+        assert_eq!(get_errno(), EINVAL);
+        // SAFETY: `r` is still live (the invalid word freed nothing).
+        unsafe { r.cast::<u8>().write(0x7E) };
+        tdallocx(r, 0);
+    }
+
+    #[test]
     fn rallocx_preserves_original_on_failure() {
         let p = topo_mallocx(100, 0);
         assert!(!p.is_null());
@@ -535,6 +582,11 @@ mod tests {
             (100, topo_align_lg(8)),
             (40_000, 0),
             (3 * 1024 * 1024, 0),
+            // Over-page alignments: classify's span-rounding diverges from
+            // the carved length here — the PR #11 P1 case.
+            (1, topo_align_lg(16)),
+            (100, topo_align_lg(18)),
+            (200_000, topo_align_lg(16)),
         ] {
             let predicted = topo_nallocx(size, flags);
             assert!(predicted >= size.max(1));

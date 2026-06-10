@@ -48,7 +48,9 @@ pub mod transfer_cache;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Convenience re-exports for the common surface.
-pub use allocator::{Allocator, AllocatorConfig, AllocatorStats, FreeOutcome, MetaArena};
+pub use allocator::{
+    predicted_usable_size, Allocator, AllocatorConfig, AllocatorStats, FreeOutcome, MetaArena,
+};
 pub use backend::{
     CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,
     TopoBackingProvider, VWindow,

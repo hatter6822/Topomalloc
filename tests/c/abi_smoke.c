@@ -177,6 +177,25 @@ int main(void) {
     assert(d != NULL);
     topo_dallocx(d, 0);
 
+    /* PR #11 review fixes, pinned from the C side:
+     * 1. nallocx is exact for over-aligned requests (align > page size). */
+    size_t oa_predicted = topo_nallocx(100, TOPO_ALIGN_LG(18));
+    void *oa = topo_mallocx(100, TOPO_ALIGN_LG(18));
+    assert(oa != NULL && ((size_t) oa % (1u << 18)) == 0u);
+    assert(topomalloc_malloc_usable_size(oa) == oa_predicted);
+    topomalloc_free(oa);
+    /* 2. rallocx(p, 0) follows the public realloc(p, 0) policy: free+NULL,
+     *    errno untouched. */
+    void *rz = topo_mallocx(64, 0);
+    errno = 7;
+    assert(topo_rallocx(rz, 0, 0) == NULL);
+    assert(errno == 7);
+    /* 3. out-of-range TOPO_ALIGN_LG is EINVAL, never a different alignment. */
+    errno = 0;
+    assert(topo_mallocx(64, TOPO_ALIGN_LG(64)) == NULL);
+    assert(errno == EINVAL);
+    assert(topo_nallocx(64, TOPO_ALIGN_LG(99)) == 0u);
+
     /* generated table header is consistent and usable from C */
     assert(TOPOMALLOC_QUANTUM == 16u);
     assert(TOPOMALLOC_NUM_SIZE_CLASSES >= 1u);

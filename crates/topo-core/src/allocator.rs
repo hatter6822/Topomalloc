@@ -422,6 +422,32 @@ impl<P: TopoBackingProvider> MetadataRegion for MetaArena<P> {
     }
 }
 
+/// The page-rounded byte length a medium/large allocation actually carves
+/// for a request of `size` bytes — the *size* alone, not classify's
+/// `max(size, align)` span: the extent carve honours the alignment by
+/// placement, without over-allocating the length. `None` only on rounding
+/// overflow (§9.7). The single formula shared by [`Allocator::allocate`] and
+/// [`predicted_usable_size`], so prediction and reality cannot drift (PR #11
+/// review).
+#[inline]
+fn medium_large_usable(size: usize) -> Option<usize> {
+    let effective = if size == 0 { 1 } else { size };
+    align_up(effective, PAGE_SIZE)
+}
+
+/// The usable size a successful [`Allocator::allocate`]`(size, align, flags)`
+/// would return, computed without allocating — the §10.3 `nallocx` oracle.
+/// `None` exactly when `allocate` would fail classification (invalid
+/// alignment/flags or rounding overflow). Pure: no allocator state is
+/// consulted, so the prediction is identical for every engine instance.
+pub fn predicted_usable_size(size: usize, align: usize, flags: RequestFlags) -> Option<usize> {
+    let req = classify(size, align, flags.raw())?;
+    match req.kind {
+        RequestKind::Small { usable, .. } => Some(usable),
+        RequestKind::Medium { .. } | RequestKind::Large { .. } => medium_large_usable(size),
+    }
+}
+
 /// The M1 allocator over the central path (W8-1a): classify → central list /
 /// large path, under the structures' own locks. See the module docs for the
 /// composition and the concurrency argument.
@@ -564,13 +590,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let (p, usable) = match req.kind {
             RequestKind::Small { sc, usable } => (self.alloc_small(sc), usable),
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                // Round the *size* alone (not `max(size, align)` — the carve
-                // honours the alignment without over-allocating the length).
-                // `classify` already checked the larger `max(size, align)`
-                // rounding, so this smaller one cannot overflow; stay total
-                // anyway.
-                let effective = if size == 0 { 1 } else { size };
-                let Some(bytes) = align_up(effective, PAGE_SIZE) else {
+                let Some(bytes) = medium_large_usable(size) else {
                     return ptr::null_mut();
                 };
                 (self.large.allocate(bytes, req.align), bytes)
@@ -1821,5 +1841,47 @@ mod tests {
         );
         assert_eq!(tfree(&a, q2), FreeOutcome::Freed);
         assert_eq!(a.stats().live_bytes, 0);
+    }
+
+    /// PR #11 review (P1): the `nallocx` oracle must equal the usable size a
+    /// real allocation gets — across small, medium, large, **and the
+    /// over-aligned requests where classify's span-rounding diverges from the
+    /// carve's size-rounding** (align > PAGE_SIZE was the reported gap).
+    #[test]
+    fn predicted_usable_size_matches_real_allocations() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        for (size, align) in [
+            (1usize, 1usize),
+            (0, 16),
+            (100, 16),
+            (4096, 16),
+            (SMALL_MAX, 16),
+            (SMALL_MAX + 1, 16),
+            (100, 4096),          // over-aligned, sub-page
+            (1, 65_536),          // align 4× PAGE_SIZE: the reported case
+            (100, 262_144),       // align ≫ size
+            (200_000, 65_536),    // medium with large alignment
+            (HUGE_THRESHOLD, 16), // large family
+        ] {
+            let predicted = predicted_usable_size(size, align, RequestFlags::NONE);
+            let p = a.allocate(size, align, RequestFlags::NONE);
+            assert!(!p.is_null(), "allocate({size}, {align})");
+            assert_eq!(
+                predicted,
+                a.usable_size(p),
+                "prediction diverged for (size={size}, align={align})"
+            );
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        // Prediction fails exactly where allocation would: invalid alignment
+        // and rounding overflow.
+        assert_eq!(predicted_usable_size(64, 24, RequestFlags::NONE), None);
+        assert_eq!(
+            predicted_usable_size(usize::MAX - 5, 16, RequestFlags::NONE),
+            None
+        );
     }
 }
