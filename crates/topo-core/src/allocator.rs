@@ -21,6 +21,16 @@
 //! Plan 05's per-CPU/thread caches are wired *under* the same API at M2
 //! (W16-4 owns that transition); nothing here changes when they arrive.
 //!
+//! **Trace spine (§33.7 / principle 6).** The allocator does not emit trace
+//! lines itself; it exposes everything an emitter needs — addresses,
+//! [`usable_size`](Allocator::usable_size), [`classify`] for the request
+//! side, [`stats`](Allocator::stats) for conservation — and the differential
+//! tests compose those with [`crate::trace`]'s grammar writers and replay the
+//! stream through the `LiveModel`/Lean oracles. In-engine emission hooks (a
+//! sink threaded through the hot paths) arrive with the deterministic-replay
+//! work that owns them (plan 08 W21), so the hot path carries no tracing
+//! cost until a consumer exists.
+//!
 //! **Concurrency.** The allocator is thread-safe: the central cache, the
 //! extent managers, and the large allocator each carry their own §27.2 locks,
 //! and the span pool is guarded by a backend-class lock. The only cross-
