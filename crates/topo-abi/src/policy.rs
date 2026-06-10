@@ -1,53 +1,39 @@
 // SPDX-License-Identifier: MIT
-//! The zero-size allocation policy (§9.6 / F-004, plan 06 W8-4).
+//! Environment wiring for the zero-size allocation policy (§9.6 / F-004,
+//! plan 06 W8-4).
 //!
-//! `malloc(0)` behavior is configurable:
-//!
-//! * [`ZeroSizePolicy::Unique`] (**default**, `compat.zero_unique`) —
-//!   `malloc(0)` returns a minimum-size, unique, freeable pointer. This
-//!   matches the dominant platform allocator (glibc), per §9.6's ABI-compat
-//!   rule.
-//! * [`ZeroSizePolicy::Null`] (`compat.zero_null`) — `malloc(0)` returns
-//!   `NULL` **without** setting `errno` (a zero-size null is not a failure).
-//!
-//! The policy governs every zero-size *allocation* entry (`malloc`, `calloc`
-//! with a zero product, `aligned_alloc`/`memalign`/`posix_memalign` with
-//! `size == 0`, `topo_mallocx`/`topo_nallocx`). Two behaviors are fixed
-//! regardless of policy: `free(NULL)` is a no-op (§9.6 MUST), and
-//! `realloc(p != NULL, 0)` frees `p` and returns `NULL` (the C17
-//! implementation-defined choice of the dominant platform; C23 deprecates
-//! zero-size realloc entirely).
-//!
-//! Configured once from the environment (`TOPOMALLOC_ZERO_SIZE=unique|null`)
-//! on first use, or programmatically via [`set_zero_size_policy`] (the
-//! plan 07 control plane maps `compat.zero_*` onto this).
+//! The policy **state** lives in the core ([`topo_core::compat`]), where the
+//! control plane reads it (`topo.compat.zero_size`, plan 07) and future
+//! engine-internal consumers will. This module is the ABI-side wiring: it
+//! applies the `TOPOMALLOC_ZERO_SIZE=unique|null` environment default exactly
+//! once, lazily, before the first policy-dependent decision — and an explicit
+//! [`set_zero_size_policy`] call always wins over the environment, even if it
+//! happens first.
 //!
 //! The environment read uses `libc::getenv` (no allocation), so consulting
-//! the policy can never re-enter the allocator — important when TopoMalloc
-//! is the process `#[global_allocator]`.
+//! the policy can never re-enter the allocator — important when TopoMalloc is
+//! the process `#[global_allocator]`.
+//!
+//! Policy semantics (see [`ZeroSizePolicy`]): `Unique` (default) returns a
+//! minimum-size unique freeable pointer for `malloc(0)`-style requests;
+//! `Null` returns `NULL` with `errno` untouched. Fixed regardless of policy:
+//! `free(NULL)` is a no-op (§9.6 MUST) and `realloc(p != NULL, 0)` frees and
+//! returns `NULL` (the dominant-platform C17 choice; C23 deprecates
+//! zero-size realloc entirely).
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::Once;
 
-/// What a zero-size allocation request returns (§9.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZeroSizePolicy {
-    /// A minimum-size unique freeable pointer (`compat.zero_unique`, default).
-    Unique,
-    /// `NULL`, with `errno` untouched (`compat.zero_null`).
-    Null,
-}
+pub use topo_core::compat::ZeroSizePolicy;
 
-/// Lazily initialized from the environment; mutable thereafter via
-/// [`set_zero_size_policy`].
-static POLICY: OnceLock<AtomicU8> = OnceLock::new();
+/// Guards the one-shot environment application. Claimed by whichever happens
+/// first: the lazy env read, or an explicit `set_zero_size_policy` (which
+/// claims it with a no-op so a later env read can never override the caller's
+/// choice).
+static ENV_INIT: Once = Once::new();
 
-const UNIQUE: u8 = 0;
-const NULL: u8 = 1;
-
-/// Allocation-free read of `TOPOMALLOC_ZERO_SIZE`. Unknown values (and
-/// non-unix hosts) fall back to the default, `Unique`.
-fn policy_from_env() -> u8 {
+/// Allocation-free read of `TOPOMALLOC_ZERO_SIZE`, applied to the core knob.
+/// Unknown values (and non-unix hosts) keep the default, `Unique`.
+fn apply_env_default() {
     #[cfg(unix)]
     {
         // SAFETY: getenv takes a valid NUL-terminated name and returns either
@@ -57,33 +43,24 @@ fn policy_from_env() -> u8 {
             // SAFETY: non-null getenv results point at a NUL-terminated string.
             let bytes = unsafe { core::ffi::CStr::from_ptr(v) }.to_bytes();
             if bytes == b"null" {
-                return NULL;
+                topo_core::set_zero_size_policy(ZeroSizePolicy::Null);
             }
         }
     }
-    UNIQUE
 }
 
-fn cell() -> &'static AtomicU8 {
-    POLICY.get_or_init(|| AtomicU8::new(policy_from_env()))
-}
-
-/// The active zero-size policy.
+/// The active zero-size policy, applying the environment default on first use.
 pub fn zero_size_policy() -> ZeroSizePolicy {
-    match cell().load(Ordering::Relaxed) {
-        NULL => ZeroSizePolicy::Null,
-        _ => ZeroSizePolicy::Unique,
-    }
+    ENV_INIT.call_once(apply_env_default);
+    topo_core::zero_size_policy()
 }
 
 /// Set the zero-size policy at runtime (W8-4 "configurable"; the plan 07
-/// control plane and tests use this).
+/// control plane and tests use this). An explicit set always wins: it claims
+/// the one-shot environment slot, so a later first-read cannot override it.
 pub fn set_zero_size_policy(p: ZeroSizePolicy) {
-    let v = match p {
-        ZeroSizePolicy::Unique => UNIQUE,
-        ZeroSizePolicy::Null => NULL,
-    };
-    cell().store(v, Ordering::Relaxed);
+    ENV_INIT.call_once(|| {});
+    topo_core::set_zero_size_policy(p);
 }
 
 #[cfg(test)]
@@ -93,7 +70,10 @@ mod tests {
     #[test]
     fn default_is_unique_and_runtime_override_works() {
         // The test environment does not set TOPOMALLOC_ZERO_SIZE, so the
-        // default (glibc-compatible) policy applies.
+        // default (glibc-compatible) policy applies. NOTE: process-global
+        // state — this test restores the default, and no other in-crate test
+        // depends on a flipped policy (the full behavioral matrix runs in its
+        // own process: tests/tests/zero_size_policy.rs).
         assert_eq!(zero_size_policy(), ZeroSizePolicy::Unique);
         set_zero_size_policy(ZeroSizePolicy::Null);
         assert_eq!(zero_size_policy(), ZeroSizePolicy::Null);

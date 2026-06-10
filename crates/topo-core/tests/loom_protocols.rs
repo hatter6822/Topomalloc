@@ -241,3 +241,116 @@ fn large_double_free_under_pool_lock_releases_the_slot_once() {
         assert_eq!(p.wins, 1, "exactly one freer won");
     });
 }
+
+/// The W8 free-path hardening protocol (plan 06; `central.rs` insert_batch +
+/// `allocator.rs` retire): under any interleaving of (a) the two frees that
+/// empty a span, (b) a stale double-free racing them, and (c) the retirement
+/// itself, **exactly one** caller is told to deactivate, the deactivation
+/// runs exactly once, `live` never underflows, and a stale free past the
+/// teardown mutates nothing. This is the model of the two W8 guards — the
+/// span-state check and the `inserted > 0` gate — whose absence allowed a
+/// double-deactivation (`span_count` corruption) and a release-mode
+/// `live_count` underflow.
+///
+/// The model mirrors the real shape: the central bin lock is a `Mutex` (the
+/// real `CentralLock` spinlock has the same acquire/release semantics), the
+/// span fields it protects are plain loads/stores under that lock, and the
+/// empty-span cache is "full" so the emptier must claim the deactivation —
+/// the configuration in which the historical bugs fired.
+#[test]
+fn w8_span_retirement_is_claimed_exactly_once() {
+    use loom::sync::atomic::AtomicU8;
+
+    const ACTIVE: u8 = 0;
+    const RELEASED: u8 = 1;
+    const OBJECTS: u8 = 2; // a 2-object span: bits 0 and 1
+
+    struct SpanModel {
+        /// Bin lock (outer); everything below is touched only while held.
+        bin: Mutex<()>,
+        state: AtomicU8,
+        bitmap: AtomicU8,
+        live: AtomicU8,
+        deactivations: AtomicU8,
+    }
+
+    /// `insert_batch(span, [i], 1)` with the two W8 guards; returns
+    /// "caller must deactivate".
+    fn insert(m: &SpanModel, i: u8) -> bool {
+        let _g = m.bin.lock().unwrap();
+        // Guard 1: a span past its teardown absorbs nothing (state check
+        // under the bin lock — `deactivate` writes it under the same lock).
+        if m.state.load(Ordering::Relaxed) != ACTIVE {
+            return false;
+        }
+        let bits = m.bitmap.load(Ordering::Relaxed);
+        let bit = 1u8 << i;
+        let inserted = bits & bit == 0;
+        if inserted {
+            m.bitmap.store(bits | bit, Ordering::Relaxed);
+            let live = m.live.load(Ordering::Relaxed);
+            assert!(live > 0, "live_count underflow: the historical bug");
+            m.live.store(live - 1, Ordering::Relaxed);
+        }
+        let empty = m.bitmap.load(Ordering::Relaxed) == (1 << OBJECTS) - 1
+            && m.live.load(Ordering::Relaxed) == 0;
+        // Guard 2: only the insert that *made* the span empty owns the
+        // transition (`inserted > 0`); the empty cache is full in this model,
+        // so that owner must deactivate.
+        empty && inserted
+    }
+
+    /// `deactivate_span` (the caller-side retirement claim).
+    fn deactivate(m: &SpanModel) {
+        let _g = m.bin.lock().unwrap();
+        assert_eq!(
+            m.state.load(Ordering::Relaxed),
+            ACTIVE,
+            "double deactivation: the historical span_count corruption"
+        );
+        assert_eq!(m.live.load(Ordering::Relaxed), 0, "C-004: must be empty");
+        m.state.store(RELEASED, Ordering::Relaxed);
+        m.deactivations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    loom::model(|| {
+        let m = Arc::new(SpanModel {
+            bin: Mutex::new(()),
+            state: AtomicU8::new(ACTIVE),
+            bitmap: AtomicU8::new(0),
+            live: AtomicU8::new(OBJECTS),
+            deactivations: AtomicU8::new(0),
+        });
+
+        // T1 frees object 0; T2 frees object 1; T3 *double*-frees object 0,
+        // racing both. When T3 arrives first it is indistinguishable from the
+        // legitimate free (the duplicate that loses is whichever runs second
+        // — that is what a double free *is*), so every thread follows the
+        // same protocol: whichever insert empties the span retires it. The
+        // invariant is global: of four insert attempts on a two-object span,
+        // exactly two insert, exactly one claims, the claim deactivates
+        // exactly once, and no count ever underflows — under EVERY
+        // interleaving (the asserts inside `insert`/`deactivate` encode the
+        // two historical corruptions).
+        let spawn_free = |i: u8| {
+            let m = m.clone();
+            thread::spawn(move || {
+                if insert(&m, i) {
+                    deactivate(&m);
+                }
+            })
+        };
+        let t1 = spawn_free(0);
+        let t2 = spawn_free(1);
+        let t3 = spawn_free(0); // the double free
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+
+        // Exactly one retirement; the span ended Released with clean counts.
+        assert_eq!(m.deactivations.load(Ordering::Relaxed), 1);
+        assert_eq!(m.state.load(Ordering::Relaxed), RELEASED);
+        assert_eq!(m.live.load(Ordering::Relaxed), 0);
+        assert_eq!(m.bitmap.load(Ordering::Relaxed), (1 << OBJECTS) - 1);
+    });
+}

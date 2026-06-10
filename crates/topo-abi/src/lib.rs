@@ -31,8 +31,8 @@ use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::{
-    reserve_meta_arena, Allocator, AllocatorConfig, ArenaId, FreeOutcome, InvalidFree, PageMap,
-    RequestFlags,
+    Allocator, AllocatorConfig, AllocatorStats, ArenaId, FreeOutcome, InvalidFree, MetaArena,
+    PageMap, RequestFlags,
 };
 
 mod c_api;
@@ -56,8 +56,17 @@ pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
 /// virtual, lazily faulted). Sized with ample headroom over the default
-/// configuration's fixed pools plus pagemap nodes and span bitmaps.
+/// configuration's fixed pools plus pagemap nodes and span bitmaps — the
+/// 4× factor below covers the growing parts (radix nodes for the regions'
+/// address ranges and out-of-line span bitmaps), each of which is measured
+/// in single-digit MiB against the pools' ~13 MiB; the assertion turns a
+/// config growth that outpaces this arena into a build failure instead of a
+/// runtime construction error.
 const META_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(
+    AllocatorConfig::DEFAULT.fixed_pool_metadata_bytes() * 4 <= META_BYTES,
+    "META_BYTES no longer covers the default configuration's metadata demand      with headroom; raise it alongside AllocatorConfig::DEFAULT"
+);
 
 /// Metadata arena for the simulator backend, whose untyped pool is charged
 /// eagerly — keep it modest (matches [`AllocatorConfig::small`]).
@@ -126,9 +135,23 @@ impl AnyAllocator {
         dispatch!(self, a => a.usable_size(ptr))
     }
 
-    /// Whether `ptr` is a live allocation of this allocator.
+    /// Whether `ptr` is a **live** allocation of this allocator.
     pub fn owns(&self, ptr: *mut u8) -> bool {
         dispatch!(self, a => a.owns(ptr))
+    }
+
+    /// Whether `ptr` lies in memory this allocator manages at all (live,
+    /// freed-awaiting-reuse, interior, retained, or metadata) — the §35.2
+    /// mixed-allocator routing predicate; see
+    /// [`Allocator::recognizes`](topo_core::Allocator::recognizes).
+    pub fn recognizes(&self, ptr: *mut u8) -> bool {
+        dispatch!(self, a => a.recognizes(ptr))
+    }
+
+    /// A statistics snapshot of the engine (§31.1; map into the Appendix-D
+    /// JSON with `topo_stats::Stats::record_allocator`).
+    pub fn stats(&self) -> AllocatorStats {
+        dispatch!(self, a => a.stats())
     }
 
     /// The active backend's name (`"posix"` / `"sele4n-sim"`), proving which
@@ -149,12 +172,12 @@ impl AnyAllocator {
 pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
     match name {
         "posix" => {
-            // The metadata provider must outlive the arena (reserve_meta_arena
-            // contract); both are leaked to 'static.
-            let meta_provider: &'static PosixBackingProvider =
-                Box::leak(Box::new(PosixBackingProvider::new()));
-            let meta = reserve_meta_arena(meta_provider, ArenaId::DEFAULT, META_BYTES).ok()?;
-            let meta = &*Box::leak(Box::new(meta));
+            // The arena owns its provider (`MetaArena`), so one leak pins the
+            // whole metadata backing for the process lifetime (§35.5/§27.5).
+            let meta: &'static MetaArena<PosixBackingProvider> = Box::leak(Box::new(
+                MetaArena::reserve(PosixBackingProvider::new(), ArenaId::DEFAULT, META_BYTES)
+                    .ok()?,
+            ));
             let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
             let a = Allocator::new(
                 PosixBackingProvider::new(),
@@ -172,10 +195,14 @@ pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
         "sele4n-sim" => {
             use topo_backend_sele4n::Sele4nSim;
             let cfg = AllocatorConfig::small();
-            let meta_provider: &'static Sele4nSim =
-                Box::leak(Box::new(Sele4nSim::new(SIM_META_BYTES)));
-            let meta = reserve_meta_arena(meta_provider, ArenaId::DEFAULT, SIM_META_BYTES).ok()?;
-            let meta = &*Box::leak(Box::new(meta));
+            let meta: &'static MetaArena<Sele4nSim> = Box::leak(Box::new(
+                MetaArena::reserve(
+                    Sele4nSim::new(SIM_META_BYTES),
+                    ArenaId::DEFAULT,
+                    SIM_META_BYTES,
+                )
+                .ok()?,
+            ));
             let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
             let a = Allocator::new(
                 Sele4nSim::new(cfg.span_region_bytes),
@@ -352,13 +379,19 @@ unsafe impl GlobalAlloc for TopoMallocGlobal {
             // SAFETY: no engine ⇒ the pointer came from `System`.
             return unsafe { System.realloc(ptr, layout, new_size) };
         };
-        if a.owns(ptr) {
+        if a.recognizes(ptr) {
+            // Engine-managed memory (live — or, for a caller violating the
+            // realloc contract, freed/interior: the engine then returns null
+            // without touching anything, which is the safe failure).
             // SAFETY: `ptr` is a live engine allocation the caller owns (the
             // `GlobalAlloc` realloc contract), reallocated exactly once.
             return unsafe { a.realloc(ptr, new_size, layout.align(), RequestFlags::NONE) };
         }
-        // A bootstrap-window `System` pointer: migrate it into the engine
-        // (allocate-before-free, so failure leaves the original intact).
+        // Never engine memory ⇒ a bootstrap-window `System` pointer: migrate
+        // it into the engine (allocate-before-free, so failure leaves the
+        // original intact). Routing on `recognizes` — not `owns` — is what
+        // keeps a (contract-violating) freed engine pointer from ever being
+        // handed to `System` (§35.2: each allocator frees only its own).
         let q = a.allocate(new_size, layout.align(), RequestFlags::NONE);
         if !q.is_null() {
             let copy = layout.size().min(new_size);

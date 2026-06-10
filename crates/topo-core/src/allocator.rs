@@ -36,15 +36,19 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
 use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, RequestKind};
 use crate::error::BackendError;
-use crate::extent::{BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit};
+use crate::extent::{
+    BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, StateBytes,
+};
 use crate::flags::RequestFlags;
 use crate::generated::tables::PAGE_SIZE;
+use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::{ArenaId, Label, NodeId, SizeClassId, SpanId};
 use crate::large::{LargeAllocator, LargeConfig};
 use crate::overflow::align_up;
@@ -104,52 +108,67 @@ impl AllocatorConfig {
     /// (span pool + both extent pools + large pool), excluding pagemap nodes
     /// and out-of-line span bitmaps which grow with use. Useful for sizing the
     /// metadata arena; saturates rather than wrapping on absurd configs.
+    ///
+    /// The extent and large slot types are private to their modules; their
+    /// sizes are bounded by a named per-slot constant that a compile-time
+    /// assertion pins to the real `size_of` values — a future field addition
+    /// that crosses the bound fails the build instead of silently
+    /// under-provisioning arenas sized from this.
     pub const fn fixed_pool_metadata_bytes(&self) -> usize {
         let span_pool = self
             .span_slots
             .saturating_mul(core::mem::size_of::<SpanSlot>());
-        // The extent Slot and LargeSlot types are private to their modules;
-        // 128 bytes is a deliberately generous per-slot bound for both (the
-        // extent slot is ~88 B, the large slot ~104 B), kept conservative so
-        // arena sizing computed from this can never under-provision.
         let extent_slots = self
             .span_extent_slots
             .saturating_add(self.large_extent_slots)
-            .saturating_mul(128);
-        let large_pool = self.large_slots.saturating_mul(128);
+            .saturating_mul(FOREIGN_SLOT_BOUND);
+        let large_pool = self.large_slots.saturating_mul(FOREIGN_SLOT_BOUND);
         span_pool
             .saturating_add(extent_slots)
             .saturating_add(large_pool)
     }
 }
 
+/// Conservative per-slot byte bound for the (module-private) extent and large
+/// descriptor slots, used by [`AllocatorConfig::fixed_pool_metadata_bytes`].
+/// Pinned to the real sizes below so it can never silently under-provision.
+const FOREIGN_SLOT_BOUND: usize = 128;
+const _: () = assert!(
+    crate::extent::EXTENT_SLOT_BYTES <= FOREIGN_SLOT_BOUND
+        && crate::large::LARGE_SLOT_BYTES <= FOREIGN_SLOT_BOUND,
+    "a descriptor slot outgrew FOREIGN_SLOT_BOUND; raise the bound so      fixed_pool_metadata_bytes keeps over-approximating"
+);
+
+impl AllocatorConfig {
+    /// Production defaults: ~0.5 GiB of span region and 2 GiB of medium/large
+    /// region on 64-bit hosts (virtual; lazily faulted on POSIX); a much
+    /// smaller address-space footprint on 32-bit targets. A `const` so
+    /// consumers (the ABI's metadata-arena sizing) can pin headroom against
+    /// it at compile time.
+    #[cfg(target_pointer_width = "64")]
+    pub const DEFAULT: AllocatorConfig = AllocatorConfig {
+        span_region_bytes: 512 * 1024 * 1024,
+        span_extent_slots: 16 * 1024,
+        span_slots: 16 * 1024,
+        large_region_bytes: 2 * 1024 * 1024 * 1024,
+        large_extent_slots: 32 * 1024,
+        large_slots: 32 * 1024,
+    };
+    /// See the 64-bit variant; 32-bit address space is the scarce resource.
+    #[cfg(not(target_pointer_width = "64"))]
+    pub const DEFAULT: AllocatorConfig = AllocatorConfig {
+        span_region_bytes: 64 * 1024 * 1024,
+        span_extent_slots: 4 * 1024,
+        span_slots: 4 * 1024,
+        large_region_bytes: 128 * 1024 * 1024,
+        large_extent_slots: 4 * 1024,
+        large_slots: 4 * 1024,
+    };
+}
+
 impl Default for AllocatorConfig {
-    /// Production defaults for 64-bit hosts: ~0.5 GiB of span region and
-    /// 2 GiB of medium/large region (virtual; lazily faulted on POSIX).
-    /// 32-bit targets get a much smaller address-space footprint.
     fn default() -> Self {
-        #[cfg(target_pointer_width = "64")]
-        {
-            Self {
-                span_region_bytes: 512 * 1024 * 1024,
-                span_extent_slots: 16 * 1024,
-                span_slots: 16 * 1024,
-                large_region_bytes: 2 * 1024 * 1024 * 1024,
-                large_extent_slots: 32 * 1024,
-                large_slots: 32 * 1024,
-            }
-        }
-        #[cfg(not(target_pointer_width = "64"))]
-        {
-            Self {
-                span_region_bytes: 64 * 1024 * 1024,
-                span_extent_slots: 4 * 1024,
-                span_slots: 4 * 1024,
-                large_region_bytes: 128 * 1024 * 1024,
-                large_extent_slots: 4 * 1024,
-                large_slots: 4 * 1024,
-            }
-        }
+        Self::DEFAULT
     }
 }
 
@@ -177,6 +196,44 @@ pub enum FreeOutcome {
     /// (a double free, or a stale free racing the span's teardown); no state
     /// was corrupted. Debug builds abort inside the central list instead.
     DoubleFree,
+}
+
+// ---------------------------------------------------------------------------
+// Stats (§8.6/§31, the W8 reconciliation surface for plan 07)
+// ---------------------------------------------------------------------------
+
+/// An instantaneous statistics snapshot of an [`Allocator`] (§31.1 "where is
+/// the memory?"). Produced by [`Allocator::stats`]; `topo-stats` maps it into
+/// the Appendix-D JSON via `Stats::record_allocator`.
+///
+/// Counter identities (§8.6, asserted by the reconciliation tests):
+/// `live_bytes == allocated_bytes_total - freed_bytes_total` holds by
+/// construction; in a quiescent state every live small byte is the complement
+/// of `central_free_bytes` within its spans' object bytes. Individual fields
+/// are relaxed-atomic reads, so a snapshot taken *during* concurrent
+/// operations is per-field accurate but not globally instantaneous
+/// (epoch-consistent snapshots are the plan 07 W17 surface).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorStats {
+    /// Usable bytes currently live in the application.
+    pub live_bytes: u64,
+    /// Cumulative usable bytes ever handed out.
+    pub allocated_bytes_total: u64,
+    /// Cumulative usable bytes ever returned.
+    pub freed_bytes_total: u64,
+    /// Free object bytes resident in the central lists (Σ over classes of
+    /// `central_free_count × object_size`).
+    pub central_free_bytes: u64,
+    /// §20.1 physical-state breakdown of the span (small-object) region.
+    pub span_backend: StateBytes,
+    /// §20.1 physical-state breakdown of the medium/large region.
+    pub large_backend: StateBytes,
+    /// Bytes of pagemap radix nodes allocated so far (metadata overhead).
+    pub pagemap_metadata_bytes: u64,
+    /// Spans currently active (created and not yet retired).
+    pub live_spans: u64,
+    /// Medium/large allocations currently live.
+    pub live_large: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,27 +348,68 @@ impl SpanPool {
 // The allocator
 // ---------------------------------------------------------------------------
 
-/// Reserve and commit a provider region and build the allocator's metadata
-/// arena over it. The arena is the [`MetadataAlloc`] + [`MetadataRegion`]
-/// source an [`Allocator`] borrows.
+/// A provider-backed metadata arena: the [`MetadataAlloc`] + [`MetadataRegion`]
+/// source an [`Allocator`] borrows, **owning** the provider whose reservation
+/// backs it.
 ///
-/// **Lifetime contract:** the returned arena aliases provider-owned memory.
-/// The caller must keep `provider` alive (and never `release` the region) for
-/// as long as the arena — and any allocator built over it — exists. Metadata
-/// is monotonic (§27.5): in production both are process-lived; tests keep the
-/// provider in scope or leak it.
-pub fn reserve_meta_arena<P: TopoBackingProvider>(
-    provider: &P,
-    arena: ArenaId,
-    bytes: usize,
-) -> Result<BumpArena, BackendError> {
-    let region = provider.reserve(arena, bytes, PAGE_SIZE)?;
-    provider.commit(region, 0, region.len)?;
-    // SAFETY: `region` is a committed, exclusively-owned mapping of
-    // `region.len` bytes that the caller keeps alive for the arena's lifetime
-    // (the contract above); the arena never outgrows it (BumpArena bounds
-    // every carve).
-    Ok(unsafe { BumpArena::new(region.base, region.len) })
+/// Owning the provider is what makes this safe by construction: both shipped
+/// providers reclaim their reservations on `Drop`, so an arena that merely
+/// *borrowed* one could be left dangling by safe code. Here the borrow checker
+/// enforces the §27.5 lifetime story instead — every `Allocator` borrows the
+/// `MetaArena`, so the arena (and the provider inside it) must outlive the
+/// allocator, and the backing cannot be reclaimed while any metadata is
+/// reachable. In production the arena is process-lived (the ABI leaks it at
+/// first use, §35.5); tests scope it around the allocator.
+pub struct MetaArena<P: TopoBackingProvider> {
+    /// The bump carver over the committed reservation.
+    arena: BumpArena,
+    /// Keeps the reservation mapped: the provider's `Drop` is the only
+    /// reclaimer, and it cannot run before `self` (and every borrower) is gone.
+    _provider: P,
+}
+
+impl<P: TopoBackingProvider> MetaArena<P> {
+    /// Reserve and commit `bytes` of metadata backing from `provider`, taking
+    /// ownership of it. Fails cleanly if the provider cannot reserve or
+    /// commit (the provider's own `Drop` reclaims any partial reservation).
+    pub fn reserve(provider: P, arena: ArenaId, bytes: usize) -> Result<Self, BackendError> {
+        let region = provider.reserve(arena, bytes, PAGE_SIZE)?;
+        provider.commit(region, 0, region.len)?;
+        // SAFETY: `region` is a committed, exclusively-owned mapping of
+        // `region.len` bytes. It stays valid for the arena's whole lifetime
+        // because `self` owns `provider` — the only reclaimer of the mapping
+        // is the provider's `Drop`, which cannot run before `self` is
+        // dropped, and the borrow checker keeps every user of the arena
+        // alive no longer than `self`. `BumpArena` bounds every carve to
+        // `region.len`.
+        let bump = unsafe { BumpArena::new(region.base, region.len) };
+        Ok(Self {
+            arena: bump,
+            _provider: provider,
+        })
+    }
+
+    /// Metadata bytes carved so far.
+    pub fn used(&self) -> usize {
+        self.arena.used()
+    }
+
+    /// Total metadata capacity.
+    pub fn capacity(&self) -> usize {
+        self.arena.capacity()
+    }
+}
+
+impl<P: TopoBackingProvider + Sync> MetadataAlloc for MetaArena<P> {
+    fn alloc(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        self.arena.alloc(size, align)
+    }
+}
+
+impl<P: TopoBackingProvider> MetadataRegion for MetaArena<P> {
+    fn contains(&self, addr: usize) -> bool {
+        self.arena.contains(addr)
+    }
 }
 
 /// The M1 allocator over the central path (W8-1a): classify → central list /
@@ -341,6 +439,12 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Guards `spans.inner` (acquire/release; lowest lock class, §27.2 —
     /// never held across a central-list or provider call).
     span_lock: BackendLock,
+    /// Cumulative usable bytes ever handed out (§31.1; relaxed — stats are
+    /// monotone counters, not synchronization).
+    allocated_bytes: AtomicU64,
+    /// Cumulative usable bytes ever returned. `live = allocated - freed` by
+    /// construction, so the §8.6 application-side identity cannot drift.
+    freed_bytes: AtomicU64,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, and `pagemap` carry their own
@@ -358,8 +462,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// Build an allocator from two provider instances (one region each for
     /// spans and medium/large), a metadata source, and the pagemap.
     ///
-    /// `meta` and `meta_region` are usually the same object (a [`BumpArena`]
-    /// from [`reserve_meta_arena`], or the [`Bootstrap`](crate::Bootstrap));
+    /// `meta` and `meta_region` are usually the same object (a [`MetaArena`],
+    /// a [`BumpArena`], or the [`Bootstrap`](crate::Bootstrap));
     /// they are separate parameters so a composite region
     /// ([`AnyMetadataRegion`](crate::AnyMetadataRegion)) can cover several
     /// metadata sources after a hand-off.
@@ -403,6 +507,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             large,
             spans,
             span_lock: BackendLock::new(),
+            allocated_bytes: AtomicU64::new(0),
+            freed_bytes: AtomicU64::new(0),
         })
     }
 
@@ -460,11 +566,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 (self.large.allocate(bytes, req.align), bytes)
             }
         };
-        if !p.is_null() && req.flags.hints().zero {
-            // SAFETY: `p` is a live allocation with at least `usable`
-            // writable bytes (the class's usable size, or the page-rounded
-            // extent length).
-            unsafe { ptr::write_bytes(p, 0, usable) };
+        if !p.is_null() {
+            self.allocated_bytes
+                .fetch_add(usable as u64, Ordering::Relaxed);
+            if req.flags.hints().zero {
+                // SAFETY: `p` is a live allocation with at least `usable`
+                // writable bytes (the class's usable size, or the page-rounded
+                // extent length).
+                unsafe { ptr::write_bytes(p, 0, usable) };
+            }
         }
         p
     }
@@ -705,12 +815,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // invariant (central.rs); stay total regardless.
                     return FreeOutcome::Invalid(InvalidFree::Foreign);
                 };
+                // Capture the class size *before* the insert: once the object
+                // is free, the span may empty, retire, and recycle under a
+                // racing thread, and its class with it.
+                let usable = size_class::usable_size(span.size_class());
                 let r = self.central.insert_batch(span, &[idx], 1);
                 if r.inserted == 0 {
                     // Already central-free (double free) or the span raced
                     // its teardown; nothing was mutated (W8 hardening).
                     return FreeOutcome::DoubleFree;
                 }
+                self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
                 if r.span_empty {
                     self.retire_span(span);
                 }
@@ -719,8 +834,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             Ok(FreeTarget::Large { .. }) => {
                 // The large allocator re-resolves under its own lock, so a
                 // concurrent double free of the same pointer settles on
-                // exactly one winner (large.rs DD-1).
-                if self.large.free(ptr) {
+                // exactly one winner (large.rs DD-1) — only the winner (the
+                // call that returns `true`) records the freed bytes, so the
+                // counter cannot double-count. The usable size is captured
+                // first: after the free the descriptor may recycle.
+                let usable = self.large.usable_size(ptr).unwrap_or(0);
+                // SAFETY: this method's own contract is the large path's
+                // contract, forwarded unchanged.
+                if unsafe { self.large.free(ptr) } {
+                    self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
                     FreeOutcome::Freed
                 } else {
                     FreeOutcome::DoubleFree
@@ -778,15 +900,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// The usable size of the allocation at `ptr` (§10.1
     /// `malloc_usable_size`): the class's object size for small allocations,
     /// the page-rounded extent length for medium/large. `None` for null,
-    /// foreign, interior, metadata, or released pointers.
+    /// foreign, interior, metadata, released, **and freed** pointers — a
+    /// small object whose free-bitmap bit is set is not a live allocation
+    /// (the W8 liveness probe; freed large allocations already resolve
+    /// `None` because their pagemap entries are retired).
     pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
         if ptr.is_null() {
             return None;
         }
         match validate_free(self.pagemap, self.meta_region, ptr as usize) {
-            Ok(FreeTarget::Small { span, .. }) => {
+            Ok(FreeTarget::Small { span, object_index }) => {
                 // SAFETY: descriptors live in never-freed metadata.
                 let span = unsafe { &*span };
+                if span.is_central_free(object_index) {
+                    return None; // freed, awaiting reuse: not a live object
+                }
                 Some(size_class::usable_size(span.size_class()))
             }
             Ok(FreeTarget::Large { .. }) => self.large.usable_size(ptr),
@@ -794,11 +922,36 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
-    /// Whether `ptr` is a live allocation of this allocator (a base pointer
-    /// of a small object or a medium/large allocation). Interior, metadata,
-    /// released, foreign, and null pointers are not owned.
+    /// Whether `ptr` is a **live** allocation of this allocator (the base
+    /// pointer of a live small object or a medium/large allocation).
+    /// Interior, metadata, released, foreign, null, and freed-awaiting-reuse
+    /// pointers are not owned. For "is this address ours at all (live or
+    /// not)?", see [`recognizes`](Self::recognizes).
     pub fn owns(&self, ptr: *mut u8) -> bool {
-        !ptr.is_null() && validate_free(self.pagemap, self.meta_region, ptr as usize).is_ok()
+        if ptr.is_null() {
+            return false;
+        }
+        match validate_free(self.pagemap, self.meta_region, ptr as usize) {
+            Ok(FreeTarget::Small { span, object_index }) => {
+                // SAFETY: descriptors live in never-freed metadata.
+                !unsafe { &*span }.is_central_free(object_index)
+            }
+            Ok(FreeTarget::Large { .. }) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether `addr` lies in memory this allocator manages **at all** — a
+    /// live object, a freed object awaiting reuse, an interior byte, a
+    /// released-but-retained page, or allocator metadata. The complement is
+    /// the §35.2 mixed-allocator routing predicate: an address this returns
+    /// `false` for was never produced by this allocator, so an adapter that
+    /// layers TopoMalloc over another allocator (the `GlobalAlloc` bootstrap
+    /// window) may hand it back to that other allocator.
+    pub fn recognizes(&self, ptr: *mut u8) -> bool {
+        !ptr.is_null()
+            && (!self.pagemap.lookup(ptr as usize).is_empty()
+                || self.meta_region.contains(ptr as usize))
     }
 
     // -- reallocation (§25, the W8-1a/W15-1/2/3a contract) ---------------------
@@ -854,7 +1007,19 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // Classify the existing allocation; reject anything we do not own
         // without touching it (§35.2).
         let old_usable = match classify_ptr(self.pagemap, self.meta_region, ptr as usize) {
-            PointerClass::Small { sc, .. } => {
+            PointerClass::Small {
+                sc,
+                span,
+                object_index,
+                ..
+            } => {
+                // W8 liveness probe: a freed object awaiting reuse is not a
+                // valid realloc source (resizing it "in place" would alias the
+                // central free list; copying from it would read stale bytes).
+                // SAFETY: descriptors live in never-freed metadata.
+                if unsafe { &*span }.is_central_free(object_index) {
+                    return ptr::null_mut();
+                }
                 let row = match size_class::checked_row(sc) {
                     Some(r) => r,
                     None => return ptr::null_mut(),
@@ -942,6 +1107,35 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// Whether both back-ends are well-formed (W4-5 oracle; debug/tests).
     pub fn check_invariants(&self) -> bool {
         self.span_extents.check_invariants() && self.large.check_invariants()
+    }
+
+    /// Take a statistics snapshot (§31.1; the W8 DoD "state exposes stats and
+    /// reconciles" surface). See [`AllocatorStats`] for the field semantics
+    /// and consistency model.
+    pub fn stats(&self) -> AllocatorStats {
+        let allocated = self.allocated_bytes.load(Ordering::Relaxed);
+        let freed = self.freed_bytes.load(Ordering::Relaxed);
+        // Σ over classes: central-resident objects × object size. Bin reads
+        // are lock-free approximations, exact when quiescent (§31.1).
+        let mut central_free_bytes = 0u64;
+        for (i, row) in SIZE_CLASSES.iter().enumerate() {
+            if let Some(bin) = self.central.bin(SizeClassId::new(i)) {
+                central_free_bytes += bin.total_central_free() * row.size as u64;
+            }
+        }
+        AllocatorStats {
+            // Saturating: `freed` can transiently exceed `allocated` only in
+            // a torn relaxed read during concurrent ops; never report a wrap.
+            live_bytes: allocated.saturating_sub(freed),
+            allocated_bytes_total: allocated,
+            freed_bytes_total: freed,
+            central_free_bytes,
+            span_backend: self.span_extents.state_bytes(),
+            large_backend: self.large.state_bytes(),
+            pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
+            live_spans: self.live_span_count() as u64,
+            live_large: self.large.live_count() as u64,
+        }
     }
 }
 
@@ -1463,5 +1657,159 @@ mod tests {
         });
         assert!(a.check_invariants());
         assert_eq!(a.live_large_count(), 0);
+    }
+
+    /// W8 liveness probes: a freed small object awaiting reuse is not live —
+    /// `owns`/`usable_size` say so, and `realloc` refuses it as a source —
+    /// while `recognizes` still claims the address (it is allocator memory).
+    #[test]
+    fn freed_small_object_is_recognized_but_not_owned() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(a.owns(p));
+        assert!(a.recognizes(p));
+        assert_eq!(a.usable_size(p), Some(64));
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Freed: no longer a live object…
+        assert!(!a.owns(p), "freed object must not be owned");
+        assert_eq!(a.usable_size(p), None, "freed object has no usable size");
+        // …its bytes can no longer seed a realloc…
+        assert!(
+            trealloc(&a, p, 128, MIN_ALIGN, RequestFlags::NONE).is_null(),
+            "realloc of a freed object must fail, not resurrect it"
+        );
+        // …but the address is still recognized as allocator-managed (§35.2
+        // routing: it must never be handed to a foreign allocator).
+        assert!(a.recognizes(p));
+
+        // Foreign and metadata addresses split the same way.
+        let mut local = 0u8;
+        let foreign = &mut local as *mut u8;
+        assert!(!a.owns(foreign));
+        assert!(!a.recognizes(foreign));
+        assert!(!a.recognizes(ptr::null_mut()));
+        let meta_ptr = m.alloc(16, 8).unwrap().as_ptr();
+        assert!(!a.owns(meta_ptr), "metadata is not an application object");
+        assert!(a.recognizes(meta_ptr), "metadata is allocator-managed");
+    }
+
+    /// A freed *large* allocation behaves the same: its pagemap entries are
+    /// retired, so every probe (and realloc) rejects it, while the span
+    /// region keeps recognizing retained small pages.
+    #[test]
+    fn freed_large_allocation_is_fully_retired() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(SMALL_MAX + 1);
+        assert!(a.owns(p) && a.recognizes(p));
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(!a.owns(p));
+        assert_eq!(a.usable_size(p), None);
+        assert!(trealloc(&a, p, 64, MIN_ALIGN, RequestFlags::NONE).is_null());
+    }
+
+    /// `MetaArena` owns its provider, so the borrow checker enforces the
+    /// §27.5 lifetime story end to end: build a full allocator over one,
+    /// exercise it, and drop everything in order.
+    #[test]
+    fn meta_arena_backs_a_full_allocator_lifecycle() {
+        let m = MetaArena::reserve(HostProvider::new(), ArenaId::DEFAULT, 4 * 1024 * 1024)
+            .expect("meta arena");
+        assert_eq!(m.used(), 0);
+        assert!(m.capacity() >= 4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = Allocator::new(
+            HostProvider::new(),
+            HostProvider::new(),
+            &m,
+            &m,
+            &pm,
+            ArenaId::DEFAULT,
+            AllocatorConfig::small(),
+        )
+        .expect("allocator");
+
+        let p = a.malloc(100);
+        assert!(!p.is_null());
+        // The engine's metadata genuinely came from the arena.
+        assert!(m.used() > 0, "pools and descriptors carve from the arena");
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+        // Drop order (a, then pm, then m) is enforced by the borrows.
+    }
+
+    /// §8.6 reconciliation (the W8 stats DoD): the counters balance against
+    /// ground truth at every quiescent point of an alloc/free cycle.
+    #[test]
+    fn stats_reconcile_through_an_alloc_free_cycle() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = size_class(64, 1).unwrap();
+        let per_span = objects_per_slab(sc) as u64;
+
+        let s0 = a.stats();
+        assert_eq!(s0.live_bytes, 0);
+        assert_eq!(s0.allocated_bytes_total, 0);
+        assert_eq!(s0.central_free_bytes, 0);
+        assert_eq!(s0.live_spans, 0);
+
+        // Allocate one span's worth of 64-byte objects plus one medium.
+        let mut ptrs = Vec::new();
+        for _ in 0..per_span {
+            ptrs.push(a.malloc(64));
+        }
+        let big = a.malloc(SMALL_MAX + 1);
+        let big_usable = a.usable_size(big).unwrap() as u64;
+
+        let s1 = a.stats();
+        assert_eq!(s1.allocated_bytes_total, per_span * 64 + big_usable);
+        assert_eq!(s1.live_bytes, per_span * 64 + big_usable);
+        assert_eq!(s1.freed_bytes_total, 0);
+        assert_eq!(s1.central_free_bytes, 0, "span fully drained");
+        assert_eq!(s1.live_spans, 1);
+        assert_eq!(s1.live_large, 1);
+        assert!(s1.span_backend.active > 0, "span backing is active");
+
+        // Free half the small objects: they become central-free bytes.
+        let half = per_span / 2;
+        for p in ptrs.drain(..half as usize) {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        let s2 = a.stats();
+        assert_eq!(s2.freed_bytes_total, half * 64);
+        assert_eq!(s2.live_bytes, (per_span - half) * 64 + big_usable);
+        assert_eq!(s2.central_free_bytes, half * 64);
+
+        // Free everything: live returns to zero and the identities hold.
+        for p in ptrs.drain(..) {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        assert_eq!(tfree(&a, big), FreeOutcome::Freed);
+        let s3 = a.stats();
+        assert_eq!(s3.live_bytes, 0);
+        assert_eq!(s3.allocated_bytes_total, s3.freed_bytes_total);
+        // The emptied span is cached (1 per bin), all its objects central-free.
+        assert_eq!(s3.central_free_bytes, per_span * 64);
+        assert_eq!(s3.live_spans, 1);
+        assert_eq!(s3.live_large, 0);
+        // Realloc accounts through its legs: a move adds then frees.
+        let q = a.malloc(100);
+        let q2 = trealloc(&a, q, 5000, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q2.is_null());
+        let s4 = a.stats();
+        assert_eq!(
+            s4.live_bytes,
+            a.usable_size(q2).unwrap() as u64,
+            "after a realloc move only the new object is live"
+        );
+        assert_eq!(tfree(&a, q2), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
     }
 }

@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-sele4n-sim = ["dep:topo-backend-sele4n"]
+sele4n-sim = ["dep:topo-backend-sele4n", "topo-abi/sele4n-sim"]
 
 [dependencies]
 topo-core = { path = "../crates/topo-core" }

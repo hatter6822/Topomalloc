@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -32,6 +34,15 @@ struct Pod {
 struct alignas(128) OverAligned {
     std::uint64_t a;
 };
+
+/// new_handler instrumentation: counts invocations and uninstalls itself, so
+/// the [new.delete.single] retry loop terminates deterministically without
+/// needing real memory exhaustion.
+int g_handler_calls = 0;
+void counting_handler() {
+    ++g_handler_calls;
+    std::set_new_handler(nullptr);
+}
 
 } // namespace
 
@@ -94,6 +105,57 @@ int main() {
     assert(z1 != nullptr && z2 != nullptr && z1 != z2);
     operator delete(z1);
     operator delete(z2, static_cast<std::size_t>(0));
+
+    // The [new.delete.single] new_handler loop: on failure the installed
+    // handler runs; when it uninstalls itself the loop ends — with bad_alloc
+    // for the throwing form, nullptr for nothrow. (A handler that frees
+    // memory and retries is the same loop with a success exit; exhaustion
+    // cannot be staged deterministically, so the termination arm is what
+    // this pins.)
+    volatile std::size_t impossible2 = static_cast<std::size_t>(-128);
+    g_handler_calls = 0;
+    std::set_new_handler(counting_handler);
+    void *nt = operator new(impossible2, std::nothrow);
+    assert(nt == nullptr);
+    assert(g_handler_calls == 1 && "nothrow new must still run the handler");
+    assert(std::get_new_handler() == nullptr);
+
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    g_handler_calls = 0;
+    std::set_new_handler(counting_handler);
+    bool caught = false;
+    try {
+        (void) operator new(impossible2);
+    } catch (const std::bad_alloc &) {
+        caught = true;
+    }
+    assert(caught && "throwing new must raise bad_alloc after the handler");
+    assert(g_handler_calls == 1);
+    assert(std::get_new_handler() == nullptr);
+#endif
+
+    // Concurrent new/delete through the replaced operators: the engine under
+    // them is thread-safe, contents stay per-thread intact.
+    {
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; t++) {
+            threads.emplace_back([t] {
+                for (int i = 0; i < 200; i++) {
+                    const std::size_t n = 1 + ((static_cast<std::size_t>(i) * 37u +
+                                                static_cast<std::size_t>(t) * 11u) %
+                                               700u);
+                    auto *buf = new unsigned char[n];
+                    std::memset(buf, t + 1, n);
+                    assert(buf[0] == static_cast<unsigned char>(t + 1));
+                    assert(buf[n - 1] == static_cast<unsigned char>(t + 1));
+                    delete[] buf;
+                }
+            });
+        }
+        for (auto &th : threads) {
+            th.join();
+        }
+    }
 
     std::printf("C++ ABI smoke: OK (version=%s, %u size classes)\n",
                 topomalloc_version(),

@@ -413,6 +413,11 @@ pub struct ExtentMap {
     committed_bytes: usize,
 }
 
+/// Byte size of one extent-descriptor slot, exposed so sizing helpers
+/// (`AllocatorConfig::fixed_pool_metadata_bytes`) can pin their per-slot bound
+/// at compile time instead of trusting a hand-written constant (W8).
+pub(crate) const EXTENT_SLOT_BYTES: usize = core::mem::size_of::<Slot>();
+
 // SAFETY: `ExtentMap` owns its slot memory exclusively (a `NonNull<Slot>` into
 // never-freed metadata) and exposes mutation only through `&mut self`. It holds
 // no thread-shared state of its own, so moving it across threads is sound; the

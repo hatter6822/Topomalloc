@@ -306,8 +306,10 @@ pub extern "C" fn topomalloc_malloc_usable_size(ptr: *mut c_void) -> usize {
 
 /// Whether `size` is a plausible original request size for the allocation at
 /// `ptr` (the C23 `free_sized` contract): it must classify to the same
-/// storage the allocation actually has. Used only as a cross-check — the
-/// free itself never trusts the hint.
+/// storage the allocation actually has — exactly for small (same-class
+/// in-place only), by fit for medium/large (in-place shrinks keep the
+/// extent). Used only as a cross-check — the free itself never trusts the
+/// hint.
 fn sized_hint_matches(a: &AnyAllocator, ptr: *mut u8, size: usize, align: usize) -> bool {
     let Some(usable) = a.usable_size(ptr) else {
         // Not a live allocation of ours: the plain free path will reject it;
@@ -320,7 +322,13 @@ fn sized_hint_matches(a: &AnyAllocator, ptr: *mut u8, size: usize, align: usize)
             ..
         }) => class_usable == usable,
         Some(RequestKind::Medium { .. }) | Some(RequestKind::Large { .. }) => {
-            align_up(size.max(1), PAGE_SIZE) == Some(usable)
+            // Fit, not equality: an in-place shrink (`Allocator::realloc`)
+            // keeps the original extent, so the truthful (last-requested)
+            // size can round to *less* than the usable size. A false accept
+            // merely weakens a heuristic; a false reject would abort a
+            // correct program (found by the W8 self-audit; pinned by
+            // `free_sized_accepts_truthful_size_after_inplace_shrink`).
+            align_up(size.max(1), PAGE_SIZE).is_some_and(|rounded| rounded <= usable)
         }
         // A size so large it cannot classify can never have been allocated.
         None => false,
@@ -431,7 +439,6 @@ pub extern "C" fn topomalloc_backend() -> *const c_char {
 mod tests {
     use super::*;
     use crate::errno_shim::get_errno;
-    use crate::policy::set_zero_size_policy;
 
     /// Test wrappers: every pointer the tests free/realloc here is either one
     /// they just received and still own, null, or a local probe that was
@@ -671,6 +678,23 @@ mod tests {
         }
     }
 
+    /// Regression (W8 self-audit): after an in-place medium shrink the
+    /// truthful (last-requested) size rounds to *less* than the usable size;
+    /// the debug cross-check must accept it, not abort a correct program.
+    #[test]
+    fn free_sized_accepts_truthful_size_after_inplace_shrink() {
+        // SAFETY: pointers are test-owned; each is freed exactly once with
+        // its truthful last-requested size.
+        unsafe {
+            let p = topomalloc_malloc(80_000); // 5 pages: usable 81920
+            assert_eq!(topomalloc_malloc_usable_size(p), 81_920);
+            let q = topomalloc_realloc(p, 40_000); // rounds to 49152 <= 81920
+            assert_eq!(q, p, "page-rounded shrink stays in place");
+            assert_eq!(topomalloc_malloc_usable_size(q), 81_920);
+            topomalloc_free_sized(q, 40_000); // C23: the one valid hint
+        }
+    }
+
     /// The mismatch check itself. The test targets the inner (Rust-ABI)
     /// `free_sized_common` rather than the `extern "C"` symbol: a panic
     /// crossing an `extern "C"` boundary aborts the process (which is the
@@ -690,10 +714,10 @@ mod tests {
     }
 
     #[test]
-    fn zero_size_policy_governs_the_allocation_entries() {
-        // NOTE: the policy is process-global; this is the single test that
-        // flips it, and it restores the default before returning.
-        // Default (unique): zero-size requests yield unique freeable pointers.
+    fn zero_size_default_unique_yields_distinct_freeable_pointers() {
+        // Default policy (zero_unique, §9.6) only — flipping the process-wide
+        // policy races sibling tests, so the full unique/null matrix runs in
+        // its own process: tests/tests/zero_size_policy.rs (W8-4).
         let a = topomalloc_malloc(0);
         let b = topomalloc_malloc(0);
         assert!(!a.is_null() && !b.is_null());
@@ -703,26 +727,11 @@ mod tests {
         let c = topomalloc_calloc(0, 8);
         assert!(!c.is_null());
         tfree(c);
-
-        // zero_null: NULL without errno.
-        set_zero_size_policy(ZeroSizePolicy::Null);
-        set_errno(0);
-        assert!(topomalloc_malloc(0).is_null());
-        assert_eq!(get_errno(), 0, "zero-size NULL is not a failure");
-        assert!(topomalloc_calloc(0, 8).is_null());
-        assert!(topomalloc_aligned_alloc(64, 0).is_null());
         let mut out: *mut c_void = ptr::null_mut();
         // SAFETY: `out` is a valid writable slot.
         unsafe { assert_eq!(topomalloc_posix_memalign(&mut out, 64, 0), 0) };
-        assert!(out.is_null());
-        set_zero_size_policy(ZeroSizePolicy::Unique);
-
-        // Unique again: posix_memalign hands out a freeable zero-size object.
-        let mut out2: *mut c_void = ptr::null_mut();
-        // SAFETY: `out2` is a valid writable slot.
-        unsafe { assert_eq!(topomalloc_posix_memalign(&mut out2, 64, 0), 0) };
-        assert!(!out2.is_null());
-        tfree(out2);
+        assert!(!out.is_null());
+        tfree(out);
     }
 
     #[test]

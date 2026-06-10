@@ -14,10 +14,31 @@
 //! Validation failures (`EINVAL` — e.g. a non-power-of-two alignment to
 //! `aligned_alloc`) are set explicitly at the call site via [`set_errno`].
 //!
-//! On non-unix hosts the shim is a no-op: there is no C `errno` to honor, and
-//! every entry point still returns its null/0 failure value.
+//! **Platform coverage.** The thread's errno cell is accessed through the
+//! libc accessor each OS actually exposes: `__errno_location` (Linux,
+//! Android, Emscripten), `__error` (Apple, FreeBSD), `__errno` (OpenBSD,
+//! NetBSD), `___errno` (Solaris, illumos). Any *other* host — non-unix, or a
+//! unix flavor without a known accessor — compiles the no-op shim instead of
+//! failing the build: the protocol degrades to the return values alone
+//! (null / 0 / error codes), which every entry point already carries.
 
-#[cfg(unix)]
+// The unix targets with a known errno accessor. `cfg` cannot expand macros,
+// so the list appears twice — here and on the fallback module below — and
+// MUST be kept identical (the fallback is its exact complement).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+))]
 mod imp {
     /// `ENOMEM` for the §10.1 failure protocol.
     pub(crate) const ENOMEM: i32 = libc::ENOMEM;
@@ -44,6 +65,16 @@ mod imp {
         unsafe {
             libc::__error()
         }
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        // SAFETY: `__errno` returns the thread's errno cell.
+        unsafe {
+            libc::__errno()
+        }
+        #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+        // SAFETY: `___errno` returns the thread's errno cell.
+        unsafe {
+            libc::___errno()
+        }
     }
 
     pub(crate) fn get_errno() -> i32 {
@@ -57,10 +88,25 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+)))]
 mod imp {
-    //! No C errno on this host: the protocol degrades to the return values
-    //! alone (null / 0 / error codes), which every entry point already carries.
+    //! No known C errno accessor on this host: the protocol degrades to the
+    //! return values alone (null / 0 / error codes), which every entry point
+    //! already carries. The constants keep the API's error vocabulary
+    //! consistent for in-crate callers.
     pub(crate) const ENOMEM: i32 = 12;
     pub(crate) const EINVAL: i32 = 22;
 

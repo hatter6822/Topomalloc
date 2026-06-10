@@ -91,20 +91,22 @@ fn sim_untyped_pool_accounting_is_exact() {
 // ---------------------------------------------------------------------------
 
 use topo_core::{
-    reserve_meta_arena, Allocator, AllocatorConfig, ArenaId, FreeOutcome, PageMap, RequestFlags,
+    Allocator, AllocatorConfig, ArenaId, FreeOutcome, MetaArena, PageMap, RequestFlags,
 };
 
 /// Build an engine over `provider`-style backends with identical, modest
 /// sizing on both sides (the simulator's untyped pool is charged eagerly).
 fn engine_outcomes<P, F>(mk: F, ops: &[Op]) -> Vec<(bool, usize)>
 where
-    P: TopoBackingProvider,
+    P: TopoBackingProvider + Sync,
     F: Fn(usize) -> P,
 {
     let cfg = AllocatorConfig::small();
-    let meta_provider = mk(4 * 1024 * 1024);
-    let meta =
-        reserve_meta_arena(&meta_provider, ArenaId::DEFAULT, 4 * 1024 * 1024).expect("meta arena");
+    // The arena owns its provider, so the borrow checker pins the drop order:
+    // the allocator (borrower) goes first, then the pagemap, then the arena
+    // with its backing (§27.5).
+    let meta = MetaArena::reserve(mk(4 * 1024 * 1024), ArenaId::DEFAULT, 4 * 1024 * 1024)
+        .expect("meta arena");
     let pagemap = PageMap::new();
     let a = Allocator::new(
         mk(cfg.span_region_bytes),
@@ -174,4 +176,33 @@ fn m1_engine_is_co_equal_over_posix_and_sim() {
         posix, sim,
         "the M1 allocator diverged between POSIX and the seLe4n simulator"
     );
+}
+
+/// W8 follow-up (self-audit): the *named selector's* simulator arm —
+/// `new_allocator_named("sele4n-sim")`, the construction the
+/// `TOPOMALLOC_BACKEND` env path runs — is executed, not merely compiled:
+/// build it, allocate across the families, free, and verify the stats
+/// identities hold over the GPL backend too.
+#[test]
+fn named_selector_builds_and_runs_the_sim_engine() {
+    let a = topo_abi::new_allocator_named("sele4n-sim").expect("sim engine via the named selector");
+    assert_eq!(a.backend_name(), "sele4n-sim");
+
+    let small = a.allocate(100, 16, RequestFlags::NONE);
+    let medium = a.allocate(40_000, 16, RequestFlags::NONE);
+    assert!(!small.is_null() && !medium.is_null());
+    let small_usable = a.usable_size(small).expect("live small");
+    let medium_usable = a.usable_size(medium).expect("live medium");
+    assert!(a.owns(small) && a.recognizes(small));
+
+    let s = a.stats();
+    assert_eq!(s.live_bytes, (small_usable + medium_usable) as u64);
+    assert_eq!(s.live_large, 1);
+
+    // SAFETY: both pointers are live and owned by this test.
+    unsafe {
+        assert_eq!(a.free(small), FreeOutcome::Freed);
+        assert_eq!(a.free(medium), FreeOutcome::Freed);
+    }
+    assert_eq!(a.stats().live_bytes, 0);
 }

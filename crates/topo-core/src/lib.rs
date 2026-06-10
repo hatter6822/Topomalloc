@@ -20,6 +20,7 @@ pub mod budget;
 pub mod cache_ops;
 pub mod central;
 pub mod classify;
+pub mod compat;
 pub mod cpu_cache;
 pub mod error;
 pub mod extent;
@@ -47,7 +48,7 @@ pub mod transfer_cache;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Convenience re-exports for the common surface.
-pub use allocator::{reserve_meta_arena, Allocator, AllocatorConfig, FreeOutcome};
+pub use allocator::{Allocator, AllocatorConfig, AllocatorStats, FreeOutcome, MetaArena};
 pub use backend::{
     CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,
     TopoBackingProvider, VWindow,
@@ -55,6 +56,7 @@ pub use backend::{
 pub use bootstrap::{Bootstrap, BumpArena, MetadataAlloc};
 pub use central::{Batch, CentralCache, CentralError, InsertResult, RemoveResult, MAX_BATCH_LEN};
 pub use classify::{classify, Request, RequestKind};
+pub use compat::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use error::BackendError;
 pub use extent::{
     Extent, ExtentError, ExtentFlags, ExtentId, ExtentManager, ExtentMap, ExtentRef, ExtentState,

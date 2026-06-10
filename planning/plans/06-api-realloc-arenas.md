@@ -56,6 +56,19 @@ W16-4 owns the transition). **Enables:** every consumer + tests.
 > (stale/double frees across span deactivation are rejected without accounting corruption, with a
 > release-mode CI pass to prove it). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W8) and
 > [docs/ABI.md](../../docs/ABI.md).
+>
+> **▸ Self-audit pass (closed).** A deliberate second pass over W8 fixed two found defects
+> (the sized-free fit check; the unsound-as-safe metadata-arena helper, replaced by the
+> provider-owning `MetaArena`), added the freed-object liveness probes + the `recognizes`
+> mixed-allocator predicate, made "no such arena" one deterministic `EINVAL`, widened the
+> errno platform matrix with a graceful fallback, wired the engine's stats into
+> `topo-stats`/`topo-control` (incl. `topo.compat.zero_size`, with the policy state moved
+> into `topo_core::compat`), and closed the verification gaps: a loom model of the span
+> retirement exclusivity, Miri over the engine/central suites, a `malloc_api` fuzz target,
+> an executed `sele4n-sim` named-selector path, `_Static_assert` struct pinning in the C
+> harness, `new_handler`/`bad_alloc`/concurrency coverage in the C++ harness, and recorded
+> criterion numbers (≈131 ns malloc+free on the M1 central path). Full detail:
+> [docs/DECISIONS.md](../../docs/DECISIONS.md) "W8 self-audit completions".
 
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|

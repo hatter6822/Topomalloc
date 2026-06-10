@@ -579,7 +579,7 @@ implementation choices; the module docs carry the detail.
   `topo_core::Allocator` (W8-1a) composes the proven plan-03/04 parts —
   classify → `CentralCache` (small, one object per `remove_batch` at M1) and
   `LargeAllocator` (medium + large) — borrowing a caller-supplied `PageMap`
-  and metadata arena (`reserve_meta_arena`). Span backing comes from a
+  and metadata arena (`MetaArena`). Span backing comes from a
   dedicated `ExtentManager` region; span descriptors live in a recycling,
   metadata-backed pool (the `LargePool` pattern: never freed, generation-
   bumped on reuse, §27.5; the base kept as a *pointer* so object addresses
@@ -610,9 +610,9 @@ implementation choices; the module docs carry the detail.
   `Allocator::free/realloc`, their `AnyAllocator` mirrors, and the
   `free`/`realloc`-family `extern "C"` exports carry the explicit contract
   (`unsafe extern "C"` changes nothing for C callers). Allocation-only and
-  read-only entries stay safe. *Recorded follow-up:* `LargeAllocator::free`
-  (an internal W4 building block with the same theoretical window) keeps its
-  safe signature until plan 08's hardening pass sweeps it.
+  read-only entries stay safe. The same promotion now covers
+  `LargeAllocator::free`/`free_with` (the internal W4 building block had the
+  identical window) — closed by the W8 self-audit, no residual debt.
 * **errno is a protocol, not a side effect (W8-1b).** Two combinators in
   `topo-abi::errno_shim` implement §10.1: `alloc_protocol` (preserve the
   caller's errno across success — backend syscalls may clobber it — set
@@ -676,3 +676,98 @@ implementation choices; the module docs carry the detail.
   validate and thread through `Request::flags` for plans 04/05/07/08.
   Requests naming a nonexistent arena fail as allocation failures until W9
   lands the arena API.
+
+### W8 self-audit completions (second pass)
+
+A deliberate post-landing audit of W8 found two defects and a set of
+incompletely-discharged obligations; all are now closed. The fixes, in
+severity order:
+
+* **Sized-free cross-check: fit, not equality (defect, fixed + regression
+  test).** The debug/hardened `free_sized` checker demanded
+  `align_up(size, PAGE) == usable` for medium/large — but the in-place
+  shrink keeps the original extent, so the *truthful* (last-requested) size
+  legitimately rounds below the usable size, and a correct C23 program
+  aborted in debug builds (reproduced before fixing). The comparison is now
+  `<=` for medium/large (exact-class equality stays for small, whose
+  in-place path is same-class only): in a corruption *heuristic*, a false
+  accept merely weakens it, a false reject is a bug. Pinned by
+  `free_sized_accepts_truthful_size_after_inplace_shrink`.
+* **`MetaArena` replaces the unsound-as-safe `reserve_meta_arena` (defect,
+  fixed).** The old helper returned a `BumpArena` aliasing provider memory
+  while only *documenting* that the provider must outlive it — and both
+  providers reclaim their reservations on `Drop`, so safe code could dangle
+  the arena. `MetaArena<P>` **owns** its provider: the borrow checker now
+  enforces the §27.5 lifetime story (allocator borrows arena ⇒ arena and
+  backing outlive it), one leak pins the whole metadata backing in the ABI,
+  and tests scope it naturally.
+* **Liveness probes + the `recognizes` routing predicate.** `owns`,
+  `usable_size`, and `realloc`'s source classification now consult the span
+  free-bitmap (`SpanDescriptor::is_central_free`, a lock-free advisory
+  read): a freed small object awaiting reuse is no longer reported live,
+  `realloc`-of-freed fails (`EINVAL` at the ABI — making the header's
+  documented behavior true) instead of silently aliasing the free list, and
+  `malloc_usable_size`/ownership probes return 0/false. The mixed-allocator
+  split is now two predicates: `owns` = live object; `recognizes` = any
+  engine-managed address (live, freed, interior, retained, metadata). The
+  `GlobalAlloc` adapter routes on `recognizes`, so a contract-violating
+  freed engine pointer can never be misrouted to `System`.
+* **Arena errors are one deterministic `EINVAL` (§10.4).** "No such arena"
+  previously surfaced as `ENOMEM` for encodable ids and `EINVAL` for
+  unencodable ones; `decode_flags` now rejects every non-default arena until
+  W9 lands the arena API, so the failure is a single invalid-argument code
+  at any id magnitude (C- and Rust-side tests pin it).
+* **errno shim: graceful platform matrix.** The per-OS accessor list now
+  covers Linux/Android/Emscripten (`__errno_location`), Apple + FreeBSD
+  (`__error`), OpenBSD/NetBSD (`__errno`), and Solaris/illumos (`___errno`);
+  any *other* host compiles the documented no-op shim instead of failing the
+  build (previously an unlisted unix was a compile error).
+* **Stats wired and reconciling (the deferred DoD item).** The engine keeps
+  two relaxed counters (allocated/freed usable bytes; `live` is their
+  difference by construction, so the §8.6 application identity cannot
+  drift) and `Allocator::stats()` snapshots them with central-free bytes
+  (Σ class `total_central_free × size`), both regions' §20.1 `StateBytes`,
+  pagemap metadata bytes, and live span/large counts.
+  `topo_stats::Stats::record_allocator` maps the snapshot into the
+  Appendix-D JSON (regions summed through `record_backend`); reconciliation
+  is asserted by an engine unit test over a full alloc/free/realloc cycle,
+  by the fuzz target after every input, and over the simulator backend by
+  the G-sim suite.
+* **Zero-size policy state moved to the core; control key added.** The
+  policy atomic lives in `topo_core::compat` (`no_std`), the ABI applies
+  the `TOPOMALLOC_ZERO_SIZE` env default once (an explicit set always
+  wins), and `topo-control` exposes `topo.compat.zero_size` — closing the
+  "knob ⇒ control plane" DoD line. The policy *matrix* test moved into its
+  own integration binary (`tests/tests/zero_size_policy.rs`) so flipping
+  the process-global policy can never race sibling tests.
+* **Checked metadata sizing.** `fixed_pool_metadata_bytes`' per-slot bound
+  for the private extent/large slot types is now a named constant pinned by
+  a compile-time assert against the real `size_of` values, and the ABI's
+  `META_BYTES` carries a compile-time 4× headroom assert against
+  `AllocatorConfig::DEFAULT` — a config growth that outruns the arena fails
+  the build, not the first allocation.
+* **Verification closures.** A loom model
+  (`w8_span_retirement_is_claimed_exactly_once`) exhaustively checks the two
+  free-path guards: across every interleaving of the two emptying frees and
+  a racing double free, exactly one caller claims exactly one deactivation
+  and no count underflows (writing the model also sharpened the invariant's
+  statement: when the duplicate free arrives *first* it is the
+  indistinguishable winner — exactly-once is the global property, not
+  per-thread innocence). Miri (with `-Zmiri-ignore-leaks` for the tests'
+  deliberate §27.5 metadata leaks) passes the engine and central suites —
+  the provenance-careful `object_ptr` path is machine-validated. A fourth
+  fuzz target (`malloc_api`) drives arbitrary allocate/free/realloc/probe
+  streams against a fresh engine asserting content survival, probe
+  agreement, §25.1 failure safety, §8.6 reconciliation, and backend
+  well-formedness (30k-run smoke campaign clean). The
+  `new_allocator_named("sele4n-sim")` arm — previously compiled but never
+  executed — now runs in the G-sim suite, and the `tests` crate's
+  `sele4n-sim` feature correctly lights up `topo-abi/sele4n-sim`. The C
+  harness pins `topomalloc_size_class_t` with `_Static_assert`
+  sizeof/offsetof (§35.3), and the C++ harness exercises the `new_handler`
+  loop, the `bad_alloc` throw path, and concurrent new/delete.
+* **Performance recorded (non-gating).** Criterion on the 4-core x86-64 dev
+  host: `size_class` ≈ 1.6 ns, `classify` ≈ 4.6 ns (5.3 ns with a
+  non-trivial flag word), and the full `malloc(64)+free` round-trip on the
+  M1 central path ≈ **131 ns** — the per-op central+span lock cost the
+  M2 caches and M3 RSEQ path (≈ 12.5 ns per cached op, W7) exist to remove.

@@ -63,13 +63,13 @@ unit), never exported symbols.
 | `topomalloc_aligned_alloc(align, size)` | power-of-two `align`, `size` a multiple of it (§25.5); else null + `EINVAL` |
 | `topomalloc_posix_memalign(&p, align, size)` | returns `0`/`EINVAL`/`ENOMEM`; never touches `errno`; writes `*memptr` only on success |
 | `topomalloc_memalign(align, size)` | obsolete compatibility: power-of-two `align`, any size |
-| `topomalloc_malloc_usable_size(ptr)` | usable bytes (≥ requested); `0` for null/foreign pointers |
+| `topomalloc_malloc_usable_size(ptr)` | usable bytes (≥ requested); `0` for null, foreign, and freed pointers |
 
 ### C23 sized free (W8-3)
 
 | Symbol | Semantics |
 |--------|-----------|
-| `topomalloc_free_sized(ptr, size)` | `size` must equal the last requested size; mismatches abort in debug/hardened builds and are ignored (the free is hint-independent) in performance builds |
+| `topomalloc_free_sized(ptr, size)` | `size` must equal the last requested size; mismatches abort in debug/hardened builds and are ignored (the free is hint-independent) in performance builds. The check is exact-class for small and *fit* (`rounding <= usable`) for medium/large, because an in-place shrink keeps the original extent |
 | `topomalloc_free_aligned_sized(ptr, align, size)` | the aligned counterpart; `align` joins the checked hint |
 
 ### Extended API (§10.3/§10.4, W8-6)
@@ -101,8 +101,14 @@ bits 53–63 reserved — must be zero
 
 Validation is total (§10.4): reserved bits, the contradictory hugepage pair,
 an unrepresentable alignment, or a nonexistent arena fail deterministically —
-never a silently degraded allocation. Alignment is extracted into a dedicated
-classifier argument, so it can never be dropped as an advisory bit.
+never a silently degraded allocation. "No such arena" is a single `EINVAL`
+at **any** id magnitude (until plan 06 W9 lands the arena API, only
+`TOPO_ARENA(0)`, the default arena, exists). Alignment is extracted into a
+dedicated classifier argument, so it can never be dropped as an advisory
+bit. `TOPO_TCACHE(id)` / `TOPO_NUMA(node)` (§10.4 recommended) are not yet
+encoded: their subsystems land with plans 05/04, and the reserved bits hold
+space for them — encoding them before a consumer exists would freeze
+guesses into ABI.
 
 ### Identification
 
@@ -116,6 +122,9 @@ classifier argument, so it can never be dropped as an advisory bit.
 * **errno (W8-1b):** allocation failure ⇒ `ENOMEM`; validation failure ⇒
   `EINVAL`; success restores the caller's `errno`; the free family never
   modifies it; `posix_memalign` reports only through its return value.
+  Covered errno platforms: Linux/Android/Emscripten, Apple, FreeBSD,
+  OpenBSD/NetBSD, Solaris/illumos; any other host degrades to the return
+  values alone (documented in `errno_shim`), never a build failure.
 * **Zero-size policy (W8-4, §9.6):** `malloc(0)`-style requests return a
   unique freeable pointer by default (`compat.zero_unique`, the glibc
   expectation); `TOPOMALLOC_ZERO_SIZE=null` in the environment — or
@@ -131,6 +140,24 @@ classifier argument, so it can never be dropped as an advisory bit.
   already-free pointers are detected by pagemap classification and ignored
   with no state change. The hardened profile (plan 08 W18) escalates these
   to aborts/quarantine.
+* **Liveness probes:** a freed object awaiting reuse is *not* live —
+  `malloc_usable_size` reports `0`, `realloc` rejects it with `EINVAL`, and
+  the Rust `owns` predicate is false — while the engine still `recognizes`
+  the address as its own (the §35.2 mixed-allocator routing split the
+  `GlobalAlloc` adapter relies on). The probes read the span free-bitmap
+  lock-free; the authoritative double-free check remains on the locked free
+  path.
+* **Stats (§31.1/§8.6):** `AnyAllocator::stats()` snapshots the engine
+  (live/allocated/freed usable bytes, central-free bytes, both regions'
+  §20.1 state breakdowns, pagemap metadata bytes, live span/large counts);
+  `topo_stats::Stats::record_allocator` maps it into the Appendix-D JSON.
+  `live == allocated − freed` holds by construction; the reconciliation
+  tests and the `malloc_api` fuzz target assert the rest. A C-callable
+  stats entry point arrives with the plan 07 control surface.
+* **Omitted compatibility shims:** `valloc`/`pvalloc` (SPEC §10.1 "optional
+  compatibility") are deliberately not exported; the `aligned_alloc` family +
+  `memalign` cover their uses without baking page-size assumptions into the
+  ABI.
 * **Rust callers:** the pointer-consuming entry points
   (`free`/`realloc`/sized frees/`posix_memalign` and the `topo_*x`
   equivalents) are `unsafe fn` in the Rust API — a *stale* pointer that

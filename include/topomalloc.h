@@ -104,9 +104,13 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * Extended API (§10.3/§10.4 — W8-6)
  * --------------------------------------------------------------------- */
 
-/* Handle/flag types (§10.3). Arena and tcache handles become meaningful with
- * the arena API (plan 06 W9, M4); at M1 only the default arena (id 0)
- * exists. */
+/* Handle/flag types (§10.3). Arena handles become meaningful with the arena
+ * API (plan 06 W9, M4); at M1 only the default arena (id 0) exists, and
+ * naming any other is a deterministic EINVAL. topo_tcache_t is declared for
+ * the §10.3 surface but has no consumer until explicit-tcache routing lands
+ * (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is
+ * deferred to its subsystem rather than frozen as a guess (reserved flag
+ * bits hold the space). */
 typedef uint32_t topo_arena_t;
 typedef uint32_t topo_tcache_t;
 typedef uint64_t topo_flags_t;

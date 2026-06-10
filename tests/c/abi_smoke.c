@@ -17,6 +17,27 @@
 #include <stdio.h>
 #include <string.h>
 
+/* §35.3 ABI pinning: the one exposed struct's layout is frozen by
+ * compile-time asserts, not just by reading field values at runtime — a
+ * field reorder or width change fails this translation unit. */
+_Static_assert(sizeof(topomalloc_size_class_t) == 24,
+               "topomalloc_size_class_t layout changed");
+_Static_assert(offsetof(topomalloc_size_class_t, size) == 0,
+               "size moved");
+_Static_assert(offsetof(topomalloc_size_class_t, align) == 4,
+               "align moved");
+_Static_assert(offsetof(topomalloc_size_class_t, slab_pages) == 8,
+               "slab_pages moved");
+_Static_assert(offsetof(topomalloc_size_class_t, objects_per_slab) == 12,
+               "objects_per_slab moved");
+_Static_assert(offsetof(topomalloc_size_class_t, batch) == 16,
+               "batch moved");
+_Static_assert(offsetof(topomalloc_size_class_t, max_local_capacity) == 20,
+               "max_local_capacity moved");
+_Static_assert(sizeof(topo_flags_t) == 8, "topo_flags_t must be 64-bit");
+_Static_assert(sizeof(topo_arena_t) == 4, "topo_arena_t must be 32-bit");
+_Static_assert(sizeof(topo_tcache_t) == 4, "topo_tcache_t must be 32-bit");
+
 int main(void) {
     /* version + backend identification */
     const char *v = topomalloc_version();
@@ -145,6 +166,12 @@ int main(void) {
     assert(topo_mallocx(64, ~(topo_flags_t) 0) == NULL);
     assert(errno == EINVAL);
     assert(topo_nallocx(64, (topo_flags_t) 1 << 60) == 0u);
+    /* a nonexistent arena is one deterministic EINVAL, at any id magnitude */
+    errno = 0;
+    assert(topo_mallocx(64, TOPO_ARENA(3)) == NULL);
+    assert(errno == EINVAL);
+    assert(topo_mallocx(64, TOPO_ARENA(300)) == NULL);
+    assert(topo_nallocx(64, TOPO_ARENA(3)) == 0u);
 
     void *d = topo_mallocx(48, 0);
     assert(d != NULL);

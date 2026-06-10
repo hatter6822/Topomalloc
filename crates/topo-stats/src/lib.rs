@@ -115,6 +115,28 @@ impl Stats {
         self.virtual_bytes = sb.total() as u64;
     }
 
+    /// Record an [`Allocator`](topo_core::Allocator) snapshot (plan 06 W8 —
+    /// the "state exposes stats and reconciles" DoD): the application-side
+    /// counters and central-list bytes map directly; the two back-end regions'
+    /// §20.1 state breakdowns are summed into the single back-end view
+    /// [`record_backend`](Self::record_backend) renders; the pagemap's radix
+    /// nodes are the metadata overhead measured so far.
+    pub fn record_allocator(&mut self, a: &topo_core::AllocatorStats) {
+        self.live_bytes = a.live_bytes;
+        self.allocated_bytes_total = a.allocated_bytes_total;
+        self.freed_bytes_total = a.freed_bytes_total;
+        self.central_free_bytes = a.central_free_bytes;
+        self.metadata_bytes = a.pagemap_metadata_bytes;
+        let combined = topo_core::StateBytes {
+            reserved: a.span_backend.reserved + a.large_backend.reserved,
+            active: a.span_backend.active + a.large_backend.active,
+            dirty: a.span_backend.dirty + a.large_backend.dirty,
+            muzzy: a.span_backend.muzzy + a.large_backend.muzzy,
+            released: a.span_backend.released + a.large_backend.released,
+        };
+        self.record_backend(combined);
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -225,5 +247,53 @@ mod tests {
         assert_eq!(s.profile, Profile::Performance);
         let v: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(v["application"]["live_bytes"], 0);
+    }
+
+    #[test]
+    fn record_allocator_maps_and_sums_the_regions() {
+        let snap = topo_core::AllocatorStats {
+            live_bytes: 1000,
+            allocated_bytes_total: 1500,
+            freed_bytes_total: 500,
+            central_free_bytes: 256,
+            span_backend: topo_core::StateBytes {
+                reserved: 10,
+                active: 20,
+                dirty: 30,
+                muzzy: 40,
+                released: 50,
+            },
+            large_backend: topo_core::StateBytes {
+                reserved: 1,
+                active: 2,
+                dirty: 3,
+                muzzy: 4,
+                released: 5,
+            },
+            pagemap_metadata_bytes: 8192,
+            live_spans: 2,
+            live_large: 1,
+        };
+        let mut s = Stats::default();
+        s.record_allocator(&snap);
+        assert_eq!(s.live_bytes, 1000);
+        assert_eq!(s.allocated_bytes_total, 1500);
+        assert_eq!(s.freed_bytes_total, 500);
+        assert_eq!(s.central_free_bytes, 256);
+        assert_eq!(s.metadata_bytes, 8192);
+        // The two regions sum into the single back-end view (§20.1/§21.2).
+        assert_eq!(s.dirty_bytes, 33);
+        assert_eq!(s.muzzy_bytes, 44);
+        assert_eq!(s.released_bytes, 55);
+        assert_eq!(
+            s.virtual_bytes,
+            (10 + 20 + 30 + 40 + 50) + (1 + 2 + 3 + 4 + 5)
+        );
+        // The application identity §8.6: live == allocated - freed.
+        assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
+        // JSON renders the recorded values (additive schema, §35.3).
+        let json = s.to_json();
+        assert!(json.contains("\"live_bytes\": 1000"));
+        assert!(json.contains("\"allocated_bytes_total\": 1500"));
     }
 }

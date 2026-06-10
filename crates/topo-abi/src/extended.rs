@@ -42,7 +42,7 @@ use core::ffi::c_void;
 use core::ptr;
 
 use topo_core::flags::Lifetime;
-use topo_core::{classify, HugepagePolicy, RequestFlags, RequestKind, MIN_ALIGN};
+use topo_core::{classify, ArenaId, HugepagePolicy, RequestFlags, RequestKind, MIN_ALIGN};
 
 use crate::c_api;
 use crate::errno_shim::{alloc_protocol, preserving_errno, set_errno, EINVAL, ENOMEM};
@@ -156,10 +156,17 @@ fn decode_flags(flags: u64) -> Option<(usize, RequestFlags)> {
 
     let arena_field = ((flags & ARENA_MASK) >> ARENA_SHIFT) as u32;
     if arena_field != 0 {
-        // The field stores id + 1. Ids beyond the internal encoding fail
-        // deterministically; at M1 only the default arena (id 0) exists, and
-        // the allocator itself rejects any other id.
+        // The field stores id + 1. Two rejection layers, one error code:
+        // an id beyond the internal encoding fails here, and an id naming an
+        // arena that does not exist fails the explicit existence check below
+        // — both are EINVAL at the entry points, so "no such arena" is one
+        // deterministic failure regardless of the id's magnitude (§10.4).
         f = f.with_arena(arena_field.checked_sub(1)?)?;
+    }
+    // Until the arena API lands (plan 06 W9, M4) only the default arena
+    // exists; routing to any other is an invalid argument, not an OOM.
+    if f.arena() != ArenaId::DEFAULT {
+        return None;
     }
     Some((align, f))
 }
@@ -409,6 +416,12 @@ mod tests {
         let (align, f) = decode_flags(topo_align_lg(9) | TOPO_ZERO).unwrap();
         assert_eq!(align, 512);
         assert!(f.hints().zero);
+        // The default arena may be named explicitly; any other id is the
+        // deterministic "no such arena" failure until W9 lands arenas.
+        assert!(decode_flags(topo_arena(0)).is_some());
+        assert!(decode_flags(topo_arena(1)).is_none());
+        assert!(decode_flags(topo_arena(254)).is_none());
+        assert!(decode_flags(topo_arena(u32::MAX)).is_none());
     }
 
     #[test]
@@ -431,10 +444,25 @@ mod tests {
         }
         tdallocx(p, topo_align_lg(8));
 
-        // A nonexistent arena fails deterministically at M1.
+        // A nonexistent arena is an invalid argument — EINVAL regardless of
+        // the id's magnitude (small ids and encoding-overflow ids alike).
         set_errno(0);
         assert!(topo_mallocx(64, topo_arena(3)).is_null());
-        assert_eq!(get_errno(), ENOMEM, "arena 3 does not exist at M1");
+        assert_eq!(get_errno(), EINVAL, "arena 3 does not exist at M1");
+        set_errno(0);
+        assert!(topo_mallocx(64, topo_arena(300)).is_null());
+        assert_eq!(get_errno(), EINVAL, "same failure for unencodable ids");
+        assert_eq!(topo_nallocx(64, topo_arena(3)), 0, "nallocx mirrors it");
+        // rallocx with a bad arena leaves the original untouched.
+        let keep = topo_mallocx(16, 0);
+        // SAFETY: `keep` is live and test-owned.
+        unsafe { keep.cast::<u8>().write(0x5A) };
+        set_errno(0);
+        assert!(trallocx(keep, 64, topo_arena(7)).is_null());
+        assert_eq!(get_errno(), EINVAL);
+        // SAFETY: `keep` is still live with its content.
+        unsafe { assert_eq!(keep.cast::<u8>().read(), 0x5A) };
+        tdallocx(keep, 0);
         // The default arena, named explicitly, works.
         let q = topo_mallocx(64, topo_arena(0));
         assert!(!q.is_null());

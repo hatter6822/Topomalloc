@@ -46,6 +46,11 @@ impl Control {
             "topo.version" => Some(VERSION.to_string()),
             "topo.profile" => Some(self.profile.as_str().to_string()),
             "topo.stats.json" => Some(self.stats.to_json()),
+            // The W8-4 zero-size policy (§9.6, Appendix E `compat.*`): read
+            // from the core's process-wide knob, so this agrees with what the
+            // allocation entry points actually do. Writable via the mutating
+            // control surface when plan 07 W20 lands it.
+            "topo.compat.zero_size" => Some(topo_core::zero_size_policy().as_str().to_string()),
             _ => None,
         }
     }
@@ -77,5 +82,16 @@ mod tests {
     fn unknown_keys_are_none() {
         let c = Control::new(Profile::Performance);
         assert_eq!(c.get("topo.nonexistent"), None);
+    }
+
+    #[test]
+    fn reads_the_zero_size_compat_policy() {
+        let c = Control::new(Profile::Performance);
+        // Default reflects the core knob (zero_unique, §9.6)…
+        assert_eq!(c.get("topo.compat.zero_size").as_deref(), Some("unique"));
+        // …and follows runtime changes (restored afterwards: process-global).
+        topo_core::set_zero_size_policy(topo_core::ZeroSizePolicy::Null);
+        assert_eq!(c.get("topo.compat.zero_size").as_deref(), Some("null"));
+        topo_core::set_zero_size_policy(topo_core::ZeroSizePolicy::Unique);
     }
 }
