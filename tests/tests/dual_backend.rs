@@ -91,7 +91,8 @@ fn sim_untyped_pool_accounting_is_exact() {
 // ---------------------------------------------------------------------------
 
 use topo_core::{
-    Allocator, AllocatorConfig, ArenaId, FreeOutcome, MetaArena, PageMap, RequestFlags,
+    Allocator, AllocatorConfig, ArenaId, ArenaPolicy, ArenaState, FreeOutcome, MetaArena, PageMap,
+    RequestFlags,
 };
 
 /// Build an engine over `provider`-style backends with identical, modest
@@ -176,6 +177,109 @@ fn m1_engine_is_co_equal_over_posix_and_sim() {
         posix, sim,
         "the M1 allocator diverged between POSIX and the seLe4n simulator"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W9 (plan 06): explicit-arena lifecycle co-equal over both backends — the
+// G-sim arena slice (§22/§36.4/§36.13). Create explicit arenas, allocate from
+// each, snapshot per-arena accounting, then reset one and destroy the other;
+// the abstract outcomes (ids, success, usable sizes, used counters, lifecycle
+// states) must match exactly on POSIX and the seLe4n simulator.
+// ---------------------------------------------------------------------------
+
+/// Record the abstract outcome of a fixed multi-arena lifecycle script over one
+/// backend, address-independent so the two backends must agree exactly.
+fn arena_lifecycle_outcomes<P, F>(mk: F) -> Vec<(bool, u64)>
+where
+    P: TopoBackingProvider + Sync,
+    F: Fn(usize) -> P,
+{
+    let cfg = AllocatorConfig::small();
+    let meta = MetaArena::reserve(mk(4 * 1024 * 1024), ArenaId::DEFAULT, 4 * 1024 * 1024)
+        .expect("meta arena");
+    let pagemap = PageMap::new();
+    let a = Allocator::new(
+        mk(cfg.span_region_bytes),
+        mk(cfg.large_region_bytes),
+        &meta,
+        &meta,
+        &pagemap,
+        ArenaId::DEFAULT,
+        cfg,
+    )
+    .expect("engine");
+
+    let mut out: Vec<(bool, u64)> = Vec::new();
+
+    // Two explicit arenas; ids are deterministic (1, then 2) on both backends.
+    let scratch = a
+        .arena_create(
+            &ArenaPolicy::explicit()
+                .with_quota(1 << 20)
+                .with_name("scratch"),
+        )
+        .expect("create scratch");
+    let temp = a
+        .arena_create(&ArenaPolicy::explicit().with_name("temp"))
+        .expect("create temp");
+    out.push((true, scratch.0 as u64));
+    out.push((true, temp.0 as u64));
+
+    // A deterministic mix across default / scratch / temp (small + large).
+    let mut default_live: Vec<*mut u8> = Vec::new();
+    for i in 0..48usize {
+        let arena = match i % 3 {
+            0 => ArenaId::DEFAULT,
+            1 => scratch,
+            _ => temp,
+        };
+        let size = 16 + (i * 53) % 5000;
+        let p = a.allocate_in(arena, size, 16, RequestFlags::NONE);
+        out.push((!p.is_null(), a.usable_size(p).unwrap_or(0) as u64));
+        if !p.is_null() && arena == ArenaId::DEFAULT {
+            default_live.push(p);
+        }
+    }
+
+    // Per-arena accounting snapshots (the §36.17 used counters).
+    out.push((true, a.arena_stats(scratch).unwrap().used));
+    out.push((true, a.arena_stats(temp).unwrap().used));
+
+    // Reset `scratch`: it stays Active with zero used (§22.5).
+    // SAFETY: this script holds no live pointers into `scratch` past this point.
+    let _ = unsafe { a.arena_reset(scratch) };
+    out.push((
+        a.arenas().is_active(scratch),
+        a.arena_stats(scratch).unwrap().used,
+    ));
+
+    // Destroy `temp`: it is retired (§22.6).
+    // SAFETY: this script holds no live pointers into `temp` past this point.
+    let _ = unsafe { a.arena_destroy(temp) };
+    out.push((
+        a.arena_stats(temp).unwrap().state == ArenaState::Destroyed,
+        a.arena_stats(temp).unwrap().used,
+    ));
+
+    // Free the surviving default-arena objects; the engine ends well-formed.
+    for p in default_live {
+        // SAFETY: `p` is a live default-arena pointer owned by this script.
+        assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+    }
+    out.push((a.check_invariants(), a.stats().live_bytes));
+    out
+}
+
+#[test]
+fn arena_lifecycle_is_co_equal_over_posix_and_sim() {
+    let posix = arena_lifecycle_outcomes(|_| PosixBackingProvider::new());
+    let sim = arena_lifecycle_outcomes(Sele4nSim::new);
+    assert_eq!(
+        posix, sim,
+        "the W9 arena lifecycle diverged between POSIX and the seLe4n simulator"
+    );
+    // Sanity: the script ends with a well-formed engine and zero live bytes.
+    assert_eq!(posix.last(), Some(&(true, 0)));
 }
 
 /// W8 follow-up (self-audit): the *named selector's* simulator arm —

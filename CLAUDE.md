@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Front-end caches (M2) and the remaining M1 pieces land per the plan.
+**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Essential Build Commands
 
@@ -149,12 +149,15 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 ## Current Development Status
 
 **Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next.
+Capability-backed arenas (W9) are implemented ahead of their M4 slot: the full §22/§36.4/§36.13
+lifecycle (create / delegate / reset / destroy / revocation), a live multi-arena data path with
+per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA policy modes (§15.5).
 
 **Test counts:**
-- Rust: ~435 tests across 12 crates (`cargo test --workspace`)
-- Lean: 79 build jobs including proof-checking every module (`lake build`) + 5 executable gates (`lake exe check`)
+- Rust: ~485 tests across 12 crates (`cargo test --workspace`)
+- Lean: 81 build jobs including proof-checking every module (`lake build`) + 6 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 4 targets (`fuzz/fuzz_targets/`)
+- Fuzzing: 5 targets (`fuzz/fuzz_targets/`, incl. `arena_api`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
@@ -162,12 +165,17 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 - Pagemap differential OK (W3-3d)
 - Provider state machine OK (§36.6, W4-1)
 - Extent state machine OK (§20.1, W4-2d)
+- Arena lifecycle OK (§22.3/§36.13 transitions + revocation chain; pins Rust `ArenaState`/`RevocationPhase`, W9)
+
+The arena lifecycle state machine (§22.3/§36.13) is modeled in `lean/TopoMalloc/ArenaLifecycle.lean`
+(proof-checked by `lake build`, mirroring the runtime `ArenaState`/`RevocationPhase`); the
+capability-monotonicity, quota, and revocation theorems live in the seLe4n bridge.
 
 ## Workspace & Crate Structure
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator | MIT | Yes |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
@@ -191,6 +199,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Module | Charter |
 |--------|---------|
 | `TopoMalloc/Types.lean` | `Range` geometry, `Owner` (all SPEC owners), IDs |
+| `TopoMalloc/ArenaLifecycle.lean` | §22.3/§36.13 arena lifecycle + revocation phase machines (pins Rust `ArenaState`/`RevocationPhase`, W9) |
 | `TopoMalloc/SizeClass.lean` | `SizeClassRow` predicate; `Params`/`buildTable`; §9.4/§9.5 proofs |
 | `TopoMalloc/Generated/SizeClasses.lean` | **generated** tuned table (72 classes to 32 KiB) — single source (DD-1) |
 | `TopoMalloc/State.lean` | abstract `State`, ownership map, `setOwner` frame primitive |
@@ -207,7 +216,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 
 | Module | Charter |
 |--------|---------|
-| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4) |
+| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4); the `ArenaTree` reservation model + tree-wide quota bound |
 | `SeLe4n/UntypedProvider.lean` | §36.6 backing-provider state machine + provenance |
 | `SeLe4n/VSpaceProvider.lean` / `CSpaceProvider.lean` | VSpace/CSlot provider contracts |
 | `SeLe4n/Bridge.lean` | abstraction relation `R` + `TopoSeLe4nWellFormed` (§36.3.3) |
@@ -226,6 +235,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Coupled alloc preserves invariants | `allocStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Coupled free preserves invariants | `freeStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Exact byte accounting | `ArenaQuotaExact` | `SeLe4n/Refinement.lean` |
+| Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
 | SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |

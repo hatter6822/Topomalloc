@@ -45,6 +45,12 @@ mod imp {
     /// `EINVAL` for argument-validation failures (`aligned_alloc`,
     /// `posix_memalign`, invalid extended-API flag words).
     pub(crate) const EINVAL: i32 = libc::EINVAL;
+    /// `EACCES` — an arena capability lacked the required right (§36.4
+    /// `TOPO_ERR_AUTHORITY_DENIED`, the POSIX projection).
+    pub(crate) const EACCES: i32 = libc::EACCES;
+    /// `EBUSY` — the arena is draining/resetting and refuses the operation
+    /// (§36.14 `TOPO_ERR_ARENA_DRAINING`, the POSIX projection).
+    pub(crate) const EBUSY: i32 = libc::EBUSY;
 
     /// The calling thread's errno cell.
     fn errno_ptr() -> *mut i32 {
@@ -109,6 +115,8 @@ mod imp {
     //! consistent for in-crate callers.
     pub(crate) const ENOMEM: i32 = 12;
     pub(crate) const EINVAL: i32 = 22;
+    pub(crate) const EACCES: i32 = 13;
+    pub(crate) const EBUSY: i32 = 16;
 
     pub(crate) fn get_errno() -> i32 {
         0
@@ -117,7 +125,7 @@ mod imp {
     pub(crate) fn set_errno(_v: i32) {}
 }
 
-pub(crate) use imp::{get_errno, set_errno, EINVAL, ENOMEM};
+pub(crate) use imp::{get_errno, set_errno, EACCES, EBUSY, EINVAL, ENOMEM};
 
 /// Run an allocation attempt under the §10.1 protocol: a null result sets
 /// `errno = ENOMEM`; a success restores the errno the caller entered with

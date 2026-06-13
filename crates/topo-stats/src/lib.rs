@@ -52,6 +52,12 @@ pub struct Stats {
     pub pageheap_free_bytes: u64,
     /// Total virtual bytes the back-end manages (§21.2 `virtual_bytes`).
     pub virtual_bytes: u64,
+
+    // --- arenas (§22/§36.4, plan 06 W9) -------------------------------------
+    /// Arenas currently registered, including the always-present default.
+    pub live_arenas: u64,
+    /// Cumulative NUMA binding failures across all arenas (§15.5).
+    pub numa_bind_failures: u64,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -127,6 +133,8 @@ impl Stats {
         self.freed_bytes_total = a.freed_bytes_total;
         self.central_free_bytes = a.central_free_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
+        self.live_arenas = a.live_arenas;
+        self.numa_bind_failures = a.numa_bind_failures;
         let combined = topo_core::StateBytes {
             reserved: a.span_backend.reserved + a.large_backend.reserved,
             active: a.span_backend.active + a.large_backend.active,
@@ -161,6 +169,10 @@ impl Stats {
                 "  \"central\": {{\n",
                 "    \"free_bytes\": {central}\n",
                 "  }},\n",
+                "  \"arenas\": {{\n",
+                "    \"count\": {live_arenas},\n",
+                "    \"numa_bind_failures\": {numa_bind_failures}\n",
+                "  }},\n",
                 "  \"backend\": {{\n",
                 "    \"dirty_bytes\": {dirty},\n",
                 "    \"muzzy_bytes\": {muzzy},\n",
@@ -183,6 +195,8 @@ impl Stats {
             thread = self.thread_cache_bytes,
             transfer = self.transfer_bytes,
             central = self.central_free_bytes,
+            live_arenas = self.live_arenas,
+            numa_bind_failures = self.numa_bind_failures,
             dirty = self.dirty_bytes,
             muzzy = self.muzzy_bytes,
             released = self.released_bytes,
@@ -273,9 +287,14 @@ mod tests {
             pagemap_metadata_bytes: 8192,
             live_spans: 2,
             live_large: 1,
+            live_arenas: 3,
+            numa_bind_failures: 7,
         };
         let mut s = Stats::default();
         s.record_allocator(&snap);
+        // Arena summary (plan 06 W9) maps through and renders.
+        assert_eq!(s.live_arenas, 3);
+        assert_eq!(s.numa_bind_failures, 7);
         assert_eq!(s.live_bytes, 1000);
         assert_eq!(s.allocated_bytes_total, 1500);
         assert_eq!(s.freed_bytes_total, 500);
@@ -295,5 +314,8 @@ mod tests {
         let json = s.to_json();
         assert!(json.contains("\"live_bytes\": 1000"));
         assert!(json.contains("\"allocated_bytes_total\": 1500"));
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["arenas"]["count"], 3);
+        assert_eq!(v["arenas"]["numa_bind_failures"], 7);
     }
 }

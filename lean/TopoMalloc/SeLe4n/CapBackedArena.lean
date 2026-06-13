@@ -73,4 +73,79 @@ theorem DelegatesFrom.trans {a b c : ArenaAuth}
   quota := Nat.le_trans h1.quota h2.quota
   label := h1.label.trans h2.label
 
+/-- **Tree-wide quota reservation (§36.4 budget partition, plan 06 W9 / PR #13).**
+
+The per-edge `DelegatesFrom.quota` (`child.quota ≤ parent.quota`) does **not**
+bound a subtree: two siblings can each be ≤ the parent yet together exceed it. The
+runtime closes that gap by *reserving* each delegated child's full quota on its
+parent (`ArenaTable::reserve_child_quota_locked`), so at every node the own-used
+bytes plus the children's reserved quotas fit the node's own quota. Modelling the
+delegation forest as a tree of `(quota, ownUsed, children)`, that discipline
+(`WellReserved`) proves what reservation guarantees: the **whole subtree's**
+own-used bytes are bounded by the root's quota (`subtree_used_le_quota`). -/
+inductive ArenaTree where
+  | node (quota ownUsed : Nat) (children : List ArenaTree)
+
+namespace ArenaTree
+
+/-- This node's own quota ceiling. -/
+def quota : ArenaTree → Nat
+  | node q _ _ => q
+
+mutual
+/-- Total own-used bytes across the whole subtree rooted at `t`. -/
+def subtreeUsed : ArenaTree → Nat
+  | node _ u cs => u + subtreeUsedList cs
+/-- Total own-used bytes across a forest. -/
+def subtreeUsedList : List ArenaTree → Nat
+  | [] => 0
+  | c :: rest => subtreeUsed c + subtreeUsedList rest
+end
+
+/-- The budget a node reserves for its children: the sum of their quotas (a
+delegation reserves the child's full quota on the parent). -/
+def childQuotaSum : List ArenaTree → Nat
+  | [] => 0
+  | c :: rest => c.quota + childQuotaSum rest
+
+mutual
+/-- The reservation discipline at every node: own-used plus the children's
+reserved quotas fit the node's quota, recursively (§36.4). -/
+def WellReserved : ArenaTree → Prop
+  | node q u cs => u + childQuotaSum cs ≤ q ∧ WellReservedList cs
+/-- `WellReserved` for every tree of a forest. -/
+def WellReservedList : List ArenaTree → Prop
+  | [] => True
+  | c :: rest => WellReserved c ∧ WellReservedList rest
+end
+
+mutual
+/-- **The tree-wide bound.** Under the reservation discipline, a subtree's total
+own-used bytes never exceed its root's quota — the property the runtime enforces
+by reserving each delegated child's quota on its parent. -/
+theorem subtree_used_le_quota (t : ArenaTree) (h : WellReserved t) :
+    subtreeUsed t ≤ t.quota := by
+  match t, h with
+  | node q u cs, h =>
+    have hc : u + childQuotaSum cs ≤ q := h.1
+    have hl : subtreeUsedList cs ≤ childQuotaSum cs :=
+      subtree_used_list_le_quota_sum cs h.2
+    show u + subtreeUsedList cs ≤ q
+    omega
+/-- Forest version: the children's combined subtree-used is bounded by the sum of
+their reserved quotas. -/
+theorem subtree_used_list_le_quota_sum (cs : List ArenaTree) (h : WellReservedList cs) :
+    subtreeUsedList cs ≤ childQuotaSum cs := by
+  match cs, h with
+  | [], _ => simp [subtreeUsedList, childQuotaSum]
+  | c :: rest, h =>
+    have hc : subtreeUsed c ≤ c.quota := subtree_used_le_quota c h.1
+    have hr : subtreeUsedList rest ≤ childQuotaSum rest :=
+      subtree_used_list_le_quota_sum rest h.2
+    show subtreeUsed c + subtreeUsedList rest ≤ c.quota + childQuotaSum rest
+    omega
+end
+
+end ArenaTree
+
 end TopoMalloc.SeLe4n

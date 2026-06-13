@@ -43,5 +43,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "arena_api"
+path = "fuzz_targets/arena_api.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]

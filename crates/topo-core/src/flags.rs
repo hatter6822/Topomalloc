@@ -118,6 +118,9 @@ impl RequestFlags {
     const ARENA_SHIFT: u32 = 15;
     const ARENA_MASK: u32 = 0xFF << Self::ARENA_SHIFT;
     /// Largest arena id encodable in the flag word (the field holds `id + 1`).
+    /// Every encodable id must have a slot in the arena registry, so this stays
+    /// strictly below [`crate::arena::MAX_ARENAS`] (asserted just below); larger
+    /// arena populations use the explicit-arena handle surface (§36.14).
     pub const MAX_ARENA_ID: u32 = 254;
 
     /// Every bit the layout defines; the complement is reserved.
@@ -131,6 +134,19 @@ impl RequestFlags {
         | Self::ARENA_MASK;
     /// Bits 23–31, which MUST be zero (§10.4 "invalid flag … MUST fail").
     const RESERVED_MASK: u32 = !Self::KNOWN_MASK;
+
+    /// Every flag-encodable arena id must have a registry slot (plan 06 W9), so a
+    /// `TOPO_ARENA`-routed request can never name an id the table cannot hold.
+    const _ARENA_ID_FITS_TABLE: () =
+        assert!((Self::MAX_ARENA_ID as usize) < crate::arena::MAX_ARENAS);
+
+    /// …and conversely, every id the registry can *vend* (the largest is
+    /// `MAX_ARENAS - 1`) must itself be flag-routable (`<= MAX_ARENA_ID`), or
+    /// `create`/`delegate` could return an id that `TOPO_ARENA(id)` rejects — an
+    /// arena unusable through the advertised allocation path (PR #13 review).
+    /// Together with the bound above this pins `MAX_ARENAS == MAX_ARENA_ID + 1`.
+    const _EVERY_VENDABLE_ID_IS_ROUTABLE: () =
+        assert!(crate::arena::MAX_ARENAS <= Self::MAX_ARENA_ID as usize + 1);
 
     /// Validate and wrap a raw flag word (§10.4). Returns `None` — so `classify`
     /// fails deterministically — on any reserved bit or the contradictory

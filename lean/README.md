@@ -51,7 +51,7 @@ from the MIT core. It imports TopoMalloc's model and seLe4n's *public* shapes on
 
 | Module | Charter | WU |
 |--------|---------|----|
-| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4) | W1-11/12a |
+| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4); `ArenaTree` reservation model + `subtree_used_le_quota` (tree-wide quota bound) | W1-11/12a |
 | `SeLe4n/UntypedProvider.lean` | the §36.6 backing-provider state machine + provenance | W1-11b |
 | `SeLe4n/VSpaceProvider.lean` / `CSpaceProvider.lean` | VSpace/CSlot provider contracts (§36.8) | W1-11 |
 | `SeLe4n/Bridge.lean` | the abstraction relation `R` (real provenance) + `TopoSeLe4nWellFormed` (§36.3.3) | W1-11a/c |

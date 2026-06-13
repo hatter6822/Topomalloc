@@ -104,13 +104,15 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * Extended API (§10.3/§10.4 — W8-6)
  * --------------------------------------------------------------------- */
 
-/* Handle/flag types (§10.3). Arena handles become meaningful with the arena
- * API (plan 06 W9, M4); at M1 only the default arena (id 0) exists, and
- * naming any other is a deterministic EINVAL. topo_tcache_t is declared for
- * the §10.3 surface but has no consumer until explicit-tcache routing lands
- * (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is
- * deferred to its subsystem rather than frozen as a guess (reserved flag
- * bits hold the space). */
+/* Handle/flag types (§10.3). An arena id names a policy + authority domain
+ * (§22/§36.4): the default arena (id 0) is always present, and explicit
+ * arenas are created with the arena API below (plan 06 W9). TOPO_ARENA(id)
+ * routes an allocation to arena `id`; naming an arena that does not exist (or
+ * is being reset/destroyed) is a deterministic EINVAL. topo_tcache_t is
+ * declared for the §10.3 surface but has no consumer until explicit-tcache
+ * routing lands (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the
+ * encoding is deferred to its subsystem rather than frozen as a guess
+ * (reserved flag bits hold the space). */
 typedef uint32_t topo_arena_t;
 typedef uint32_t topo_tcache_t;
 typedef uint64_t topo_flags_t;
@@ -149,8 +151,10 @@ typedef uint64_t topo_flags_t;
 #define TOPO_COLD TOPO_HOT(0)
 #define TOPO_ARENA(id) (((topo_flags_t) (id) + 1) << 21)
 
-/* Allocate with extended flags. NULL + EINVAL on an invalid flag word;
- * NULL + ENOMEM on allocation failure. */
+/* Allocate with extended flags. NULL + EINVAL on an invalid flag word or a
+ * TOPO_ARENA naming no such (active) arena; NULL + EACCES if the named arena's
+ * capability lacks the alloc right (§36.4, as topo_mallocx_arena); NULL + ENOMEM
+ * on allocation failure (quota/storage). */
 void *topo_mallocx(size_t size, topo_flags_t flags);
 
 /* Reallocate with flags under the §25 contract (failure leaves the original
@@ -177,6 +181,75 @@ void topo_sdallocx(void *ptr, size_t size, topo_flags_t flags);
  * the allocation path's formula); 0 on an invalid flag word or
  * unsatisfiable size. Pure. */
 size_t topo_nallocx(size_t size, topo_flags_t flags);
+
+/* ------------------------------------------------------------------------
+ * Arena policy & authority domains (§22/§36.4/§36.13 — W9)
+ * --------------------------------------------------------------------- */
+
+/* Arena-capability rights (§36.4), an attenuable authority set. A delegated
+ * arena may carry any subset of its parent's rights, never a superset. */
+#define TOPO_RIGHT_ALLOC ((uint64_t) 1)   /* allocate from the arena */
+#define TOPO_RIGHT_FREE ((uint64_t) 2)    /* free the arena's allocations */
+#define TOPO_RIGHT_STATS ((uint64_t) 4)   /* observe the arena's statistics */
+#define TOPO_RIGHT_DESTROY ((uint64_t) 8) /* reset/destroy the arena */
+#define TOPO_RIGHTS_ALL ((uint64_t) 0xf)  /* every right (the ambient default) */
+
+/* Create an explicit arena with full authority and an unlimited quota.
+ * Returns its id (>= 1, routable via TOPO_ARENA(id)), or 0 on failure. */
+topo_arena_t topo_arena_create(void);
+
+/* Create an explicit arena conferring `rights` with a quota of `quota_bytes`
+ * (0 = unlimited). Returns the new arena id, or 0 on failure (EINVAL on a bad
+ * rights word, or the arena table being full). */
+topo_arena_t topo_arena_create_ex(size_t quota_bytes, uint64_t rights);
+
+/* Delegate an attenuated child arena from `parent` (§36.4): `rights` MUST be a
+ * subset of the parent's, `quota_bytes` MUST not exceed the parent's remaining
+ * quota, and the label is preserved. Returns the child id, or 0 + EINVAL on
+ * any attenuation violation. */
+topo_arena_t topo_arena_delegate(topo_arena_t parent, size_t quota_bytes, uint64_t rights);
+
+/* Reset an arena (§22.5): discard all its allocations, return their backing,
+ * and bump its reset generation; the arena stays usable. Returns 0, or -1 +
+ * EINVAL (e.g. the default arena, or an illegal state). The caller MUST ensure
+ * the arena is quiesced and accepts that its outstanding pointers become
+ * invalid — exactly like the contract around free(). */
+int topo_arena_reset(topo_arena_t arena);
+
+/* Destroy an arena (§22.6/§36.13): reset it, then retire its id behind a
+ * generation bump. Returns 0, or -1 + EINVAL. Same quiescence/invalidation
+ * contract as topo_arena_reset.
+ *
+ * Failures carry a mapped errno (the POSIX projection of §36.14's error
+ * classes): EACCES (authority denied), EBUSY (arena draining), ENOMEM (quota
+ * exceeded), EINVAL (no such arena / illegal request). */
+int topo_arena_destroy(topo_arena_t arena);
+
+/* Reconfigure arena `id`'s decay timing (§22.4 configure, F-005) — the headline
+ * per-arena tunable. The authority and quota are immutable here (a configure can
+ * never widen authority). Returns 0, or -1 + a mapped errno. */
+int topo_arena_configure(uint32_t id, uint64_t dirty_decay_ms, uint64_t muzzy_decay_ms);
+
+/* A generation-checked arena handle (§36.13/§36.14): packs (incarnation
+ * generation << 32) | id. Unlike a raw id it detects a destroyed-then-recreated
+ * arena as stale; 0 is never a valid handle. */
+typedef uint64_t topo_arena_handle_t;
+
+/* Mint a handle for arena `id`'s current incarnation, or 0 if unregistered. */
+topo_arena_handle_t topo_arena_handle(uint32_t id);
+
+/* The arena id a handle names (its low 32 bits), for use with TOPO_ARENA(id).
+ * Does not check the handle's generation — use topo_mallocx_arena for that. */
+topo_arena_t topo_arena_id(topo_arena_handle_t handle);
+
+/* Allocate from the arena a handle names, with generation checking (§36.14): a
+ * stale handle (its arena was destroyed, possibly recreated at the same id) is
+ * NULL + EINVAL — the §36.13 guarantee a raw TOPO_ARENA(id) flag cannot give.
+ * The flag word's arena field is ignored (the handle wins); its other hints
+ * apply, and size == 0 follows the zero-size policy (§9.6) exactly as
+ * topo_mallocx. Allocation failure maps through the arena taxonomy
+ * (EACCES/EBUSY/ENOMEM). */
+void *topo_mallocx_arena(topo_arena_handle_t handle, size_t size, topo_flags_t flags);
 
 /* ------------------------------------------------------------------------
  * Identification

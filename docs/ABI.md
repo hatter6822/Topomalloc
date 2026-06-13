@@ -102,10 +102,15 @@ bits 53–63 reserved — must be zero
 Validation is total (§10.4): reserved bits, the contradictory hugepage pair,
 an unrepresentable alignment, or a nonexistent arena fail deterministically —
 never a silently degraded allocation. "No such arena" is a single `EINVAL`
-at **any** id magnitude (until plan 06 W9 lands the arena API, only
-`TOPO_ARENA(0)`, the default arena, exists). Alignment is extracted into a
-dedicated classifier argument, so it can never be dropped as an advisory
-bit. `TOPO_TCACHE(id)` / `TOPO_NUMA(node)` (§10.4 recommended) are not yet
+at **any** id magnitude. For the allocating front door (`topo_mallocx` /
+`topo_nallocx`), an arena that *exists and is active* but whose capability
+lacks the `ALLOC` right is instead an authority denial — `EACCES` (§36.4),
+matching the handle-routed `topo_mallocx_arena`, not a misreported `ENOMEM`.
+Arenas beyond the default are created through the plan 06 W9 arena API
+(`topo_arena_create`/`delegate`/…); flag-routable ids run `0..=254` (the
+flag-encodable range — every id the registry vends is routable). Alignment is
+extracted into a dedicated classifier argument, so it can never be dropped as
+an advisory bit. `TOPO_TCACHE(id)` / `TOPO_NUMA(node)` (§10.4 recommended) are not yet
 encoded: their subsystems land with plans 05/04, and the reserved bits hold
 space for them — encoding them before a consumer exists would freeze
 guesses into ABI.

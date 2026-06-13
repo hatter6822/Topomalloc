@@ -84,6 +84,14 @@ class), upgrading to arena-qualified slots at M4 when multiple authority domains
 become active. No cache code exists at M0; the decision is recorded so plan 05
 (M2) implements the fast path directly.
 
+**Update (W9 landed).** Multiple authority domains are now active — the live
+multi-arena data path ships ahead of M4 (see the W9 notes below) — but it rides
+on the **central** cache, which is already arena-keyed and filters by arena on
+remove (W5-4a), so arena isolation (§22.7) holds without front-end caches. D6
+remains the standing decision for the *front-end* caches when they arrive (M2):
+the per-CPU/thread/transfer slots take the bound-arena fast path, and the W9
+`drain_arena` teardown grows its cache-drain hook there (W9-4b/W9-6b).
+
 ## D7 — Property / fuzz / differential stack
 
 * **Property testing:** [`proptest`](https://crates.io/crates/proptest) (see
@@ -771,3 +779,193 @@ severity order:
   non-trivial flag word), and the full `malloc(64)+free` round-trip on the
   M1 central path ≈ **131 ns** — the per-op central+span lock cost the
   M2 caches and M3 RSEQ path (≈ 12.5 ns per cached op, W7) exist to remove.
+
+## W9 — capability-backed arenas over a live multi-arena data path (plan 06)
+
+W9 makes an arena two things at once (D2): a jemalloc-style **policy domain**
+(§22) and a seLe4n-style **capability-controlled resource domain** (§36.4) — the
+types live in the MIT core (`crates/topo-core/src/arena.rs`), trivial/ambient on
+POSIX, real on seLe4n. The design notes, in the order they matter:
+
+* **Shared-region, arena-tagged isolation — not per-arena regions.** §22.7
+  permits "shared global backend structures … only if each extent retains its
+  arena identity." The live multi-arena path takes that route: one engine, one
+  central cache (already keyed `(node, arena, label, sc)`, W5-4a), one span +
+  one large region, but **every span and every large descriptor carries its
+  requesting arena**. The alternative — a full engine (with its own pools) per
+  arena — was rejected because re-creating an arena would re-carve pools from
+  the never-freed metadata arena (§27.5), an unbounded leak under arena churn.
+  Tagging keeps metadata bounded (spans/larges recycle) while satisfying every
+  §22.7 clause: each extent/span/cache-entry belongs to exactly one arena.
+  Per-arena cache *sharding* (D6, W5-4d/W6-6) stays an M2/M4 performance concern;
+  it is not needed for correctness here (no front-end caches exist at M1).
+* **The default arena fast path is untouched.** `allocate` routes by the
+  requested arena; the ambient default arena (id 0, all rights, unlimited quota,
+  always `Active`) admits unconditionally, so the existing hot path keeps its
+  characteristics. Explicit arenas pay one lock-free state/rights load plus a
+  quota compare-exchange (`ArenaTable::try_charge`), and credit on free
+  (`credit`, saturating so a stale/double free can never underflow). The result
+  is the §8.6/§36.17 reconciliation `Σ arena.used == live_bytes`, asserted
+  through an alloc/free cycle *including a reset that discards live objects*
+  (the discarded bytes are accounted as freed so the global counter stays exact).
+* **The lifecycle is a state machine with a non-`DESTROYED` failure state.**
+  `ArenaState` is the §22.3 set plus §36.13 `ErrorQuarantined`; `can_transition`
+  is the exact legal edge set (mirrored, and proof-checked, in
+  `lean/TopoMalloc/ArenaLifecycle.lean` — the new abstract transition the
+  governance rule requires). Reset is `Active → Resetting →` drain `→ Active`;
+  destroy is `Active → Draining →` drain `→ Destroyed`; either drain failure
+  `quarantine`s to `ErrorQuarantined`, which Lean proves terminal — so a partial
+  failure can **never** be reported as a clean teardown (§36.13). The default
+  arena rejects reset/destroy (§22.5).
+* **Revocation is ordered and step-isolated; POSIX is the collapse.**
+  `RevocationPhase` pins the §36.13 / DD-3 order (drain → unmap → **revoke** →
+  recycle → finalize) with Lean lemmas `unmap_before_revoke` /
+  `revoke_before_recycle`. On POSIX the unmap/revoke/recycle steps collapse to
+  "free the extent" (a no-op revoke under single ambient authority); the real
+  VSpace unmap, capability revocation, and untyped recycle drop in at plan 09
+  **with no change above the seam**, because the structure is identical.
+* **Delegation is attenuation-only, mirroring Lean `DelegatesFrom`.**
+  `ArenaTable::delegate` enforces the three §36.4 monotonicity invariants —
+  rights ⊆ parent (`CapRights::attenuates`), quota ≤ the parent's *remaining*
+  budget, label preserved — the runtime image of the bridge's `DelegatesFrom`.
+  A property test drives arbitrary parent/child rights and quotas and asserts
+  delegation succeeds *iff* it is a sound attenuation and never widens authority.
+* **Id assignment retires-then-recycles behind a generation bump.** The
+  `ArenaTable` is a fixed-capacity registry (ids `0..MAX_ARENAS`, the
+  flag-encodable range, pinned to `RequestFlags::MAX_ARENA_ID` by a compile-time
+  assertion). Ids are assigned from a high-water mark and only recycled under
+  capacity pressure; destroy bumps the generation, so a stale reference to a
+  prior incarnation is detectable (§B.5 / §36.13 "generation checks").
+* **`realloc` preserves the arena (§25.4).** A move allocates the new object in
+  the *original's* arena (recovered from its span/large descriptor), not the
+  arena the call's flags happen to name — keeping the storage family a function
+  of the live object, not the request.
+* **The C ABI is `topo_arena_create/create_ex/delegate/reset/destroy`** over the
+  existing `TOPO_ARENA(id)` flag routing (`topo-abi/src/arena_api.rs`). A request
+  naming a nonexistent or draining arena is one deterministic `EINVAL` (the
+  entry-point existence check, distinct from the `ENOMEM` of a real allocation
+  failure); reset/destroy carry the same quiescence/invalidation contract as
+  `free`. The five symbols are declared in `include/topomalloc.h` and exercised
+  by the C and C++ ABI harnesses; the header↔symbol cross-check now balances 28
+  exported functions. The arena summary (`live_arenas`, `numa_bind_failures`)
+  reconciles into `topo-stats` and the `topo.arena.*` control keys.
+
+### W9 second pass (optimization completions)
+
+A deliberate completeness pass closed every item the first pass deferred:
+
+* **`configure` (F-005) + the full §22.2 descriptor.** `arena_configure` /
+  `topo_arena_configure` reconfigure the non-authority policy (decay/hugepage/
+  NUMA/cache-budget/name); a configure can never widen authority (rights/label/
+  quota are create/delegate-time). The descriptor now carries `decay`/`huge`/
+  `cache_budget` (consumed by W12/W11/W6 when they land); the `hooks` field is
+  W10's.
+* **Generation split + capability handles (§36.13/§36.14).** The incarnation
+  generation (create/destroy) is split from the reset generation (§22.5), so a
+  `topo_arena_handle` survives a reset of its own arena but goes stale on a
+  destroy+recreate. `topo_mallocx_arena` routes generation-checked — the §36.13
+  stale-detection a raw `TOPO_ARENA(id)` flag cannot give.
+* **A real revoke-before-recycle seam, fault-injection-tested.**
+  `ExtentManager::free_revoking` / `LargeAllocator::free_revoking` revoke a
+  backing's descendants before recycling it (§36.6/§36.13); the drain drives
+  them, and a revoke failure **quarantines** (`ErrorQuarantined`, never
+  `DESTROYED`). A provider whose `revoke_descendants` fails now exercises that
+  partial-failure path end to end — it was unreachable dead code before. On
+  POSIX `revoke_descendants` is a no-op, so this is the seam plan 09 fills.
+* **Error taxonomy → `errno`.** The §36.14 classes map to `EACCES`
+  (authority), `EBUSY` (draining), `ENOMEM` (quota), `EINVAL` (else) across the
+  lifecycle API and `topo_mallocx_arena` — and, for the allocation cases, the
+  flag-routed `topo_mallocx`/`topo_nallocx` front door too (third-pass parity).
+* **Trace grammar + verification.** `ARENA_CREATE`/`DELEGATE`/`RESET`/`DESTROY`
+  join the §33.7 grammar (round-trip-tested); `Check.lean` gains an executable
+  **G-arena** gate pinning `ArenaState`/`RevocationPhase` to the Lean machines;
+  a **loom** model checks the quota CAS under contention; a **concurrent
+  multi-arena** isolation test and an **`arena_api` fuzz target** were added; and
+  **Miri** runs clean over the new arena unsafe.
+* **Rights enforcement is the D2 collapse (audited, made explicit).** All four
+  `CapRights` are carried (delegation attenuates them; seLe4n enforces them), but
+  the POSIX *engine* gates only `ALLOC` — `try_charge` rejects allocation from an
+  arena whose cap lacks it (§36.16's authority test, the property intrinsic to the
+  arena). `free`/`stats`/`destroy` are ambient on POSIX: the single process holds
+  full authority, and gating them on a *delegated child's* rights would wrongly
+  bar the *parent*-authority holder from destroying what it delegated. They are
+  enforced against the **caller's** cap at the seLe4n resource-server IPC boundary
+  (plan 09) — the engine API takes an arena id, not a cap, so it cannot know the
+  caller's authority. This is documented on `CapRights` so the asymmetry reads as
+  deliberate, not a forgotten check.
+* **Zero-size policy uniformity (audit fix).** `topo_mallocx_arena` now applies
+  the §9.6 zero-size policy (`zero_unique`/`zero_null`) exactly as `topo_mallocx`;
+  the handle path previously skipped it, so a size-0 request returned a unique
+  pointer even under `zero_null`. (Also: a `manual_is_multiple_of` clippy warning
+  in the `arena_api` fuzz target — the standalone fuzz workspace is outside the
+  main `xtask ci` clippy — was fixed.)
+* **Documented boundaries (not avoidance).** Cross-label scrub *recording* is
+  plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena stats
+  *rendering* is W17 (M6); label *restriction* (vs. the sound equality) would
+  re-open the proven Lean `DelegatesFrom`, so it is an M7 model refinement; the
+  full combined phase×`State` refinement is M7 formal hardening. (Quota
+  *budget-partition* was once deferred here too; it was **pulled forward** — see
+  the third pass below.)
+
+### W9 third pass (PR #13 review hardening)
+
+A round of automated review surfaced five real issues on the live data path —
+four defects and one deliberately-deferred refinement pulled forward; each is
+fixed with a test (and, for the refinement, a Lean theorem) that pins the
+corrected behavior:
+
+* **Every vendable arena id is flag-routable (off-by-one).** `MAX_ARENAS` was
+  `256`, one past the flag-encodable range, so `create`/`delegate` could hand
+  back id `255` while `TOPO_ARENA(255)` (capped at `MAX_ARENA_ID = 254`) rejected
+  it — an arena usable through the advertised allocation path in name only. The
+  bound is now `255 = MAX_ARENA_ID + 1`, and a *second* compile-time assertion in
+  `flags.rs` pins the converse (every vendable id ≤ `MAX_ARENA_ID`), so the two
+  can never drift apart again. (Larger populations still need the §36.14 handle
+  surface and a wider internal field, not merely a bigger bound.)
+* **`topo_xallocx` validates its arena flag.** The in-place-resize query decoded
+  the flag word but skipped the existence check its siblings
+  (`mallocx`/`rallocx`/`nallocx`) perform, so `TOPO_ARENA(uncreated_id)` returned
+  a usable size instead of the documented `0 + EINVAL`. It now rejects a
+  nonexistent/inactive arena like the rest — existence only, since `xallocx`
+  resizes in place and never allocates *from* the flag arena, so its `ALLOC`
+  authority is not consulted (as with `rallocx`, which preserves the original's
+  arena across a move).
+* **Normal span retirement revokes before cross-arena recycle.** An empty span's
+  backing leaves the arena-tagged empty-span cache (DD-4, capacity 1/bin) for the
+  single shared `span_extents` pool, from which a later `create_span` may serve a
+  *different* arena — so the owning arena's capability descendants must be revoked
+  first, exactly as the reset/destroy drain does. Retirement previously recycled
+  without revoking (a stale comment claimed a per-arena pool that does not exist);
+  it now reuses the same `free_revoking` discipline on **every** retirement, so
+  `reclaim_span_slot` revokes unconditionally. On POSIX the revoke is the ambient
+  no-op; a counting test provider observes it firing on the normal path. (A
+  per-arena pool that would make same-domain reuse revoke-free is a plan-04
+  performance concern, M3+; "safety before policy" ships the correct revoke now.)
+* **The flag-routed front door reports `EACCES` for a no-`ALLOC` arena.** An
+  active arena whose cap lacks `ALLOC` passed `topo_mallocx`/`topo_nallocx`'s
+  existence-only gate, and the engine's bare-null rejection then surfaced as
+  `ENOMEM` (with `nallocx` predicting a nonzero size) — inconsistent with the
+  handle path, which maps the authority denial to `EACCES`. The front door now
+  consults the arena's rights: `EACCES` for the denial, `EINVAL` for "no such
+  arena", matching `topo_mallocx_arena` (§36.4).
+* **Delegation reserves the child's quota on the parent (P1; budget-partition
+  pulled forward from M7).** The first two passes used the *ceiling* model: a
+  child's quota was checked `≤ parent.remaining` at delegation but never reserved,
+  so a finite parent that delegated a finite child let **both** allocate the full
+  quota — Σ descendants could reach 2× the parent's authority. Delegation now
+  **reserves** the child's quota on the parent: a per-arena `committed` counter
+  (own bytes + reserved child quota) is the single atomic the allocation gate and
+  the reservation both compare-exchange against, so they can never jointly exceed
+  the quota even under concurrency; `reserved` is tracked separately so the
+  §36.17 `used` a caller sees stays own-live and `Σ used == live_bytes` still
+  reconciles (§8.6). Reservation bites only a *finite* parent (an unlimited parent
+  partitions nothing, and a finite parent cannot delegate an unlimited child). A
+  child's destroy returns its reservation to the parent — **generation-checked**,
+  so a destroyed/recycled parent slot is never miscredited; reset keeps the child
+  alive, so its reservation stays. The Lean bridge gains `ArenaTree` +
+  `subtree_used_le_quota` (`SeLe4n/CapBackedArena.lean`): under the reservation
+  discipline the **whole subtree's** own-used bytes are bounded by the root's
+  quota — the tree-wide monotonicity the per-edge `DelegatesFrom.quota` alone
+  cannot give. New unit + property tests (`delegation_reserves_parent_quota_…`,
+  `delegated_subtree_never_exceeds_parent_quota`) and the loom quota model (the
+  reservation commits through the same gate CAS) pin it.

@@ -15,6 +15,10 @@ Cargo.lock.bak
 /fuzz/corpus
 /fuzz/artifacts
 
+# proptest failure-seed caches (local artifacts; the tests themselves pin the
+# meaningful edge cases explicitly — see the arena quota/delegation tests)
+**/*.proptest-regressions
+
 # Vendored, pinned seLe4n ABI mirror (D8, GPL-3.0-or-later): the SOURCE is committed
 # under vendor/sele4n/ (separately licensed; see NOTICE §2/§4). Ignore only its build
 # artifacts and standalone lockfile (the root Cargo.lock governs the real-abi build).

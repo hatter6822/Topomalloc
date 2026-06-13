@@ -17,7 +17,10 @@ use topo_backend_posix::PosixBackingProvider;
 use topo_core::classify::RequestKind;
 use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
 use topo_core::size_class::row;
-use topo_core::{classify, trace, usable_size, RequestFlags, SkeletonAllocator};
+use topo_core::{
+    classify, trace, usable_size, ArenaPolicy, ArenaTable, CapRights, Delegation, RequestFlags,
+    SkeletonAllocator,
+};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -114,6 +117,51 @@ proptest! {
             arena: arena as u64, flags: flags as u64, ptr,
             usable_size: usable as u64, sc: sc.map(u64::from), span: span.map(u64::from),
         });
+    }
+}
+
+proptest! {
+    /// The arena trace events round-trip (§33.7, W9): anything
+    /// `topo_core::trace`'s arena emitters write parses back to an equal record,
+    /// so the emit and parse sides of the grammar cannot drift.
+    #[test]
+    fn arena_trace_roundtrips(
+        arena in any::<u16>(),
+        rights in 0u8..16,
+        quota in proptest::option::of(any::<u32>()),
+        parent in any::<u16>(),
+        reset_gen in any::<u16>(),
+        generation in any::<u16>(),
+    ) {
+        // CREATE
+        let mut s = String::new();
+        trace::emit_arena_create(&mut s, arena as u64, rights, quota.map(u64::from)).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaCreate { arena: arena as u64, rights: rights as u64, quota: quota.map(u64::from) }
+        );
+        // DELEGATE
+        let mut s = String::new();
+        trace::emit_arena_delegate(&mut s, parent as u64, arena as u64, rights, quota.map(u64::from)).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaDelegate {
+                parent: parent as u64, child: arena as u64, rights: rights as u64, quota: quota.map(u64::from)
+            }
+        );
+        // RESET / DESTROY
+        let mut s = String::new();
+        trace::emit_arena_reset(&mut s, arena as u64, reset_gen as u64).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaReset { arena: arena as u64, reset_gen: reset_gen as u64 }
+        );
+        let mut s = String::new();
+        trace::emit_arena_destroy(&mut s, arena as u64, generation as u64).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaDestroy { arena: arena as u64, generation: generation as u64 }
+        );
     }
 }
 
@@ -322,5 +370,158 @@ proptest! {
             // SAFETY: `p` is live and owned by this test.
             unsafe { topomalloc_free(p) };
         }
+    }
+}
+
+proptest! {
+    /// **Capability monotonicity (§36.4/§36.16, plan 06 W9-5).** Over arbitrary
+    /// parent/child rights and quotas, a delegation succeeds *iff* it is a sound
+    /// attenuation — the child's rights are a subset of the parent's and its
+    /// quota is within the parent's remaining budget — and whenever it succeeds
+    /// the child can neither widen authority, exceed the parent's remaining
+    /// quota, nor downgrade the label. This is the runtime mirror of the Lean
+    /// `DelegatesFrom` invariants.
+    #[test]
+    fn delegation_is_attenuation_only(
+        parent_rights in 0u8..16,
+        parent_quota in 1u64..1_000_000,
+        child_rights in 0u8..16,
+        child_quota in 0u64..2_000_000,
+    ) {
+        let t = ArenaTable::new();
+        let prights = CapRights::from_bits(parent_rights).unwrap();
+        let parent = t
+            .create(&ArenaPolicy::explicit().with_rights(prights).with_quota(parent_quota))
+            .unwrap();
+        let pstats = t.stats(parent).unwrap();
+        let crights = CapRights::from_bits(child_rights).unwrap();
+        let del = Delegation::inheriting(&pstats, child_quota, "child").with_rights(crights);
+
+        let result = t.delegate(parent, &del);
+        // `inheriting` copies the parent's label, so label monotonicity always
+        // holds here; the decisive conditions are a positive quota (a zero quota
+        // is an invalid policy, §22.4), attenuating authority, and a quota within
+        // the parent's remaining budget.
+        let should_succeed = child_quota >= 1
+            && crights.attenuates(prights)
+            && child_quota <= pstats.remaining_quota();
+        prop_assert_eq!(result.is_ok(), should_succeed);
+
+        if let Ok(child) = result {
+            let cs = t.stats(child).unwrap();
+            prop_assert!(cs.rights.attenuates(pstats.rights), "delegation widened rights");
+            prop_assert!(cs.quota_limit <= pstats.remaining_quota(), "delegation widened quota");
+            prop_assert_eq!(cs.label, pstats.label, "delegation downgraded the label");
+            prop_assert_eq!(cs.parent, Some(parent));
+        }
+    }
+}
+
+proptest! {
+    /// **Tree-wide quota monotonicity (§36.4, PR #13).** Delegation reserves each
+    /// child's quota on its parent, so the *whole subtree's* own-live bytes never
+    /// exceed the parent's quota — however the budget is split across children and
+    /// whatever each child (or the parent) then allocates. This is the runtime
+    /// mirror of the Lean bridge's `subtree_used_le_quota` theorem; without the
+    /// reservation a parent and child could each allocate the full quota (the
+    /// PR #13 P1).
+    #[test]
+    fn delegated_subtree_never_exceeds_parent_quota(
+        parent_quota in 1u64..10_000,
+        parent_charge in 0u64..10_000,
+        child_quotas in prop::collection::vec(0u64..4_000, 0..8),
+        child_charges in prop::collection::vec(0u64..4_000, 0..8),
+    ) {
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(parent_quota)).unwrap();
+        let mut children = Vec::new();
+        for &q in &child_quotas {
+            let pstats = t.stats(parent).unwrap();
+            let before = pstats.remaining_quota();
+            match t.delegate(parent, &Delegation::inheriting(&pstats, q, "c")) {
+                Ok(child) => {
+                    // A successful delegation reserves exactly `q`: the parent's
+                    // remaining budget drops by the child's quota, no more.
+                    prop_assert_eq!(t.stats(parent).unwrap().remaining_quota(), before - q);
+                    children.push(child);
+                }
+                // A delegation fails only for a zero quota (an arena that can
+                // never allocate is an invalid policy, §22.4) or a quota exceeding
+                // the parent's (reservation-aware) remaining budget — never within
+                // budget for a valid quota.
+                Err(_) => prop_assert!(
+                    q == 0 || q > before,
+                    "a valid delegation within budget must succeed"
+                ),
+            }
+        }
+        // Charge the parent and each child arbitrarily; over-budget charges simply
+        // fail and change nothing.
+        let _ = t.try_charge(parent, parent_charge);
+        for (child, &c) in children.iter().zip(child_charges.iter()) {
+            let _ = t.try_charge(*child, c);
+        }
+        // The guarantee: Σ over the subtree of own-live bytes ≤ the parent's quota.
+        let subtree_used: u64 = core::iter::once(parent)
+            .chain(children.iter().copied())
+            .map(|id| t.stats(id).unwrap().used)
+            .sum();
+        prop_assert!(
+            subtree_used <= parent_quota,
+            "subtree used {} exceeded parent quota {}",
+            subtree_used,
+            parent_quota
+        );
+        prop_assert!(t.check_invariants());
+    }
+}
+
+proptest! {
+    /// **Quota is never exceeded (§36.4, plan 06 W9).** Under an arbitrary stream
+    /// of charges against a fixed ceiling, the arena's used bytes never exceed
+    /// the quota and never wrap — a charge either fits and is recorded or is
+    /// refused, deterministically.
+    #[test]
+    fn arena_quota_is_never_exceeded(
+        quota in 1u64..100_000,
+        charges in prop::collection::vec(1u64..20_000, 0..40),
+    ) {
+        let t = ArenaTable::new();
+        let id = t.create(&ArenaPolicy::explicit().with_quota(quota)).unwrap();
+        for c in charges {
+            let before = t.stats(id).unwrap().used;
+            let r = t.try_charge(id, c);
+            let after = t.stats(id).unwrap().used;
+            prop_assert!(after <= quota, "used {} exceeded quota {}", after, quota);
+            match r {
+                Ok(()) => prop_assert_eq!(after, before + c, "a successful charge records exactly"),
+                Err(_) => prop_assert_eq!(after, before, "a refused charge changes nothing"),
+            }
+        }
+        prop_assert!(t.check_invariants());
+    }
+}
+
+proptest! {
+    /// **Reset accounting (§22.5/B.5, plan 06 W9-4c).** After a reset, the
+    /// arena's used bytes are zero and its generation has advanced (so stale
+    /// references are detectable) — regardless of how much was charged first.
+    #[test]
+    fn arena_reset_zeroes_used_and_bumps_generation(
+        charges in prop::collection::vec(1u64..50_000, 0..30),
+    ) {
+        let t = ArenaTable::new();
+        let id = t.create(&ArenaPolicy::explicit()).unwrap(); // unlimited quota
+        let rg0 = t.stats(id).unwrap().reset_generation;
+        let inc0 = t.stats(id).unwrap().generation;
+        for c in charges {
+            let _ = t.try_charge(id, c);
+        }
+        t.begin_reset(id).unwrap();
+        let rg1 = t.finish_reset(id).unwrap();
+        prop_assert_eq!(t.stats(id).unwrap().used, 0, "B.5: no live bytes after reset");
+        prop_assert_ne!(rg1, rg0, "reset must bump the reset generation (§22.5)");
+        prop_assert_eq!(t.stats(id).unwrap().generation, inc0, "reset keeps the incarnation");
+        prop_assert!(t.is_active(id), "reset returns the arena to Active (§22.5)");
     }
 }

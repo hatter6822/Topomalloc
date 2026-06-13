@@ -73,6 +73,34 @@ def extentStateGate : Bool :=
   ExtentState.all.all (fun s => ExtentState.all.all (fun t =>
     ExtentState.canTransition s t == (s == t || ExtentState.hasEdge s t)))
 
+/-- The §22.3/§36.13 arena-lifecycle edge set (the single source of truth the
+Rust `ArenaState::can_transition` is pinned to, plan 06 W9). -/
+def arenaLifecycleEdges : List (ArenaPhase × ArenaPhase) :=
+  [(.initializing, .active), (.active, .resetting), (.resetting, .active),
+   (.active, .draining), (.draining, .destroyed),
+   (.resetting, .errorQuarantined), (.draining, .errorQuarantined)]
+
+/-- The §36.13 / DD-3 revocation chain `drain → unmap → revoke → recycle →
+finalize`, the single source of truth the Rust `RevocationPhase::next` is pinned
+to. -/
+def revPhaseChain : List RevPhase :=
+  [.draining, .drainCaches, .unmap, .revoke, .recycle, .finalize]
+
+/-- The arena-lifecycle differential (W9): `ArenaPhase.canStep` is exactly the
+§22.3/§36.13 edge set over all 36 ordered pairs, and `RevPhase.next` is exactly
+the linear unmap→revoke→recycle chain, terminating at `finalize`. The Rust tests
+`state_machine_is_exactly_the_spec_graph` and
+`revocation_phases_are_a_linear_chain_unmap_before_revoke_before_recycle` pin the
+runtime `ArenaState::can_transition` / `RevocationPhase::next` to the *same* sets,
+so the runtime machines and this model cannot drift (the §22/§36.13 analogue of
+`providerChainGate`). -/
+def arenaLifecycleGate : Bool :=
+  ArenaPhase.all.all (fun s => ArenaPhase.all.all (fun t =>
+    ArenaPhase.canStep s t == arenaLifecycleEdges.any (fun e =>
+      decide (e.1 = s) && decide (e.2 = t))))
+    && (revPhaseChain.zip revPhaseChain.tail).all (fun p => decide (RevPhase.next p.1 = some p.2))
+    && decide (RevPhase.next RevPhase.finalize = none)
+
 def main : IO UInt32 := do
   let mut ok := true
   if tableGate then
@@ -99,5 +127,10 @@ def main : IO UInt32 := do
     IO.println "lake check: extent state machine OK (§20.1 transitions match ExtentState.canTransition; pins Rust ExtentState, W4-2d)"
   else
     IO.eprintln "lake check: extent state machine FAILED (§20.1 transition drift, W4-2d)"
+    ok := false
+  if arenaLifecycleGate then
+    IO.println "lake check: arena lifecycle OK (§22.3/§36.13 transitions + revocation chain match ArenaPhase/RevPhase; pins Rust ArenaState/RevocationPhase, W9)"
+  else
+    IO.eprintln "lake check: arena lifecycle FAILED (§22.3/§36.13 transition drift, W9)"
     ok := false
   return if ok then 0 else 1
