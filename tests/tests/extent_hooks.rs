@@ -409,10 +409,23 @@ fn allocator_runs_the_full_central_path_over_a_hook_backing() {
 
 /// A backing whose `alloc` deliberately violates the §23.3 output contract: it
 /// returns a range that is either undersized or misaligned (selectable), to prove
-/// `HookProvider` rejects it rather than handing out unsound memory.
+/// `HookProvider` rejects it rather than handing out unsound memory. `deallocs`
+/// counts `dealloc` calls so a test can confirm a *rejected* reserve hands the
+/// (real) backing block back — never leaks it (W10 / §2.4 safety-before-policy).
 struct BadHooks {
     misalign: bool,
     backing: Mutex<Option<(usize, Layout)>>,
+    deallocs: Arc<AtomicU32>,
+}
+
+impl BadHooks {
+    fn new(misalign: bool) -> Self {
+        Self {
+            misalign,
+            backing: Mutex::new(None),
+            deallocs: Arc::new(AtomicU32::new(0)),
+        }
+    }
 }
 
 impl ExtentHooks for BadHooks {
@@ -447,6 +460,7 @@ impl ExtentHooks for BadHooks {
         }
     }
     fn dealloc(&self, _region: Region, _committed: bool) -> Result<(), BackendError> {
+        self.deallocs.fetch_add(1, Ordering::Relaxed);
         if let Some((base, layout)) = self.backing.lock().unwrap().take() {
             // SAFETY: exactly the block from `alloc`.
             unsafe { dealloc(base as *mut u8, layout) };
@@ -472,10 +486,7 @@ fn reserve_rejects_an_undersized_hook_result() {
     // a too-small range is rejected, never handed out. (Release-only: in debug the
     // contract violation aborts via `debug_assert!`, which is the intended loud
     // failure — see the companion `#[should_panic]` test.)
-    let p = HookProvider::new(BadHooks {
-        misalign: false,
-        backing: Mutex::new(None),
-    });
+    let p = HookProvider::new(BadHooks::new(false));
     assert!(matches!(
         p.reserve(ArenaId::DEFAULT, 4096, 64),
         Err(BackendError::InvalidRequest)
@@ -486,14 +497,35 @@ fn reserve_rejects_an_undersized_hook_result() {
 #[test]
 fn reserve_rejects_a_misaligned_hook_result() {
     use topo_core::TopoBackingProvider;
-    let p = HookProvider::new(BadHooks {
-        misalign: true,
-        backing: Mutex::new(None),
-    });
+    let p = HookProvider::new(BadHooks::new(true));
     assert!(matches!(
         p.reserve(ArenaId::DEFAULT, 4096, 64),
         Err(BackendError::InvalidRequest)
     ));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_rejected_reserve_hands_the_backing_back() {
+    use topo_core::TopoBackingProvider;
+    // §23.3 / §2.4 (PR-review comment 4): a hook result that fails the geometry
+    // contract is rejected — and the real backing block the hook allocated for it is
+    // **returned to the hook** (`dealloc`) on the reject path, never leaked. The hook
+    // allocated one block in `alloc`; assert the rejected reserve called `dealloc`
+    // exactly once (so the block went back), and that the slot is empty afterwards.
+    // (Release-only: in debug the contract violation aborts via `debug_assert!`.)
+    let bad = BadHooks::new(false); // undersized result → rejected
+    let deallocs = bad.deallocs.clone();
+    let p = HookProvider::new(bad);
+    assert!(matches!(
+        p.reserve(ArenaId::DEFAULT, 4096, 64),
+        Err(BackendError::InvalidRequest)
+    ));
+    assert_eq!(
+        deallocs.load(Ordering::Relaxed),
+        1,
+        "a rejected reserve returns the hook's backing block (no leak)"
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -504,10 +536,7 @@ fn reserve_debug_aborts_on_a_contract_violation() {
     // The debug counterpart: a §23.3 contract violation aborts loudly (W10-2
     // "violations detected in debug"). CI runs tests in debug, so this is the
     // profile that actually exercises the abort.
-    let p = HookProvider::new(BadHooks {
-        misalign: true,
-        backing: Mutex::new(None),
-    });
+    let p = HookProvider::new(BadHooks::new(true));
     let _ = p.reserve(ArenaId::DEFAULT, 4096, 64);
 }
 
@@ -1082,4 +1111,126 @@ fn concurrent_hooked_and_default_arena_allocation_is_sound() {
         "all backends well-formed after the storm"
     );
     assert_eq!(a.stats().live_bytes, 0, "no leaks: everything freed");
+}
+
+// ===========================================================================
+// W10 / §23.3: no-overlap ACROSS a hooked arena's two reservations.
+// ===========================================================================
+
+/// A custom backing that returns **overlapping** span and large regions: a hooked
+/// arena reserves its span region (the first `alloc`) and its large region (the
+/// second `alloc`) through two *separate* `HookProvider`s, so neither provider's own
+/// tracker sees the other's range. This backing hands both reservations a range that
+/// starts at the **same** base — each is page-aligned and ≥ its requested size (so it
+/// passes `validate_alloc` and each provider's single-reservation tracker), yet the
+/// two ranges alias. Only the cross-region disjointness check in
+/// `build_and_register_hook_backend` can catch it (PR-review comment 2): without that
+/// check the arena's small-object spans and large allocations would alias.
+struct OverlapBacking {
+    /// The one shared host block both reservations alias (freed exactly once).
+    host: Mutex<Option<(usize, Layout)>>,
+    /// Block size — every reservation must fit (asserted in `alloc`).
+    block: usize,
+}
+
+impl OverlapBacking {
+    fn new(block: usize) -> Self {
+        let layout = Layout::from_size_align(block, PAGE).unwrap();
+        // SAFETY: nonzero size, power-of-two (page) alignment.
+        let base = unsafe { alloc(layout) };
+        assert!(!base.is_null());
+        Self {
+            host: Mutex::new(Some((base as usize, layout))),
+            block,
+        }
+    }
+    fn base(&self) -> usize {
+        self.host
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|&(b, _)| b)
+            .unwrap_or(0)
+    }
+}
+
+impl ExtentHooks for OverlapBacking {
+    fn alloc(
+        &self,
+        size: usize,
+        _align: usize,
+        zero: &mut bool,
+        commit: &mut bool,
+    ) -> Result<Region, BackendError> {
+        // Both reserves return ranges starting at the SAME (page-aligned) base, so
+        // they OVERLAP — yet each is ≥ `size` and aligned, so `validate_alloc` and
+        // each provider's own tracker accept it. The block fits every reservation.
+        assert!(size <= self.block, "overlap backing: block too small");
+        let base = self.base();
+        assert!(base != 0, "overlap backing already released");
+        *zero = false;
+        *commit = true; // host memory is immediately usable
+        Ok(Region {
+            base: base as *mut u8,
+            len: size,
+        })
+    }
+    fn dealloc(&self, _region: Region, _committed: bool) -> Result<(), BackendError> {
+        // Idempotent: the span and large regions ALIAS the one shared block, so free
+        // it exactly once — both providers' `Drop` (on the rejected create) land here.
+        if let Some((base, layout)) = self.host.lock().unwrap().take() {
+            // SAFETY: exactly the block from `new`.
+            unsafe { dealloc(base as *mut u8, layout) };
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OverlapBacking {
+    fn drop(&mut self) {
+        if let Some((base, layout)) = self.host.get_mut().unwrap().take() {
+            // SAFETY: exactly the block from `new`.
+            unsafe { dealloc(base as *mut u8, layout) };
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn hooked_arena_with_overlapping_span_and_large_regions_is_rejected() {
+    // §23.3 no-overlap ACROSS the two per-arena reservations (PR-review comment 2):
+    // a hook returning overlapping span/large regions would let the arena's small
+    // spans and large allocations alias. The cross-region disjointness check rejects
+    // it, and both built managers drop (returning the shared block to the hook). The
+    // `hook_cfg` large region is 16 MiB, so a 17 MiB block fits either reservation.
+    // (Release: in debug the check `debug_assert!`-aborts — see the companion test.)
+    let a = posix_allocator();
+    let backing: &'static OverlapBacking =
+        Box::leak(Box::new(OverlapBacking::new(17 * 1024 * 1024)));
+    let r = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, hook_cfg());
+    assert!(
+        matches!(r, Err(topo_core::ArenaError::Exhausted)),
+        "overlapping span/large regions must be rejected, got {r:?}"
+    );
+    // The rejected create left the default arena intact and leaked no reservation
+    // (the shared block was handed back when the two managers dropped).
+    assert!(a.check_invariants());
+    assert!(
+        backing.base() == 0,
+        "the rejected create returned the hook's backing block"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "span and large regions overlap")]
+fn hooked_arena_with_overlapping_regions_debug_aborts() {
+    // The debug counterpart of the release reject above: overlapping span/large
+    // regions trip the cross-region `debug_assert!` (W10 / comment 2). CI runs tests
+    // in debug, so this is the profile that actually exercises the abort. The two
+    // built managers drop during unwinding, returning the shared block to the hook.
+    let a = posix_allocator();
+    let backing: &'static OverlapBacking =
+        Box::leak(Box::new(OverlapBacking::new(17 * 1024 * 1024)));
+    let _ = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, hook_cfg());
 }

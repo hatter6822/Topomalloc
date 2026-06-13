@@ -257,6 +257,13 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.extents.backend_name()
     }
 
+    /// The whole reserved [`Region`] backing this large allocator (W10: used to
+    /// confirm an arena's span and large regions are disjoint).
+    #[inline]
+    pub fn reserved_region(&self) -> Region {
+        self.extents.reserved_region()
+    }
+
     /// Allocate a large region of at least `bytes` aligned to `align`, install its
     /// [`LargeDescriptor`] in the pagemap, and return the base pointer (null on
     /// failure). Consults `hook` (the §18.6 region cache) first. **Bypasses the

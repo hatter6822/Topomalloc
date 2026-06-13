@@ -1533,6 +1533,24 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             },
         )
         .map_err(|_| ArenaError::Exhausted)?;
+        // §23.3 no-overlap **across the two reservations**: the span and large
+        // regions are served by separate `HookProvider`s, so neither provider's
+        // own tracker sees the other's range. Check disjointness explicitly here —
+        // a hook that returns an overlapping span/large region would otherwise let
+        // the arena's small-object spans and large allocations alias. On overlap,
+        // both `span_extents` and `large` drop, returning their regions to the hooks.
+        {
+            let (sb, se) = span_extents.reserved_region().addr_range();
+            let (lb, le) = large.reserved_region().addr_range();
+            let disjoint = se <= lb || le <= sb;
+            debug_assert!(
+                disjoint,
+                "§23.3: a hooked arena's span and large regions overlap (W10)"
+            );
+            if !disjoint {
+                return Err(ArenaError::Exhausted);
+            }
+        }
         // Held in an `Option` so a failed insert (registry full) drops the built
         // backing here, returning its regions to the hooks — and so the move into a
         // slot is a single, unconditional `take`.

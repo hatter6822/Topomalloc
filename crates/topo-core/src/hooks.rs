@@ -441,10 +441,11 @@ impl<H: ExtentHooks> HookProvider<H> {
     /// contracts that are **load-bearing for safety**: the range must be non-null,
     /// aligned to `align`, and at least `size` bytes. A violation is rejected (so a
     /// buggy hook cannot make the allocator hand out memory that does not satisfy
-    /// the request — §2.4) and debug-aborts to surface the hook bug. `align` is a
-    /// power of two (the caller checked).
+    /// the request — §2.4) and debug-aborts to surface the hook bug. The caller
+    /// hands a rejected range back to the hook (`dealloc`), so a failed `reserve`
+    /// never leaks the backing. `align` is a power of two (the caller checked).
     #[inline]
-    fn validate_alloc(region: Region, size: usize, align: usize) -> Result<Region, BackendError> {
+    fn validate_alloc(region: Region, size: usize, align: usize) -> Result<(), BackendError> {
         let base = region.base as usize;
         let aligned = base & (align - 1) == 0; // align is a power of two
         let big_enough = region.len >= size;
@@ -464,7 +465,7 @@ impl<H: ExtentHooks> HookProvider<H> {
         if !non_null || !aligned || !big_enough {
             return Err(BackendError::InvalidRequest);
         }
-        Ok(region)
+        Ok(())
     }
 
     /// Validate that `[offset, offset+len)` is a sub-range of `region` (§23.3
@@ -503,12 +504,13 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             let mut commit = false;
             self.hooks.alloc(size, align, &mut zero, &mut commit)?
         };
-        // §23.3 / §2.4: never trust the hook's geometry — validate or reject.
-        let region = Self::validate_alloc(region, size, align)?;
-        // §23.3 no-overlap: record the reservation; a hook returning a range that
-        // overlaps a live one is rejected (and debug-aborted), the bad range handed
-        // straight back rather than used.
-        if self
+        // §23.3 / §2.4: never trust the hook's geometry. Reject — and **hand the
+        // range back** (so a failed reserve never leaks the backing) — if it fails
+        // the load-bearing geometry checks (alignment / size, validated + debug-
+        // aborted) OR overlaps a live reservation (no-overlap, debug-aborted).
+        let reject = if Self::validate_alloc(region, size, align).is_err() {
+            true
+        } else if self
             .live
             .try_record(region.base as usize, region.len)
             .is_err()
@@ -517,6 +519,11 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
                 false,
                 "§23.3: extent-hook alloc overlaps a live reservation (W10)"
             );
+            true
+        } else {
+            false
+        };
+        if reject {
             let _guard = self.enter_hook();
             let _ = self.hooks.dealloc(region, false);
             return Err(BackendError::InvalidRequest);

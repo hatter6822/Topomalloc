@@ -15,6 +15,7 @@
 //! rejected, never trusted).
 
 use core::ffi::c_void;
+use std::sync::Mutex;
 
 use topo_core::{
     AllocatorConfig, ArenaPolicy, BackendError, ExtentHooks, Region, MAX_HOOK_BACKENDS,
@@ -23,6 +24,33 @@ use topo_core::{
 use crate::arena_api::arena_errno;
 use crate::errno_shim::{set_errno, EINVAL};
 use crate::global;
+
+/// Tracks each live hooked arena's `CHooks` adapter (`arena_id → box address`), so
+/// it is **reclaimed** on `topo_arena_destroy` (and on a failed create) rather than
+/// leaked. Bounded: one entry per live hooked arena (pushed on create, removed on
+/// destroy), so a create/destroy loop does not grow the heap. Addresses are stored
+/// as `usize` (a raw `*mut CHooks` is not `Send`); the `Mutex` makes it thread-safe.
+static CHOOKS_REGISTRY: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+/// Reclaim the `CHooks` adapter tracked for arena `id`, if any — called after a
+/// **successful** `topo_arena_destroy`. By then the allocator has unregistered the
+/// arena's hooked backend (dropped its `HookProvider<&CHooks>`), so no live
+/// reference to the adapter remains and freeing it is sound. A no-op for a
+/// non-hooked arena (or a quarantined destroy, which keeps its resources).
+pub(crate) fn reclaim_chooks(id: u32) {
+    let addr = {
+        let mut reg = CHOOKS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .position(|&(a, _)| a == id)
+            .map(|i| reg.swap_remove(i).1)
+    };
+    if let Some(addr) = addr {
+        // SAFETY: `addr` is exactly a `Box::into_raw(CHooks)` from a successful
+        // create; the arena is now destroyed and its backend unregistered, so
+        // nothing references it. Reconstituting + dropping the box frees it once.
+        drop(unsafe { Box::from_raw(addr as *mut CHooks) });
+    }
+}
 
 /// The §23.2 C extent-hook vtable. Every field is a nullable function pointer
 /// (`Option<extern fn>` has the null-pointer layout of the bare pointer, so this
@@ -303,15 +331,30 @@ pub unsafe extern "C" fn topo_arena_create_hooked(
         set_errno(EINVAL);
         return 0;
     };
-    // Leak the adapter: it must outlive the process-global (`'static`) allocator,
-    // exactly as the metadata/pagemap do. Bounded by the number of hooked arenas
-    // ever created (≤ MAX_HOOK_BACKENDS live at once).
-    let chooks: &'static CHooks = Box::leak(Box::new(CHooks { vt, ctx }));
+    // The adapter must outlive the process-global (`'static`) allocator, so it is
+    // heap-owned via a raw box. It is **not** leaked: it is tracked in
+    // `CHOOKS_REGISTRY` and reclaimed on `topo_arena_destroy` (or freed right here
+    // on a failed create), so a create/destroy loop never grows the heap.
+    let raw: *mut CHooks = Box::into_raw(Box::new(CHooks { vt, ctx }));
+    // SAFETY: `raw` is a fresh, exclusively-owned `CHooks`; the `'static` borrow is
+    // upheld by keeping the box alive until destroy (the success path tracks it) or
+    // freeing it on the failure path below — never by an actual leak. `chooks` is
+    // not used after the call, so the failure-path free cannot alias it.
+    let chooks: &'static CHooks = unsafe { &*raw };
     let cfg = hooked_cfg(span_region_bytes, large_region_bytes);
     match a.arena_create_hooked(&ArenaPolicy::explicit(), chooks, cfg) {
-        Ok(id) => id.0,
+        Ok(id) => {
+            CHOOKS_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id.0, raw as usize));
+            id.0
+        }
         Err(e) => {
             set_errno(arena_errno(e));
+            // SAFETY: the create failed ⇒ the adapter was never registered with the
+            // allocator ⇒ no live reference remains; reclaim the box.
+            drop(unsafe { Box::from_raw(raw) });
             0
         }
     }
@@ -457,5 +500,67 @@ mod tests {
     #[test]
     fn max_hook_backends_is_exposed() {
         assert_eq!(topo_max_hook_backends(), MAX_HOOK_BACKENDS);
+    }
+
+    /// Whether arena `id`'s `CHooks` adapter is currently tracked (keyed by the
+    /// unique arena id, so concurrency-robust without exact-length assertions).
+    fn chooks_tracked(id: u32) -> bool {
+        CHOOKS_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, _)| a == id)
+    }
+
+    #[test]
+    fn destroy_reclaims_the_hook_adapter_no_leak() {
+        // A successful create tracks its adapter; destroy reclaims it (so a
+        // create/destroy loop does not grow the heap — the P2 review fix).
+        let vt = c_vtable();
+        // SAFETY: a valid vtable with the required alloc/dealloc.
+        let id = unsafe { topo_arena_create_hooked(&vt, core::ptr::null_mut(), 2 << 20, 4 << 20) };
+        assert!(id >= 1);
+        assert!(
+            chooks_tracked(id),
+            "a live hooked arena's adapter is tracked"
+        );
+        // SAFETY: quiesced; no live pointers into the arena.
+        assert_eq!(unsafe { crate::topo_arena_destroy(id) }, 0);
+        assert!(
+            !chooks_tracked(id),
+            "destroy reclaims the adapter (no unbounded leak)"
+        );
+    }
+
+    /// A backing whose `alloc` always fails, so the create fails after the adapter
+    /// box exists — exercising the failure-path reclaim.
+    unsafe extern "C" fn c_alloc_fail(
+        _ctx: *mut c_void,
+        _size: usize,
+        _align: usize,
+        _zero: *mut bool,
+        _commit: *mut bool,
+    ) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+
+    #[test]
+    fn failed_hooked_create_reclaims_its_adapter() {
+        // A create that fails *after* building the adapter (the hook cannot reserve)
+        // must free the adapter box on the failure path, not leak it (the P2 review
+        // fix: failed/retry creates do not grow the heap). A failed create returns
+        // id 0 and never tracks an entry (the registry is keyed by the granted id,
+        // which only exists on success), so retrying never accumulates entries;
+        // the box-free itself is verified leak-free by the CI Miri run.
+        let mut vt = c_vtable();
+        vt.alloc = Some(c_alloc_fail);
+        for _ in 0..4 {
+            // SAFETY: a valid vtable; each create is expected to fail cleanly.
+            let id = unsafe { topo_arena_create_hooked(&vt, core::ptr::null_mut(), 0, 0) };
+            assert_eq!(
+                id, 0,
+                "create fails (no leak/track) when the hook cannot allocate"
+            );
+        }
     }
 }

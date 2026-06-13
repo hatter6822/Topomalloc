@@ -1618,6 +1618,14 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         self.provider.name()
     }
 
+    /// The whole reserved [`Region`] this manager owns (its single provider
+    /// reservation). Used to confirm two managers over a custom backing hold
+    /// **disjoint** regions (§23.3 no-overlap across separate reservations, W10).
+    #[inline]
+    pub fn reserved_region(&self) -> Region {
+        self.region
+    }
+
     /// Acquire the backend lock and expose the guarded map (RAII release).
     #[inline]
     fn lock(&self) -> MapGuard<'_> {

@@ -192,7 +192,13 @@ pub unsafe extern "C" fn topo_arena_destroy(id: u32) -> i32 {
     };
     // SAFETY: the caller upholds this function's quiescence contract.
     match unsafe { a.arena_destroy(ArenaId(id)) } {
-        Ok(_) => 0,
+        Ok(_) => {
+            // The arena (and its hooked backend, if any) is fully destroyed — the
+            // allocator no longer references the C hook adapter, so reclaim it
+            // (no-op for a non-hooked arena). Bounds the per-create heap (W10).
+            crate::hooks_api::reclaim_chooks(id);
+            0
+        }
         Err(e) => {
             set_errno(arena_errno(e));
             -1
