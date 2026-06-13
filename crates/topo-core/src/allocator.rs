@@ -938,7 +938,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     }
 
     /// Retire an empty span (W5-5): deactivate it, clear its pagemap entries,
-    /// return the backing extent, and recycle the descriptor slot.
+    /// revoke the backing's capability descendants, return the backing extent,
+    /// and recycle the descriptor slot.
     ///
     /// Exclusivity: only the thread whose insert emptied the span is told to
     /// deactivate (`span_empty` is reported once — central.rs), the span is
@@ -949,12 +950,30 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// (`retire_span`) *before* the extent is freed, so a re-allocation of
     /// the same address range can never collide with stale entries
     /// (P-Map-001: a page maps to at most one descriptor).
+    ///
+    /// **Revoke discipline (§36.6/§36.13).** The retired extent goes back to the
+    /// single shared `span_extents` pool, from which a *later* `create_span` may
+    /// satisfy a **different** arena — there is no per-arena span-extent pool. So
+    /// the backing crosses authority domains, and recycling it while the owning
+    /// arena's capability descendants still exist would hand live authority to
+    /// another security domain. Normal retirement therefore revokes exactly as
+    /// the reset/destroy teardown does (`Some(arena)`); on POSIX the revoke is the
+    /// ambient-authority no-op (D2). A revoke failure here is unexpected (the
+    /// owning arena is `Active`, not draining) and leaves the extent allocated and
+    /// well-formed — a safe leak, never a cross-domain reuse. (A per-arena pool,
+    /// which would make same-domain reuse revoke-free, is a plan-04 performance
+    /// concern, M3+; "safety before policy" ships the correct revoke now.)
     fn retire_span(&self, span: &SpanDescriptor) {
+        // Capture the owning arena before deactivation, mirroring
+        // `force_retire_span` (the descriptor stays readable in never-freed
+        // metadata, but the capture keeps the two retirement paths uniform).
+        let arena = span.arena();
         self.central.deactivate_span(span, self.pagemap);
-        // Normal retirement returns the backing to *this arena's* pool (reuse
-        // within the same authority domain), so no capability revoke is needed
-        // (§36.6 requires revoke only before returning to a cross-domain pool).
-        self.reclaim_span_slot(span, None);
+        let revoked = self.reclaim_span_slot(span, arena);
+        debug_assert!(
+            revoked,
+            "retire_span: revoking an Active arena's retired backing must succeed"
+        );
     }
 
     /// **Forcibly** retire a span regardless of liveness — the arena
@@ -987,19 +1006,26 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
         // Drain returns the backing to a pool that may serve another arena, so
         // revoke its descendants before recycling (§36.6/§36.13).
-        self.reclaim_span_slot(span, Some(arena))
+        self.reclaim_span_slot(span, arena)
     }
 
-    /// Clear `span`'s pagemap entries, recycle its descriptor slot, and return
-    /// its backing extent — the shared tail of [`retire_span`](Self::retire_span)
-    /// and [`force_retire_span`](Self::force_retire_span), run **after** the span
-    /// has been deactivated in the central list.
+    /// Clear `span`'s pagemap entries, recycle its descriptor slot, and revoke +
+    /// return its backing extent — the shared tail of
+    /// [`retire_span`](Self::retire_span) and
+    /// [`force_retire_span`](Self::force_retire_span), run **after** the span has
+    /// been deactivated in the central list.
     ///
-    /// `revoke` selects the §36.6 recycle discipline: `Some(arena)` revokes the
-    /// backing's descendants before recycling (arena destroy/drain) and returns
-    /// whether the revoke+recycle succeeded; `None` recycles directly (normal
-    /// same-arena retirement) and returns `true`.
-    fn reclaim_span_slot(&self, span: &SpanDescriptor, revoke: Option<ArenaId>) -> bool {
+    /// The §36.6/§36.13 recycle discipline is **unconditional**: the retired
+    /// backing returns to the single shared `span_extents` pool, which a later
+    /// `create_span` may hand to a *different* arena, so its capability
+    /// descendants under `arena` are revoked before it is recycled — on every
+    /// retirement, normal or forced. On POSIX the revoke is the ambient no-op
+    /// (D2). Returns whether the revoke + recycle **succeeded**: `false` means the
+    /// revoke failed, the extent stays allocated and well-formed (W4-5), and the
+    /// caller turns that into a §36.13 quarantine (drain) or a safe leak (normal
+    /// retirement). (No per-arena pool exists yet — were one added for
+    /// same-domain reuse, M3+, this revoke could be elided for that path.)
+    fn reclaim_span_slot(&self, span: &SpanDescriptor, arena: ArenaId) -> bool {
         self.pagemap.retire_span(span);
 
         let Some(idx) = self.spans.index_of(span as *const SpanDescriptor) else {
@@ -1025,16 +1051,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             ext
         };
         self.span_lock.release();
-        match revoke {
-            // A failed extent free leaves the manager well-formed (W4-5).
-            None => {
-                let _ = self.span_extents.free(ext);
-                true
-            }
-            // Revoke-before-recycle; a revoke failure leaves the extent allocated
-            // (well-formed) and is reported so the drain quarantines (§36.13).
-            Some(arena) => self.span_extents.free_revoking(ext, arena).is_ok(),
-        }
+        // Revoke-before-recycle; a revoke failure leaves the extent allocated
+        // (well-formed) and is reported so a drain quarantines (§36.13).
+        self.span_extents.free_revoking(ext, arena).is_ok()
     }
 
     // -- introspection --------------------------------------------------------
@@ -1474,8 +1493,8 @@ mod tests {
         use super::*;
         use crate::backend::Region;
         use std::alloc::{alloc, dealloc, Layout};
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Arc, Mutex};
 
         pub(super) struct HostProvider {
             owned: Mutex<Vec<(usize, Layout)>>,
@@ -1483,6 +1502,12 @@ mod tests {
             /// capability-revoke failure so the arena-destroy drain quarantines
             /// (§36.13), the partial-failure path POSIX cannot otherwise reach.
             fail_revoke: AtomicBool,
+            /// Count of `revoke_descendants` calls — lets a test observe that the
+            /// recycle discipline (§36.6) revokes on *every* retirement, including
+            /// the normal empty-span path, where POSIX/SIM revoke is a silent
+            /// no-op and so otherwise unobservable. Behind an `Arc` so a test can
+            /// keep a handle after the provider is moved into the allocator.
+            revokes: Arc<AtomicU64>,
         }
 
         impl HostProvider {
@@ -1490,6 +1515,7 @@ mod tests {
                 Self {
                     owned: Mutex::new(Vec::new()),
                     fail_revoke: AtomicBool::new(false),
+                    revokes: Arc::new(AtomicU64::new(0)),
                 }
             }
 
@@ -1497,6 +1523,12 @@ mod tests {
             /// arena-drain quarantine path).
             pub(super) fn fail_revoke(&self) {
                 self.fail_revoke.store(true, Ordering::Relaxed);
+            }
+
+            /// A handle to the revoke counter — cloned *before* the provider is
+            /// moved into the allocator so a test can read it afterward.
+            pub(super) fn revokes_handle(&self) -> Arc<AtomicU64> {
+                Arc::clone(&self.revokes)
             }
         }
 
@@ -1547,6 +1579,7 @@ mod tests {
                 _arena: ArenaId,
                 _region: Region,
             ) -> Result<(), BackendError> {
+                self.revokes.fetch_add(1, Ordering::Relaxed);
                 if self.fail_revoke.load(Ordering::Relaxed) {
                     Err(BackendError::Unsupported)
                 } else {
@@ -2604,6 +2637,53 @@ mod tests {
         // retired them all); the call is rejected before touching anything.
         let outcome = unsafe { a.arena_destroy(id) };
         assert_eq!(outcome, Err(ArenaError::IllegalTransition));
+    }
+
+    #[test]
+    fn normal_span_retirement_revokes_backing_before_cross_arena_recycle() {
+        // §36.6/§36.13 recycle discipline on the *normal* path (PR #13 review):
+        // when an empty span's backing leaves the arena-tagged empty-span cache
+        // (DD-4, capacity 1/bin) and returns to the single shared `span_extents`
+        // pool, a *later* `create_span` may hand it to a different arena — so the
+        // owning arena's capability descendants must be revoked first, exactly as
+        // the reset/destroy drain does. POSIX/SIM revoke is a silent no-op, so a
+        // counting provider is the only way to observe the discipline holds.
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let span_p = HostProvider::new();
+        let revokes = span_p.revokes_handle();
+        let a = Allocator::new(
+            span_p,
+            HostProvider::new(),
+            &m,
+            &m,
+            &pm,
+            ArenaId::DEFAULT,
+            AllocatorConfig::small(),
+        )
+        .expect("allocator");
+
+        // The 8192-byte class holds 2 objects per slab, so 16 allocations create
+        // 8 distinct spans of one bin. Freeing them all empties every span: one
+        // stays in the empty-span cache (DD-4), the other seven retire to the
+        // shared pool — and each of those must revoke its backing first.
+        let before = revokes.load(Ordering::Relaxed);
+        let mut ptrs = Vec::new();
+        for _ in 0..16 {
+            let p = a.allocate_in(ArenaId::DEFAULT, 8192, MIN_ALIGN, RequestFlags::NONE);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in ptrs {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        let after = revokes.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "normal empty-span retirement must revoke its backing before recycle \
+             (revoke calls: {before} -> {after})"
+        );
+        assert!(a.check_invariants());
     }
 
     #[test]

@@ -303,7 +303,7 @@ pub extern "C" fn topo_arena_configure(id: u32, dirty_decay_ms: u64, muzzy_decay
 mod tests {
     use super::*;
     use crate::c_api::topomalloc_free;
-    use crate::extended::{topo_arena, topo_mallocx};
+    use crate::extended::{topo_arena, topo_mallocx, topo_nallocx};
 
     #[test]
     fn create_allocate_and_destroy_an_arena_end_to_end() {
@@ -450,6 +450,34 @@ mod tests {
         set_errno(0);
         assert!(topo_mallocx_arena(h, 64, 0).is_null());
         assert_eq!(get_errno(), EACCES, "no ALLOC right ⇒ EACCES (§36.4)");
+        // SAFETY: quiesced (nothing was allocated).
+        assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
+    }
+
+    #[test]
+    fn no_alloc_right_arena_is_eacces_through_the_flag_path() {
+        use crate::errno_shim::{get_errno, EACCES};
+        // The *flag-routed* front door must report the same §36.4 taxonomy as the
+        // handle path (PR #13 review): an arena that exists and is Active but
+        // whose cap lacks ALLOC is an authority denial — EACCES, not the
+        // misleading ENOMEM of the bare engine gate. `topo_nallocx` likewise must
+        // predict 0 (it could never allocate there), staying pure.
+        let id = topo_arena_create_ex(0, TOPO_RIGHT_STATS);
+        assert!(id >= 1);
+        set_errno(0);
+        assert!(topo_mallocx(64, topo_arena(id)).is_null());
+        assert_eq!(
+            get_errno(),
+            EACCES,
+            "no ALLOC right ⇒ EACCES via the flag path"
+        );
+        set_errno(0);
+        assert_eq!(
+            topo_nallocx(64, topo_arena(id)),
+            0,
+            "nallocx predicts failure"
+        );
+        assert_eq!(get_errno(), 0, "nallocx stays pure (errno untouched)");
         // SAFETY: quiesced (nothing was allocated).
         assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
     }

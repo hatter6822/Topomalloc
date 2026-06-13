@@ -874,7 +874,8 @@ A deliberate completeness pass closed every item the first pass deferred:
   POSIX `revoke_descendants` is a no-op, so this is the seam plan 09 fills.
 * **Error taxonomy → `errno`.** The §36.14 classes map to `EACCES`
   (authority), `EBUSY` (draining), `ENOMEM` (quota), `EINVAL` (else) across the
-  lifecycle API and `topo_mallocx_arena`.
+  lifecycle API and `topo_mallocx_arena` — and, for the allocation cases, the
+  flag-routed `topo_mallocx`/`topo_nallocx` front door too (third-pass parity).
 * **Trace grammar + verification.** `ARENA_CREATE`/`DELEGATE`/`RESET`/`DESTROY`
   join the §33.7 grammar (round-trip-tested); `Check.lean` gains an executable
   **G-arena** gate pinning `ArenaState`/`RevocationPhase` to the Lean machines;
@@ -904,3 +905,43 @@ A deliberate completeness pass closed every item the first pass deferred:
   *budget-partition* (vs. the ceiling) would re-open the proven Lean
   `DelegatesFrom`, so they are M7 model refinements; the full combined
   phase×`State` refinement is M7 formal hardening.
+
+### W9 third pass (PR #13 review hardening)
+
+A round of automated review surfaced four real defects on the live data path;
+each is fixed with a test that pins the corrected behavior:
+
+* **Every vendable arena id is flag-routable (off-by-one).** `MAX_ARENAS` was
+  `256`, one past the flag-encodable range, so `create`/`delegate` could hand
+  back id `255` while `TOPO_ARENA(255)` (capped at `MAX_ARENA_ID = 254`) rejected
+  it — an arena usable through the advertised allocation path in name only. The
+  bound is now `255 = MAX_ARENA_ID + 1`, and a *second* compile-time assertion in
+  `flags.rs` pins the converse (every vendable id ≤ `MAX_ARENA_ID`), so the two
+  can never drift apart again. (Larger populations still need the §36.14 handle
+  surface and a wider internal field, not merely a bigger bound.)
+* **`topo_xallocx` validates its arena flag.** The in-place-resize query decoded
+  the flag word but skipped the existence check its siblings
+  (`mallocx`/`rallocx`/`nallocx`) perform, so `TOPO_ARENA(uncreated_id)` returned
+  a usable size instead of the documented `0 + EINVAL`. It now rejects a
+  nonexistent/inactive arena like the rest — existence only, since `xallocx`
+  resizes in place and never allocates *from* the flag arena, so its `ALLOC`
+  authority is not consulted (as with `rallocx`, which preserves the original's
+  arena across a move).
+* **Normal span retirement revokes before cross-arena recycle.** An empty span's
+  backing leaves the arena-tagged empty-span cache (DD-4, capacity 1/bin) for the
+  single shared `span_extents` pool, from which a later `create_span` may serve a
+  *different* arena — so the owning arena's capability descendants must be revoked
+  first, exactly as the reset/destroy drain does. Retirement previously recycled
+  without revoking (a stale comment claimed a per-arena pool that does not exist);
+  it now reuses the same `free_revoking` discipline on **every** retirement, so
+  `reclaim_span_slot` revokes unconditionally. On POSIX the revoke is the ambient
+  no-op; a counting test provider observes it firing on the normal path. (A
+  per-arena pool that would make same-domain reuse revoke-free is a plan-04
+  performance concern, M3+; "safety before policy" ships the correct revoke now.)
+* **The flag-routed front door reports `EACCES` for a no-`ALLOC` arena.** An
+  active arena whose cap lacks `ALLOC` passed `topo_mallocx`/`topo_nallocx`'s
+  existence-only gate, and the engine's bare-null rejection then surfaced as
+  `ENOMEM` (with `nallocx` predicting a nonzero size) — inconsistent with the
+  handle path, which maps the authority denial to `EACCES`. The front door now
+  consults the arena's rights: `EACCES` for the denial, `EINVAL` for "no such
+  arena", matching `topo_mallocx_arena` (§36.4).

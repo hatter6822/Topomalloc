@@ -52,13 +52,18 @@ use crate::ids::{ArenaId, Generation, Label, NodeId};
 
 /// Maximum number of arenas a single [`ArenaTable`] tracks (ids `0..MAX_ARENAS`).
 ///
-/// The bound is deliberately the flag-encodable range: the public `TOPO_ARENA`
+/// The bound is **exactly** the flag-encodable range: the internal `TOPO_ARENA`
 /// flag field carries an arena id in a fixed width (see
-/// [`crate::flags::RequestFlags::MAX_ARENA_ID`]), so an arena routable through
-/// the per-call flag word must have `id <= MAX_ARENA_ID`. Larger populations are
-/// the "explicit-arena handle" surface (§36.14) — out of scope for the M4
-/// vertical slice. A compile-time assertion in `flags.rs` keeps the two in step.
-pub const MAX_ARENAS: usize = 256;
+/// [`crate::flags::RequestFlags::MAX_ARENA_ID`]), so *every* id the table can
+/// vend — the largest being `MAX_ARENAS - 1` — must satisfy `id <= MAX_ARENA_ID`,
+/// i.e. `MAX_ARENAS == MAX_ARENA_ID + 1`. Were the bound any larger, `create` /
+/// `delegate` could hand back an id that `TOPO_ARENA(id)` then rejects as
+/// unroutable — an arena usable through the advertised allocation path in name
+/// only (a PR #13 review finding). Larger arena populations are the
+/// "explicit-arena handle" surface (§36.14) — out of scope for the M4 vertical
+/// slice, and would require widening the *internal* field, not merely this bound.
+/// The compile-time assertions in `flags.rs` pin the two together.
+pub const MAX_ARENAS: usize = 255;
 
 /// A quota of [`QUOTA_UNLIMITED`] imposes no ceiling — the ambient POSIX case.
 pub const QUOTA_UNLIMITED: u64 = u64::MAX;

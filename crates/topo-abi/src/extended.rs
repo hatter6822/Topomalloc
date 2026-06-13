@@ -43,10 +43,12 @@ use core::ffi::c_void;
 use core::ptr;
 
 use topo_core::flags::Lifetime;
-use topo_core::{predicted_usable_size, ArenaId, HugepagePolicy, RequestFlags, MIN_ALIGN};
+use topo_core::{
+    predicted_usable_size, ArenaId, CapRights, HugepagePolicy, RequestFlags, MIN_ALIGN,
+};
 
 use crate::c_api;
-use crate::errno_shim::{alloc_protocol, preserving_errno, set_errno, EINVAL, ENOMEM};
+use crate::errno_shim::{alloc_protocol, preserving_errno, set_errno, EACCES, EINVAL, ENOMEM};
 use crate::global;
 use crate::policy::{zero_size_policy, ZeroSizePolicy};
 
@@ -172,13 +174,55 @@ pub(crate) fn decode_flags(flags: u64) -> Option<(usize, RequestFlags)> {
     Some((align, f))
 }
 
-/// Whether `arena` can be routed to right now: the default arena always, or an
+/// Whether `arena` can be *named* right now: the default arena always, or an
 /// explicit arena that is registered and `Active` in the global engine (§22.3,
 /// plan 06 W9). A request naming an unregistered, draining, or destroyed arena is
 /// a §10.4 *invalid argument* — reported as `EINVAL`, distinct from the `ENOMEM`
 /// of a genuine allocation failure.
+///
+/// This is existence/liveness only — the right check for the paths that merely
+/// *name* an arena without allocating *from* it (`topo_rallocx` preserves the
+/// original allocation's arena across a move, §25.4; `topo_xallocx` resizes in
+/// place). The paths that allocate from the flag arena use [`alloc_routing`],
+/// which additionally honors the §36.4 `ALLOC` authority.
 fn arena_routable(arena: ArenaId) -> bool {
     arena == ArenaId::DEFAULT || global().is_some_and(|a| a.arena_is_active(arena))
+}
+
+/// The §36.4 authority disposition of routing a **new** allocation to `arena`
+/// (the `topo_mallocx` / `topo_nallocx` front door). It separates the two ways a
+/// flag-routed allocation can be refused *before* the engine even tries, so each
+/// carries the same taxonomy the generation-checked handle path
+/// (`topo_mallocx_arena`, §36.14) reports:
+///
+/// * [`NoSuchArena`](AllocRouting::NoSuchArena) — unregistered / draining /
+///   destroyed: a §10.4 invalid argument (`EINVAL`).
+/// * [`Denied`](AllocRouting::Denied) — registered and `Active`, but the arena's
+///   cap lacks [`CapRights::ALLOC`] (§36.4): an *authority* denial (`EACCES`),
+///   **not** the `ENOMEM` a quota/storage failure would raise. Collapsing this to
+///   `ENOMEM` (the engine gate's bare-null result) would misreport "you may not
+///   allocate here" as "out of memory" and let `topo_nallocx` predict a nonzero
+///   size for an arena it can never serve (a PR #13 review finding).
+enum AllocRouting {
+    Ok,
+    NoSuchArena,
+    Denied,
+}
+
+fn alloc_routing(arena: ArenaId) -> AllocRouting {
+    if arena == ArenaId::DEFAULT {
+        return AllocRouting::Ok; // ambient authority: always allocatable
+    }
+    match global().and_then(|a| a.arena_stats(arena)) {
+        Some(s) if s.state.is_active() => {
+            if s.rights.contains(CapRights::ALLOC) {
+                AllocRouting::Ok
+            } else {
+                AllocRouting::Denied
+            }
+        }
+        _ => AllocRouting::NoSuchArena,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,19 +231,30 @@ fn arena_routable(arena: ArenaId) -> bool {
 
 /// `void* topo_mallocx(size_t size, topo_flags_t flags)` (§10.3): allocate
 /// with extended flags. Invalid flags fail deterministically with `NULL` +
-/// `errno = EINVAL` (§10.4); allocation failure is `NULL` + `ENOMEM`;
-/// `size == 0` follows the zero-size policy (§9.6).
+/// `errno = EINVAL` (§10.4); a flag naming an arena whose cap lacks
+/// [`CapRights::ALLOC`] is an authority denial — `NULL` + `EACCES` (§36.4),
+/// matching the handle path; allocation failure (quota/storage) is `NULL` +
+/// `ENOMEM`; `size == 0` follows the zero-size policy (§9.6).
 #[no_mangle]
 pub extern "C" fn topo_mallocx(size: usize, flags: u64) -> *mut c_void {
     let Some((align, f)) = decode_flags(flags) else {
         set_errno(EINVAL);
         return ptr::null_mut();
     };
-    if !arena_routable(f.arena()) {
+    match alloc_routing(f.arena()) {
+        AllocRouting::Ok => {}
         // No such (active) arena: a deterministic invalid argument (§10.4),
         // distinct from the ENOMEM of a real allocation failure.
-        set_errno(EINVAL);
-        return ptr::null_mut();
+        AllocRouting::NoSuchArena => {
+            set_errno(EINVAL);
+            return ptr::null_mut();
+        }
+        // The arena exists and is Active but its cap forbids allocation: an
+        // authority denial (§36.4), reported as the handle path reports it.
+        AllocRouting::Denied => {
+            set_errno(EACCES);
+            return ptr::null_mut();
+        }
     }
     if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
         return ptr::null_mut();
@@ -272,7 +327,8 @@ pub unsafe extern "C" fn topo_rallocx(ptr: *mut c_void, size: usize, flags: u64)
 ///
 /// At M1 the allocator cannot extend backing in place (extent-merge growth is
 /// plan 04 M5), so the call succeeds exactly when the current usable size
-/// already satisfies `size`. Deterministic failures — invalid flags, a
+/// already satisfies `size`. Deterministic failures — invalid flags, a flag
+/// naming a nonexistent/inactive arena (§10.4, as the sibling entry points), a
 /// pointer this allocator does not own, or a `TOPO_ALIGN_LG` the existing
 /// base cannot satisfy (in-place resizing can never change an address) —
 /// return `0` with `errno = EINVAL` (the standard declares these undefined;
@@ -293,10 +349,21 @@ pub unsafe extern "C" fn topo_xallocx(
     // caller's `result >= size` success test and `extra` is a dead
     // best-effort bound (W15-3a/M5 wire them up).
     let _ = (size, extra);
-    let Some((align, _f)) = decode_flags(flags) else {
+    let Some((align, f)) = decode_flags(flags) else {
         set_errno(EINVAL);
         return 0;
     };
+    // A flag naming a nonexistent/inactive arena is a §10.4 invalid argument,
+    // exactly as in `topo_mallocx`/`topo_rallocx`/`topo_nallocx` — without this,
+    // `xallocx` alone would accept `TOPO_ARENA(uncreated_id)` and report a usable
+    // size instead of the documented `0 + EINVAL` (a PR #13 review finding). The
+    // existence check is all that applies: like `rallocx`, `xallocx` does not
+    // allocate *from* the flag arena (it resizes in place), so the arena's ALLOC
+    // authority is not consulted here.
+    if !arena_routable(f.arena()) {
+        set_errno(EINVAL);
+        return 0;
+    }
     preserving_errno(|| {
         let a = global()?;
         let usable = a.usable_size(ptr.cast::<u8>())?;
@@ -373,9 +440,10 @@ pub extern "C" fn topo_nallocx(size: usize, flags: u64) -> usize {
     let Some((align, f)) = decode_flags(flags) else {
         return 0;
     };
-    // Mirror `topo_mallocx`: a request that would fail with EINVAL (no such
-    // arena) predicts a 0 usable size — `topo_mallocx` would return null.
-    if !arena_routable(f.arena()) {
+    // Mirror `topo_mallocx`: a request it would refuse — no such arena (EINVAL)
+    // or an arena whose cap lacks ALLOC (EACCES) — predicts a 0 usable size,
+    // since `topo_mallocx` would return null. (Pure: errno is left untouched.)
+    if !matches!(alloc_routing(f.arena()), AllocRouting::Ok) {
         return 0;
     }
     if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
@@ -592,6 +660,14 @@ mod tests {
         let r = txallocx(p, usable + 1, 0, 0);
         assert_eq!(r, usable);
         assert!(r < usable + 1, "caller-visible failure: result < size");
+
+        // A flag naming a nonexistent arena is a §10.4 invalid argument even for
+        // this live, owned pointer — xallocx now validates it like its siblings
+        // instead of silently reporting a usable size (PR #13 review). Arena 200
+        // is never created in these tests.
+        set_errno(0);
+        assert_eq!(txallocx(p, 1, 0, topo_arena(200)), 0);
+        assert_eq!(get_errno(), EINVAL, "xallocx rejects a nonexistent arena");
         tdallocx(p, 0);
 
         // Invalid flags / foreign pointer: 0 + EINVAL.

@@ -123,7 +123,9 @@ M4, W10, plan 09.
 > ([`topo_core::Allocator`](../../crates/topo-core/src/allocator.rs)): allocation routes by the
 > requested arena, gates on its state + rights + quota, and tags every span / large allocation with its
 > arena (§22.7 isolation via the shared, arena-tagged backend, not per-arena regions — §27.5 keeps
-> metadata bounded); `realloc` preserves the original's arena (§25.4); reset / destroy force-retire the
+> metadata bounded; because that backend is shared, **every** span retirement — normal, not only the
+> destroy/reset drain — revokes the owning arena's descendants before its backing returns to the pool a
+> different arena may reclaim, §36.6); `realloc` preserves the original's arena (§25.4); reset / destroy force-retire the
 > arena's spans and free its large allocations, then finish-or-quarantine (partial failure never
 > reaches `DESTROYED`). The C ABI is `topo_arena_create/create_ex/delegate/reset/destroy` over the
 > existing `TOPO_ARENA(id)` flag routing ([`topo-abi::arena_api`](../../crates/topo-abi/src/arena_api.rs)),
