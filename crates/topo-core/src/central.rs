@@ -890,6 +890,64 @@ impl CentralCache {
         span.set_state(SpanState::Released);
         pagemap.release_span(span);
     }
+
+    /// Forcibly deactivate a span **regardless of liveness** — the arena
+    /// reset/destroy teardown (plan 06 W9-4b/W9-6b). Unlike
+    /// [`deactivate_span`](Self::deactivate_span), this does **not** require the
+    /// span be empty: arena reset "discards all extant allocations" (§22.5), so a
+    /// span with live objects is torn down and its backing reclaimed, the live
+    /// objects abandoned (the caller has accepted that outstanding pointers
+    /// become invalid). It removes the span from whichever central list holds it,
+    /// drops its central-free contribution, and transitions its pagemap entries
+    /// to `Released`.
+    ///
+    /// Soundness rests on the §22.5 precondition the lifecycle enforces: the
+    /// arena is `Resetting`/`Draining`, so no thread is allocating from or freeing
+    /// into it concurrently — the only mutator of these spans is this drain. A
+    /// span already torn down (state != `Active`) is skipped, so a double drain is
+    /// harmless.
+    ///
+    /// Returns the number of objects that were still live when torn down (for the
+    /// caller's quota credit). The caller returns the backing extent afterwards.
+    ///
+    /// SPEC-transition: span `Active -> Released` (forced, §22.5/§36.13)
+    pub fn deactivate_span_forced(&self, span: &SpanDescriptor, pagemap: &PageMap) -> u32 {
+        let sc = span.size_class();
+        let bin = self
+            .bins
+            .get(sc.index())
+            .expect("deactivate_span_forced: invalid size class");
+        let _guard = bin.lock();
+
+        // A span that is no longer Active was already torn down (by a prior drain
+        // step or a normal retirement); skip it idempotently.
+        if span.state() != SpanState::Active {
+            return 0;
+        }
+
+        let (free_before, live_before) = {
+            let sg = span.lock();
+            let free = sg.central_free_count();
+            let live = sg.live_count();
+            sg.deactivate();
+            (free, live)
+        };
+
+        // Remove from whichever list the span is in (partial or empty cache).
+        if !bin.remove_partial(span as *const SpanDescriptor) {
+            bin.remove_empty(span as *const SpanDescriptor);
+        }
+        bin.span_count.fetch_sub(1, Ordering::Relaxed);
+
+        if free_before > 0 {
+            bin.total_central_free
+                .fetch_sub(free_before as u64, Ordering::Relaxed);
+        }
+
+        span.set_state(SpanState::Released);
+        pagemap.release_span(span);
+        live_before
+    }
 }
 
 impl Default for CentralCache {

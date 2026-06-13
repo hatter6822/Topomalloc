@@ -268,6 +268,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large_allocate` (§18.5) + pagemap publish (§17.2 P-Map-006)
     pub fn allocate_with(&self, bytes: usize, align: usize, hook: &dyn RegionCacheHook) -> *mut u8 {
+        self.allocate_with_in(self.arena, bytes, align, hook)
+    }
+
+    /// As [`allocate_with`](Self::allocate_with), but tags the resulting
+    /// [`LargeDescriptor`] with the **requesting** arena (plan 06 W9), so the
+    /// large allocation retains its arena identity for isolation (§22.7) and for
+    /// per-arena reset/destroy ([`free_arena`](Self::free_arena)). The shared
+    /// region is still reserved under the manager's region arena; only the
+    /// per-allocation descriptor carries `arena`.
+    pub fn allocate_with_in(
+        &self,
+        arena: ArenaId,
+        bytes: usize,
+        align: usize,
+        hook: &dyn RegionCacheHook,
+    ) -> *mut u8 {
         let (region, backing) = match self.extents.alloc_large(bytes, align, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
@@ -297,9 +313,9 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // (no Drop) and overwritten, a reused one is recycled in place.
         unsafe {
             if fresh {
-                (*slot).desc = LargeDescriptor::new(id, self.arena, base, usable, align);
+                (*slot).desc = LargeDescriptor::new(id, arena, base, usable, align);
             } else {
-                (*slot).desc.recycle(self.arena, base, usable, align);
+                (*slot).desc.recycle(arena, base, usable, align);
             }
             match backing {
                 Some(ext) => {
@@ -328,6 +344,110 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// Allocate with the default (no-op) region cache.
     pub fn allocate(&self, bytes: usize, align: usize) -> *mut u8 {
         self.allocate_with(bytes, align, &NoRegionCache)
+    }
+
+    /// Allocate from arena `arena` with the default region cache (plan 06 W9).
+    pub fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
+        self.allocate_with_in(arena, bytes, align, &NoRegionCache)
+    }
+
+    /// The owning arena of the live large allocation based at `ptr`, or `None`
+    /// if `ptr` is not a live large allocation of this allocator. Resolved under
+    /// the pool lock (as [`usable_size`](Self::usable_size)) so it never races a
+    /// concurrent free/recycle. Used by the free path to credit the right arena's
+    /// quota (plan 06 W9).
+    pub fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId> {
+        if ptr.is_null() {
+            return None;
+        }
+        self.lock.acquire();
+        let res = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr).map(|idx| {
+                    // SAFETY: `idx` is a live slot under the lock.
+                    unsafe { (*pool.slot_ptr(idx)).desc.arena() }
+                })
+            }
+            None => None,
+        };
+        self.lock.release();
+        res
+    }
+
+    /// Free **every** live large allocation belonging to `arena` (plan 06 W9-4c
+    /// / W9-6: the large-side of arena reset/destroy). Returns `(count, bytes,
+    /// fully_drained)` — the number freed, their total usable bytes (for the
+    /// caller's global `freed_bytes` accounting, since this frees at the
+    /// large-allocator level below the engine's counters), and whether the arena
+    /// was fully drained (no live large could not be freed). A `false`
+    /// `fully_drained` is the §36.13 partial-failure signal the caller turns into
+    /// a quarantine.
+    ///
+    /// Each iteration finds one live large of `arena` (its pagemap entry still
+    /// points at its descriptor) under the pool lock, then frees it through the
+    /// ordinary [`free`](Self::free) path (which retires the pagemap entry, so the
+    /// next scan cannot re-find it — guaranteeing progress) and returns its
+    /// backing. The scan reads descriptor fields only under the pool lock, so it
+    /// never races a concurrent recycle of *another* arena's slot; the SPEC §22.5
+    /// precondition (the arena being drained is quiesced) means no concurrent
+    /// mutation of *this* arena's allocations. A free that unexpectedly fails
+    /// stops the loop so the caller can quarantine (§36.13 partial-failure).
+    ///
+    /// # Safety
+    ///
+    /// The caller guarantees `arena` is quiesced (no thread holds or is freeing
+    /// its large allocations) — the §22.5/§36.13 reset/destroy precondition. Each
+    /// freed pointer is a live base pointer this allocator handed out, so the
+    /// per-free [`free`](Self::free) contract is met.
+    pub unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        loop {
+            // Find one live large of `arena` under the pool lock.
+            self.lock.acquire();
+            // SAFETY: lock held ⇒ exclusive pool access; slots are never freed.
+            let found = unsafe {
+                let pool = &mut *self.pool.get();
+                let hw = pool.high_water;
+                let mut found: Option<(usize, usize)> = None;
+                let mut idx = 0u32;
+                while idx < hw {
+                    let slot = pool.slot_ptr(idx);
+                    let desc_ptr = &(*slot).desc as *const LargeDescriptor;
+                    let base = (*slot).desc.base();
+                    // Live iff the pagemap still resolves its base to this very
+                    // descriptor (a freed slot's entry was retired). This also
+                    // confirms `base` is the descriptor's current base.
+                    let live = self.pagemap.lookup(base).large_ptr() == Some(desc_ptr);
+                    if live && (*slot).desc.arena() == arena {
+                        found = Some((base, (*slot).desc.usable_size()));
+                        break;
+                    }
+                    idx += 1;
+                }
+                found
+            };
+            self.lock.release();
+
+            match found {
+                Some((base, usable)) => {
+                    // SAFETY: `base` is the current base pointer of a live large
+                    // allocation of this allocator (the pagemap confirmed it under
+                    // the lock); freeing it meets the `free` contract.
+                    if unsafe { self.free(base as *mut u8) } {
+                        count += 1;
+                        bytes += usable;
+                    } else {
+                        // A live large we could not free: stop so the caller
+                        // quarantines rather than spinning (§36.13 partial-failure).
+                        return (count, bytes, false);
+                    }
+                }
+                None => return (count, bytes, true),
+            }
+        }
     }
 
     /// Free a large allocation by base pointer (§17.5: `free` requires a base

@@ -196,6 +196,38 @@ int main(void) {
     assert(errno == EINVAL);
     assert(topo_nallocx(64, TOPO_ALIGN_LG(99)) == 0u);
 
+    /* arena API (§22/§36.4/§36.13 — W9): create an explicit arena, allocate
+       from it through the flag-routed path, reset it, then destroy it. */
+    topo_arena_t ar = topo_arena_create();
+    assert(ar >= 1u); /* never the default (id 0) */
+    void *ap = topo_mallocx(128, TOPO_ARENA(ar));
+    assert(ap != NULL);
+    memset(ap, 0x5a, 128);
+    topomalloc_free(ap);
+
+    /* a quota-capped arena refuses an oversized demand (§36.4) */
+    topo_arena_t aq = topo_arena_create_ex(256, TOPO_RIGHTS_ALL);
+    assert(aq >= 1u);
+    void *aqp = topo_mallocx(200, TOPO_ARENA(aq));
+    assert(aqp != NULL);
+    assert(topo_mallocx(200, TOPO_ARENA(aq)) == NULL); /* over quota */
+    topomalloc_free(aqp); /* release the budget before delegating */
+
+    /* delegation attenuates (§36.4): a child with alloc+free and a sub-quota */
+    topo_arena_t child = topo_arena_delegate(aq, 128, TOPO_RIGHT_ALLOC | TOPO_RIGHT_FREE);
+    assert(child >= 1u);
+    /* widening the quota past the parent's budget is rejected */
+    assert(topo_arena_delegate(aq, (size_t) 1 << 40, TOPO_RIGHTS_ALL) == 0u);
+
+    /* reset keeps the arena usable; destroy retires it (§22.5/§22.6) */
+    assert(topo_arena_reset(ar) == 0);
+    assert(topo_arena_destroy(ar) == 0);
+    assert(topo_arena_destroy(child) == 0);
+    assert(topo_arena_destroy(aq) == 0);
+    /* the default arena cannot be reset or destroyed (§22.5) */
+    assert(topo_arena_reset(0) == -1);
+    assert(topo_arena_destroy(0) == -1);
+
     /* generated table header is consistent and usable from C */
     assert(TOPOMALLOC_QUANTUM == 16u);
     assert(TOPOMALLOC_NUM_SIZE_CLASSES >= 1u);

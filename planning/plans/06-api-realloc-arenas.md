@@ -1,8 +1,10 @@
 # Plan 06 — Public API, Reallocation & Arenas
 
 **Workstreams:** W8 (public API/ABI), W15 (realloc/aligned/calloc), W9 (capability-backed arenas), W10
-(extent hooks) · **Status:** rev 2.2 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
-realloc core · **Overview:** [README.md](README.md)
+(extent hooks) · **Status:** rev 2.3 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
+realloc core; **W9 landed (all units, ahead of M4): the live multi-arena data path, the §22.3/§36.13
+lifecycle, capability-monotonic delegation, quotas, NUMA policy, and the C arena API** ·
+**Overview:** [README.md](README.md)
 **SPEC anchors:** §10, §25, §26, §9.6/§9.7, §22, §36.4, §36.13, §23, §35.2/§35.3; F-001..F-010, §15.5.
 **Upstream deps:** [03](03-core-allocator.md) (classify, pagemap, central), [04](04-backend-hugepages-release.md)
 (provider, extents), [05](05-caches-concurrency-fastpath.md) (front-end). **Downstream:** every consumer;
@@ -112,22 +114,44 @@ W16-4 owns the transition). **Enables:** every consumer + tests.
 **Depends on:** plan 04 (provider), plan 03 W5 (central per arena), plan 05 W6 (cache routing). **Enables:**
 M4, W10, plan 09.
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W9-1 | Arena descriptor (above) with `authority_cap`, `label`, `quota` (§36.4); trivial ambient values on POSIX. | M | | POSIX default arena works; fields present for seLe4n. |
-| W9-2 | Arena states + lifecycle (§22.3); allocations only in `Active`. | M | | illegal-state ops rejected. |
-| W9-3 | Create/configure (§22.4, F-005/F-006): validate policy; metadata from a safe arena; hooks installed before the first extent; publish id only after init. | M | | creation order enforced; default-arena policy (F-006) covers no-extended-API programs. |
-| W9-4a | State transitions Active→Resetting/Draining + precondition checks (no active allocators; explicit, not the default arena unless special mode) (§22.5). | M | | illegal reset rejected. |
-| W9-4b | Cache drain/invalidate of *every* per-CPU/thread/transfer cache holding the arena's objects (uses W6 routing). | M | | post-drain: no cache holds an arena object (B.5). |
-| W9-4c | Return arena extents to backend/retain per policy; reset accounting; bump reset generation. | M | ∥ | §22.5 postconditions met. |
-| W9-4d | Destroy = reset + metadata removal + id non-reuse-while-stale (§22.6); isolation preserved (§22.7); mirrors plan 02 W1-9. | M | | `arena_destroy` tests; isolation invariant. |
-| W9-5 | **Capability monotonicity** (§36.4): authority/quota/label monotonic on delegation; attenuation-only. | M | | delegation cannot widen rights/quota or downgrade label (§36.16). |
-| W9-6a | Revocation: enter DRAINING — reject new allocations + delegations; notify clients (§36.13). | M | | no new alloc/delegation while draining. |
-| W9-6b | Revocation: drain local/transfer caches + central lists; quarantine or reject stale frees. | M | | post-drain inventory empty (shares W9-4b). |
-| W9-6c | Revocation: unmap client VSpace windows; scrub dirty pages if cross-label reuse is possible (uses plan 08 W18-6). | M | ∥ | unmapped before revoke; scrub recorded. |
-| W9-6d | Revocation: revoke derived frame/mapping caps; delete CSlots; recycle untyped (provider `revoke_descendants`/`recycle`). | M | | no live derived cap/mapping remains. |
-| W9-6e | Revocation: finalize DESTROYED + generation++; **partial failure ⇒ DRAINING/ERROR_QUARANTINED, never DESTROYED**; emergency allocs never depend on a destroying arena. | M | | revocation test (§36.16); mirrors `destroy_revokes_descendants` (plan 02 W1-12c). |
-| W9-7 | NUMA policy modes (§15.5) + binding-failure visibility in stats. | M | ∥ | local/interleave/bind/arena_policy/OS_default; failures surfaced. |
+> **▸ Implementation status.** W9 is **landed** (ahead of its M4 slot). The arena authority + lifecycle
+> subsystem is [`topo_core::arena`](../../crates/topo-core/src/arena.rs): the descriptor + `ArenaStats`
+> view, the §22.3/§36.13 [`ArenaState`] machine, the [`CapRights`] lattice with attenuation-only
+> [`Delegation`], quota accounting that cannot wrap, [`NumaPolicy`] modes, the ordered
+> [`RevocationPhase`] protocol, and the fixed-capacity [`ArenaTable`] registry (lock-free hot-path gate,
+> lock-guarded slow path). It is wired into the **live multi-arena data path**
+> ([`topo_core::Allocator`](../../crates/topo-core/src/allocator.rs)): allocation routes by the
+> requested arena, gates on its state + rights + quota, and tags every span / large allocation with its
+> arena (§22.7 isolation via the shared, arena-tagged backend, not per-arena regions — §27.5 keeps
+> metadata bounded); `realloc` preserves the original's arena (§25.4); reset / destroy force-retire the
+> arena's spans and free its large allocations, then finish-or-quarantine (partial failure never
+> reaches `DESTROYED`). The C ABI is `topo_arena_create/create_ex/delegate/reset/destroy` over the
+> existing `TOPO_ARENA(id)` flag routing ([`topo-abi::arena_api`](../../crates/topo-abi/src/arena_api.rs)),
+> and the arena summary reconciles into `topo-stats`/`topo-control`. Verified by per-crate unit tests,
+> multi-arena allocator tests (isolation, reset, destroy, quota, realloc-preserves-arena, the
+> §8.6/§36.17 `Σ used == live_bytes` reconciliation), arena property tests (delegation attenuation,
+> quota bound, reset accounting), the dual-backend G-sim arena slice, the C/C++ ABI harness arena
+> lifecycle, and the Lean lifecycle state machine (`lean/TopoMalloc/ArenaLifecycle.lean`, proof-checked)
+> plus the bridge's `DelegatesFrom`/`ArenaQuotaExact`/`destroy_revokes_descendants`. The seLe4n-specific
+> revocation steps (real unmap → cap revoke → untyped recycle) are the POSIX collapse here; plan 09
+> overrides them against the capability provider with **no change above the seam**.
+
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W9-1 | Arena descriptor (above) with `authority_cap`, `label`, `quota` (§36.4); trivial ambient values on POSIX. | M | | POSIX default arena works; fields present for seLe4n. | **DONE** — `ArenaStats`/`ArenaPolicy`/`CapRights`/`NumaPolicy`; default arena is ambient (all rights, `PUBLIC`, unlimited) |
+| W9-2 | Arena states + lifecycle (§22.3); allocations only in `Active`. | M | | illegal-state ops rejected. | **DONE** — `ArenaState` machine + lock-free `try_charge` gate; illegal transitions rejected; mirrored in Lean |
+| W9-3 | Create/configure (§22.4, F-005/F-006): validate policy; metadata from a safe arena; hooks installed before the first extent; publish id only after init. | M | | creation order enforced; default-arena policy (F-006) covers no-extended-API programs. | **DONE** — validate-then-claim-then-publish (`Initializing → Active`); default arena present from construction (F-006) |
+| W9-4a | State transitions Active→Resetting/Draining + precondition checks (no active allocators; explicit, not the default arena unless special mode) (§22.5). | M | | illegal reset rejected. | **DONE** — `begin_reset`/`begin_destroy` reject the default arena + non-`Active` states |
+| W9-4b | Cache drain/invalidate of *every* per-CPU/thread/transfer cache holding the arena's objects (uses W6 routing). | M | | post-drain: no cache holds an arena object (B.5). | **DONE** — `drain_arena` force-retires the arena's spans (the only holder at M1; the front-end-cache drain hook extends here at M2) |
+| W9-4c | Return arena extents to backend/retain per policy; reset accounting; bump reset generation. | M | ∥ | §22.5 postconditions met. | **DONE** — spans' + larges' extents returned; `used` zeroed; generation bumped; `Σ used == live_bytes` reconciled |
+| W9-4d | Destroy = reset + metadata removal + id non-reuse-while-stale (§22.6); isolation preserved (§22.7); mirrors plan 02 W1-9. | M | | `arena_destroy` tests; isolation invariant. | **DONE** — `arena_destroy` retires the id behind a generation bump; isolation tested (other arenas untouched) |
+| W9-5 | **Capability monotonicity** (§36.4): authority/quota/label monotonic on delegation; attenuation-only. | M | | delegation cannot widen rights/quota or downgrade label (§36.16). | **DONE** — `delegate` enforces `CapRights::attenuates` + quota ≤ remaining + label equality; property-tested; mirrors Lean `DelegatesFrom` |
+| W9-6a | Revocation: enter DRAINING — reject new allocations + delegations; notify clients (§36.13). | M | | no new alloc/delegation while draining. | **DONE** — `begin_destroy` enters `Draining`; the gate refuses allocations and `delegate` refuses a draining parent |
+| W9-6b | Revocation: drain local/transfer caches + central lists; quarantine or reject stale frees. | M | | post-drain inventory empty (shares W9-4b). | **DONE** — shares `drain_arena`; post-drain the arena holds no spans/larges |
+| W9-6c | Revocation: unmap client VSpace windows; scrub dirty pages if cross-label reuse is possible (uses plan 08 W18-6). | M | ∥ | unmapped before revoke; scrub recorded. | **DONE (POSIX collapse)** — extent free unmaps; `RevocationPhase` pins unmap-before-revoke; real VSpace unmap + scrub is plan 09/W18-6 behind the seam |
+| W9-6d | Revocation: revoke derived frame/mapping caps; delete CSlots; recycle untyped (provider `revoke_descendants`/`recycle`). | M | | no live derived cap/mapping remains. | **DONE (POSIX collapse)** — no-op revoke + `release` recycle (single ambient authority); `RevocationPhase` pins revoke-before-recycle; real cap revocation is plan 09 |
+| W9-6e | Revocation: finalize DESTROYED + generation++; **partial failure ⇒ DRAINING/ERROR_QUARANTINED, never DESTROYED**; emergency allocs never depend on a destroying arena. | M | | revocation test (§36.16); mirrors `destroy_revokes_descendants` (plan 02 W1-12c). | **DONE** — `finish_destroy` finalizes; a partial drain `quarantine`s to `ErrorQuarantined`; Lean proves `errorQuarantined` is terminal; mirrors `destroy_revokes_descendants` |
+| W9-7 | NUMA policy modes (§15.5) + binding-failure visibility in stats. | M | ∥ | local/interleave/bind/arena_policy/OS_default; failures surfaced. | **DONE** — `NumaPolicy` (all five modes) recorded per arena; `numa_bind_failures` counter surfaces in `AllocatorStats`/`topo-stats`/`topo.arena.numa_bind_failures` |
 
 > **▸ Decomposition — W9-6 (arena revocation), the seLe4n-critical lifecycle.** Ordering is the whole game:
 > **unmap before revoke before recycle**, because recycling untyped backing while a client mapping or derived

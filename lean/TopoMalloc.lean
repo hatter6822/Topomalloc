@@ -16,6 +16,7 @@ whole model:
   hardware/RSEQ, host/Rust, and progress refinements that are discharged elsewhere.
 -/
 import TopoMalloc.Types
+import TopoMalloc.ArenaLifecycle
 import TopoMalloc.ExtentState
 import TopoMalloc.SizeClass
 import TopoMalloc.Generated.SizeClasses

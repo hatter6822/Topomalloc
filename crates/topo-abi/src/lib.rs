@@ -31,15 +31,21 @@ use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::{
-    Allocator, AllocatorConfig, AllocatorStats, ArenaId, FreeOutcome, InvalidFree, MetaArena,
-    PageMap, RequestFlags,
+    Allocator, AllocatorConfig, AllocatorStats, ArenaError, ArenaId, ArenaPolicy, ArenaStats,
+    Delegation, FreeOutcome, Generation, InvalidFree, MetaArena, PageMap, RequestFlags,
 };
 
+mod arena_api;
 mod c_api;
 mod errno_shim;
 mod extended;
 mod policy;
 
+pub use arena_api::{
+    topo_arena_create, topo_arena_create_ex, topo_arena_delegate, topo_arena_destroy,
+    topo_arena_reset, TOPO_RIGHTS_ALL, TOPO_RIGHT_ALLOC, TOPO_RIGHT_DESTROY, TOPO_RIGHT_FREE,
+    TOPO_RIGHT_STATS,
+};
 pub use c_api::{
     topomalloc_aligned_alloc, topomalloc_backend, topomalloc_calloc, topomalloc_free,
     topomalloc_free_aligned_sized, topomalloc_free_sized, topomalloc_malloc,
@@ -101,6 +107,18 @@ impl AnyAllocator {
         dispatch!(self, a => a.allocate(size, align, flags))
     }
 
+    /// Allocate from an explicit arena (plan 06 W9), overriding the arena the
+    /// `flags` encode. Used by `realloc` (arena preservation) and the arena API.
+    pub fn allocate_in(
+        &self,
+        arena: ArenaId,
+        size: usize,
+        align: usize,
+        flags: RequestFlags,
+    ) -> *mut u8 {
+        dispatch!(self, a => a.allocate_in(arena, size, align, flags))
+    }
+
     /// Free a pointer; see [`FreeOutcome`] for the validation outcomes.
     ///
     /// # Safety
@@ -158,6 +176,49 @@ impl AnyAllocator {
     /// provider the runtime flag selected (W0-14b).
     pub fn backend_name(&self) -> &'static str {
         dispatch!(self, a => a.backend_name())
+    }
+
+    // -- arena lifecycle & authority (plan 06 W9) ------------------------------
+
+    /// Create a new explicit arena (§22.4). Returns its [`ArenaId`].
+    pub fn arena_create(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
+        dispatch!(self, a => a.arena_create(policy))
+    }
+
+    /// Delegate an attenuated child arena from `parent` (§36.4).
+    pub fn arena_delegate(&self, parent: ArenaId, del: &Delegation) -> Result<ArenaId, ArenaError> {
+        dispatch!(self, a => a.arena_delegate(parent, del))
+    }
+
+    /// A snapshot of an arena's authority + accounting (§22.2/§36.4).
+    pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
+        dispatch!(self, a => a.arena_stats(arena))
+    }
+
+    /// Whether `arena` is registered and currently allocatable (§22.3).
+    pub fn arena_is_active(&self, arena: ArenaId) -> bool {
+        dispatch!(self, a => a.arenas().is_active(arena))
+    }
+
+    /// Reset an explicit arena (§22.5).
+    ///
+    /// # Safety
+    ///
+    /// As [`topo_core::Allocator::arena_reset`]: the arena must be quiesced and
+    /// the caller accepts that its outstanding pointers become invalid.
+    pub unsafe fn arena_reset(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        // SAFETY: the caller upholds this method's identical contract.
+        dispatch!(self, a => unsafe { a.arena_reset(arena) })
+    }
+
+    /// Destroy an explicit arena (§22.6/§36.13).
+    ///
+    /// # Safety
+    ///
+    /// As [`arena_reset`](Self::arena_reset).
+    pub unsafe fn arena_destroy(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        // SAFETY: the caller upholds this method's identical contract.
+        dispatch!(self, a => unsafe { a.arena_destroy(arena) })
     }
 }
 

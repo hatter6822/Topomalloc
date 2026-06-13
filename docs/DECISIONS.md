@@ -84,6 +84,14 @@ class), upgrading to arena-qualified slots at M4 when multiple authority domains
 become active. No cache code exists at M0; the decision is recorded so plan 05
 (M2) implements the fast path directly.
 
+**Update (W9 landed).** Multiple authority domains are now active — the live
+multi-arena data path ships ahead of M4 (see the W9 notes below) — but it rides
+on the **central** cache, which is already arena-keyed and filters by arena on
+remove (W5-4a), so arena isolation (§22.7) holds without front-end caches. D6
+remains the standing decision for the *front-end* caches when they arrive (M2):
+the per-CPU/thread/transfer slots take the bound-arena fast path, and the W9
+`drain_arena` teardown grows its cache-drain hook there (W9-4b/W9-6b).
+
 ## D7 — Property / fuzz / differential stack
 
 * **Property testing:** [`proptest`](https://crates.io/crates/proptest) (see
@@ -771,3 +779,73 @@ severity order:
   non-trivial flag word), and the full `malloc(64)+free` round-trip on the
   M1 central path ≈ **131 ns** — the per-op central+span lock cost the
   M2 caches and M3 RSEQ path (≈ 12.5 ns per cached op, W7) exist to remove.
+
+## W9 — capability-backed arenas over a live multi-arena data path (plan 06)
+
+W9 makes an arena two things at once (D2): a jemalloc-style **policy domain**
+(§22) and a seLe4n-style **capability-controlled resource domain** (§36.4) — the
+types live in the MIT core (`crates/topo-core/src/arena.rs`), trivial/ambient on
+POSIX, real on seLe4n. The design notes, in the order they matter:
+
+* **Shared-region, arena-tagged isolation — not per-arena regions.** §22.7
+  permits "shared global backend structures … only if each extent retains its
+  arena identity." The live multi-arena path takes that route: one engine, one
+  central cache (already keyed `(node, arena, label, sc)`, W5-4a), one span +
+  one large region, but **every span and every large descriptor carries its
+  requesting arena**. The alternative — a full engine (with its own pools) per
+  arena — was rejected because re-creating an arena would re-carve pools from
+  the never-freed metadata arena (§27.5), an unbounded leak under arena churn.
+  Tagging keeps metadata bounded (spans/larges recycle) while satisfying every
+  §22.7 clause: each extent/span/cache-entry belongs to exactly one arena.
+  Per-arena cache *sharding* (D6, W5-4d/W6-6) stays an M2/M4 performance concern;
+  it is not needed for correctness here (no front-end caches exist at M1).
+* **The default arena fast path is untouched.** `allocate` routes by the
+  requested arena; the ambient default arena (id 0, all rights, unlimited quota,
+  always `Active`) admits unconditionally, so the existing hot path keeps its
+  characteristics. Explicit arenas pay one lock-free state/rights load plus a
+  quota compare-exchange (`ArenaTable::try_charge`), and credit on free
+  (`credit`, saturating so a stale/double free can never underflow). The result
+  is the §8.6/§36.17 reconciliation `Σ arena.used == live_bytes`, asserted
+  through an alloc/free cycle *including a reset that discards live objects*
+  (the discarded bytes are accounted as freed so the global counter stays exact).
+* **The lifecycle is a state machine with a non-`DESTROYED` failure state.**
+  `ArenaState` is the §22.3 set plus §36.13 `ErrorQuarantined`; `can_transition`
+  is the exact legal edge set (mirrored, and proof-checked, in
+  `lean/TopoMalloc/ArenaLifecycle.lean` — the new abstract transition the
+  governance rule requires). Reset is `Active → Resetting →` drain `→ Active`;
+  destroy is `Active → Draining →` drain `→ Destroyed`; either drain failure
+  `quarantine`s to `ErrorQuarantined`, which Lean proves terminal — so a partial
+  failure can **never** be reported as a clean teardown (§36.13). The default
+  arena rejects reset/destroy (§22.5).
+* **Revocation is ordered and step-isolated; POSIX is the collapse.**
+  `RevocationPhase` pins the §36.13 / DD-3 order (drain → unmap → **revoke** →
+  recycle → finalize) with Lean lemmas `unmap_before_revoke` /
+  `revoke_before_recycle`. On POSIX the unmap/revoke/recycle steps collapse to
+  "free the extent" (a no-op revoke under single ambient authority); the real
+  VSpace unmap, capability revocation, and untyped recycle drop in at plan 09
+  **with no change above the seam**, because the structure is identical.
+* **Delegation is attenuation-only, mirroring Lean `DelegatesFrom`.**
+  `ArenaTable::delegate` enforces the three §36.4 monotonicity invariants —
+  rights ⊆ parent (`CapRights::attenuates`), quota ≤ the parent's *remaining*
+  budget, label preserved — the runtime image of the bridge's `DelegatesFrom`.
+  A property test drives arbitrary parent/child rights and quotas and asserts
+  delegation succeeds *iff* it is a sound attenuation and never widens authority.
+* **Id assignment retires-then-recycles behind a generation bump.** The
+  `ArenaTable` is a fixed-capacity registry (ids `0..MAX_ARENAS`, the
+  flag-encodable range, pinned to `RequestFlags::MAX_ARENA_ID` by a compile-time
+  assertion). Ids are assigned from a high-water mark and only recycled under
+  capacity pressure; destroy bumps the generation, so a stale reference to a
+  prior incarnation is detectable (§B.5 / §36.13 "generation checks").
+* **`realloc` preserves the arena (§25.4).** A move allocates the new object in
+  the *original's* arena (recovered from its span/large descriptor), not the
+  arena the call's flags happen to name — keeping the storage family a function
+  of the live object, not the request.
+* **The C ABI is `topo_arena_create/create_ex/delegate/reset/destroy`** over the
+  existing `TOPO_ARENA(id)` flag routing (`topo-abi/src/arena_api.rs`). A request
+  naming a nonexistent or draining arena is one deterministic `EINVAL` (the
+  entry-point existence check, distinct from the `ENOMEM` of a real allocation
+  failure); reset/destroy carry the same quiescence/invalidation contract as
+  `free`. The five symbols are declared in `include/topomalloc.h` and exercised
+  by the C and C++ ABI harnesses; the header↔symbol cross-check now balances 24
+  exported functions. The arena summary (`live_arenas`, `numa_bind_failures`)
+  reconciles into `topo-stats` and the `topo.arena.*` control keys.

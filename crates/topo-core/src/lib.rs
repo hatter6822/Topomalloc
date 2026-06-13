@@ -14,6 +14,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod allocator;
+pub mod arena;
 pub mod backend;
 pub mod bootstrap;
 pub mod budget;
@@ -50,6 +51,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Convenience re-exports for the common surface.
 pub use allocator::{
     predicted_usable_size, Allocator, AllocatorConfig, AllocatorStats, FreeOutcome, MetaArena,
+};
+pub use arena::{
+    ArenaError, ArenaPolicy, ArenaState, ArenaStats, ArenaTable, CapRights, Delegation, NumaPolicy,
+    RevocationPhase, ARENA_NAME_LEN, MAX_ARENAS, QUOTA_UNLIMITED,
 };
 pub use backend::{
     CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,

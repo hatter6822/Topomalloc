@@ -51,6 +51,12 @@ impl Control {
             // allocation entry points actually do. Writable via the mutating
             // control surface when plan 07 W20 lands it.
             "topo.compat.zero_size" => Some(topo_core::zero_size_policy().as_str().to_string()),
+            // Arena summary (§22/§36.4, plan 06 W9): the number of registered
+            // arenas and the cumulative NUMA binding-failure count (§15.5), read
+            // from the latest stats snapshot. Per-arena introspection and the
+            // mutating arena-lifecycle control surface land with plan 07 W20.
+            "topo.arena.count" => Some(self.stats.live_arenas.to_string()),
+            "topo.arena.numa_bind_failures" => Some(self.stats.numa_bind_failures.to_string()),
             _ => None,
         }
     }
@@ -82,6 +88,20 @@ mod tests {
     fn unknown_keys_are_none() {
         let c = Control::new(Profile::Performance);
         assert_eq!(c.get("topo.nonexistent"), None);
+    }
+
+    #[test]
+    fn reads_the_arena_summary() {
+        // Plan 06 W9: the arena count + NUMA-failure summary surface in the
+        // control namespace, sourced from the stats snapshot.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            live_arenas: 4,
+            numa_bind_failures: 2,
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.arena.count").as_deref(), Some("4"));
+        assert_eq!(c.get("topo.arena.numa_bind_failures").as_deref(), Some("2"));
     }
 
     #[test]

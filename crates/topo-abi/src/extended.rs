@@ -162,18 +162,22 @@ fn decode_flags(flags: u64) -> Option<(usize, RequestFlags)> {
     let arena_field = ((flags & ARENA_MASK) >> ARENA_SHIFT) as u32;
     if arena_field != 0 {
         // The field stores id + 1. Two rejection layers, one error code:
-        // an id beyond the internal encoding fails here, and an id naming an
-        // arena that does not exist fails the explicit existence check below
-        // — both are EINVAL at the entry points, so "no such arena" is one
-        // deterministic failure regardless of the id's magnitude (§10.4).
+        // an id beyond the flag-encodable range fails here (decode), and an id
+        // naming an arena that does not *exist* fails the entry point's
+        // existence check ([`arena_routable`]) — both are EINVAL, so "no such
+        // arena" is one deterministic failure regardless of the id (§10.4).
         f = f.with_arena(arena_field.checked_sub(1)?)?;
     }
-    // Until the arena API lands (plan 06 W9, M4) only the default arena
-    // exists; routing to any other is an invalid argument, not an OOM.
-    if f.arena() != ArenaId::DEFAULT {
-        return None;
-    }
     Some((align, f))
+}
+
+/// Whether `arena` can be routed to right now: the default arena always, or an
+/// explicit arena that is registered and `Active` in the global engine (§22.3,
+/// plan 06 W9). A request naming an unregistered, draining, or destroyed arena is
+/// a §10.4 *invalid argument* — reported as `EINVAL`, distinct from the `ENOMEM`
+/// of a genuine allocation failure.
+fn arena_routable(arena: ArenaId) -> bool {
+    arena == ArenaId::DEFAULT || global().is_some_and(|a| a.arena_is_active(arena))
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +194,12 @@ pub extern "C" fn topo_mallocx(size: usize, flags: u64) -> *mut c_void {
         set_errno(EINVAL);
         return ptr::null_mut();
     };
+    if !arena_routable(f.arena()) {
+        // No such (active) arena: a deterministic invalid argument (§10.4),
+        // distinct from the ENOMEM of a real allocation failure.
+        set_errno(EINVAL);
+        return ptr::null_mut();
+    }
     if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
         return ptr::null_mut();
     }
@@ -219,6 +229,14 @@ pub unsafe extern "C" fn topo_rallocx(ptr: *mut c_void, size: usize, flags: u64)
         set_errno(EINVAL);
         return ptr::null_mut();
     };
+    if !arena_routable(f.arena()) {
+        // A flag naming a nonexistent arena fails deterministically, leaving the
+        // original untouched (§10.4 / §25.1). The engine's realloc preserves the
+        // original allocation's arena across a move (§25.4); the validated flag
+        // arena is not used to migrate it.
+        set_errno(EINVAL);
+        return ptr::null_mut();
+    }
     if ptr.is_null() {
         return topo_mallocx(size, flags);
     }
@@ -354,6 +372,11 @@ pub extern "C" fn topo_nallocx(size: usize, flags: u64) -> usize {
     let Some((align, f)) = decode_flags(flags) else {
         return 0;
     };
+    // Mirror `topo_mallocx`: a request that would fail with EINVAL (no such
+    // arena) predicts a 0 usable size — `topo_mallocx` would return null.
+    if !arena_routable(f.arena()) {
+        return 0;
+    }
     if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
         return 0;
     }
@@ -437,11 +460,14 @@ mod tests {
         let (align, f) = decode_flags(topo_align_lg(9) | TOPO_ZERO).unwrap();
         assert_eq!(align, 512);
         assert!(f.hints().zero);
-        // The default arena may be named explicitly; any other id is the
-        // deterministic "no such arena" failure until W9 lands arenas.
+        // Any flag-encodable arena id (0..=MAX_ARENA_ID) decodes; whether the
+        // arena *exists* is an entry-point check, not a decode concern (plan 06
+        // W9). An id beyond the encodable range is rejected at decode — it
+        // collapses to the same EINVAL as the entry point's "no such arena".
         assert!(decode_flags(topo_arena(0)).is_some());
-        assert!(decode_flags(topo_arena(1)).is_none());
-        assert!(decode_flags(topo_arena(254)).is_none());
+        assert!(decode_flags(topo_arena(1)).is_some());
+        assert!(decode_flags(topo_arena(254)).is_some());
+        assert!(decode_flags(topo_arena(255)).is_none());
         assert!(decode_flags(topo_arena(u32::MAX)).is_none());
     }
 
@@ -466,20 +492,23 @@ mod tests {
         tdallocx(p, topo_align_lg(8));
 
         // A nonexistent arena is an invalid argument — EINVAL regardless of
-        // the id's magnitude (small ids and encoding-overflow ids alike).
+        // the id's magnitude (an uncreated id and an encoding-overflow id
+        // alike). Ids ≥ 200 are never created by the create tests (which
+        // assign sequentially from 1), so they stay reliably "nonexistent" in
+        // this shared-process test.
         set_errno(0);
-        assert!(topo_mallocx(64, topo_arena(3)).is_null());
-        assert_eq!(get_errno(), EINVAL, "arena 3 does not exist at M1");
+        assert!(topo_mallocx(64, topo_arena(200)).is_null());
+        assert_eq!(get_errno(), EINVAL, "arena 200 was never created");
         set_errno(0);
         assert!(topo_mallocx(64, topo_arena(300)).is_null());
         assert_eq!(get_errno(), EINVAL, "same failure for unencodable ids");
-        assert_eq!(topo_nallocx(64, topo_arena(3)), 0, "nallocx mirrors it");
+        assert_eq!(topo_nallocx(64, topo_arena(200)), 0, "nallocx mirrors it");
         // rallocx with a bad arena leaves the original untouched.
         let keep = topo_mallocx(16, 0);
         // SAFETY: `keep` is live and test-owned.
         unsafe { keep.cast::<u8>().write(0x5A) };
         set_errno(0);
-        assert!(trallocx(keep, 64, topo_arena(7)).is_null());
+        assert!(trallocx(keep, 64, topo_arena(201)).is_null());
         assert_eq!(get_errno(), EINVAL);
         // SAFETY: `keep` is still live with its content.
         unsafe { assert_eq!(keep.cast::<u8>().read(), 0x5A) };

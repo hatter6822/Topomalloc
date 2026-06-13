@@ -45,8 +45,15 @@ The public API runs over the real central-path allocator: classify → central
 free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`,
 errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++
 operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the
-seLe4n simulator (G-sim). Front-end caches (M2) and the remaining M1 pieces
-land per the plan.
+seLe4n simulator (G-sim).
+
+**Capability-backed arenas (W9)** ride on top: a live multi-arena data path with
+per-arena isolation (§22.7), the full §22.3/§36.13 lifecycle
+(create / delegate / reset / destroy / revocation), attenuation-only delegation
+of rights / quota / label (§36.4), NUMA policy modes (§15.5), and a C arena API
+(`topo_arena_create` / `delegate` / `reset` / `destroy`). The arena lifecycle
+state machine is modeled and proof-checked in Lean. Front-end caches (M2) and
+the remaining M1 pieces land per the plan.
 
 ## Quick start
 
@@ -96,7 +103,7 @@ are co-equal behind it from M1, so the core allocator is OS-agnostic and
 
 | Crate | Role | License |
 |-------|------|---------|
-| `topo-core` | classifier, size classes, seam, metadata, pagemap, extents, central-path allocator | MIT |
+| `topo-core` | classifier, size classes, seam, metadata, pagemap, extents, central-path allocator, capability-backed arena registry | MIT |
 | `topo-abi` | C/C++/Rust ABI surface (malloc, free, GlobalAlloc, C23, `topo_*x`) | MIT |
 | `topo-backend-posix` | POSIX backend — mmap/madvise/mprotect | MIT |
 | `topo-backend-sele4n` | seLe4n simulator + (M1) real seLe4n ABI backend | GPL-3.0-or-later |
@@ -134,6 +141,8 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 |----------|--------|
 | Size-class table covers all small requests | `Theorems/SizeClass.lean` |
 | 14-clause WellFormed preservation (per transition) | `Theorems/*.lean` |
+| Arena lifecycle: alloc only in Active; partial failure never Destroyed | `ArenaLifecycle.lean` |
+| Capability delegation is attenuation-only (`DelegatesFrom`) | `SeLe4n/CapBackedArena.lean` |
 | Coupled alloc/free preserves combined invariants | `SeLe4n/Refinement.lean` |
 | Exact byte accounting (`ArenaQuotaExact`) | `SeLe4n/Refinement.lean` |
 | SMP correctness (every interleaving) | `SeLe4n/SMP.lean` |

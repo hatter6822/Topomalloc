@@ -157,6 +157,25 @@ int main() {
         }
     }
 
+    // Arena API (§22/§36.4 — W9): create an explicit arena, allocate from it
+    // through the flag-routed path, then destroy it. The header's C linkage is
+    // exercised from C++ too.
+    {
+        const topo_arena_t arena = topo_arena_create();
+        assert(arena >= 1u);
+        void *ap = topo_mallocx(96, TOPO_ARENA(arena));
+        assert(ap != nullptr);
+        std::memset(ap, 0x33, 96);
+        topomalloc_free(ap);
+        const topo_arena_t child =
+            topo_arena_delegate(arena, 256, TOPO_RIGHT_ALLOC | TOPO_RIGHT_FREE);
+        assert(child >= 1u);
+        assert(topo_arena_destroy(child) == 0);
+        assert(topo_arena_destroy(arena) == 0);
+        // The default arena is protected.
+        assert(topo_arena_destroy(0) == -1);
+    }
+
     std::printf("C++ ABI smoke: OK (version=%s, %u size classes)\n",
                 topomalloc_version(),
                 static_cast<unsigned>(TOPOMALLOC_NUM_SIZE_CLASSES));
