@@ -1631,6 +1631,31 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         Ok(())
     }
 
+    /// **Revoke-before-recycle** for arena destroy/drain (§36.6/§36.13, plan 06
+    /// W9-6d): revoke the descendant capabilities of `r`'s backing for `arena`,
+    /// **then** free (recycle) the extent. §36.6 requires revocation to complete
+    /// before backing is returned to a pool that can serve another authority
+    /// domain, which is exactly what arena destruction does.
+    ///
+    /// A revoke failure leaves the extent **allocated and well-formed** and
+    /// returns the error *without* freeing it — so the arena-destroy drain
+    /// quarantines (§36.13: partial failure ⇒ DRAINING/ERROR_QUARANTINED, never
+    /// DESTROYED) rather than recycling backing whose capabilities are still
+    /// live. On POSIX `revoke_descendants` is a no-op, so this is exactly
+    /// [`free`](Self::free); on the seLe4n capability provider (plan 09) it is
+    /// real frame/mapping-capability revocation, with **no change above the seam**.
+    ///
+    /// SPEC-transition: provider `Unmapped -> Revoked` then recycle (§36.6)
+    pub fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError> {
+        // Resolve the extent's *sub-region* (the granularity revocation acts on),
+        // not the whole managed region, so a per-arena extent is revoked precisely.
+        let region = self.region_of(r).ok_or(ExtentError::Stale)?;
+        self.provider
+            .revoke_descendants(arena, region)
+            .map_err(ExtentError::Backend)?;
+        self.free(r)
+    }
+
     /// Recommit a free extent's backing (M-005): a [`Released`](ExtentState::Released)
     /// extent becomes [`Dirty`](ExtentState::Dirty) again. Idempotent on an
     /// already-backed extent.

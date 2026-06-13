@@ -102,6 +102,49 @@ pub fn emit_release<W: Write>(w: &mut W, base: usize, len: usize, state: &str) -
     writeln!(w, "RELEASE {base:#x}:{len} {state}")
 }
 
+/// Emit an `ARENA_CREATE` line (§22.4/§36.4, W9):
+/// `ARENA_CREATE arena rights quota` — a new arena `arena` was created with the
+/// authority `rights` (the [`CapRights`](crate::CapRights) bit pattern) and a
+/// quota ceiling (`-` for an unlimited quota).
+pub fn emit_arena_create<W: Write>(
+    w: &mut W,
+    arena: u64,
+    rights: u8,
+    quota: Option<u64>,
+) -> fmt::Result {
+    writeln!(w, "ARENA_CREATE {arena} {rights} {}", OptNum(quota))
+}
+
+/// Emit an `ARENA_DELEGATE` line (§36.4, W9):
+/// `ARENA_DELEGATE parent child rights quota` — `child` was delegated from
+/// `parent` with attenuated `rights` and quota.
+pub fn emit_arena_delegate<W: Write>(
+    w: &mut W,
+    parent: u64,
+    child: u64,
+    rights: u8,
+    quota: Option<u64>,
+) -> fmt::Result {
+    writeln!(
+        w,
+        "ARENA_DELEGATE {parent} {child} {rights} {}",
+        OptNum(quota)
+    )
+}
+
+/// Emit an `ARENA_RESET` line (§22.5, W9): `ARENA_RESET arena reset_gen` — arena
+/// `arena` was reset, advancing its reset generation to `reset_gen`.
+pub fn emit_arena_reset<W: Write>(w: &mut W, arena: u64, reset_gen: u64) -> fmt::Result {
+    writeln!(w, "ARENA_RESET {arena} {reset_gen}")
+}
+
+/// Emit an `ARENA_DESTROY` line (§22.6/§36.13, W9):
+/// `ARENA_DESTROY arena generation` — arena `arena` was destroyed, advancing its
+/// incarnation `generation`.
+pub fn emit_arena_destroy<W: Write>(w: &mut W, arena: u64, generation: u64) -> fmt::Result {
+    writeln!(w, "ARENA_DESTROY {arena} {generation}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +185,24 @@ mod tests {
              SPAN_ALLOC 0 1 7 1 2\n\
              SPAN_ALLOC 0 1 8 1 -\n\
              RELEASE 0x2000:4096 released\n"
+        );
+    }
+
+    #[test]
+    fn arena_lifecycle_lines_match_grammar() {
+        let mut s = std::string::String::new();
+        emit_arena_create(&mut s, 1, 0b1111, Some(4096)).unwrap();
+        emit_arena_create(&mut s, 2, 0b0001, None).unwrap();
+        emit_arena_delegate(&mut s, 1, 3, 0b0011, Some(512)).unwrap();
+        emit_arena_reset(&mut s, 1, 2).unwrap();
+        emit_arena_destroy(&mut s, 3, 4).unwrap();
+        assert_eq!(
+            s,
+            "ARENA_CREATE 1 15 4096\n\
+             ARENA_CREATE 2 1 -\n\
+             ARENA_DELEGATE 1 3 3 512\n\
+             ARENA_RESET 1 2\n\
+             ARENA_DESTROY 3 4\n"
         );
     }
 }

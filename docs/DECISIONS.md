@@ -846,6 +846,44 @@ POSIX, real on seLe4n. The design notes, in the order they matter:
   entry-point existence check, distinct from the `ENOMEM` of a real allocation
   failure); reset/destroy carry the same quiescence/invalidation contract as
   `free`. The five symbols are declared in `include/topomalloc.h` and exercised
-  by the C and C++ ABI harnesses; the header↔symbol cross-check now balances 24
+  by the C and C++ ABI harnesses; the header↔symbol cross-check now balances 28
   exported functions. The arena summary (`live_arenas`, `numa_bind_failures`)
   reconciles into `topo-stats` and the `topo.arena.*` control keys.
+
+### W9 second pass (optimization completions)
+
+A deliberate completeness pass closed every item the first pass deferred:
+
+* **`configure` (F-005) + the full §22.2 descriptor.** `arena_configure` /
+  `topo_arena_configure` reconfigure the non-authority policy (decay/hugepage/
+  NUMA/cache-budget/name); a configure can never widen authority (rights/label/
+  quota are create/delegate-time). The descriptor now carries `decay`/`huge`/
+  `cache_budget` (consumed by W12/W11/W6 when they land); the `hooks` field is
+  W10's.
+* **Generation split + capability handles (§36.13/§36.14).** The incarnation
+  generation (create/destroy) is split from the reset generation (§22.5), so a
+  `topo_arena_handle` survives a reset of its own arena but goes stale on a
+  destroy+recreate. `topo_mallocx_arena` routes generation-checked — the §36.13
+  stale-detection a raw `TOPO_ARENA(id)` flag cannot give.
+* **A real revoke-before-recycle seam, fault-injection-tested.**
+  `ExtentManager::free_revoking` / `LargeAllocator::free_revoking` revoke a
+  backing's descendants before recycling it (§36.6/§36.13); the drain drives
+  them, and a revoke failure **quarantines** (`ErrorQuarantined`, never
+  `DESTROYED`). A provider whose `revoke_descendants` fails now exercises that
+  partial-failure path end to end — it was unreachable dead code before. On
+  POSIX `revoke_descendants` is a no-op, so this is the seam plan 09 fills.
+* **Error taxonomy → `errno`.** The §36.14 classes map to `EACCES`
+  (authority), `EBUSY` (draining), `ENOMEM` (quota), `EINVAL` (else) across the
+  lifecycle API and `topo_mallocx_arena`.
+* **Trace grammar + verification.** `ARENA_CREATE`/`DELEGATE`/`RESET`/`DESTROY`
+  join the §33.7 grammar (round-trip-tested); `Check.lean` gains an executable
+  **G-arena** gate pinning `ArenaState`/`RevocationPhase` to the Lean machines;
+  a **loom** model checks the quota CAS under contention; a **concurrent
+  multi-arena** isolation test and an **`arena_api` fuzz target** were added; and
+  **Miri** runs clean over the new arena unsafe.
+* **Documented boundaries (not avoidance).** Cross-label scrub *recording* is
+  plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena stats
+  *rendering* is W17 (M6); label *restriction* (vs. the sound equality) and quota
+  *budget-partition* (vs. the ceiling) would re-open the proven Lean
+  `DelegatesFrom`, so they are M7 model refinements; the full combined
+  phase×`State` refinement is M7 formal hardening.

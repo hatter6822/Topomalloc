@@ -298,7 +298,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             None => {
                 // Pool full: undo the extent/cache allocation and fail.
                 self.lock.release();
-                self.return_backing(backing, region, hook);
+                self.return_backing(backing, region, hook, None);
                 return ptr::null_mut();
             }
         };
@@ -334,7 +334,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         if installed.is_err() {
             pool.release(idx);
             self.lock.release();
-            self.return_backing(backing, region, hook);
+            self.return_backing(backing, region, hook, None);
             return ptr::null_mut();
         }
         self.lock.release();
@@ -386,14 +386,16 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// a quarantine.
     ///
     /// Each iteration finds one live large of `arena` (its pagemap entry still
-    /// points at its descriptor) under the pool lock, then frees it through the
-    /// ordinary [`free`](Self::free) path (which retires the pagemap entry, so the
-    /// next scan cannot re-find it — guaranteeing progress) and returns its
-    /// backing. The scan reads descriptor fields only under the pool lock, so it
-    /// never races a concurrent recycle of *another* arena's slot; the SPEC §22.5
-    /// precondition (the arena being drained is quiesced) means no concurrent
-    /// mutation of *this* arena's allocations. A free that unexpectedly fails
-    /// stops the loop so the caller can quarantine (§36.13 partial-failure).
+    /// points at its descriptor) under the pool lock, then frees it via
+    /// [`free_revoking`](Self::free_revoking) — which retires the pagemap entry
+    /// (so the next scan cannot re-find it, guaranteeing progress) and revokes the
+    /// backing's descendants before recycling (§36.6/§36.13). The scan reads
+    /// descriptor fields only under the pool lock, so it never races a concurrent
+    /// recycle of *another* arena's slot; the SPEC §22.5 precondition (the arena
+    /// being drained is quiesced) means no concurrent mutation of *this* arena's
+    /// allocations. Every object is retired (so the arena's live bytes go to
+    /// zero); `fully_drained` is `false` iff some backing revoke failed — those
+    /// extents stay allocated and well-formed, and the caller quarantines.
     ///
     /// # Safety
     ///
@@ -404,6 +406,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     pub unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
         let mut count = 0usize;
         let mut bytes = 0usize;
+        let mut all_revoked = true;
         loop {
             // Find one live large of `arena` under the pool lock.
             self.lock.acquire();
@@ -435,17 +438,23 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 Some((base, usable)) => {
                     // SAFETY: `base` is the current base pointer of a live large
                     // allocation of this allocator (the pagemap confirmed it under
-                    // the lock); freeing it meets the `free` contract.
-                    if unsafe { self.free(base as *mut u8) } {
+                    // the lock); freeing it meets the `free` contract. Revoke the
+                    // backing's descendants before recycling (§36.6/§36.13).
+                    let (retired, revoked) = unsafe { self.free_revoking(base as *mut u8, arena) };
+                    if retired {
+                        // The object is gone regardless of revoke; count its bytes.
                         count += 1;
                         bytes += usable;
+                        all_revoked &= revoked;
                     } else {
-                        // A live large we could not free: stop so the caller
-                        // quarantines rather than spinning (§36.13 partial-failure).
+                        // A live large we somehow could not retire: stop so the
+                        // caller quarantines rather than spinning (defensive).
                         return (count, bytes, false);
                     }
                 }
-                None => return (count, bytes, true),
+                // All of this arena's larges are retired; the arena is fully
+                // drained iff every backing revoke also succeeded (§36.13).
+                None => return (count, bytes, all_revoked),
             }
         }
     }
@@ -466,8 +475,42 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large free` (pagemap clear §17.2 + extent free §18.3)
     pub unsafe fn free_with(&self, ptr: *mut u8, hook: &dyn RegionCacheHook) -> bool {
+        // SAFETY: identical contract, forwarded; `None` = no capability revoke.
+        unsafe { self.free_inner(ptr, hook, None) }.0
+    }
+
+    /// Free a live large of `arena`, **revoking its backing's descendants before
+    /// recycling** (§36.6/§36.13, plan 06 W9-6d). Returns `(retired,
+    /// backing_reclaimed)`: `retired` is whether `ptr` was a live large (now
+    /// retired — its object is gone either way), `backing_reclaimed` is whether
+    /// the backing was revoked and recycled (`false` ⇒ a revoke failure left the
+    /// extent allocated, the §36.13 partial-failure signal). Used by
+    /// [`free_arena`](Self::free_arena).
+    ///
+    /// # Safety
+    ///
+    /// As [`free_with`](Self::free_with).
+    pub unsafe fn free_revoking(&self, ptr: *mut u8, arena: ArenaId) -> (bool, bool) {
+        // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first.
+        unsafe { self.free_inner(ptr, &NoRegionCache, Some(arena)) }
+    }
+
+    /// The shared body of the large-free paths. `revoke` selects whether the
+    /// backing is recycled via [`ExtentManager::free_revoking`] (capability
+    /// revoke first) or plain [`free`](ExtentManager::free). Returns `(retired,
+    /// backing_reclaimed)` — see [`free_revoking`](Self::free_revoking).
+    ///
+    /// # Safety
+    ///
+    /// As [`free_with`](Self::free_with).
+    unsafe fn free_inner(
+        &self,
+        ptr: *mut u8,
+        hook: &dyn RegionCacheHook,
+        revoke: Option<ArenaId>,
+    ) -> (bool, bool) {
         if ptr.is_null() {
-            return false;
+            return (false, false);
         }
         self.lock.acquire();
         // Resolve the descriptor *under the lock*. The first thread to free `ptr`
@@ -481,7 +524,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             Some(p) => p,
             None => {
                 self.lock.release();
-                return false; // not live (foreign / small / released / already freed)
+                return (false, false); // not live (foreign / small / released / already freed)
             }
         };
         // SAFETY: lock held ⇒ exclusive access to the pool.
@@ -490,7 +533,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             Some(i) => i,
             None => {
                 self.lock.release();
-                return false; // a Large pointer not from this pool — not ours
+                return (false, false); // a Large pointer not from this pool — not ours
             }
         };
         let slot = pool.slot_ptr(idx);
@@ -502,7 +545,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
         if ptr as usize != unsafe { (*slot).desc.base() } {
             self.lock.release();
-            return false;
+            return (false, false);
         }
         // Capture the backing and the region before retiring/recycling.
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
@@ -529,9 +572,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.lock.release();
 
         // Return the backing outside the pool lock (the provider call is the slow,
-        // §27.2-lowest step). A failed extent free still leaves us well-formed.
-        self.return_backing(backing, region, hook);
-        true
+        // §27.2-lowest step). A failed extent free still leaves us well-formed;
+        // a failed *revoke* (drain path) is reported so the caller quarantines.
+        let reclaimed = self.return_backing(backing, region, hook, revoke);
+        (true, reclaimed)
     }
 
     /// Free with the default region cache.
@@ -575,20 +619,35 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// Return an allocation's backing to wherever it came from: a cache-served
     /// region (`None` backing) is offered back to the region cache; an
     /// extent-served region is freed through the extent manager.
+    ///
+    /// When `revoke` is `Some(arena)` (the arena destroy/drain path, plan 06
+    /// W9-6d) an extent-backed region is reclaimed through
+    /// [`ExtentManager::free_revoking`] — its descendant capabilities are revoked
+    /// before it is recycled (§36.6/§36.13). Returns `true` if the backing was
+    /// fully reclaimed (no revoke requested, revoke succeeded, or cache-served);
+    /// `false` only when a requested revoke failed (the extent then stays
+    /// allocated and well-formed, the §36.13 partial-failure signal).
     fn return_backing(
         &self,
         backing: Option<ExtentRef>,
         region: Region,
         hook: &dyn RegionCacheHook,
-    ) {
+        revoke: Option<ArenaId>,
+    ) -> bool {
         match backing {
-            Some(ext) => {
-                let _ = self.extents.free(ext); // a failed free still leaves us well-formed
-            }
+            Some(ext) => match revoke {
+                Some(arena) => self.extents.free_revoking(ext, arena).is_ok(),
+                // a failed free still leaves us well-formed (W4-5)
+                None => {
+                    let _ = self.extents.free(ext);
+                    true
+                }
+            },
             None => {
                 // Cache-served (§18.6): offer it back; if the cache declines, the
                 // region is simply dropped (the cache owns its lifecycle).
                 let _ = hook.try_cache(region);
+                true
             }
         }
     }

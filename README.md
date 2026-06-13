@@ -134,6 +134,7 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 - Pagemap differential (Lean model ↔ Rust radix)
 - Provider state machine differential (§36.6)
 - Extent state machine differential (§20.1)
+- Arena lifecycle differential (§22.3/§36.13 transitions + revocation chain)
 
 **Selected headline theorems:**
 

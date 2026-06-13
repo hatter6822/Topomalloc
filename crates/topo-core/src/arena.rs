@@ -47,6 +47,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::extent::BackendLock;
+use crate::flags::HugepagePolicy;
 use crate::ids::{ArenaId, Generation, Label, NodeId};
 
 /// Maximum number of arenas a single [`ArenaTable`] tracks (ids `0..MAX_ARENAS`).
@@ -127,6 +128,39 @@ impl CapRights {
     #[inline]
     pub const fn attenuates(self, parent: CapRights) -> bool {
         parent.contains(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decay policy (§20.5/§22.2) — a carried descriptor field
+// ---------------------------------------------------------------------------
+
+/// Per-arena decay timing (§22.2 `DecayConfig`, Appendix C): how long freed
+/// backing lingers *dirty* (physically backed, reusable cheaply) before it is
+/// lazily purged to *muzzy*, and how long *muzzy* lingers before being returned
+/// to the OS. Carried on the arena descriptor from M1 (D2); the **release
+/// controller that consumes it is plan 04 W12 (M5)** — at M4 the field is
+/// recorded and reconfigurable, not yet acted on, so an arena that wants
+/// low-RSS behavior can already express it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecayConfig {
+    /// Milliseconds a freed extent stays *dirty* before lazy purge (§20.1).
+    pub dirty_decay_ms: u64,
+    /// Milliseconds a *muzzy* extent stays before being returned to the OS.
+    pub muzzy_decay_ms: u64,
+}
+
+impl DecayConfig {
+    /// The Appendix-C server defaults (10 s dirty, 10 s muzzy).
+    pub const DEFAULT: DecayConfig = DecayConfig {
+        dirty_decay_ms: 10_000,
+        muzzy_decay_ms: 10_000,
+    };
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -384,6 +418,16 @@ pub struct ArenaPolicy {
     pub quota_limit: u64,
     /// The NUMA placement policy (§15.5).
     pub numa: NumaPolicy,
+    /// The decay timing for this arena's freed backing (§20.5/§22.2). Carried
+    /// from M1; consumed by the release controller at plan 04 W12 (M5).
+    pub decay: DecayConfig,
+    /// The hugepage placement policy for this arena (§22.2 `HugePolicy`).
+    /// Carried from M1; consumed by the hugepage backend at plan 04 W11 (M5).
+    pub huge: HugepagePolicy,
+    /// A soft per-arena front-end cache budget in bytes (§22.2 `CacheBudget`);
+    /// `0` ⇒ the global default. Carried from M1; consumed by the cache layer at
+    /// plan 05 W6 (M2).
+    pub cache_budget_bytes: u64,
     /// A short diagnostic name (truncated to [`ARENA_NAME_LEN`]).
     pub name: [u8; ARENA_NAME_LEN],
 }
@@ -403,6 +447,9 @@ impl ArenaPolicy {
             label: Label::PUBLIC,
             quota_limit: QUOTA_UNLIMITED,
             numa: NumaPolicy::OsDefault,
+            decay: DecayConfig::DEFAULT,
+            huge: HugepagePolicy::Default,
+            cache_budget_bytes: 0,
             name: *b"default\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
         }
     }
@@ -416,6 +463,9 @@ impl ArenaPolicy {
             label: Label::PUBLIC,
             quota_limit: QUOTA_UNLIMITED,
             numa: NumaPolicy::OsDefault,
+            decay: DecayConfig::DEFAULT,
+            huge: HugepagePolicy::Default,
+            cache_budget_bytes: 0,
             name: [0u8; ARENA_NAME_LEN],
         }
     }
@@ -454,6 +504,24 @@ impl ArenaPolicy {
     /// Set the NUMA placement policy.
     pub const fn with_numa(mut self, numa: NumaPolicy) -> Self {
         self.numa = numa;
+        self
+    }
+
+    /// Set the decay timing (§20.5/§22.2).
+    pub const fn with_decay(mut self, decay: DecayConfig) -> Self {
+        self.decay = decay;
+        self
+    }
+
+    /// Set the hugepage placement policy (§22.2).
+    pub const fn with_huge(mut self, huge: HugepagePolicy) -> Self {
+        self.huge = huge;
+        self
+    }
+
+    /// Set the soft per-arena cache budget in bytes (`0` ⇒ global default).
+    pub const fn with_cache_budget(mut self, bytes: u64) -> Self {
+        self.cache_budget_bytes = bytes;
         self
     }
 
@@ -511,6 +579,59 @@ impl Delegation {
     }
 }
 
+/// The reconfigurable (non-authority) policy of an arena (§22.4 *configure*,
+/// F-005). Reconfiguration deliberately **cannot** change the authority
+/// (rights/label) or the quota ceiling — those are fixed at create/delegate
+/// time so a `configure` can never widen authority (§36.4). It updates the
+/// placement/lifetime knobs an arena owns (§22.1): decay, hugepage policy, NUMA
+/// preference, the soft cache budget, and the diagnostic name.
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaConfig {
+    /// New decay timing (§20.5/§22.2).
+    pub decay: DecayConfig,
+    /// New hugepage placement policy (§22.2).
+    pub huge: HugepagePolicy,
+    /// New NUMA placement policy (§15.5).
+    pub numa: NumaPolicy,
+    /// New soft cache budget in bytes (`0` ⇒ global default).
+    pub cache_budget_bytes: u64,
+    /// New diagnostic name (truncated to [`ARENA_NAME_LEN`]).
+    pub name: [u8; ARENA_NAME_LEN],
+}
+
+impl ArenaConfig {
+    /// Build a config snapshot from an arena's current [`ArenaStats`], so a
+    /// caller can change one knob and keep the rest (`ArenaConfig::from_stats(s)
+    /// .with_decay(d)`).
+    pub fn from_stats(s: &ArenaStats) -> ArenaConfig {
+        ArenaConfig {
+            decay: s.decay,
+            huge: s.huge,
+            numa: s.numa,
+            cache_budget_bytes: s.cache_budget_bytes,
+            name: s.name,
+        }
+    }
+
+    /// Set the decay timing.
+    pub const fn with_decay(mut self, decay: DecayConfig) -> Self {
+        self.decay = decay;
+        self
+    }
+
+    /// Set the NUMA placement policy.
+    pub const fn with_numa(mut self, numa: NumaPolicy) -> Self {
+        self.numa = numa;
+        self
+    }
+
+    /// Set the hugepage placement policy.
+    pub const fn with_huge(mut self, huge: HugepagePolicy) -> Self {
+        self.huge = huge;
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stats view
 // ---------------------------------------------------------------------------
@@ -534,11 +655,23 @@ pub struct ArenaStats {
     /// Bytes currently charged to the arena (live usable bytes — the §36.17
     /// `used` counter).
     pub used: u64,
-    /// The reset/destroy generation (§22.5/§36.13): bumped each time the arena's
-    /// contents are invalidated, so a stale reference is detectable.
+    /// The **incarnation** generation (§36.13): bumped on create and destroy, so
+    /// a handle/reference to a *destroyed-then-recreated* id is detectably stale.
+    /// Survives a reset (the arena persists), which is what lets an arena handle
+    /// remain valid across resets of its own arena.
     pub generation: Generation,
+    /// The **reset** generation (§22.5 "stats record reset generation"): bumped
+    /// each time the arena is reset, so a stale pointer into a reset arena is
+    /// detectable independently of the incarnation.
+    pub reset_generation: Generation,
     /// The NUMA placement policy (§15.5).
     pub numa: NumaPolicy,
+    /// The decay timing (§20.5/§22.2).
+    pub decay: DecayConfig,
+    /// The hugepage placement policy (§22.2).
+    pub huge: HugepagePolicy,
+    /// The soft per-arena cache budget in bytes (§22.2; `0` ⇒ global default).
+    pub cache_budget_bytes: u64,
     /// Count of NUMA binding failures surfaced for this arena (§15.5).
     pub numa_bind_failures: u64,
     /// The delegating parent arena, if this arena was delegated (§36.4).
@@ -572,8 +705,10 @@ struct ArenaAtomics {
     state: AtomicU8,
     /// [`CapRights`] bits.
     rights: AtomicU8,
-    /// Reset/destroy generation.
+    /// Incarnation generation (§36.13): bumped on create + destroy.
     generation: AtomicU32,
+    /// Reset generation (§22.5): bumped on reset, independent of incarnation.
+    reset_gen: AtomicU32,
     /// Bytes currently charged (the §36.17 `used` counter).
     used: AtomicU64,
     /// Quota ceiling ([`QUOTA_UNLIMITED`] for ambient).
@@ -590,6 +725,7 @@ impl ArenaAtomics {
             state: AtomicU8::new(ArenaState::Destroyed as u8),
             rights: AtomicU8::new(0),
             generation: AtomicU32::new(0),
+            reset_gen: AtomicU32::new(0),
             used: AtomicU64::new(0),
             quota_limit: AtomicU64::new(QUOTA_UNLIMITED),
             numa_bind_failures: AtomicU64::new(0),
@@ -602,6 +738,9 @@ impl ArenaAtomics {
 struct ArenaMeta {
     label: Label,
     numa: NumaPolicy,
+    decay: DecayConfig,
+    huge: HugepagePolicy,
+    cache_budget_bytes: u64,
     /// Delegating parent as `id + 1` (`0` ⇒ no parent / root arena).
     parent_plus1: u32,
     name: [u8; ARENA_NAME_LEN],
@@ -612,6 +751,9 @@ impl ArenaMeta {
         ArenaMeta {
             label: Label::PUBLIC,
             numa: NumaPolicy::OsDefault,
+            decay: DecayConfig::DEFAULT,
+            huge: HugepagePolicy::Default,
+            cache_budget_bytes: 0,
             parent_plus1: 0,
             name: [0u8; ARENA_NAME_LEN],
         }
@@ -693,6 +835,9 @@ impl ArenaTable {
             (*table.meta.get())[ArenaId::DEFAULT.0 as usize] = ArenaMeta {
                 label: p.label,
                 numa: p.numa,
+                decay: p.decay,
+                huge: p.huge,
+                cache_budget_bytes: p.cache_budget_bytes,
                 parent_plus1: 0,
                 name: p.name,
             };
@@ -781,10 +926,13 @@ impl ArenaTable {
     ) -> Result<ArenaId, ArenaError> {
         let id = self.claim_slot_locked()?;
         let a = &self.atomics[id as usize];
-        // Bump the generation off whatever the (possibly recycled) slot carried,
-        // so a stale reference to a prior incarnation is detectable (§B.5).
+        // Bump the *incarnation* generation off whatever the (possibly recycled)
+        // slot carried, so a handle to a prior incarnation is detectably stale
+        // (§B.5/§36.13). A fresh incarnation starts its reset generation at FIRST.
         let gen = Generation(a.generation.load(Ordering::Relaxed)).next();
         a.generation.store(gen.0, Ordering::Relaxed);
+        a.reset_gen
+            .store(Generation::FIRST.next().0, Ordering::Relaxed);
         a.rights.store(policy.rights.bits(), Ordering::Relaxed);
         a.used.store(0, Ordering::Relaxed);
         a.quota_limit.store(policy.quota_limit, Ordering::Relaxed);
@@ -798,6 +946,9 @@ impl ArenaTable {
             (*self.meta.get())[id as usize] = ArenaMeta {
                 label: policy.label,
                 numa: policy.numa,
+                decay: policy.decay,
+                huge: policy.huge,
+                cache_budget_bytes: policy.cache_budget_bytes,
                 parent_plus1,
                 name: policy.name,
             };
@@ -828,11 +979,17 @@ impl ArenaTable {
         if del.label != pstats.label {
             return Err(ArenaError::Attenuation);
         }
+        // The child inherits the delegated authority/label/quota/NUMA; the
+        // non-authority placement knobs (decay/hugepage/cache budget) start at
+        // their defaults and may be tuned later with `configure`.
         let policy = ArenaPolicy {
             rights: del.rights,
             label: del.label,
             quota_limit: del.quota_limit,
             numa: del.numa,
+            decay: DecayConfig::DEFAULT,
+            huge: HugepagePolicy::Default,
+            cache_budget_bytes: 0,
             name: del.name,
         };
         policy.validate()?;
@@ -878,9 +1035,11 @@ impl ArenaTable {
     }
 
     /// Complete a reset (`Resetting → Active`, §22.5): zero the used counter,
-    /// bump the generation (so outstanding pointers are detectably stale), and
-    /// return the arena to service. The caller MUST have drained the arena's
-    /// objects first (B.5).
+    /// bump the **reset** generation (so a stale pointer into the reset arena is
+    /// detectable), and return the arena to service. The **incarnation**
+    /// generation is left unchanged — the arena persists, so a handle to it
+    /// survives the reset. The caller MUST have drained the arena's objects first
+    /// (B.5). Returns the new reset generation.
     ///
     /// SPEC-transition: arena `Resetting → Active` (§22.5)
     pub fn finish_reset(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
@@ -897,10 +1056,10 @@ impl ArenaTable {
             return Err(ArenaError::IllegalTransition);
         }
         a.used.store(0, Ordering::Relaxed);
-        let gen = Generation(a.generation.load(Ordering::Relaxed)).next();
-        a.generation.store(gen.0, Ordering::Relaxed);
+        let reset_gen = Generation(a.reset_gen.load(Ordering::Relaxed)).next();
+        a.reset_gen.store(reset_gen.0, Ordering::Relaxed);
         a.state.store(ArenaState::Active as u8, Ordering::Release);
-        Ok(gen)
+        Ok(reset_gen)
     }
 
     /// Begin a destroy (`Active → Draining`, §36.13 step 1): reject new
@@ -950,9 +1109,27 @@ impl ArenaTable {
     /// never reaching `Destroyed`. Allocations stay refused. This is the §36.13
     /// "partial failure MUST leave DRAINING or ERROR_QUARANTINED, not DESTROYED".
     ///
+    /// The used counter is zeroed: a quarantine is reached only *after* the drain
+    /// has deactivated/retired every object (the partial failure is that some
+    /// *backing* could not be recycled, not that objects survived), so no live
+    /// bytes remain charged — only leaked backing pending operator recovery.
+    ///
     /// SPEC-transition: arena `* → ErrorQuarantined` (§36.13)
     pub fn quarantine(&self, arena: ArenaId) -> Result<(), ArenaError> {
-        self.transition(arena, ArenaState::ErrorQuarantined)
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            let cur = ArenaState::from_u8(a.state.load(Ordering::Acquire));
+            if !cur.can_transition(ArenaState::ErrorQuarantined) {
+                return Err(ArenaError::IllegalTransition);
+            }
+            a.used.store(0, Ordering::Relaxed);
+            a.state
+                .store(ArenaState::ErrorQuarantined as u8, Ordering::Release);
+            Ok(())
+        })();
+        self.lock.release();
+        r
     }
 
     /// Apply a single guarded lifecycle transition under the lock.
@@ -1063,7 +1240,11 @@ impl ArenaTable {
             quota_limit: a.quota_limit.load(Ordering::Relaxed),
             used: a.used.load(Ordering::Relaxed),
             generation: Generation(a.generation.load(Ordering::Relaxed)),
+            reset_generation: Generation(a.reset_gen.load(Ordering::Relaxed)),
             numa: m.numa,
+            decay: m.decay,
+            huge: m.huge,
+            cache_budget_bytes: m.cache_budget_bytes,
             numa_bind_failures: a.numa_bind_failures.load(Ordering::Relaxed),
             parent: if m.parent_plus1 == 0 {
                 None
@@ -1072,6 +1253,69 @@ impl ArenaTable {
             },
             name: m.name,
         })
+    }
+
+    /// Reconfigure `arena`'s non-authority policy (§22.4 *configure*, F-005): its
+    /// decay timing, hugepage policy, NUMA preference, soft cache budget, and
+    /// name. The authority (rights/label) and the quota ceiling are **not**
+    /// changeable here — those are fixed at create/delegate time so a configure
+    /// can never widen authority (§36.4). The arena must be registered (any
+    /// non-`Destroyed` state); reconfiguring a draining/resetting arena is
+    /// permitted (it only adjusts inert policy knobs).
+    ///
+    /// SPEC-transition: arena configure (§22.4)
+    pub fn configure(&self, arena: ArenaId, cfg: &ArenaConfig) -> Result<(), ArenaError> {
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            if ArenaState::from_u8(a.state.load(Ordering::Acquire)) == ArenaState::Destroyed {
+                return Err(ArenaError::NotFound);
+            }
+            // SAFETY: the table lock is held, so this is the exclusive writer of
+            // `meta[arena]` (the authority atomics are untouched).
+            unsafe {
+                let m = &mut (*self.meta.get())[arena.0 as usize];
+                m.decay = cfg.decay;
+                m.huge = cfg.huge;
+                m.numa = cfg.numa;
+                m.cache_budget_bytes = cfg.cache_budget_bytes;
+                m.name = cfg.name;
+            }
+            Ok(())
+        })();
+        self.lock.release();
+        r
+    }
+
+    // -- handles (§36.13/§36.14: generation-checked arena references) ----------
+
+    /// A generation-checked **handle** to `arena`'s current incarnation, or
+    /// `None` if the id is unregistered. The handle packs `(incarnation
+    /// generation << 32) | id`; [`resolve_handle`](Self::resolve_handle) rejects
+    /// it once the id is destroyed-and-recreated (a new incarnation, §36.13). `0`
+    /// is never a valid handle (the default arena's generation is `≥ 1`).
+    pub fn handle(&self, arena: ArenaId) -> Option<u64> {
+        let s = self.stats(arena)?;
+        if s.state == ArenaState::Destroyed {
+            return None;
+        }
+        Some(((s.generation.0 as u64) << 32) | arena.0 as u64)
+    }
+
+    /// Resolve a [`handle`](Self::handle) to its [`ArenaId`], or `None` if the
+    /// handle is **stale** — its id was destroyed (and possibly recreated as a
+    /// new incarnation), so the packed generation no longer matches the live one
+    /// (§36.13 "a stale reference MUST NOT become valid for a new arena"). A
+    /// handle survives resets of its own arena (the incarnation is unchanged).
+    pub fn resolve_handle(&self, handle: u64) -> Option<ArenaId> {
+        let id = ArenaId((handle & 0xffff_ffff) as u32);
+        let gen = (handle >> 32) as u32;
+        let s = self.stats(id)?;
+        if s.state != ArenaState::Destroyed && s.generation.0 == gen {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     /// Total NUMA binding failures across every arena (§15.5 stats visibility,
@@ -1107,10 +1351,12 @@ impl ArenaTable {
     ///   ambient domain that must always be allocatable);
     /// * every registered arena's `used` never exceeds its quota (§36.4 quota
     ///   accounting);
-    /// * a cleanly `Destroyed` arena holds zero used bytes (B.5 "no live objects
-    ///   remain in arena accounting" after teardown). An `ErrorQuarantined`
-    ///   arena is deliberately exempt: a partial-failure teardown leaves its
-    ///   accounting best-effort, which is exactly why it is *not* `Destroyed`.
+    /// * a **terminal** arena (`Destroyed` or `ErrorQuarantined`) holds zero used
+    ///   bytes — B.5 "no live objects remain in arena accounting" after teardown.
+    ///   A quarantine is reached only after the drain has retired every object
+    ///   (the partial failure is leaked *backing*, not surviving objects), so its
+    ///   live-byte accounting is exact too, and `Σ arena.used == live_bytes` keeps
+    ///   reconciling even across a quarantine (§8.6/§36.17).
     pub fn check_invariants(&self) -> bool {
         self.lock.acquire();
         // SAFETY: lock held.
@@ -1128,7 +1374,7 @@ impl ArenaTable {
             if used > limit {
                 return false;
             }
-            if st == ArenaState::Destroyed && used != 0 {
+            if st.is_terminal() && used != 0 {
                 return false;
             }
         }
@@ -1363,10 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_lifecycle_bumps_generation_and_stays_active() {
+    fn reset_lifecycle_bumps_reset_gen_keeps_incarnation_and_stays_active() {
         let t = ArenaTable::new();
         let id = t.create(&ArenaPolicy::explicit().with_quota(4096)).unwrap();
-        let g0 = t.stats(id).unwrap().generation;
+        let inc0 = t.stats(id).unwrap().generation; // incarnation
+        let rg0 = t.stats(id).unwrap().reset_generation;
+        let handle = t.handle(id).unwrap();
         t.try_charge(id, 1024).unwrap();
 
         // The default arena cannot be reset (§22.5).
@@ -1376,14 +1624,25 @@ mod tests {
         assert_eq!(t.state(id), Some(ArenaState::Resetting));
         // New allocations are refused mid-reset.
         assert_eq!(t.try_charge(id, 16), Err(ArenaError::NotActive));
-        let g1 = t.finish_reset(id).unwrap();
+        let rg1 = t.finish_reset(id).unwrap();
         assert!(t.is_active(id), "reset returns the arena to Active (§22.5)");
         assert_eq!(
             t.stats(id).unwrap().used,
             0,
             "B.5: no live bytes after reset"
         );
-        assert_ne!(g1, g0, "reset bumps the generation");
+        assert_ne!(rg1, rg0, "reset bumps the reset generation (§22.5)");
+        // The incarnation is unchanged, so a handle survives the reset.
+        assert_eq!(
+            t.stats(id).unwrap().generation,
+            inc0,
+            "reset must not change the incarnation generation"
+        );
+        assert_eq!(
+            t.resolve_handle(handle),
+            Some(id),
+            "a handle stays valid across a reset of its own arena"
+        );
         assert!(t.check_invariants());
     }
 
@@ -1399,15 +1658,22 @@ mod tests {
             Err(ArenaError::IsDefault)
         );
 
-        // Happy path: Active → Draining → Destroyed, generation++.
+        // Happy path: Active → Draining → Destroyed, incarnation generation++.
+        let handle = t.handle(id).unwrap();
         t.begin_destroy(id).unwrap();
         assert_eq!(t.state(id), Some(ArenaState::Draining));
         let g1 = t.finish_destroy(id).unwrap();
         assert_eq!(t.state(id), Some(ArenaState::Destroyed));
-        assert_ne!(g1, g0);
+        assert_ne!(g1, g0, "destroy bumps the incarnation generation (§36.13)");
         assert!(
             !t.is_registered(id),
             "a destroyed slot is available for reuse"
+        );
+        // The pre-destroy handle is now stale (the incarnation is gone).
+        assert_eq!(
+            t.resolve_handle(handle),
+            None,
+            "a handle to a destroyed arena is stale (§36.13)"
         );
 
         // Partial-failure path: Draining → ErrorQuarantined, never Destroyed.
@@ -1472,5 +1738,70 @@ mod tests {
             gen_before,
             "a recycled id carries a fresh generation"
         );
+    }
+
+    #[test]
+    fn configure_updates_policy_but_never_authority() {
+        let t = ArenaTable::new();
+        let id = t
+            .create(
+                &ArenaPolicy::explicit()
+                    .with_quota(4096)
+                    .with_rights(CapRights::ALLOC)
+                    .with_label(Label(3)),
+            )
+            .unwrap();
+        let before = t.stats(id).unwrap();
+        // Reconfigure the placement/lifetime knobs.
+        let cfg = ArenaConfig::from_stats(&before)
+            .with_decay(DecayConfig {
+                dirty_decay_ms: 1,
+                muzzy_decay_ms: 2,
+            })
+            .with_numa(NumaPolicy::Interleave)
+            .with_huge(HugepagePolicy::Prefer);
+        t.configure(id, &cfg).unwrap();
+        let after = t.stats(id).unwrap();
+        assert_eq!(after.decay.dirty_decay_ms, 1);
+        assert_eq!(after.decay.muzzy_decay_ms, 2);
+        assert_eq!(after.numa, NumaPolicy::Interleave);
+        assert_eq!(after.huge, HugepagePolicy::Prefer);
+        // Authority and quota are untouched — configure cannot widen authority.
+        assert_eq!(after.rights, CapRights::ALLOC);
+        assert_eq!(after.label, Label(3));
+        assert_eq!(after.quota_limit, 4096);
+        // Configuring an unregistered/destroyed id fails.
+        assert_eq!(t.configure(ArenaId(9999), &cfg), Err(ArenaError::NotFound));
+    }
+
+    #[test]
+    fn handle_detects_a_reused_id_as_stale() {
+        // §36.13: a handle to a destroyed-then-recreated id is stale even though
+        // the raw id is reused. Fill the table so the destroyed id is recycled.
+        let t = ArenaTable::new();
+        let mut ids = Vec::new();
+        while let Ok(id) = t.create(&ArenaPolicy::explicit()) {
+            ids.push(id);
+        }
+        let victim = ids[3];
+        let handle = t.handle(victim).unwrap();
+        assert_eq!(t.resolve_handle(handle), Some(victim));
+        t.begin_destroy(victim).unwrap();
+        t.finish_destroy(victim).unwrap();
+        // The old handle is stale immediately after destroy.
+        assert_eq!(t.resolve_handle(handle), None);
+        // Recreate: the id is recycled with a new incarnation; the old handle
+        // stays stale (it must not become valid for the new arena, §36.13).
+        let reused = t.create(&ArenaPolicy::explicit()).unwrap();
+        assert_eq!(reused, victim, "id recycled under pressure");
+        assert_eq!(
+            t.resolve_handle(handle),
+            None,
+            "a stale handle must not resolve to the reused id's new incarnation"
+        );
+        // A fresh handle to the new incarnation works.
+        let fresh = t.handle(reused).unwrap();
+        assert_eq!(t.resolve_handle(fresh), Some(reused));
+        assert_ne!(handle, fresh, "the new incarnation has a distinct handle");
     }
 }

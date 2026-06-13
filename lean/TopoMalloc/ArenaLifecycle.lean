@@ -43,6 +43,11 @@ inductive ArenaPhase where
 
 namespace ArenaPhase
 
+/-- Every phase, for the exhaustive `lake exe check` differential (the G-arena
+gate in `Check.lean`). -/
+def all : List ArenaPhase :=
+  [initializing, active, resetting, draining, destroyed, errorQuarantined]
+
 /-- Whether allocations are admitted in this phase (§22.3: only `active`). -/
 def isActive : ArenaPhase → Bool
   | active => true
@@ -71,6 +76,16 @@ def canStep : ArenaPhase → ArenaPhase → Bool
 `active`. -/
 theorem alloc_admitted_iff_active (p : ArenaPhase) : p.isActive = true ↔ p = active := by
   cases p <;> simp [isActive]
+
+/-- **A reset begins only from `Active` (§22.5 precondition).** Entering
+`Resetting` is legal only from `Active`, so the `arenaReset` state transition
+(`Transitions.lean`) fires only on a live arena. -/
+theorem reset_begins_from_active : ∀ p, canStep p resetting = true → p = active := by
+  intro p h; cases p <;> simp_all [canStep]
+
+/-- **A destroy begins only from `Active` (§36.13 step 1 precondition).** -/
+theorem destroy_begins_from_active : ∀ p, canStep p draining = true → p = active := by
+  intro p h; cases p <;> simp_all [canStep]
 
 /-- **A completed reset returns the arena to service (§22.5).** -/
 theorem reset_completes_to_active : canStep resetting active = true := rfl

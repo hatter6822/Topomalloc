@@ -121,6 +121,51 @@ proptest! {
 }
 
 proptest! {
+    /// The arena trace events round-trip (§33.7, W9): anything
+    /// `topo_core::trace`'s arena emitters write parses back to an equal record,
+    /// so the emit and parse sides of the grammar cannot drift.
+    #[test]
+    fn arena_trace_roundtrips(
+        arena in any::<u16>(),
+        rights in 0u8..16,
+        quota in proptest::option::of(any::<u32>()),
+        parent in any::<u16>(),
+        reset_gen in any::<u16>(),
+        generation in any::<u16>(),
+    ) {
+        // CREATE
+        let mut s = String::new();
+        trace::emit_arena_create(&mut s, arena as u64, rights, quota.map(u64::from)).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaCreate { arena: arena as u64, rights: rights as u64, quota: quota.map(u64::from) }
+        );
+        // DELEGATE
+        let mut s = String::new();
+        trace::emit_arena_delegate(&mut s, parent as u64, arena as u64, rights, quota.map(u64::from)).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaDelegate {
+                parent: parent as u64, child: arena as u64, rights: rights as u64, quota: quota.map(u64::from)
+            }
+        );
+        // RESET / DESTROY
+        let mut s = String::new();
+        trace::emit_arena_reset(&mut s, arena as u64, reset_gen as u64).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaReset { arena: arena as u64, reset_gen: reset_gen as u64 }
+        );
+        let mut s = String::new();
+        trace::emit_arena_destroy(&mut s, arena as u64, generation as u64).unwrap();
+        prop_assert_eq!(
+            parse_trace_line(s.trim_end()).unwrap(),
+            TraceRecord::ArenaDestroy { arena: arena as u64, generation: generation as u64 }
+        );
+    }
+}
+
+proptest! {
     /// Ownership conservation (§34.3): under any well-formed ALLOC/FREE stream the
     /// executable model's live set tracks a reference set exactly, and never
     /// reports a spurious violation. Each slot `k` is the range `[16k, 16k+16)`, so
@@ -405,14 +450,16 @@ proptest! {
     ) {
         let t = ArenaTable::new();
         let id = t.create(&ArenaPolicy::explicit()).unwrap(); // unlimited quota
-        let g0 = t.stats(id).unwrap().generation;
+        let rg0 = t.stats(id).unwrap().reset_generation;
+        let inc0 = t.stats(id).unwrap().generation;
         for c in charges {
             let _ = t.try_charge(id, c);
         }
         t.begin_reset(id).unwrap();
-        let g1 = t.finish_reset(id).unwrap();
+        let rg1 = t.finish_reset(id).unwrap();
         prop_assert_eq!(t.stats(id).unwrap().used, 0, "B.5: no live bytes after reset");
-        prop_assert_ne!(g1, g0, "reset must bump the generation (§22.5)");
+        prop_assert_ne!(rg1, rg0, "reset must bump the reset generation (§22.5)");
+        prop_assert_eq!(t.stats(id).unwrap().generation, inc0, "reset keeps the incarnation");
         prop_assert!(t.is_active(id), "reset returns the arena to Active (§22.5)");
     }
 }

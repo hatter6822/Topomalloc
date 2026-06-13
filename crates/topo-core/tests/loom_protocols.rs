@@ -354,3 +354,57 @@ fn w8_span_retirement_is_claimed_exactly_once() {
         assert_eq!(m.bitmap.load(Ordering::Relaxed), (1 << OBJECTS) - 1);
     });
 }
+
+/// The W9 arena quota protocol (plan 06; `arena.rs` `ArenaTable::try_charge` /
+/// `credit`): under any interleaving of two concurrent charges against a fixed
+/// quota, the used counter **never exceeds the quota** and two charges that
+/// together overflow it can never *both* succeed — the §36.4/§36.17 guarantee
+/// the lock-free allocation gate must keep under contention. The model uses the
+/// identical CAS loop and orderings the real `try_charge` uses (Acquire load,
+/// AcqRel/Acquire compare-exchange on the `used` counter), so it pins the
+/// ordering logic, not the literal code.
+#[test]
+fn w9_arena_quota_charge_never_exceeds_under_contention() {
+    use loom::sync::atomic::AtomicU64;
+
+    const QUOTA: u64 = 100;
+
+    /// `ArenaTable::try_charge`'s bounded CAS loop: charge `size` iff it fits.
+    fn try_charge(used: &AtomicU64, size: u64) -> bool {
+        let mut cur = used.load(Ordering::Acquire);
+        loop {
+            let next = cur + size;
+            if next > QUOTA {
+                return false; // would exceed the quota (§36.4)
+            }
+            match used.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    loom::model(|| {
+        let used = Arc::new(AtomicU64::new(0));
+        // Two 60-byte charges; 60 + 60 = 120 > 100, so at most one can win.
+        let charger = |used: Arc<AtomicU64>| thread::spawn(move || try_charge(&used, 60));
+        let t1 = charger(used.clone());
+        let t2 = charger(used.clone());
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // The ceiling is never breached under any interleaving, and the two
+        // over-budget charges are not both admitted.
+        assert!(
+            used.load(Ordering::Acquire) <= QUOTA,
+            "quota ceiling breached"
+        );
+        assert!(
+            !(r1 && r2),
+            "both 60-byte charges admitted into a 100-byte quota"
+        );
+        // A winner's charge is exactly recorded; if neither won, used stayed 0.
+        let expected = if r1 ^ r2 { 60 } else { 0 };
+        assert_eq!(used.load(Ordering::Acquire), expected);
+    });
+}

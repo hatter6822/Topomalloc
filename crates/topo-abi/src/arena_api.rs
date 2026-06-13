@@ -16,10 +16,40 @@
 //! default arena, which creation never yields, so it is an unambiguous error
 //! sentinel).
 
-use topo_core::{ArenaId, ArenaPolicy, CapRights, Delegation, QUOTA_UNLIMITED};
+use core::ffi::c_void;
+use core::ptr;
 
-use crate::errno_shim::{set_errno, EINVAL};
+use topo_core::{
+    ArenaConfig, ArenaError, ArenaId, ArenaPolicy, CapRights, DecayConfig, Delegation, MIN_ALIGN,
+    QUOTA_UNLIMITED,
+};
+
+use crate::errno_shim::{alloc_protocol, set_errno, EACCES, EBUSY, EINVAL, ENOMEM};
+use crate::extended::decode_flags;
 use crate::global;
+
+/// Map an [`ArenaError`] onto the POSIX `errno` taxonomy — the projection of the
+/// §36.14 `TOPO_ERR_*` classes a C caller can read after a failed arena call:
+/// authority denials are `EACCES`, a draining/inactive arena is `EBUSY`, a quota
+/// overrun is `ENOMEM`, and every malformed/illegal request is `EINVAL`.
+fn arena_errno(e: ArenaError) -> i32 {
+    match e {
+        ArenaError::AuthorityDenied => EACCES,
+        ArenaError::NotActive => EBUSY,
+        ArenaError::QuotaExceeded | ArenaError::Exhausted => ENOMEM,
+        ArenaError::NotFound
+        | ArenaError::Attenuation
+        | ArenaError::InvalidPolicy
+        | ArenaError::IllegalTransition
+        | ArenaError::IsDefault => EINVAL,
+    }
+}
+
+/// Pack a generation-checked arena **handle** (§36.13/§36.14): `(generation <<
+/// 32) | id`. `0` is never a valid handle.
+fn make_handle(a: &crate::AnyAllocator, id: ArenaId) -> u64 {
+    a.arena_handle(id).unwrap_or(0)
+}
 
 /// Authority to allocate from the arena (§36.4). Mirrors [`CapRights::ALLOC`].
 pub const TOPO_RIGHT_ALLOC: u64 = 1;
@@ -73,8 +103,8 @@ pub extern "C" fn topo_arena_create_ex(quota_bytes: usize, rights: u64) -> u32 {
         .with_quota(quota_from_c(quota_bytes));
     match a.arena_create(&policy) {
         Ok(id) => id.0,
-        Err(_) => {
-            set_errno(EINVAL);
+        Err(e) => {
+            set_errno(arena_errno(e));
             0
         }
     }
@@ -111,8 +141,8 @@ pub extern "C" fn topo_arena_delegate(parent: u32, quota_bytes: usize, rights: u
     let del = Delegation::inheriting(&pstats, quota_from_c(quota_bytes), "").with_rights(rights);
     match a.arena_delegate(ArenaId(parent), &del) {
         Ok(id) => id.0,
-        Err(_) => {
-            set_errno(EINVAL);
+        Err(e) => {
+            set_errno(arena_errno(e));
             0
         }
     }
@@ -138,8 +168,8 @@ pub unsafe extern "C" fn topo_arena_reset(id: u32) -> i32 {
     // SAFETY: the caller upholds this function's quiescence contract.
     match unsafe { a.arena_reset(ArenaId(id)) } {
         Ok(_) => 0,
-        Err(_) => {
-            set_errno(EINVAL);
+        Err(e) => {
+            set_errno(arena_errno(e));
             -1
         }
     }
@@ -162,8 +192,101 @@ pub unsafe extern "C" fn topo_arena_destroy(id: u32) -> i32 {
     // SAFETY: the caller upholds this function's quiescence contract.
     match unsafe { a.arena_destroy(ArenaId(id)) } {
         Ok(_) => 0,
-        Err(_) => {
-            set_errno(EINVAL);
+        Err(e) => {
+            set_errno(arena_errno(e));
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generation-checked handles (§36.13/§36.14): the capability-routing surface.
+// ---------------------------------------------------------------------------
+
+/// `topo_arena_handle_t topo_arena_handle(uint32_t id)` (§36.13/§36.14): mint a
+/// generation-checked **handle** for arena `id`'s current incarnation. The
+/// handle packs `(incarnation generation << 32) | id`; unlike a raw id it
+/// detects a destroyed-then-recreated arena as stale. Returns `0` (never a valid
+/// handle) for an unregistered id.
+#[no_mangle]
+pub extern "C" fn topo_arena_handle(id: u32) -> u64 {
+    match global() {
+        Some(a) => make_handle(a, ArenaId(id)),
+        None => 0,
+    }
+}
+
+/// `uint32_t topo_arena_id(topo_arena_handle_t handle)`: the arena id a handle
+/// names (its low 32 bits), for use with `TOPO_ARENA(id)`. Does not validate the
+/// handle's generation — use [`topo_mallocx_arena`] for generation-checked
+/// routing.
+#[no_mangle]
+pub extern "C" fn topo_arena_id(handle: u64) -> u32 {
+    (handle & 0xffff_ffff) as u32
+}
+
+/// `void *topo_mallocx_arena(topo_arena_handle_t handle, size_t size,
+/// topo_flags_t flags)` (§36.14): allocate from the arena a **handle** names,
+/// with generation checking. A stale handle (its arena was destroyed, possibly
+/// recreated at the same id) is `NULL` + `EINVAL` — the §36.13 guarantee a raw
+/// `TOPO_ARENA(id)` flag cannot give. The flag word's own arena field is ignored
+/// (the handle wins); its alignment/zero/etc. hints apply. Allocation failure is
+/// mapped through the arena taxonomy: `EACCES` (no alloc right), `EBUSY`
+/// (draining), `ENOMEM` (quota/OOM).
+#[no_mangle]
+pub extern "C" fn topo_mallocx_arena(handle: u64, size: usize, flags: u64) -> *mut c_void {
+    let Some((align, f)) = decode_flags(flags) else {
+        set_errno(EINVAL);
+        return ptr::null_mut();
+    };
+    let Some(a) = global() else {
+        set_errno(ENOMEM);
+        return ptr::null_mut();
+    };
+    // Resolve the handle (stale ⇒ EINVAL, §36.13).
+    let Some(arena) = a.arena_resolve_handle(handle) else {
+        set_errno(EINVAL);
+        return ptr::null_mut();
+    };
+    // Pre-check the gate so a failure carries the precise taxonomy errno, not a
+    // bare ENOMEM (§36.14 distinguishes authority/quota/draining).
+    if let Some(s) = a.arena_stats(arena) {
+        if !s.state.is_active() {
+            set_errno(EBUSY);
+            return ptr::null_mut();
+        }
+        if !s.rights.contains(topo_core::CapRights::ALLOC) {
+            set_errno(EACCES);
+            return ptr::null_mut();
+        }
+    }
+    alloc_protocol(|| a.allocate_in(arena, size, align.max(MIN_ALIGN), f)).cast::<c_void>()
+}
+
+/// `int topo_arena_configure(uint32_t id, uint64_t dirty_decay_ms,
+/// uint64_t muzzy_decay_ms)` (§22.4 *configure*, F-005): update arena `id`'s
+/// decay timing (the headline per-arena tunable, §22.1). The authority and quota
+/// are immutable here (a configure cannot widen authority). Returns `0`, or `-1`
+/// with a mapped `errno` on failure. The fuller policy surface (NUMA, hugepage,
+/// cache budget) is the Rust [`ArenaConfig`] API and the plan-07 control plane.
+#[no_mangle]
+pub extern "C" fn topo_arena_configure(id: u32, dirty_decay_ms: u64, muzzy_decay_ms: u64) -> i32 {
+    let Some(a) = global() else {
+        set_errno(EINVAL);
+        return -1;
+    };
+    let Some(s) = a.arena_stats(ArenaId(id)) else {
+        set_errno(EINVAL);
+        return -1;
+    };
+    let cfg = ArenaConfig::from_stats(&s).with_decay(DecayConfig {
+        dirty_decay_ms,
+        muzzy_decay_ms,
+    });
+    match a.arena_configure(ArenaId(id), &cfg) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_errno(arena_errno(e));
             -1
         }
     }
@@ -234,5 +357,72 @@ mod tests {
             assert_eq!(topo_arena_reset(0), -1);
             assert_eq!(topo_arena_destroy(0), -1);
         }
+    }
+
+    #[test]
+    fn handle_routes_and_detects_staleness() {
+        use crate::c_api::topomalloc_malloc_usable_size;
+        use crate::errno_shim::{get_errno, EINVAL};
+
+        let id = topo_arena_create();
+        assert!(id >= 1);
+        let h = topo_arena_handle(id);
+        assert_ne!(h, 0, "a live arena has a nonzero handle");
+        assert_eq!(topo_arena_id(h), id, "the handle carries its id");
+
+        // Handle-routed allocation works and survives a reset of the arena.
+        let p = topo_mallocx_arena(h, 100, 0);
+        assert!(!p.is_null());
+        assert!(topomalloc_malloc_usable_size(p) >= 100);
+        // SAFETY: `p` is live and test-owned.
+        unsafe { topomalloc_free(p) };
+        // SAFETY: quiesced (p freed); reset keeps the same incarnation.
+        assert_eq!(unsafe { topo_arena_reset(id) }, 0);
+        let q = topo_mallocx_arena(h, 64, 0);
+        assert!(!q.is_null(), "a handle survives a reset of its own arena");
+        // SAFETY: `q` is live and test-owned.
+        unsafe { topomalloc_free(q) };
+
+        // Destroy invalidates the handle: a stale handle is EINVAL, not a wrong
+        // allocation (§36.13).
+        // SAFETY: quiesced.
+        assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
+        set_errno(0);
+        assert!(topo_mallocx_arena(h, 64, 0).is_null());
+        assert_eq!(get_errno(), EINVAL, "a stale handle is rejected");
+    }
+
+    #[test]
+    fn configure_updates_decay_through_the_c_abi() {
+        let id = topo_arena_create();
+        assert!(id >= 1);
+        // Reconfigure the decay timing; it must take effect and not disturb the
+        // arena's usability.
+        assert_eq!(topo_arena_configure(id, 1234, 5678), 0);
+        let p = topo_mallocx(64, topo_arena(id));
+        assert!(!p.is_null());
+        // SAFETY: live, test-owned.
+        unsafe { topomalloc_free(p) };
+        // Configuring the default arena's decay is allowed (it is not a lifecycle
+        // op); configuring a nonexistent arena fails.
+        assert_eq!(topo_arena_configure(0, 1, 1), 0);
+        assert_eq!(topo_arena_configure(200, 1, 1), -1);
+        // SAFETY: quiesced.
+        assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
+    }
+
+    #[test]
+    fn no_alloc_right_arena_is_eacces_through_the_handle() {
+        use crate::errno_shim::{get_errno, EACCES};
+        // An arena with STATS but not ALLOC refuses allocation with EACCES — the
+        // §36.4 authority-denied taxonomy, surfaced through the handle path.
+        let id = topo_arena_create_ex(0, TOPO_RIGHT_STATS);
+        assert!(id >= 1);
+        let h = topo_arena_handle(id);
+        set_errno(0);
+        assert!(topo_mallocx_arena(h, 64, 0).is_null());
+        assert_eq!(get_errno(), EACCES, "no ALLOC right ⇒ EACCES (§36.4)");
+        // SAFETY: quiesced (nothing was allocated).
+        assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
     }
 }

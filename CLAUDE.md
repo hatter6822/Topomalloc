@@ -154,8 +154,8 @@ lifecycle (create / delegate / reset / destroy / revocation), a live multi-arena
 per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA policy modes (§15.5).
 
 **Test counts:**
-- Rust: ~470 tests across 12 crates (`cargo test --workspace`)
-- Lean: 81 build jobs including proof-checking every module (`lake build`) + 5 executable gates (`lake exe check`)
+- Rust: ~485 tests across 12 crates (`cargo test --workspace`)
+- Lean: 81 build jobs including proof-checking every module (`lake build`) + 6 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 5 targets (`fuzz/fuzz_targets/`, incl. `arena_api`)
 
@@ -165,6 +165,7 @@ per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA po
 - Pagemap differential OK (W3-3d)
 - Provider state machine OK (§36.6, W4-1)
 - Extent state machine OK (§20.1, W4-2d)
+- Arena lifecycle OK (§22.3/§36.13 transitions + revocation chain; pins Rust `ArenaState`/`RevocationPhase`, W9)
 
 The arena lifecycle state machine (§22.3/§36.13) is modeled in `lean/TopoMalloc/ArenaLifecycle.lean`
 (proof-checked by `lake build`, mirroring the runtime `ArenaState`/`RevocationPhase`); the

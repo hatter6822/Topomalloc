@@ -219,9 +219,25 @@ int main(void) {
     /* widening the quota past the parent's budget is rejected */
     assert(topo_arena_delegate(aq, (size_t) 1 << 40, TOPO_RIGHTS_ALL) == 0u);
 
+    /* configure: update the arena's decay timing (§22.4) */
+    assert(topo_arena_configure(ar, 1000, 2000) == 0);
+
+    /* generation-checked handle routing (§36.13/§36.14) */
+    topo_arena_handle_t h = topo_arena_handle(ar);
+    assert(h != 0u);
+    assert(topo_arena_id(h) == ar);
+    void *hp = topo_mallocx_arena(h, 64, 0);
+    assert(hp != NULL);
+    topomalloc_free(hp);
+
     /* reset keeps the arena usable; destroy retires it (§22.5/§22.6) */
     assert(topo_arena_reset(ar) == 0);
     assert(topo_arena_destroy(ar) == 0);
+    /* the handle is now stale: a generation-checked allocation fails with EINVAL
+     * (the guarantee a raw TOPO_ARENA(id) flag cannot give) */
+    errno = 0;
+    assert(topo_mallocx_arena(h, 64, 0) == NULL);
+    assert(errno == EINVAL);
     assert(topo_arena_destroy(child) == 0);
     assert(topo_arena_destroy(aq) == 0);
     /* the default arena cannot be reset or destroyed (§22.5) */

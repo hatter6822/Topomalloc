@@ -216,8 +216,37 @@ int topo_arena_reset(topo_arena_t arena);
 
 /* Destroy an arena (§22.6/§36.13): reset it, then retire its id behind a
  * generation bump. Returns 0, or -1 + EINVAL. Same quiescence/invalidation
- * contract as topo_arena_reset. */
+ * contract as topo_arena_reset.
+ *
+ * Failures carry a mapped errno (the POSIX projection of §36.14's error
+ * classes): EACCES (authority denied), EBUSY (arena draining), ENOMEM (quota
+ * exceeded), EINVAL (no such arena / illegal request). */
 int topo_arena_destroy(topo_arena_t arena);
+
+/* Reconfigure arena `id`'s decay timing (§22.4 configure, F-005) — the headline
+ * per-arena tunable. The authority and quota are immutable here (a configure can
+ * never widen authority). Returns 0, or -1 + a mapped errno. */
+int topo_arena_configure(uint32_t id, uint64_t dirty_decay_ms, uint64_t muzzy_decay_ms);
+
+/* A generation-checked arena handle (§36.13/§36.14): packs (incarnation
+ * generation << 32) | id. Unlike a raw id it detects a destroyed-then-recreated
+ * arena as stale; 0 is never a valid handle. */
+typedef uint64_t topo_arena_handle_t;
+
+/* Mint a handle for arena `id`'s current incarnation, or 0 if unregistered. */
+topo_arena_handle_t topo_arena_handle(uint32_t id);
+
+/* The arena id a handle names (its low 32 bits), for use with TOPO_ARENA(id).
+ * Does not check the handle's generation — use topo_mallocx_arena for that. */
+topo_arena_t topo_arena_id(topo_arena_handle_t handle);
+
+/* Allocate from the arena a handle names, with generation checking (§36.14): a
+ * stale handle (its arena was destroyed, possibly recreated at the same id) is
+ * NULL + EINVAL — the §36.13 guarantee a raw TOPO_ARENA(id) flag cannot give.
+ * The flag word's arena field is ignored (the handle wins); its other hints
+ * apply. Allocation failure maps through the arena taxonomy (EACCES/EBUSY/
+ * ENOMEM). */
+void *topo_mallocx_arena(topo_arena_handle_t handle, size_t size, topo_flags_t flags);
 
 /* ------------------------------------------------------------------------
  * Identification

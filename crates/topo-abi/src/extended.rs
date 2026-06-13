@@ -121,8 +121,9 @@ pub const fn topo_arena(id: u32) -> u64 {
 /// Decode and validate a public flag word into `(alignment, internal flags)`.
 /// `None` is the deterministic §10.4 failure: reserved bits, an unrepresentable
 /// alignment, the contradictory hugepage pair, or an arena id the internal
-/// encoding cannot carry.
-fn decode_flags(flags: u64) -> Option<(usize, RequestFlags)> {
+/// encoding cannot carry. `pub(crate)` so the handle-routed `topo_mallocx_arena`
+/// (arena_api) shares the identical flag validation.
+pub(crate) fn decode_flags(flags: u64) -> Option<(usize, RequestFlags)> {
     if flags & RESERVED_MASK != 0 {
         return None;
     }

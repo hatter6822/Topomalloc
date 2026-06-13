@@ -170,6 +170,13 @@ int main() {
         const topo_arena_t child =
             topo_arena_delegate(arena, 256, TOPO_RIGHT_ALLOC | TOPO_RIGHT_FREE);
         assert(child >= 1u);
+        // Generation-checked handle routing + configure (§36.13/§36.14/§22.4).
+        const topo_arena_handle_t h = topo_arena_handle(arena);
+        assert(h != 0u && topo_arena_id(h) == arena);
+        assert(topo_arena_configure(arena, 1000, 2000) == 0);
+        void *hp = topo_mallocx_arena(h, 80, 0);
+        assert(hp != nullptr);
+        topomalloc_free(hp);
         assert(topo_arena_destroy(child) == 0);
         assert(topo_arena_destroy(arena) == 0);
         // The default arena is protected.

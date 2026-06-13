@@ -48,7 +48,7 @@ use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{ArenaError, ArenaPolicy, ArenaStats, ArenaTable, Delegation};
+use crate::arena::{ArenaConfig, ArenaError, ArenaPolicy, ArenaStats, ArenaTable, Delegation};
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
 use crate::central::{CentralCache, RemoveResult};
@@ -951,7 +951,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// (P-Map-001: a page maps to at most one descriptor).
     fn retire_span(&self, span: &SpanDescriptor) {
         self.central.deactivate_span(span, self.pagemap);
-        self.reclaim_span_slot(span);
+        // Normal retirement returns the backing to *this arena's* pool (reuse
+        // within the same authority domain), so no capability revoke is needed
+        // (§36.6 requires revoke only before returning to a cross-domain pool).
+        self.reclaim_span_slot(span, None);
     }
 
     /// **Forcibly** retire a span regardless of liveness — the arena
@@ -963,10 +966,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// (`Resetting`/`Draining`), which the lifecycle enforces.
     ///
     /// SPEC-transition: span `Active -> Released` (forced, §22.5/§36.13)
-    fn force_retire_span(&self, span: &SpanDescriptor) {
-        // Capture the class size before the teardown clears the bitmap; the
-        // descriptor (in never-freed metadata) stays readable through reclaim.
+    ///
+    /// Returns whether the backing was **revoked and recycled** — `false` means a
+    /// capability revoke failed (the extent stays allocated and well-formed), the
+    /// §36.13 partial-failure signal the drain turns into a quarantine.
+    fn force_retire_span(&self, span: &SpanDescriptor) -> bool {
+        // Capture the class size + owning arena before the teardown clears the
+        // bitmap; the descriptor (in never-freed metadata) stays readable.
         let usable = size_class::usable_size(span.size_class());
+        let arena = span.arena();
         let discarded_live = self.central.deactivate_span_forced(span, self.pagemap);
         // The discarded live objects never pass through `free`, so account their
         // bytes as freed here — otherwise the cumulative `freed_bytes` (and thus
@@ -977,19 +985,26 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             self.freed_bytes
                 .fetch_add(discarded_live as u64 * usable as u64, Ordering::Relaxed);
         }
-        self.reclaim_span_slot(span);
+        // Drain returns the backing to a pool that may serve another arena, so
+        // revoke its descendants before recycling (§36.6/§36.13).
+        self.reclaim_span_slot(span, Some(arena))
     }
 
     /// Clear `span`'s pagemap entries, recycle its descriptor slot, and return
     /// its backing extent — the shared tail of [`retire_span`](Self::retire_span)
     /// and [`force_retire_span`](Self::force_retire_span), run **after** the span
     /// has been deactivated in the central list.
-    fn reclaim_span_slot(&self, span: &SpanDescriptor) {
+    ///
+    /// `revoke` selects the §36.6 recycle discipline: `Some(arena)` revokes the
+    /// backing's descendants before recycling (arena destroy/drain) and returns
+    /// whether the revoke+recycle succeeded; `None` recycles directly (normal
+    /// same-arena retirement) and returns `true`.
+    fn reclaim_span_slot(&self, span: &SpanDescriptor, revoke: Option<ArenaId>) -> bool {
         self.pagemap.retire_span(span);
 
         let Some(idx) = self.spans.index_of(span as *const SpanDescriptor) else {
             debug_assert!(false, "reclaim_span_slot: span not from this pool");
-            return;
+            return true;
         };
         let slot = self.spans.slot_ptr(idx);
         // Capture the backing and release the slot under the lock; the
@@ -1010,8 +1025,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             ext
         };
         self.span_lock.release();
-        // A failed extent free leaves the manager well-formed (W4-5).
-        let _ = self.span_extents.free(ext);
+        match revoke {
+            // A failed extent free leaves the manager well-formed (W4-5).
+            None => {
+                let _ = self.span_extents.free(ext);
+                true
+            }
+            // Revoke-before-recycle; a revoke failure leaves the extent allocated
+            // (well-formed) and is reported so the drain quarantines (§36.13).
+            Some(arena) => self.span_extents.free_revoking(ext, arena).is_ok(),
+        }
     }
 
     // -- introspection --------------------------------------------------------
@@ -1228,6 +1251,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.arenas.create(policy)
     }
 
+    /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005):
+    /// decay, hugepage policy, NUMA preference, soft cache budget, and name. The
+    /// authority (rights/label) and quota ceiling are immutable here (a configure
+    /// can never widen authority — §36.4); change authority by delegation.
+    ///
+    /// SPEC-transition: arena configure (§22.4)
+    pub fn arena_configure(&self, arena: ArenaId, cfg: &ArenaConfig) -> Result<(), ArenaError> {
+        self.arenas.configure(arena, cfg)
+    }
+
     /// Delegate an attenuated child arena from `parent` (§36.4/§36.14, W9-5).
     /// Enforces authority/quota/label monotonicity — a delegation can only
     /// narrow rights, cap quota at the parent's remaining budget, and preserve
@@ -1305,15 +1338,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     }
 
     /// Reclaim every span and large allocation belonging to `arena` (W9-4b/4c/6b:
-    /// "no cache holds an arena object" after drain, B.5). Returns `true` if the
-    /// arena was fully drained, `false` on a partial failure (a live large the
-    /// backend could not release — the §36.13 quarantine signal).
+    /// "no cache holds an arena object" after drain, B.5), revoking each backing's
+    /// descendant capabilities before recycling (§36.6/§36.13). Every object is
+    /// retired (so the arena's live bytes go to zero); returns `true` if **every**
+    /// backing was also revoked and recycled, `false` on a partial failure (a
+    /// revoke the provider refused — the §36.13 quarantine signal). It drains
+    /// *all* objects regardless, accumulating revoke failures, so a partial
+    /// failure leaks only the un-revoked backing, never live objects.
     ///
-    /// On POSIX the §36.13 unmap→revoke→recycle steps collapse to "free the
-    /// extent" (a no-op revoke under single ambient authority), so the *structure*
-    /// is identical and the seLe4n capability provider (plan 09) is a drop-in:
-    /// the small spans are force-retired (their backing extents returned), then
-    /// the large allocations are freed.
+    /// On POSIX the §36.13 unmap→revoke→recycle steps collapse — `revoke` is a
+    /// no-op that always succeeds — so the *structure* is identical and the
+    /// seLe4n capability provider (plan 09) is a drop-in with real revocation.
     ///
     /// # Safety
     ///
@@ -1321,6 +1356,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// allocation or free of its objects (the §22.5/§36.13 precondition the
     /// lifecycle transition established).
     unsafe fn drain_arena(&self, arena: ArenaId) -> bool {
+        let mut all_revoked = true;
         // Step 1 (small): force-retire every active span of this arena. Walk the
         // descriptor pool; a slot's descriptor is stable to read because slots
         // live in never-freed metadata (§27.5) and only *this* arena's spans are
@@ -1336,7 +1372,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // the descriptor reference is valid for the process lifetime.
             let span = unsafe { &(*slot).desc };
             if span.arena() == arena && span.state() == SpanState::Active {
-                self.force_retire_span(span);
+                all_revoked &= self.force_retire_span(span);
             }
         }
         // Step 2 (large): free every live large allocation of this arena.
@@ -1346,12 +1382,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // arena's own `used` is zeroed by the reset/destroy completion.
         // SAFETY: the arena is quiesced (its objects are not concurrently freed),
         // the reset/destroy precondition.
-        let (_, large_bytes, fully_drained) = unsafe { self.large.free_arena(arena) };
+        let (_, large_bytes, large_revoked) = unsafe { self.large.free_arena(arena) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
         }
-        fully_drained
+        all_revoked && large_revoked
     }
 
     /// Record a NUMA binding failure for `arena` (§15.5, W9-7): surfaced in
@@ -1438,17 +1474,29 @@ mod tests {
         use super::*;
         use crate::backend::Region;
         use std::alloc::{alloc, dealloc, Layout};
+        use std::sync::atomic::AtomicBool;
         use std::sync::Mutex;
 
         pub(super) struct HostProvider {
             owned: Mutex<Vec<(usize, Layout)>>,
+            /// When set, `revoke_descendants` fails — modeling a seLe4n
+            /// capability-revoke failure so the arena-destroy drain quarantines
+            /// (§36.13), the partial-failure path POSIX cannot otherwise reach.
+            fail_revoke: AtomicBool,
         }
 
         impl HostProvider {
             pub(super) fn new() -> Self {
                 Self {
                     owned: Mutex::new(Vec::new()),
+                    fail_revoke: AtomicBool::new(false),
                 }
+            }
+
+            /// Make every `revoke_descendants` fail (fault injection for the
+            /// arena-drain quarantine path).
+            pub(super) fn fail_revoke(&self) {
+                self.fail_revoke.store(true, Ordering::Relaxed);
             }
         }
 
@@ -1493,6 +1541,17 @@ mod tests {
                     unsafe { dealloc(base as *mut u8, layout) };
                 }
                 Ok(())
+            }
+            fn revoke_descendants(
+                &self,
+                _arena: ArenaId,
+                _region: Region,
+            ) -> Result<(), BackendError> {
+                if self.fail_revoke.load(Ordering::Relaxed) {
+                    Err(BackendError::Unsupported)
+                } else {
+                    Ok(())
+                }
             }
             fn name(&self) -> &'static str {
                 "posix"
@@ -2246,7 +2305,7 @@ mod tests {
         let a = small_allocator(&m, &pm);
 
         let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
-        let g0 = a.arena_stats(id).unwrap().generation;
+        let rg0 = a.arena_stats(id).unwrap().reset_generation;
 
         // A default-arena allocation we will verify survives the reset.
         let keep = a.malloc(128);
@@ -2268,12 +2327,12 @@ mod tests {
 
         // Reset: the arena's allocations are discarded and its backing returned;
         // the default arena's object is untouched (§22.7 isolation).
-        let g1 = treset(&a, id).expect("reset");
+        let rg1 = treset(&a, id).expect("reset");
         assert!(
             a.arenas().is_active(id),
             "reset returns the arena to Active"
         );
-        assert_ne!(g1, g0, "reset bumps the generation (§22.5)");
+        assert_ne!(rg1, rg0, "reset bumps the reset generation (§22.5)");
         assert_eq!(
             a.arena_stats(id).unwrap().used,
             0,
@@ -2436,6 +2495,169 @@ mod tests {
         assert_eq!(a.stats().live_bytes, 0);
         assert_eq!(sum_used(&a), 0);
         assert!(a.check_invariants());
+    }
+
+    #[test]
+    fn arena_destroy_quarantines_on_a_revoke_failure() {
+        // §36.13 partial-failure path (W9-6e): when the backend cannot revoke an
+        // arena's backing capabilities, destroy must land the arena in
+        // ErrorQuarantined — never DESTROYED — while still retiring every object.
+        // POSIX revoke never fails, so we inject the failure with a provider whose
+        // `revoke_descendants` returns Err (the seLe4n revoke-failure shape).
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let span_p = HostProvider::new();
+        span_p.fail_revoke();
+        let large_p = HostProvider::new();
+        large_p.fail_revoke();
+        let a = Allocator::new(
+            span_p,
+            large_p,
+            &m,
+            &m,
+            &pm,
+            ArenaId::DEFAULT,
+            AllocatorConfig::small(),
+        )
+        .expect("allocator");
+
+        let keep = a.malloc(64); // a default-arena object that must survive
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let p = a.allocate_in(id, 200, MIN_ALIGN, RequestFlags::NONE);
+        let big = a.allocate_in(id, HUGE_THRESHOLD, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null() && !big.is_null());
+
+        // Destroy: the drain retires every object but every revoke fails, so the
+        // arena is quarantined, not destroyed.
+        let outcome = tdestroy(&a, id);
+        assert!(outcome.is_err(), "a revoke failure must not report success");
+        assert_eq!(
+            a.arena_stats(id).unwrap().state,
+            ArenaState::ErrorQuarantined,
+            "§36.13: partial failure ⇒ ERROR_QUARANTINED, never DESTROYED"
+        );
+        // Every object was still retired (gone), so no live bytes remain and the
+        // §8.6/§36.17 reconciliation holds — only backing leaked.
+        assert_eq!(
+            a.arena_stats(id).unwrap().used,
+            0,
+            "objects retired on drain"
+        );
+        assert!(
+            !a.owns(p) && !a.owns(big),
+            "the arena's objects are invalid"
+        );
+        // The default arena is untouched and still serves.
+        assert!(a.owns(keep));
+        let sum = a.arena_stats(ArenaId::DEFAULT).unwrap().used + a.arena_stats(id).unwrap().used;
+        assert_eq!(
+            sum,
+            a.stats().live_bytes,
+            "Σ used == live_bytes after quarantine"
+        );
+        assert_eq!(tfree(&a, keep), FreeOutcome::Freed);
+        // A quarantined arena can never be finalized as destroyed.
+        // SAFETY: the arena is quarantined with no live objects (the drain
+        // retired them all); the call is rejected before touching anything.
+        let outcome = unsafe { a.arena_destroy(id) };
+        assert_eq!(outcome, Err(ArenaError::IllegalTransition));
+    }
+
+    #[test]
+    fn concurrent_allocation_across_distinct_arenas_is_isolated() {
+        // Multiple threads each hammer their *own* explicit arena concurrently;
+        // objects never cross arenas, per-arena accounting stays exact, and the
+        // engine ends well-formed (the multi-arena hot path under contention).
+        let m = meta(32 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let arenas: Vec<ArenaId> = (0..4)
+            .map(|_| a.arena_create(&ArenaPolicy::explicit()).unwrap())
+            .collect();
+        let a = &a;
+        let arenas = &arenas;
+
+        std::thread::scope(|s| {
+            for (t, &arena) in arenas.iter().enumerate() {
+                s.spawn(move || {
+                    let mut live = Vec::new();
+                    for i in 0..300usize {
+                        let size = 16 + ((i * 41 + t * 97) % 3000);
+                        let p = a.allocate_in(arena, size, MIN_ALIGN, RequestFlags::NONE);
+                        assert!(!p.is_null());
+                        // SAFETY: `size` usable bytes; stamp the arena index.
+                        unsafe { ptr::write_bytes(p, t as u8, size) };
+                        live.push((p, size));
+                        if i % 3 == 0 {
+                            let (q, qs) = live.swap_remove((i * 7) % live.len());
+                            // SAFETY: still-live, owned by this thread; verify the
+                            // stamp survived (no cross-arena bleed) then free.
+                            unsafe {
+                                assert_eq!(q.read(), t as u8, "cross-arena corruption");
+                                assert_eq!(q.add(qs - 1).read(), t as u8);
+                            }
+                            assert_eq!(tfree(a, q), FreeOutcome::Freed);
+                        }
+                    }
+                    for (p, _) in live {
+                        assert_eq!(tfree(a, p), FreeOutcome::Freed);
+                    }
+                });
+            }
+        });
+
+        // Every arena drained back to zero; the engine is well-formed.
+        for &arena in arenas {
+            assert_eq!(a.arena_stats(arena).unwrap().used, 0);
+        }
+        assert_eq!(a.stats().live_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    #[test]
+    fn default_arena_allocations_survive_a_concurrent_arena_destroy() {
+        // §36.13 "emergency allocations MUST NOT depend on an arena being
+        // destroyed": the default arena is undestroyable, so it remains the
+        // always-available fallback while an explicit arena is torn down.
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let victim = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let _ = a.allocate_in(victim, 256, MIN_ALIGN, RequestFlags::NONE);
+
+        // A default-arena ("emergency") allocation made before the destroy.
+        let e0 = a.malloc(64);
+        assert!(!e0.is_null());
+        tdestroy(&a, victim).expect("destroy");
+        // The default arena still serves after the destroy, and the pre-destroy
+        // object is untouched (it never depended on the destroyed arena).
+        assert!(a.owns(e0));
+        let e1 = a.malloc(64);
+        assert!(!e1.is_null());
+        assert_eq!(tfree(&a, e0), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, e1), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    #[test]
+    fn arena_configure_changes_policy_through_the_engine() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let before = a.arena_stats(id).unwrap();
+        let cfg = crate::arena::ArenaConfig::from_stats(&before)
+            .with_numa(crate::arena::NumaPolicy::Interleave);
+        a.arena_configure(id, &cfg).unwrap();
+        assert_eq!(
+            a.arena_stats(id).unwrap().numa,
+            crate::arena::NumaPolicy::Interleave
+        );
+        // Allocation still works after reconfiguration.
+        let p = a.allocate_in(id, 64, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
     }
 
     #[test]

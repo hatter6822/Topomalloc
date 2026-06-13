@@ -32,7 +32,11 @@ members = [
 exclude = ["fuzz", "vendor/sele4n"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.1.1: W9 (plan 06) adds the arena lifecycle/authority/handle/configure
+# surface. In a 0.x series new backwards-compatible functionality is a patch
+# bump (the 0.x minor is the breaking axis), which also keeps the `^0.1.0`
+# inter-crate requirements satisfied.
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

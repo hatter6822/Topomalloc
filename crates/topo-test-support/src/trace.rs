@@ -86,6 +86,40 @@ pub enum TraceRecord {
         /// New memory state (e.g. `dirty`/`muzzy`/`released`).
         state: String,
     },
+    /// `ARENA_CREATE arena rights quota` (§22.4/§36.4, W9).
+    ArenaCreate {
+        /// The created arena id.
+        arena: u64,
+        /// The authority bits (`CapRights`).
+        rights: u64,
+        /// The quota ceiling, or `None` for unlimited.
+        quota: Option<u64>,
+    },
+    /// `ARENA_DELEGATE parent child rights quota` (§36.4, W9).
+    ArenaDelegate {
+        /// The delegating parent arena.
+        parent: u64,
+        /// The delegated child arena.
+        child: u64,
+        /// The (attenuated) authority bits.
+        rights: u64,
+        /// The child's quota ceiling, or `None` for unlimited.
+        quota: Option<u64>,
+    },
+    /// `ARENA_RESET arena reset_gen` (§22.5, W9).
+    ArenaReset {
+        /// The reset arena id.
+        arena: u64,
+        /// The new reset generation.
+        reset_gen: u64,
+    },
+    /// `ARENA_DESTROY arena generation` (§22.6/§36.13, W9).
+    ArenaDestroy {
+        /// The destroyed arena id.
+        arena: u64,
+        /// The new incarnation generation.
+        generation: u64,
+    },
 }
 
 /// Why a trace line failed to parse.
@@ -227,6 +261,42 @@ pub fn parse_trace_line(line: &str) -> Result<TraceRecord, ParseError> {
             expect_end(&mut it)?;
             Ok(TraceRecord::Release { base, len, state })
         }
+        "ARENA_CREATE" => {
+            let arena = parse_u64(next()?)?;
+            let rights = parse_u64(next()?)?;
+            let quota = parse_opt(next()?)?;
+            expect_end(&mut it)?;
+            Ok(TraceRecord::ArenaCreate {
+                arena,
+                rights,
+                quota,
+            })
+        }
+        "ARENA_DELEGATE" => {
+            let parent = parse_u64(next()?)?;
+            let child = parse_u64(next()?)?;
+            let rights = parse_u64(next()?)?;
+            let quota = parse_opt(next()?)?;
+            expect_end(&mut it)?;
+            Ok(TraceRecord::ArenaDelegate {
+                parent,
+                child,
+                rights,
+                quota,
+            })
+        }
+        "ARENA_RESET" => {
+            let arena = parse_u64(next()?)?;
+            let reset_gen = parse_u64(next()?)?;
+            expect_end(&mut it)?;
+            Ok(TraceRecord::ArenaReset { arena, reset_gen })
+        }
+        "ARENA_DESTROY" => {
+            let arena = parse_u64(next()?)?;
+            let generation = parse_u64(next()?)?;
+            expect_end(&mut it)?;
+            Ok(TraceRecord::ArenaDestroy { arena, generation })
+        }
         _ => Err(ParseError::UnknownVerb),
     }
 }
@@ -341,6 +411,49 @@ mod tests {
                 base: 0x2000,
                 len: 4096,
                 state: "released".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_arena_lifecycle() {
+        assert_eq!(
+            parse_trace_line("ARENA_CREATE 1 15 4096").unwrap(),
+            TraceRecord::ArenaCreate {
+                arena: 1,
+                rights: 15,
+                quota: Some(4096)
+            }
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_CREATE 2 1 -").unwrap(),
+            TraceRecord::ArenaCreate {
+                arena: 2,
+                rights: 1,
+                quota: None
+            }
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_DELEGATE 1 3 3 512").unwrap(),
+            TraceRecord::ArenaDelegate {
+                parent: 1,
+                child: 3,
+                rights: 3,
+                quota: Some(512)
+            }
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_RESET 1 2").unwrap(),
+            TraceRecord::ArenaReset {
+                arena: 1,
+                reset_gen: 2
+            }
+        );
+        assert_eq!(
+            parse_trace_line("ARENA_DESTROY 3 4").unwrap(),
+            TraceRecord::ArenaDestroy {
+                arena: 3,
+                generation: 4
             }
         );
     }

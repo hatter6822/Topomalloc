@@ -31,8 +31,8 @@ use std::sync::OnceLock;
 
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::{
-    Allocator, AllocatorConfig, AllocatorStats, ArenaError, ArenaId, ArenaPolicy, ArenaStats,
-    Delegation, FreeOutcome, Generation, InvalidFree, MetaArena, PageMap, RequestFlags,
+    Allocator, AllocatorConfig, AllocatorStats, ArenaConfig, ArenaError, ArenaId, ArenaPolicy,
+    ArenaStats, Delegation, FreeOutcome, Generation, InvalidFree, MetaArena, PageMap, RequestFlags,
 };
 
 mod arena_api;
@@ -42,9 +42,9 @@ mod extended;
 mod policy;
 
 pub use arena_api::{
-    topo_arena_create, topo_arena_create_ex, topo_arena_delegate, topo_arena_destroy,
-    topo_arena_reset, TOPO_RIGHTS_ALL, TOPO_RIGHT_ALLOC, TOPO_RIGHT_DESTROY, TOPO_RIGHT_FREE,
-    TOPO_RIGHT_STATS,
+    topo_arena_configure, topo_arena_create, topo_arena_create_ex, topo_arena_delegate,
+    topo_arena_destroy, topo_arena_handle, topo_arena_id, topo_arena_reset, topo_mallocx_arena,
+    TOPO_RIGHTS_ALL, TOPO_RIGHT_ALLOC, TOPO_RIGHT_DESTROY, TOPO_RIGHT_FREE, TOPO_RIGHT_STATS,
 };
 pub use c_api::{
     topomalloc_aligned_alloc, topomalloc_backend, topomalloc_calloc, topomalloc_free,
@@ -190,6 +190,11 @@ impl AnyAllocator {
         dispatch!(self, a => a.arena_delegate(parent, del))
     }
 
+    /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005).
+    pub fn arena_configure(&self, arena: ArenaId, cfg: &ArenaConfig) -> Result<(), ArenaError> {
+        dispatch!(self, a => a.arena_configure(arena, cfg))
+    }
+
     /// A snapshot of an arena's authority + accounting (§22.2/§36.4).
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
         dispatch!(self, a => a.arena_stats(arena))
@@ -198,6 +203,17 @@ impl AnyAllocator {
     /// Whether `arena` is registered and currently allocatable (§22.3).
     pub fn arena_is_active(&self, arena: ArenaId) -> bool {
         dispatch!(self, a => a.arenas().is_active(arena))
+    }
+
+    /// A generation-checked handle for `arena`'s current incarnation (§36.13),
+    /// or `None` if unregistered.
+    pub fn arena_handle(&self, arena: ArenaId) -> Option<u64> {
+        dispatch!(self, a => a.arenas().handle(arena))
+    }
+
+    /// Resolve a handle to its [`ArenaId`], or `None` if it is stale (§36.13).
+    pub fn arena_resolve_handle(&self, handle: u64) -> Option<ArenaId> {
+        dispatch!(self, a => a.arenas().resolve_handle(handle))
     }
 
     /// Reset an explicit arena (§22.5).
