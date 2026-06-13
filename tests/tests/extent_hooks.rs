@@ -883,6 +883,13 @@ fn hooked_arena_serves_from_its_own_region_and_isolates() {
     );
     // SAFETY: live 4 MiB allocation.
     unsafe { large.write(0x5a) };
+    // Aggregate stats include the hooked region: the large is counted, and the
+    // large-region physical-state breakdown covers more than the shared region.
+    let st_live = a.stats();
+    assert!(
+        st_live.live_large >= 1,
+        "a hooked-arena large allocation is counted in live_large (W10 stats aggregation)"
+    );
 
     // §22.7 isolation: a *default-arena* allocation is NOT in the hooked region
     // (it comes from the shared POSIX backend) — the two arenas' memory is disjoint.

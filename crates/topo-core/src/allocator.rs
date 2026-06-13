@@ -1800,6 +1800,25 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 central_free_bytes += bin.total_central_free() * row.size as u64;
             }
         }
+        // Aggregate the shared backend with every per-arena hooked region (W10), so
+        // the §20.1 physical-state breakdown and the live-large count reflect *all*
+        // backends — not just the shared one (an arena's own region is still this
+        // allocator's memory). A no-op when no hooked arena exists.
+        let mut span_backend = self.span_extents.state_bytes();
+        let mut large_backend = self.large.state_bytes();
+        let mut live_large = self.large.live_count() as u64;
+        if self.hooks.count.load(Ordering::Acquire) > 0 {
+            self.hooks.lock.acquire();
+            for i in 0..MAX_HOOK_BACKENDS {
+                // SAFETY: registry lock held; per-element borrow of slot `i` only.
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    span_backend = span_backend.add(b.span_extents.state_bytes());
+                    large_backend = large_backend.add(b.large.state_bytes());
+                    live_large += b.large.live_count() as u64;
+                }
+            }
+            self.hooks.lock.release();
+        }
         AllocatorStats {
             // Saturating: `freed` can transiently exceed `allocated` only in
             // a torn relaxed read during concurrent ops; never report a wrap.
@@ -1807,11 +1826,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             allocated_bytes_total: allocated,
             freed_bytes_total: freed,
             central_free_bytes,
-            span_backend: self.span_extents.state_bytes(),
-            large_backend: self.large.state_bytes(),
+            span_backend,
+            large_backend,
             pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
             live_spans: self.live_span_count() as u64,
-            live_large: self.large.live_count() as u64,
+            live_large,
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
         }

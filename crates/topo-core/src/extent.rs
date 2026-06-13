@@ -300,6 +300,21 @@ impl StateBytes {
     pub const fn free(self) -> usize {
         self.reserved + self.dirty + self.muzzy + self.released
     }
+
+    /// Field-wise sum, for aggregating several regions' breakdowns into one total
+    /// (e.g. the shared backend plus each per-arena hooked region, W10). Saturating
+    /// so an aggregate never wraps (`StateBytes` are byte counts bounded by the
+    /// reserved address space; saturation is belt-and-suspenders).
+    #[inline]
+    pub const fn add(self, other: StateBytes) -> StateBytes {
+        StateBytes {
+            reserved: self.reserved.saturating_add(other.reserved),
+            active: self.active.saturating_add(other.active),
+            dirty: self.dirty.saturating_add(other.dirty),
+            muzzy: self.muzzy.saturating_add(other.muzzy),
+            released: self.released.saturating_add(other.released),
+        }
+    }
 }
 
 /// A back-end operation that could not complete. Every variant leaves the

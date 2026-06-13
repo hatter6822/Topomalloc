@@ -1072,17 +1072,30 @@ A deliberate completeness pass closed every gap the first pass deferred:
     global allocator); a hooked arena's hooks outlive the allocator like the
     metadata/pagemap do.
   - Routing: span create/retire route by `span.arena()`; large alloc by arena;
-    large **free finds the owner** (the one backend whose descriptor pool resolves
-    the pointer — the shared pagemap is global, so the descriptor is found by
-    trying the shared backend then each hooked one); drain routes by arena.
+    large **free / `usable_size` / `realloc` find the owner** (the one backend whose
+    descriptor pool resolves the pointer — the shared pagemap is global, so the
+    descriptor is found by trying the shared backend then each hooked one; a hooked
+    arena's descriptor is *not* in the shared pool, so every pool-querying op must
+    route, not just `free`); drain routes by arena. `stats()` and `check_invariants`
+    **aggregate** every backend, so the live-large count and the §20.1 physical-state
+    breakdown cover the hooked regions too.
   - Lifecycle (§22.4 order): the hooked backing is reserved + **registered before**
     the arena id is published `Active` (the id is private to the create call until
     then, so the window is race-free). `arena.rs` gains
     `create_pending`/`publish`/`abandon_pending` for that split. Destroy tears the
     region down (returns it to the hooks via `dealloc`, *outside* the registry lock
-    so the hook never runs under it); reset keeps it. Registry slots are cleared in
-    place (never moved), so a backend reference is stable for an arena's op under
-    the §22.5/§36.13 quiescence contract.
+    so the hook never runs under it); reset keeps it.
+  - Concurrency (soundness): the registry is accessed **per element via raw
+    pointers** — never a whole-array `&[Option; N]` / `&mut [Option; N]` — the same
+    slot-pool discipline `ExtentMap`/`SpanPool`/`ArenaTable` use. A reference into
+    one slot is then disjoint from a concurrent destroy clearing *another* slot
+    (which only forms a narrow `&mut` to its own element), so a worker holding a
+    backend reference for arena X is never invalidated by a destroy of arena Y — no
+    whole-array `&mut` to over-assert. Slots are cleared in place (never moved), so
+    under the §22.5/§36.13 quiescence contract (an arena's create/destroy does not
+    race its own alloc/free) a backend reference is stable for the op. A concurrent
+    stress test (workers hammer one hooked arena while another thread create/destroys
+    others) exercises exactly this.
 * **The C `topo_extent_hooks_t` ABI (§23.2's C-struct surface).** `topo-abi`
   exposes the vtable + `topo_arena_create_hooked(hooks, ctx, span_bytes,
   large_bytes)` + `topo_max_hook_backends()`; a `CHooks` adapter maps the C
@@ -1103,3 +1116,15 @@ A deliberate completeness pass closed every gap the first pass deferred:
   just the extent manager) is fuzzed under injected hook failures asserting the
   §8.6 identity + non-aliasing; a hook-vs-POSIX behavioural-equivalence test; and
   per-arena routing/isolation/lifecycle/registry-full integration tests.
+
+* **Audit pass (two real fixes).** A deliberate deep audit of the per-arena work
+  found and fixed: **(a)** a soundness hazard — the registry originally formed
+  whole-array `&`/`&mut` references and returned an element reference held without
+  the lock, which a concurrent destroy of a *different* arena could invalidate
+  under Stacked/Tree Borrows (latent UB despite disjoint writes); rewritten to
+  per-element raw access. **(b)** a correctness bug — `realloc`/`usable_size` of a
+  hooked-arena *large* object queried the shared large pool (which cannot resolve a
+  hooked descriptor) and so spuriously returned NULL/None; routed through the owner
+  like `free`. Both now have regression tests (a concurrent registry stress test
+  and a hooked-arena large realloc test). The audit also closed the stats gap above
+  (aggregate `live_large` + backend breakdown over the hooked regions).

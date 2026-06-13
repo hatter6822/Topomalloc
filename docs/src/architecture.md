@@ -295,10 +295,14 @@ transitions the allocator actually runs cannot drift from the model.
   The **full §22.2 per-arena `hooks` field** is wired (`Allocator::arena_create_hooked`,
   C `topo_arena_create_hooked`): an arena serves its span/large allocations from its
   **own** `HookProvider`-backed region (the `ExtentBacking`/`LargeBacking` seams + a
-  fixed-capacity `HookRegistry` with a lock-free no-hooked-arena fast path), isolated
-  from every other arena's region by construction (§22.7, proven in Lean by
-  `perArena_disjoint_regions_isolate`). The hooked region is reserved + registered
-  before the arena id is published (§22.4), and returned to the hooks on destroy.
+  fixed-capacity `HookRegistry` — accessed per-element via raw pointers, the slot-pool
+  discipline, with a lock-free no-hooked-arena fast path), isolated from every other
+  arena's region by construction (§22.7, proven in Lean by
+  `perArena_disjoint_regions_isolate`). Every pool-querying op on a large pointer
+  (`free`/`usable_size`/`realloc`) routes to the backend that owns it; `stats`/
+  `check_invariants` aggregate all backends. The hooked region is reserved +
+  registered before the arena id is published (§22.4), and returned to the hooks on
+  destroy.
 
 ## Front-end: per-CPU caches & the RSEQ fast path (plan 05 W6/W7)
 
