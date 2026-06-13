@@ -54,8 +54,16 @@ of rights / quota / label (§36.4) — with each child's quota **reserved** on i
 parent so a delegated subtree's live bytes stay within the root's quota (proved
 in Lean by `subtree_used_le_quota`) — NUMA policy modes (§15.5), and a C arena API
 (`topo_arena_create` / `delegate` / `reset` / `destroy`). The arena lifecycle
-state machine is modeled and proof-checked in Lean. Front-end caches (M2) and
-the remaining M1 pieces land per the plan.
+state machine is modeled and proof-checked in Lean.
+
+**Extent hooks & custom backing (W10)** ride on the same provider seam: the §23.2
+`ExtentHooks` interface and the `HookProvider` adapter run the whole central path
+over a user-supplied memory source / OS policy, with the §23.3 output contracts
+enforced (a misaligned or undersized result is rejected, never handed out), the
+`split` / `merge` notifications dispatched from the back-end's carve / coalesce,
+and the §23.4 "allocator correctness assumes hook correctness" assumption modeled
+and proof-checked in Lean (`ExtentHooks.lean`). Front-end caches (M2) and the
+remaining M1 pieces land per the plan.
 
 ## Quick start
 

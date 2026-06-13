@@ -269,6 +269,25 @@ model by a Rust differential test (`extent_state_transition_matches_lean`) and t
 `can_transition` is `debug_assert`ed at every physical-state write, so the extent-state
 transitions the allocator actually runs cannot drift from the model.
 
+- **Extent hooks & custom backing** (`hooks.rs`, W10, §23). Because everything
+  OS/kernel-facing already flows through the seam, a **custom backing** is just a
+  provider: `ExtentHooks` is the §23.2 interface (alloc/dealloc/commit/decommit/
+  purge/split/merge) and `HookProvider<H>` adapts it to `TopoBackingProvider`, so an
+  `ExtentManager`/`Allocator` built over it runs the whole central path on the user
+  memory source **unchanged above the seam**. The six physical ops gate (a hook
+  failure is a `BackendError` the manager recovers from, W4-5); `split`/`merge` are
+  **advisory** seam notifications (the `ExtentMap` owns sub-extent geometry, so a
+  failure is recorded — `HookProvider::split_hook_failures` — never corrupting the
+  bookkeeping, §23.3/§23.4), dispatched from carve/coalesce through the `ExtentNotify`
+  sink (default `NoNotify` ⇒ POSIX/seLe4n unchanged). `HookProvider` **enforces** the
+  load-bearing §23.3 output contracts (alignment, size, sub-range) — rejecting *and*
+  debug-aborting a violation (§2.4) rather than trusting it. The §23.4 "allocator
+  correctness assumes hook correctness" assumption is modeled in
+  `lean/TopoMalloc/ExtentHooks.lean`: given the §23.3 contracts, alloc/split/merge/
+  subrange preserve range disjointness and the region tiling. A proptest and the
+  `fuzz/fuzz_targets/extent_hooks.rs` target assert the back-end stays well-formed
+  under arbitrary hook failures (W10-3).
+
 ## Front-end: per-CPU caches & the RSEQ fast path (plan 05 W6/W7)
 
 The front-end holds free objects in per-`(cpu, size-class)` slots and serves the
@@ -336,6 +355,12 @@ theorem set is complete:
   safety, the arena lifecycle, and size-class coverage.
 - **§9.4/§9.5 size classes** — the spacing-dominated ratio bound, the
   alignment-dominated waste caveat, the slab-layout lemmas, and lookup coverage.
+- **§23.4 extent-hook assumption (W10)** — `ExtentHooks.lean` states the §23.3 hook
+  contracts as hypotheses and proves the operations preserve the well-formedness
+  core *under* them (a contract-honouring `alloc` keeps ranges disjoint;
+  `split`/`merge` keep the region tiled; a sub-range op touches no other extent) —
+  the precise "allocator correctness assumes hook correctness" of §23.4, with the
+  cheap half of the premise enforced at runtime by `HookProvider`.
 - **seLe4n bridge (§36, GPL-3.0-or-later)** — the abstraction relation and
   `TopoSeLe4nWellFormed`, the §36.6 backing-provider state machine, the §36.17
   families (authority/quota, provenance/release, destroy/label/scrub,

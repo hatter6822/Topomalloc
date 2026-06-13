@@ -489,6 +489,61 @@ pub trait TopoBackingProvider {
     fn recycle(&self, arena: ArenaId, mapped: MappedRange) -> Result<(), BackendError> {
         self.release(arena, mapped.region)
     }
+
+    // --- §23.2 extent-hook split/merge notifications (plan 06 W10) -----------
+    //
+    // These are the two §23.2 hook operations with no §20.4 physical-state
+    // analogue: they tell a *custom backing* (one supplied through these very
+    // methods, e.g. a `HookProvider`) that the allocator's extent manager has
+    // subdivided or coalesced an extent within a reserved region, so the backing
+    // can keep its own notion of extent boundaries (§23.1) in step.
+    //
+    // They are **advisory** (§23.4 "allocator correctness assumes hook
+    // correctness"): the extent manager's `ExtentMap` is the source of truth for
+    // sub-extent geometry (it splits/merges the region it `reserve`d without
+    // otherwise involving the provider, which sees only offset ranges, never
+    // extent objects), so a failure here is *reported* (§23.3) but never alters
+    // the bookkeeping — the back-end stays well-formed regardless (W10-3). A
+    // **no-op default is therefore correct** for POSIX and seLe4n, whose backings
+    // do not track sub-extent boundaries (a `reserve` is one indivisible
+    // mapping / untyped run).
+
+    /// Notify the backing that the extent occupying `region` (length
+    /// `size_a + size_b`) was split into a prefix of `size_a` bytes and a suffix
+    /// of `size_b` bytes at offset `size_a` (§23.2 `split`). `committed` is whether
+    /// the extent was fully physically backed (so both halves are). Advisory — see
+    /// the section note; the default is a no-op.
+    ///
+    /// SPEC-transition: extent split notification (§23.2 / §18.4)
+    fn split(
+        &self,
+        arena: ArenaId,
+        region: Region,
+        size_a: usize,
+        size_b: usize,
+        committed: bool,
+    ) -> Result<(), BackendError> {
+        let _ = (arena, region, size_a, size_b, committed);
+        Ok(())
+    }
+
+    /// Notify the backing that the address-adjacent extents `left` and `right`
+    /// (with `left.end() == right.base`) were merged into one covering both
+    /// (§23.2 `merge`). `committed` is whether both were fully backed (the merge
+    /// only coalesces backing-compatible neighbours, §18.4). Advisory — see the
+    /// section note; the default is a no-op.
+    ///
+    /// SPEC-transition: extent merge notification (§23.2 / §18.4)
+    fn merge(
+        &self,
+        arena: ArenaId,
+        left: Region,
+        right: Region,
+        committed: bool,
+    ) -> Result<(), BackendError> {
+        let _ = (arena, left, right, committed);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +671,51 @@ mod tests {
         let (lo, hi) = r.addr_range();
         assert_eq!(lo, buf.as_ptr() as usize);
         assert_eq!(hi - lo, 64);
+    }
+
+    /// A minimal provider that implements only the required methods, to prove the
+    /// §23.2 `split`/`merge` notifications default to a well-formed no-op (W10) —
+    /// the property POSIX/seLe4n rely on (their backings do not track sub-extent
+    /// boundaries, so they never override these).
+    struct BareProvider;
+    impl TopoBackingProvider for BareProvider {
+        fn reserve(&self, _: ArenaId, _: usize, _: usize) -> Result<Region, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        fn commit(&self, _: Region, _: usize, _: usize) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn release(&self, _: ArenaId, _: Region) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+    }
+
+    #[test]
+    fn split_merge_notifications_default_to_a_noop() {
+        // W10 / §23.2: a backing that does not track sub-extent boundaries (POSIX,
+        // seLe4n) inherits a no-op `split`/`merge`, so the allocator can subdivide
+        // its reserved region freely without the provider having to care.
+        let p = BareProvider;
+        let mut buf = [0u8; 64];
+        let region = Region {
+            base: buf.as_mut_ptr(),
+            len: 64,
+        };
+        let left = Region {
+            base: buf.as_mut_ptr(),
+            len: 32,
+        };
+        // SAFETY: `buf` is 64 bytes, so offset 32 is in bounds — the base of the
+        // right half (a notification carries only the address, never a deref).
+        let right_base = unsafe { buf.as_mut_ptr().add(32) };
+        let right = Region {
+            base: right_base,
+            len: 32,
+        };
+        assert!(p.split(ArenaId::DEFAULT, region, 32, 32, true).is_ok());
+        assert!(p.merge(ArenaId::DEFAULT, left, right, true).is_ok());
     }
 }

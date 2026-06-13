@@ -969,3 +969,83 @@ corrected behavior:
   cannot give. New unit + property tests (`delegation_reserves_parent_quota_…`,
   `delegated_subtree_never_exceeds_parent_quota`) and the loom quota model (the
   reservation commits through the same gate CAS) pin it.
+
+## W10 — extent hooks & custom backing over the provider seam (plan 06)
+
+Extent hooks (§23) let an application supply a **custom memory source** or
+**custom OS policies**. The design decision is where they attach, and the answer
+follows from the existing architecture rather than adding a parallel mechanism:
+
+* **Hooks *are* a backing provider.** Every OS/kernel interaction already flows
+  through the `TopoBackingProvider` seam (§3/§36.6) — that seam *is* the
+  custom-backing abstraction (overview §3, D2). So the §23.2 interface is realized
+  as `topo_core::hooks::ExtentHooks` (the eight ops in Rust idiom), adapted to the
+  seam by `HookProvider<H>`. An `ExtentManager`/`Allocator` built over a
+  `HookProvider` runs the whole proven central path on the user backing **with no
+  change above the seam** — the exact reading of "wired through the provider seam
+  (plan 04)". This reuses the seam's fallibility-and-well-formedness contract
+  (§36.6 / W4-5) instead of re-deriving it. The six physical ops map 1:1
+  (`alloc→reserve`, `dealloc→release`, `commit`/`decommit`/`purge_lazy`/
+  `purge_forced`), and a hook failure is the `BackendError` the manager already
+  recovers from.
+
+* **`split`/`merge` are advisory seam notifications, not gates.** They are the two
+  §23.2 ops with no §20.4 physical analogue. In TopoMalloc's architecture the
+  `ExtentMap` is the **source of truth** for sub-extent geometry: the manager
+  reserves one region and subdivides it internally, so the provider/backing sees
+  only offset ranges, never extent objects. `split`/`merge` were therefore added to
+  `TopoBackingProvider` as **default-Ok notification** methods (joining the
+  `decommit`/`purge`/`revoke_descendants` family of default seam ops, so POSIX and
+  seLe4n are unchanged), dispatched from the manager's carve/coalesce through a new
+  `ExtentNotify` sink (`ProviderNotify` adapter; default `NoNotify` is a ZST, so the
+  pre-W10 path is byte-for-byte identical). A hook failure here is **recorded**
+  (`HookProvider::split_hook_failures`/`merge_hook_failures`) but never alters the
+  bookkeeping — §23.3 "hook failures are reported without corrupting allocator
+  state", and §23.4 "allocator correctness assumes hook correctness". This is the
+  only sound choice given an authoritative `ExtentMap`: a notification cannot be a
+  veto without making the allocator's own metadata subordinate to an unverified
+  hook. Threading was done **additively** (`carve`/`split`/`merge`/`coalesce`/`free`
+  keep their signatures; new `*_in` variants take the notifier), so every existing
+  caller, test, and fuzz target is untouched and the proven `ExtentMap` logic is
+  unchanged save for the post-success notify call.
+
+* **§23.3 contracts: enforce the load-bearing half, assume the rest (§2.4).**
+  `HookProvider` validates the cheap, allocation-free output contracts on every
+  call — an `alloc` result must be non-null, aligned to the request, and at least
+  the requested size; a commit/decommit/purge target must be a sub-range of the
+  reservation — and **rejects** a violation with `InvalidRequest` (so even a buggy
+  hook cannot make the allocator hand out memory that fails the request) *and*
+  debug-aborts to surface the hook bug. The stateful contracts (no-overlap with
+  live ranges, dealloc pairs a live reservation) are self-checked by the test/fuzz
+  backings. Reentrancy (§23.3 "no recursive TopoMalloc calls") is the inherited
+  seam contract: hooks run under the held back-end extent lock (as the existing
+  `commit`/`decommit` provider calls do), so a re-entrant allocator call deadlocks
+  on that non-re-entrant lock — the documented, enforced boundary; explicit
+  recursion detection is a hardened-profile concern (plan 08).
+
+* **§23.4 modeled in Lean.** `lean/TopoMalloc/ExtentHooks.lean` states the §23.3
+  contracts as hypotheses and proves the operations preserve the well-formedness
+  core *under* them: a contract-honouring `alloc` keeps the allocator's ranges
+  pairwise disjoint; `split`/`merge` keep the region tiled and preserve
+  disjointness from every other extent; a sub-range op touches no other extent. Each
+  theorem consumes the contract and concludes well-formedness — literally "allocator
+  correctness assumes hook correctness" — and rests only on the standard axioms
+  (`propext`/`Quot.sound`/`Classical.choice`), with a non-vacuity witness so nothing
+  is proved vacuously. The Rust `HookProvider` discharges the cheap half of the
+  premise at runtime, so only the genuinely unverifiable backing behaviour is
+  assumed.
+
+* **W10-3 failure injection.** Every fallible runtime hook can fail and the back-end
+  stays well-formed: a `commit` failure rolls the carve back (W4-5), a `decommit`
+  failure (unmap policy) retains the extent, `split`/`merge` failures are advisory.
+  A proptest (`tests/tests/extent_hooks.rs`) and the `extent_hooks` fuzz target
+  assert `check_invariants` after every step under randomized per-hook failures.
+
+* **Boundary: the arena `hooks` *descriptor field* is deferred with the
+  shared-backend architecture.** §22.2 lists a per-arena `hooks` field, but the
+  M1/M4 data path achieves §22.7 isolation through one **shared, arena-tagged**
+  backend, not per-arena regions (§27.5 keeps metadata bounded). Per-arena hook
+  *selection* would require per-arena regions; the W10 deliverable is the hook
+  **mechanism** (construct an allocator over a `HookProvider`), and per-arena
+  descriptor wiring stays deferred with that architecture choice — documented, not
+  avoided.

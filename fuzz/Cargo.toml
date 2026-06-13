@@ -50,5 +50,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "extent_hooks"
+path = "fuzz_targets/extent_hooks.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]
