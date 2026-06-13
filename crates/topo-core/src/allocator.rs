@@ -2498,6 +2498,49 @@ mod tests {
     }
 
     #[test]
+    fn arena_reset_drains_an_empty_cached_span() {
+        // An arena whose objects were all freed leaves an *empty-cached* span
+        // (state Active, in the central bin's empty cache, not the partial list).
+        // Reset must still find and reclaim it (the `remove_empty` drain branch),
+        // not just live/partial spans — otherwise that span would leak.
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let sc = size_class(64, 1).unwrap();
+        let per_span = objects_per_slab(sc) as usize;
+
+        // Fill exactly one span, then free every object → the span empties and is
+        // cached for reuse (not deactivated).
+        let ptrs: Vec<_> = (0..per_span)
+            .map(|_| a.allocate_in(id, 64, MIN_ALIGN, RequestFlags::NONE))
+            .collect();
+        assert!(ptrs.iter().all(|p| !p.is_null()));
+        for p in &ptrs {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        assert_eq!(a.arena_stats(id).unwrap().used, 0, "all freed");
+        assert!(
+            a.live_span_count() >= 1,
+            "the emptied span is cached, not gone"
+        );
+
+        // Reset drains the empty-cached span; afterwards the arena holds nothing
+        // and the engine reconciles.
+        let _ = treset(&a, id).expect("reset");
+        assert_eq!(a.arena_stats(id).unwrap().used, 0);
+        assert_eq!(
+            a.arena_stats(ArenaId::DEFAULT).unwrap().used + a.arena_stats(id).unwrap().used,
+            a.stats().live_bytes
+        );
+        assert!(a.check_invariants());
+        // The arena is reusable.
+        let q = a.allocate_in(id, 64, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    #[test]
     fn arena_destroy_quarantines_on_a_revoke_failure() {
         // §36.13 partial-failure path (W9-6e): when the backend cannot revoke an
         // arena's backing capabilities, destroy must land the arena in

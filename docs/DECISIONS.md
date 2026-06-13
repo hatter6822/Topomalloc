@@ -881,6 +881,23 @@ A deliberate completeness pass closed every item the first pass deferred:
   a **loom** model checks the quota CAS under contention; a **concurrent
   multi-arena** isolation test and an **`arena_api` fuzz target** were added; and
   **Miri** runs clean over the new arena unsafe.
+* **Rights enforcement is the D2 collapse (audited, made explicit).** All four
+  `CapRights` are carried (delegation attenuates them; seLe4n enforces them), but
+  the POSIX *engine* gates only `ALLOC` — `try_charge` rejects allocation from an
+  arena whose cap lacks it (§36.16's authority test, the property intrinsic to the
+  arena). `free`/`stats`/`destroy` are ambient on POSIX: the single process holds
+  full authority, and gating them on a *delegated child's* rights would wrongly
+  bar the *parent*-authority holder from destroying what it delegated. They are
+  enforced against the **caller's** cap at the seLe4n resource-server IPC boundary
+  (plan 09) — the engine API takes an arena id, not a cap, so it cannot know the
+  caller's authority. This is documented on `CapRights` so the asymmetry reads as
+  deliberate, not a forgotten check.
+* **Zero-size policy uniformity (audit fix).** `topo_mallocx_arena` now applies
+  the §9.6 zero-size policy (`zero_unique`/`zero_null`) exactly as `topo_mallocx`;
+  the handle path previously skipped it, so a size-0 request returned a unique
+  pointer even under `zero_null`. (Also: a `manual_is_multiple_of` clippy warning
+  in the `arena_api` fuzz target — the standalone fuzz workspace is outside the
+  main `xtask ci` clippy — was fixed.)
 * **Documented boundaries (not avoidance).** Cross-label scrub *recording* is
   plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena stats
   *rendering* is W17 (M6); label *restriction* (vs. the sound equality) and quota

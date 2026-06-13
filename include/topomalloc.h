@@ -244,8 +244,9 @@ topo_arena_t topo_arena_id(topo_arena_handle_t handle);
  * stale handle (its arena was destroyed, possibly recreated at the same id) is
  * NULL + EINVAL — the §36.13 guarantee a raw TOPO_ARENA(id) flag cannot give.
  * The flag word's arena field is ignored (the handle wins); its other hints
- * apply. Allocation failure maps through the arena taxonomy (EACCES/EBUSY/
- * ENOMEM). */
+ * apply, and size == 0 follows the zero-size policy (§9.6) exactly as
+ * topo_mallocx. Allocation failure maps through the arena taxonomy
+ * (EACCES/EBUSY/ENOMEM). */
 void *topo_mallocx_arena(topo_arena_handle_t handle, size_t size, topo_flags_t flags);
 
 /* ------------------------------------------------------------------------

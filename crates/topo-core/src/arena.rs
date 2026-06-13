@@ -72,6 +72,18 @@ pub const QUOTA_UNLIMITED: u64 = u64::MAX;
 /// carry any subset of the delegator's rights, never a superset
 /// ([`attenuates`](Self::attenuates)). Mirrors the Lean `CapRights` structure
 /// (`SeLe4n/CapBackedArena.lean`); the four bits are the four Lean fields.
+///
+/// **Enforcement on POSIX (D2 collapse).** All four rights are carried (so
+/// delegation can attenuate them and the seLe4n profile can enforce them). The
+/// POSIX *engine* enforces only [`ALLOC`](Self::ALLOC) — [`ArenaTable::try_charge`]
+/// rejects allocation from an arena whose cap lacks it (§36.16's "clients cannot
+/// allocate from arenas without rights"), the property that is intrinsic to the
+/// arena. `free`/`stats`/`destroy` are **ambient** on POSIX: a single process
+/// holds full authority, and gating them on a *delegated child's* rights would
+/// wrongly bar the *parent*-authority holder from freeing/destroying what it
+/// delegated. Those rights are enforced at the seLe4n resource-server IPC
+/// boundary against the **caller's** cap (plan 09), not here — the API takes an
+/// arena id, not a cap, so the engine cannot know the caller's authority.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapRights(u8);
 
@@ -1772,6 +1784,31 @@ mod tests {
         assert_eq!(after.quota_limit, 4096);
         // Configuring an unregistered/destroyed id fails.
         assert_eq!(t.configure(ArenaId(9999), &cfg), Err(ArenaError::NotFound));
+    }
+
+    #[test]
+    fn lifecycle_is_ambient_not_gated_on_the_arenas_own_rights() {
+        // POSIX collapse (D2): only ALLOC is gated on the arena's cap rights
+        // (§36.16). reset/destroy are ambient — gating them on a *delegated
+        // child's* rights would wrongly bar the *parent*-authority holder. A
+        // no-DESTROY, no-FREE arena is therefore still resettable and
+        // destroyable here; the caller-cap check is the seLe4n IPC boundary's job.
+        let t = ArenaTable::new();
+        let id = t
+            .create(&ArenaPolicy::explicit().with_rights(CapRights::ALLOC))
+            .unwrap();
+        let r = t.stats(id).unwrap().rights;
+        assert!(r.contains(CapRights::ALLOC));
+        assert!(!r.contains(CapRights::DESTROY) && !r.contains(CapRights::FREE));
+        // Allocation IS gated (has ALLOC → admitted).
+        t.try_charge(id, 64).unwrap();
+        t.credit(id, 64);
+        // reset + destroy succeed despite no DESTROY right (ambient on POSIX).
+        t.begin_reset(id).unwrap();
+        t.finish_reset(id).unwrap();
+        t.begin_destroy(id).unwrap();
+        t.finish_destroy(id).unwrap();
+        assert_eq!(t.stats(id).unwrap().state, ArenaState::Destroyed);
     }
 
     #[test]

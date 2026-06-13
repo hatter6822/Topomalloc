@@ -155,7 +155,7 @@ fuzz_target!(|data: &[u8]| {
             }
             // allocate from a selected arena (default or one of the explicit).
             1 => {
-                let arena = if arenas.is_empty() || sel % 2 == 0 {
+                let arena = if arenas.is_empty() || sel.is_multiple_of(2) {
                     ArenaId::DEFAULT
                 } else {
                     arenas[sel % arenas.len()]

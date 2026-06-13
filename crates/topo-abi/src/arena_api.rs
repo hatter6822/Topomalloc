@@ -27,6 +27,7 @@ use topo_core::{
 use crate::errno_shim::{alloc_protocol, set_errno, EACCES, EBUSY, EINVAL, ENOMEM};
 use crate::extended::decode_flags;
 use crate::global;
+use crate::policy::{zero_size_policy, ZeroSizePolicy};
 
 /// Map an [`ArenaError`] onto the POSIX `errno` taxonomy — the projection of the
 /// §36.14 `TOPO_ERR_*` classes a C caller can read after a failed arena call:
@@ -248,6 +249,12 @@ pub extern "C" fn topo_mallocx_arena(handle: u64, size: usize, flags: u64) -> *m
         set_errno(EINVAL);
         return ptr::null_mut();
     };
+    // Honor the configurable zero-size policy uniformly with `topo_mallocx`
+    // (§9.6): under `zero_null`, a zero-size request is NULL with errno
+    // untouched.
+    if size == 0 && zero_size_policy() == ZeroSizePolicy::Null {
+        return ptr::null_mut();
+    }
     // Pre-check the gate so a failure carries the precise taxonomy errno, not a
     // bare ENOMEM (§36.14 distinguishes authority/quota/draining).
     if let Some(s) = a.arena_stats(arena) {
@@ -408,6 +415,27 @@ mod tests {
         assert_eq!(topo_arena_configure(0, 1, 1), 0);
         assert_eq!(topo_arena_configure(200, 1, 1), -1);
         // SAFETY: quiesced.
+        assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
+    }
+
+    #[test]
+    fn mallocx_arena_honors_the_zero_size_policy() {
+        // The handle path must apply the §9.6 zero-size policy uniformly with
+        // `topo_mallocx`. NOTE: process-global policy — this test toggles it and
+        // restores `Unique`; no other test in this binary does a size-0 malloc.
+        use crate::policy::{set_zero_size_policy, ZeroSizePolicy};
+        let id = topo_arena_create();
+        let h = topo_arena_handle(id);
+        // Default (zero_unique): size 0 → a unique, freeable pointer.
+        let p = topo_mallocx_arena(h, 0, 0);
+        assert!(!p.is_null());
+        // SAFETY: `p` is a live zero-size allocation owned by this test.
+        unsafe { topomalloc_free(p) };
+        // zero_null: size 0 → NULL (matching topo_mallocx).
+        set_zero_size_policy(ZeroSizePolicy::Null);
+        assert!(topo_mallocx_arena(h, 0, 0).is_null());
+        set_zero_size_policy(ZeroSizePolicy::Unique); // restore the default
+                                                      // SAFETY: quiesced.
         assert_eq!(unsafe { topo_arena_destroy(id) }, 0);
     }
 
