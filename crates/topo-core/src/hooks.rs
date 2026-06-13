@@ -61,10 +61,12 @@
 //! enforced boundary (explicit recursion detection is a hardened-profile concern,
 //! plan 08).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::backend::{Region, TopoBackingProvider};
 use crate::error::BackendError;
+use crate::extent::BackendLock;
 use crate::ids::ArenaId;
 
 /// The §23.2 extent-hook interface — the Rust idiom of the C `topo_extent_hooks_t`
@@ -185,6 +187,172 @@ pub trait ExtentHooks {
     }
 }
 
+/// Forward [`ExtentHooks`] through a shared trait-object reference, so a
+/// [`HookProvider`] can carry a **type-erased, borrowed** backing — the shape the
+/// per-arena hook registry needs (each arena's hooks are a different concrete type,
+/// stored as `&'a (dyn ExtentHooks + Send + Sync)`). Borrowing (not boxing) keeps
+/// `topo-core` allocation-free: a hooked arena's backing is owned by the caller and
+/// outlives the allocator, exactly as the metadata/pagemap already are.
+impl ExtentHooks for &(dyn ExtentHooks + Send + Sync + '_) {
+    #[inline]
+    fn alloc(
+        &self,
+        size: usize,
+        align: usize,
+        zero: &mut bool,
+        commit: &mut bool,
+    ) -> Result<Region, BackendError> {
+        (**self).alloc(size, align, zero, commit)
+    }
+    #[inline]
+    fn dealloc(&self, region: Region, committed: bool) -> Result<(), BackendError> {
+        (**self).dealloc(region, committed)
+    }
+    #[inline]
+    fn commit(&self, region: Region, offset: usize, length: usize) -> Result<(), BackendError> {
+        (**self).commit(region, offset, length)
+    }
+    #[inline]
+    fn decommit(&self, region: Region, offset: usize, length: usize) -> Result<(), BackendError> {
+        (**self).decommit(region, offset, length)
+    }
+    #[inline]
+    fn purge_lazy(&self, region: Region, offset: usize, length: usize) -> Result<(), BackendError> {
+        (**self).purge_lazy(region, offset, length)
+    }
+    #[inline]
+    fn purge_forced(
+        &self,
+        region: Region,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), BackendError> {
+        (**self).purge_forced(region, offset, length)
+    }
+    #[inline]
+    fn split(
+        &self,
+        region: Region,
+        size_a: usize,
+        size_b: usize,
+        committed: bool,
+    ) -> Result<(), BackendError> {
+        (**self).split(region, size_a, size_b, committed)
+    }
+    #[inline]
+    fn merge(&self, left: Region, right: Region, committed: bool) -> Result<(), BackendError> {
+        (**self).merge(left, right, committed)
+    }
+    #[inline]
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
+/// Capacity of a [`HookProvider`]'s live-reservation tracker. A provider backs one
+/// [`ExtentManager`](crate::ExtentManager), which reserves exactly one region, so a
+/// provider holds 0 or 1 live reservation in practice; this is generous headroom.
+/// If it is ever exceeded the §23.3 no-overlap/pairing check degrades to
+/// best-effort (it never reports a false overlap, only stops tracking new ranges).
+const RESERVATION_CAP: usize = 16;
+
+/// The live-reservation set behind the §23.3 no-overlap + dealloc-pairing checks,
+/// guarded by a [`BackendLock`]. Fixed-capacity and allocation-free (`no_std`).
+struct ReservationSet {
+    lock: BackendLock,
+    inner: UnsafeCell<ReservationInner>,
+}
+
+struct ReservationInner {
+    ranges: [(usize, usize); RESERVATION_CAP],
+    count: usize,
+    /// Set once the set overflows, so a later not-found `remove` is inconclusive
+    /// (not a violation) rather than a false alarm.
+    overflowed: bool,
+}
+
+impl ReservationSet {
+    const fn new() -> Self {
+        Self {
+            lock: BackendLock::new(),
+            inner: UnsafeCell::new(ReservationInner {
+                ranges: [(0, 0); RESERVATION_CAP],
+                count: 0,
+                overflowed: false,
+            }),
+        }
+    }
+
+    /// Record `[base, base+len)` as live. Returns `Err(())` if it overlaps a live
+    /// range (§23.3 "do not overlap existing allocator ranges"); otherwise records
+    /// it (or, when full, sets `overflowed` and records nothing). The critical
+    /// section is panic-free, so the manual lock needs no RAII guard.
+    fn try_record(&self, base: usize, len: usize) -> Result<(), ()> {
+        self.lock.acquire();
+        // SAFETY: the lock is held, granting exclusive access to `inner`.
+        let inner = unsafe { &mut *self.inner.get() };
+        let end = base.saturating_add(len);
+        let mut overlap = false;
+        for &(b, l) in &inner.ranges[..inner.count] {
+            let e = b.saturating_add(l);
+            if base < e && b < end {
+                overlap = true;
+                break;
+            }
+        }
+        if !overlap {
+            if inner.count < RESERVATION_CAP {
+                inner.ranges[inner.count] = (base, len);
+                inner.count += 1;
+            } else {
+                inner.overflowed = true;
+            }
+        }
+        self.lock.release();
+        if overlap {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Remove the reservation based at `base`. Returns `true` if it was tracked (or
+    /// the set overflowed, so absence is inconclusive); `false` means a `dealloc` of
+    /// a region this backing never handed out (§23.3 violation).
+    fn remove(&self, base: usize) -> bool {
+        self.lock.acquire();
+        // SAFETY: the lock is held, granting exclusive access to `inner`.
+        let inner = unsafe { &mut *self.inner.get() };
+        let mut found = false;
+        let mut i = 0;
+        while i < inner.count {
+            if inner.ranges[i].0 == base {
+                inner.count -= 1;
+                inner.ranges[i] = inner.ranges[inner.count];
+                found = true;
+                break;
+            }
+            i += 1;
+        }
+        let ok = found || inner.overflowed;
+        self.lock.release();
+        ok
+    }
+}
+
+/// RAII reentrancy guard: clears the provider's `in_hook` flag on drop — including
+/// an unwinding hook in `std` tests — so the flag never sticks (§23.3 reentrancy).
+struct HookGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for HookGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 /// Adapts user-supplied [`ExtentHooks`] to the [`TopoBackingProvider`] seam (W10-1),
 /// so the proven allocator core runs unchanged over a custom backing. Construct it
 /// with [`new`](Self::new) and pass it to
@@ -205,7 +373,22 @@ pub struct HookProvider<H: ExtentHooks> {
     split_hook_failures: AtomicU64,
     /// Count of advisory §23.2 `merge`-hook failures (see above).
     merge_hook_failures: AtomicU64,
+    /// The §23.3 live-reservation set: detects an `alloc` result overlapping a live
+    /// reservation, and a `dealloc` of a region this backing never handed out.
+    live: ReservationSet,
+    /// The §23.3 reentrancy guard: set while any hook of this provider is running,
+    /// so a hook that re-enters an op on this provider is caught (debug-abort +
+    /// refuse) rather than deadlocking on the held back-end lock.
+    in_hook: AtomicBool,
 }
+
+// SAFETY: `live.inner` is an `UnsafeCell` touched only under `live.lock`; every
+// other field is an atomic or the user-provided hooks. So concurrent `&self` use is
+// data-race-free when the hooks are `Sync`.
+unsafe impl<H: ExtentHooks + Sync> Sync for HookProvider<H> {}
+// SAFETY: the provider owns its state with no thread-affinity; moving it across
+// threads is sound when the hooks are `Send`.
+unsafe impl<H: ExtentHooks + Send> Send for HookProvider<H> {}
 
 impl<H: ExtentHooks> HookProvider<H> {
     /// Wrap `hooks` as a backing provider.
@@ -214,7 +397,26 @@ impl<H: ExtentHooks> HookProvider<H> {
             hooks,
             split_hook_failures: AtomicU64::new(0),
             merge_hook_failures: AtomicU64::new(0),
+            live: ReservationSet::new(),
+            in_hook: AtomicBool::new(false),
         }
+    }
+
+    /// Enter a hook dispatch, refusing — and debug-aborting on — a re-entrant call
+    /// that reaches this provider while another of its hooks is running (§23.3
+    /// "hooks do not call TopoMalloc recursively"). Hook calls on one provider are
+    /// serialized (the back-end lock during ops, single-threaded construct/teardown),
+    /// so observing the flag already set is genuine same-provider re-entry — no false
+    /// positives. The returned [`HookGuard`] clears the flag on drop.
+    #[inline]
+    fn enter_hook(&self) -> Result<HookGuard<'_>, BackendError> {
+        if self.in_hook.swap(true, Ordering::Acquire) {
+            debug_assert!(false, "§23.3: extent hook re-entered TopoMalloc (W10)");
+            return Err(BackendError::Unsupported);
+        }
+        Ok(HookGuard {
+            flag: &self.in_hook,
+        })
     }
 
     /// Borrow the wrapped hooks (e.g. to read a custom backing's own stats).
@@ -291,37 +493,73 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
         }
         // The extent manager commits before use (M-005), so reserve asks the hook
         // for neither committed nor zeroed memory; a hook is free to deliver either
-        // (the out-flags), but the allocator does not depend on it.
-        let mut zero = false;
-        let mut commit = false;
-        let region = self.hooks.alloc(size, align, &mut zero, &mut commit)?;
+        // (the out-flags), but the allocator does not depend on it — it always
+        // commits before use and zeroes via the §26.3 span zeroed-flag, so the
+        // optimization a pre-committing/-zeroing backing offers rides on its own
+        // cheap `commit` hook, not on the reservation flags (a layering choice).
+        let region = {
+            let _guard = self.enter_hook()?;
+            let mut zero = false;
+            let mut commit = false;
+            self.hooks.alloc(size, align, &mut zero, &mut commit)?
+        };
         // §23.3 / §2.4: never trust the hook's geometry — validate or reject.
-        Self::validate_alloc(region, size, align)
+        let region = Self::validate_alloc(region, size, align)?;
+        // §23.3 no-overlap: record the reservation; a hook returning a range that
+        // overlaps a live one is rejected (and debug-aborted), the bad range handed
+        // straight back rather than used.
+        if self
+            .live
+            .try_record(region.base as usize, region.len)
+            .is_err()
+        {
+            debug_assert!(
+                false,
+                "§23.3: extent-hook alloc overlaps a live reservation (W10)"
+            );
+            let _guard = self.enter_hook();
+            let _ = self.hooks.dealloc(region, false);
+            return Err(BackendError::InvalidRequest);
+        }
+        Ok(region)
     }
 
     fn commit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
+        let _guard = self.enter_hook()?;
         self.hooks.commit(region, offset, len)
     }
 
     fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
+        let _guard = self.enter_hook()?;
         self.hooks.decommit(region, offset, len)
     }
 
     fn purge_lazy(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
+        let _guard = self.enter_hook()?;
         self.hooks.purge_lazy(region, offset, len)
     }
 
     fn purge_forced(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
+        let _guard = self.enter_hook()?;
         self.hooks.purge_forced(region, offset, len)
     }
 
     fn release(&self, _arena: ArenaId, region: Region) -> Result<(), BackendError> {
-        // `release` returns a whole reservation (the manager's region, on Drop);
-        // `committed` is the conservative hint that it may hold committed pages.
+        // §23.3 dealloc-pairing: the released region must be one this backing handed
+        // out (debug-aborts otherwise; in release the hook still gets it, since the
+        // tracker may have overflowed). `release` returns a whole reservation (the
+        // manager's region, on Drop); `committed` is the conservative hint that it
+        // may hold committed pages.
+        let known = self.live.remove(region.base as usize);
+        debug_assert!(
+            known,
+            "§23.3: extent-hook dealloc of a region never handed out (W10)"
+        );
+        let _guard = self.enter_hook()?;
         self.hooks.dealloc(region, true)
     }
 
@@ -335,6 +573,7 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
     ) -> Result<(), BackendError> {
         // Advisory (§23.4): dispatch and record a failure, but do not propagate it
         // as a fault that could roll back the (already-committed) bookkeeping.
+        let _guard = self.enter_hook()?;
         match self.hooks.split(region, size_a, size_b, committed) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -351,6 +590,7 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
         right: Region,
         committed: bool,
     ) -> Result<(), BackendError> {
+        let _guard = self.enter_hook()?;
         match self.hooks.merge(left, right, committed) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -369,6 +609,7 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
 mod tests {
     use super::*;
     use std::alloc::{alloc as host_alloc, dealloc, Layout};
+    use std::cell::Cell;
     use std::sync::atomic::AtomicU32;
     use std::sync::Mutex;
 
@@ -635,6 +876,195 @@ mod tests {
             // The hook was not reached for the rejected ops.
             assert_eq!(p.hooks().commits.load(Ordering::Relaxed), 0);
         }
+        p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[test]
+    fn reserve_release_pairing_does_not_false_alarm() {
+        // §23.3 tracking must accept the normal reserve→release pairing without
+        // tripping the no-overlap or dealloc-pairing checks (runs in both profiles).
+        let p = HookProvider::new(TestHooks::new());
+        for _ in 0..3 {
+            let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+            p.release(ArenaId::DEFAULT, r).expect("release");
+        }
+    }
+
+    /// A backing that returns the **same** range for every `alloc`, so a second
+    /// reservation overlaps the first (a §23.3 no-overlap violation).
+    struct OverlapHooks {
+        block: Mutex<Option<(usize, Layout)>>,
+    }
+    impl OverlapHooks {
+        fn new() -> Self {
+            Self {
+                block: Mutex::new(None),
+            }
+        }
+        fn base(&self, size: usize, align: usize) -> *mut u8 {
+            let mut b = self.block.lock().unwrap();
+            if let Some((base, _)) = *b {
+                return base as *mut u8;
+            }
+            let layout = Layout::from_size_align(size.max(4096) + align, align).unwrap();
+            // SAFETY: nonzero size, valid alignment.
+            let base = unsafe { host_alloc(layout) };
+            assert!(!base.is_null());
+            *b = Some((base as usize, layout));
+            base
+        }
+    }
+    impl Drop for OverlapHooks {
+        fn drop(&mut self) {
+            if let Some((base, layout)) = self.block.get_mut().unwrap().take() {
+                // SAFETY: exactly the block from `host_alloc`.
+                unsafe { dealloc(base as *mut u8, layout) };
+            }
+        }
+    }
+    impl ExtentHooks for OverlapHooks {
+        fn alloc(
+            &self,
+            size: usize,
+            align: usize,
+            _z: &mut bool,
+            _c: &mut bool,
+        ) -> Result<Region, BackendError> {
+            Ok(Region {
+                base: self.base(size, align),
+                len: size,
+            })
+        }
+        fn dealloc(&self, _r: Region, _c: bool) -> Result<(), BackendError> {
+            Ok(()) // the single block is freed on Drop
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn reserve_rejects_an_overlapping_hook_result() {
+        // §23.3 no-overlap (release behaviour): the first reservation is accepted;
+        // the second, overlapping it, is rejected — never handed out (§2.4).
+        let p = HookProvider::new(OverlapHooks::new());
+        let r1 = p
+            .reserve(ArenaId::DEFAULT, 4096, 64)
+            .expect("first reserve");
+        assert!(matches!(
+            p.reserve(ArenaId::DEFAULT, 4096, 64),
+            Err(BackendError::InvalidRequest)
+        ));
+        p.release(ArenaId::DEFAULT, r1).expect("release");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "overlaps a live reservation")]
+    fn reserve_overlap_aborts_in_debug() {
+        let p = HookProvider::new(OverlapHooks::new());
+        let _r1 = p
+            .reserve(ArenaId::DEFAULT, 4096, 64)
+            .expect("first reserve");
+        let _ = p.reserve(ArenaId::DEFAULT, 4096, 64); // overlaps ⇒ debug-abort
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "never handed out")]
+    fn double_release_aborts_in_debug() {
+        // §23.3 dealloc-pairing: a release of a region not currently tracked (here a
+        // double release) is a violation and debug-aborts.
+        let p = HookProvider::new(TestHooks::new());
+        let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+        p.release(ArenaId::DEFAULT, r).expect("first release");
+        let _ = p.release(ArenaId::DEFAULT, r); // untracked ⇒ debug-abort
+    }
+
+    /// A backing whose `split` hook re-enters the provider (calls `commit` on it),
+    /// to exercise the §23.3 reentrancy guard. Holds a self-pointer set after
+    /// construction (single-threaded test use).
+    struct ReentrantHooks {
+        block: Mutex<Option<(usize, Layout)>>,
+        me: Cell<*const HookProvider<ReentrantHooks>>,
+        inner: Cell<Option<Result<(), BackendError>>>,
+    }
+    impl ReentrantHooks {
+        fn new() -> Self {
+            Self {
+                block: Mutex::new(None),
+                me: Cell::new(core::ptr::null()),
+                inner: Cell::new(None),
+            }
+        }
+    }
+    impl Drop for ReentrantHooks {
+        fn drop(&mut self) {
+            if let Some((base, layout)) = self.block.get_mut().unwrap().take() {
+                // SAFETY: exactly the block from `host_alloc`.
+                unsafe { dealloc(base as *mut u8, layout) };
+            }
+        }
+    }
+    impl ExtentHooks for ReentrantHooks {
+        fn alloc(
+            &self,
+            size: usize,
+            align: usize,
+            _z: &mut bool,
+            _c: &mut bool,
+        ) -> Result<Region, BackendError> {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            // SAFETY: nonzero size, valid alignment.
+            let base = unsafe { host_alloc(layout) };
+            assert!(!base.is_null());
+            *self.block.lock().unwrap() = Some((base as usize, layout));
+            Ok(Region { base, len: size })
+        }
+        fn dealloc(&self, _r: Region, _c: bool) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn split(
+            &self,
+            region: Region,
+            _a: usize,
+            _b: usize,
+            _c: bool,
+        ) -> Result<(), BackendError> {
+            // Re-enter the *same* provider from inside a hook (the forbidden pattern).
+            let me = self.me.get();
+            assert!(!me.is_null(), "self-pointer must be set first");
+            // SAFETY: `me` points at the live `HookProvider` for the duration of the
+            // test; `commit` takes `&self`, so the shared re-borrow is sound.
+            let res = unsafe { (*me).commit(region, 0, region.len) };
+            self.inner.set(Some(res));
+            Ok(())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "re-entered TopoMalloc")]
+    fn reentrant_hook_aborts_in_debug() {
+        let p = HookProvider::new(ReentrantHooks::new());
+        p.hooks().me.set(&p as *const _);
+        let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+        // The split hook re-enters `commit`; the guard debug-aborts.
+        let _ = p.split(ArenaId::DEFAULT, r, 2048, 2048, true);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn reentrant_hook_is_refused_in_release() {
+        // §23.3 reentrancy (release behaviour): the inner re-entrant call is refused
+        // with `Unsupported` instead of deadlocking; the advisory split still returns.
+        let p = HookProvider::new(ReentrantHooks::new());
+        p.hooks().me.set(&p as *const _);
+        let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+        let _ = p.split(ArenaId::DEFAULT, r, 2048, 2048, true);
+        assert_eq!(
+            p.hooks().inner.get(),
+            Some(Err(BackendError::Unsupported)),
+            "the re-entrant commit must be refused, not deadlock"
+        );
         p.release(ArenaId::DEFAULT, r).expect("release");
     }
 }

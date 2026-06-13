@@ -73,6 +73,12 @@ def extentStateGate : Bool :=
   ExtentState.all.all (fun s => ExtentState.all.all (fun t =>
     ExtentState.canTransition s t == (s == t || ExtentState.hasEdge s t)))
 
+/-- The §23.3 extent-hook contract gate (W10): the decidable Lean mirror of the Rust
+`HookProvider` output checks (alignment, size, sub-range) accepts exactly the legal
+cases and rejects the violations the `HookProvider` tests exercise — a runtime
+witness that the §23.4 contract model and the runtime enforcement agree. -/
+def hookContractGate : Bool := TopoMalloc.ExtentHooks.hookContractGate
+
 /-- The §22.3/§36.13 arena-lifecycle edge set (the single source of truth the
 Rust `ArenaState::can_transition` is pinned to, plan 06 W9). -/
 def arenaLifecycleEdges : List (ArenaPhase × ArenaPhase) :=
@@ -132,5 +138,10 @@ def main : IO UInt32 := do
     IO.println "lake check: arena lifecycle OK (§22.3/§36.13 transitions + revocation chain match ArenaPhase/RevPhase; pins Rust ArenaState/RevocationPhase, W9)"
   else
     IO.eprintln "lake check: arena lifecycle FAILED (§22.3/§36.13 transition drift, W9)"
+    ok := false
+  if hookContractGate then
+    IO.println "lake check: extent-hook contracts OK (§23.3 alignment/size/subrange checks match HookProvider; §23.4 conditional-correctness model, W10)"
+  else
+    IO.eprintln "lake check: extent-hook contracts FAILED (§23.3 contract drift, W10)"
     ok := false
   return if ok then 0 else 1

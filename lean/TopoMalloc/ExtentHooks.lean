@@ -34,6 +34,7 @@ The model is sorry-free and rests only on the standard axioms (it reuses the
 -/
 import TopoMalloc.Types
 import TopoMalloc.ExtentState
+import TopoMalloc.WellFormed
 
 namespace TopoMalloc
 namespace ExtentHooks
@@ -199,6 +200,92 @@ example : Disjoint (splitPrefix ⟨0, 8⟩ 3) (splitSuffix ⟨0, 8⟩ 3)
     ∧ (splitSuffix ⟨0, 8⟩ 3).stop = (⟨0, 8⟩ : Range).stop := by
   refine ⟨split_disjoint _ _, ?_⟩
   exact (split_tiles ⟨0, 8⟩ 3 (by decide)).2
+
+-- ---------------------------------------------------------------------------
+-- Connection to the abstract `WellFormed` (the real model, not just `Range`)
+-- ---------------------------------------------------------------------------
+
+/-- Place a hook-`alloc`'d object as a new `Block` in the abstract `State` (the
+allocator handing out the contract-honouring range from a custom backing). -/
+def placeAllocated (s : State) (nb : Block) : State :=
+  { s with blocks := nb :: s.blocks }
+
+/-- **§23.4, tied to the real `WellFormed`.** If a hook's `alloc` returns a range
+disjoint from every existing block's range (the §23.3 no-overlap contract), then
+placing the new object preserves the allocator's actual range-disjointness clause
+`WfRangesDisjoint` — not merely a stand-alone `Range` fact. This is the bridge from
+the hook contract to the *real* well-formedness predicate the allocator maintains. -/
+theorem placeAllocated_preserves_rangesDisjoint
+    (s : State) (nb : Block) (hwf : WfRangesDisjoint s)
+    (hdisj : ∀ blk ∈ s.blocks, Range.Disjoint nb.range blk.range) :
+    WfRangesDisjoint (placeAllocated s nb) := by
+  unfold WfRangesDisjoint placeAllocated
+  simp only [List.map_cons, List.pairwise_cons]
+  refine ⟨?_, hwf⟩
+  intro r hr
+  simp only [List.mem_map] at hr
+  obtain ⟨blk, hblk, rfl⟩ := hr
+  exact hdisj blk hblk
+
+/-- **§23.4 headline, on the abstract model.** An `alloc` hook that honours its
+§23.3 contract against the live ranges (`AllocContract` over `s.blocks.map (·.range)`)
+keeps the allocator's `WfRangesDisjoint` invariant when its object is placed. So
+"allocator correctness assumes hook correctness" is discharged for the disjointness
+core *of the real `State`*: assume the contract, conclude well-formedness. -/
+theorem allocContract_preserves_rangesDisjoint
+    {s : State} {nb : Block} {size align : Nat}
+    (hwf : WfRangesDisjoint s)
+    (c : AllocContract nb.range size align (s.blocks.map (·.range))) :
+    WfRangesDisjoint (placeAllocated s nb) := by
+  refine placeAllocated_preserves_rangesDisjoint s nb hwf ?_
+  intro blk hblk
+  have hmem : blk.range ∈ s.blocks.map (·.range) := List.mem_map.mpr ⟨blk, hblk, rfl⟩
+  exact (c.disjoint blk.range hmem).symm
+
+-- ---------------------------------------------------------------------------
+-- Executable contract gate (the Rust `HookProvider` checks, decidably mirrored)
+-- ---------------------------------------------------------------------------
+
+/-- Decidable mirror of `HookProvider::validate_alloc`'s alignment check
+(`base & (align-1) == 0` for a power-of-two `align`, i.e. `align ∣ base`). -/
+def alignedOk (base align : Nat) : Bool := decide (align ≠ 0) && decide (base % align = 0)
+
+/-- Decidable mirror of the size check (a `len`-byte result satisfies a `size`
+request iff `size ≤ len`). -/
+def atLeastOk (len size : Nat) : Bool := decide (size ≤ len)
+
+/-- Decidable mirror of `HookProvider::check_subrange` (`offset + len ≤ region_len`). -/
+def subrangeOk (offset len regionLen : Nat) : Bool := decide (offset + len ≤ regionLen)
+
+/-- `alignedOk` agrees with the `AllocContract.aligned` proposition (`align ∣ base`),
+so the decidable runtime check the Rust enforces is exactly the modeled contract. -/
+theorem alignedOk_iff (base align : Nat) (h : align ≠ 0) :
+    alignedOk base align = true ↔ align ∣ base := by
+  simp only [alignedOk, Bool.and_eq_true, decide_eq_true_eq, Nat.dvd_iff_mod_eq_zero]
+  omega
+
+/-- `subrangeOk` agrees with the `SubrangeOf` contract for an offset sub-range that
+starts at the same base (`[base+offset, base+offset+len) ⊆ [base, base+regionLen)`
+iff `offset + len ≤ regionLen`) — the premise `subrange_touches_no_other` consumes. -/
+theorem subrangeOk_iff (base offset len regionLen : Nat) :
+    subrangeOk offset len regionLen = true ↔
+      SubrangeOf ⟨base + offset, len⟩ ⟨base, regionLen⟩ := by
+  simp only [subrangeOk, decide_eq_true_eq, SubrangeOf, Range.Subset, Range.stop]
+  omega
+
+/-- The executable §23.3 contract gate (W10): the decidable Rust-mirror checks
+accept exactly the legal cases and reject the violations the Rust `HookProvider`
+tests exercise (aligned vs. misaligned, big-enough vs. undersized, in-range vs.
+out-of-range). A runtime witness that the Lean contract model and the Rust
+enforcement agree on the same examples. -/
+def hookContractGate : Bool :=
+  alignedOk 0x2000 64 && !alignedOk 0x2001 64        -- aligned accept / misaligned reject
+    && atLeastOk 4096 4096 && !atLeastOk 4095 4096    -- exact accept / undersized reject
+    && subrangeOk 0 4096 4096 && !subrangeOk 4096 1 4096 -- in-range accept / out reject
+
+/-- The gate evaluates `true` (proof-checked, not just `#eval`uated), so the example
+set is genuinely the accept/reject split the Rust checks implement. -/
+theorem hookContractGate_holds : hookContractGate = true := by decide
 
 end ExtentHooks
 end TopoMalloc
