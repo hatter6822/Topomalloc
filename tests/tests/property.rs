@@ -399,9 +399,12 @@ proptest! {
 
         let result = t.delegate(parent, &del);
         // `inheriting` copies the parent's label, so label monotonicity always
-        // holds here; the decisive conditions are authority and quota.
-        let should_succeed =
-            crights.attenuates(prights) && child_quota <= pstats.remaining_quota();
+        // holds here; the decisive conditions are a positive quota (a zero quota
+        // is an invalid policy, §22.4), attenuating authority, and a quota within
+        // the parent's remaining budget.
+        let should_succeed = child_quota >= 1
+            && crights.attenuates(prights)
+            && child_quota <= pstats.remaining_quota();
         prop_assert_eq!(result.is_ok(), should_succeed);
 
         if let Ok(child) = result {
@@ -411,6 +414,65 @@ proptest! {
             prop_assert_eq!(cs.label, pstats.label, "delegation downgraded the label");
             prop_assert_eq!(cs.parent, Some(parent));
         }
+    }
+}
+
+proptest! {
+    /// **Tree-wide quota monotonicity (§36.4, PR #13).** Delegation reserves each
+    /// child's quota on its parent, so the *whole subtree's* own-live bytes never
+    /// exceed the parent's quota — however the budget is split across children and
+    /// whatever each child (or the parent) then allocates. This is the runtime
+    /// mirror of the Lean bridge's `subtree_used_le_quota` theorem; without the
+    /// reservation a parent and child could each allocate the full quota (the
+    /// PR #13 P1).
+    #[test]
+    fn delegated_subtree_never_exceeds_parent_quota(
+        parent_quota in 1u64..10_000,
+        parent_charge in 0u64..10_000,
+        child_quotas in prop::collection::vec(0u64..4_000, 0..8),
+        child_charges in prop::collection::vec(0u64..4_000, 0..8),
+    ) {
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(parent_quota)).unwrap();
+        let mut children = Vec::new();
+        for &q in &child_quotas {
+            let pstats = t.stats(parent).unwrap();
+            let before = pstats.remaining_quota();
+            match t.delegate(parent, &Delegation::inheriting(&pstats, q, "c")) {
+                Ok(child) => {
+                    // A successful delegation reserves exactly `q`: the parent's
+                    // remaining budget drops by the child's quota, no more.
+                    prop_assert_eq!(t.stats(parent).unwrap().remaining_quota(), before - q);
+                    children.push(child);
+                }
+                // A delegation fails only for a zero quota (an arena that can
+                // never allocate is an invalid policy, §22.4) or a quota exceeding
+                // the parent's (reservation-aware) remaining budget — never within
+                // budget for a valid quota.
+                Err(_) => prop_assert!(
+                    q == 0 || q > before,
+                    "a valid delegation within budget must succeed"
+                ),
+            }
+        }
+        // Charge the parent and each child arbitrarily; over-budget charges simply
+        // fail and change nothing.
+        let _ = t.try_charge(parent, parent_charge);
+        for (child, &c) in children.iter().zip(child_charges.iter()) {
+            let _ = t.try_charge(*child, c);
+        }
+        // The guarantee: Σ over the subtree of own-live bytes ≤ the parent's quota.
+        let subtree_used: u64 = core::iter::once(parent)
+            .chain(children.iter().copied())
+            .map(|id| t.stats(id).unwrap().used)
+            .sum();
+        prop_assert!(
+            subtree_used <= parent_quota,
+            "subtree used {} exceeded parent quota {}",
+            subtree_used,
+            parent_quota
+        );
+        prop_assert!(t.check_invariants());
     }
 }
 

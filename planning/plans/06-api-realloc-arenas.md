@@ -132,9 +132,10 @@ M4, W10, plan 09.
 > and the arena summary reconciles into `topo-stats`/`topo-control`. Verified by per-crate unit tests,
 > multi-arena allocator tests (isolation, reset, destroy, quota, realloc-preserves-arena, the
 > §8.6/§36.17 `Σ used == live_bytes` reconciliation), arena property tests (delegation attenuation,
-> quota bound, reset accounting), the dual-backend G-sim arena slice, the C/C++ ABI harness arena
-> lifecycle, and the Lean lifecycle state machine (`lean/TopoMalloc/ArenaLifecycle.lean`, proof-checked)
-> plus the bridge's `DelegatesFrom`/`ArenaQuotaExact`/`destroy_revokes_descendants`. The seLe4n-specific
+> quota bound, reset accounting, the delegated-subtree quota bound), the dual-backend G-sim arena
+> slice, the C/C++ ABI harness arena lifecycle, and the Lean lifecycle state machine
+> (`lean/TopoMalloc/ArenaLifecycle.lean`, proof-checked) plus the bridge's
+> `DelegatesFrom`/`subtree_used_le_quota`/`ArenaQuotaExact`/`destroy_revokes_descendants`. The seLe4n-specific
 > revocation steps (real unmap → cap revoke → untyped recycle) are the POSIX collapse here; plan 09
 > overrides them against the capability provider with **no change above the seam**.
 >
@@ -153,9 +154,11 @@ M4, W10, plan 09.
 > **`arena_api` fuzz target**; and a **Miri**-clean pass over the new arena unsafe. Deliberate boundaries
 > (documented, not avoided): the `hooks` descriptor field is W10; cross-label **scrub recording** is
 > plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena **stats rendering** is W17
-> (M6); label *restriction* (vs. the sound equality) and quota *budget-partition* (vs. the ceiling) are
-> §36.12/§36.4 model refinements that would re-open the proven Lean `DelegatesFrom`, deferred to M7; the
-> full combined phase×`State` refinement is M7 formal hardening.
+> (M6); label *restriction* (vs. the sound equality) is a §36.12 model refinement that would re-open the
+> proven Lean `DelegatesFrom`, deferred to M7; the full combined phase×`State` refinement is M7 formal
+> hardening. Quota *budget-partition* (vs. the ceiling) was **pulled forward** from M7 (PR #13 review): a
+> delegation now **reserves** the child's quota on the parent so the whole subtree's live bytes stay
+> within the root's quota, proven by the Lean bridge's `subtree_used_le_quota`.
 
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|
@@ -166,7 +169,7 @@ M4, W10, plan 09.
 | W9-4b | Cache drain/invalidate of *every* per-CPU/thread/transfer cache holding the arena's objects (uses W6 routing). | M | | post-drain: no cache holds an arena object (B.5). | **DONE** — `drain_arena` force-retires the arena's spans (the only holder at M1; the front-end-cache drain hook extends here at M2) |
 | W9-4c | Return arena extents to backend/retain per policy; reset accounting; bump reset generation. | M | ∥ | §22.5 postconditions met. | **DONE** — spans' + larges' extents returned; `used` zeroed; generation bumped; `Σ used == live_bytes` reconciled |
 | W9-4d | Destroy = reset + metadata removal + id non-reuse-while-stale (§22.6); isolation preserved (§22.7); mirrors plan 02 W1-9. | M | | `arena_destroy` tests; isolation invariant. | **DONE** — `arena_destroy` retires the id behind a generation bump; isolation tested (other arenas untouched) |
-| W9-5 | **Capability monotonicity** (§36.4): authority/quota/label monotonic on delegation; attenuation-only. | M | | delegation cannot widen rights/quota or downgrade label (§36.16). | **DONE** — `delegate` enforces `CapRights::attenuates` + quota ≤ remaining + label equality; property-tested; mirrors Lean `DelegatesFrom` |
+| W9-5 | **Capability monotonicity** (§36.4): authority/quota/label monotonic on delegation; attenuation-only. | M | | delegation cannot widen rights/quota or downgrade label (§36.16). | **DONE** — `delegate` enforces `CapRights::attenuates` + quota ≤ remaining + label equality; **reserves** the child's quota on the parent (budget-partition) so the whole subtree's live bytes stay ≤ the root quota (Lean `subtree_used_le_quota`); property-tested; mirrors Lean `DelegatesFrom` |
 | W9-6a | Revocation: enter DRAINING — reject new allocations + delegations; notify clients (§36.13). | M | | no new alloc/delegation while draining. | **DONE** — `begin_destroy` enters `Draining`; the gate refuses allocations and `delegate` refuses a draining parent |
 | W9-6b | Revocation: drain local/transfer caches + central lists; quarantine or reject stale frees. | M | | post-drain inventory empty (shares W9-4b). | **DONE** — shares `drain_arena`; post-drain the arena holds no spans/larges |
 | W9-6c | Revocation: unmap client VSpace windows; scrub dirty pages if cross-label reuse is possible (uses plan 08 W18-6). | M | ∥ | unmapped before revoke; scrub recorded. | **DONE** — the drain calls `free_revoking` (provider `revoke_descendants` then recycle); the `RevocationPhase` chain pins unmap-before-revoke; POSIX decommit discards pages (single-label, so no cross-label scrub) — explicit cross-label scrub recording is plan 08 W18-6 |

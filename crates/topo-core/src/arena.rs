@@ -669,9 +669,17 @@ pub struct ArenaStats {
     pub label: Label,
     /// The quota ceiling in bytes ([`QUOTA_UNLIMITED`] for none).
     pub quota_limit: u64,
-    /// Bytes currently charged to the arena (live usable bytes — the §36.17
-    /// `used` counter).
+    /// Bytes currently charged to the arena (own live usable bytes — the §36.17
+    /// `used` counter). Excludes quota reserved for delegated children (see
+    /// [`reserved`](Self::reserved)), so `Σ arena.used == live_bytes` reconciles
+    /// (§8.6/§36.17).
     pub used: u64,
+    /// Quota reserved for this arena's live delegated children — the sum of each
+    /// child's `quota_limit` (§36.4 budget partition). `used + reserved` is the
+    /// arena's committed total against `quota_limit`; `remaining_quota` is what is
+    /// left for further own allocations *or* delegations. Zero for an arena with
+    /// no live children, so reservation is invisible to the common case.
+    pub reserved: u64,
     /// The **incarnation** generation (§36.13): bumped on create and destroy, so
     /// a handle/reference to a *destroyed-then-recreated* id is detectably stale.
     /// Survives a reset (the arena persists), which is what lets an arena handle
@@ -698,14 +706,20 @@ pub struct ArenaStats {
 }
 
 impl ArenaStats {
-    /// Remaining quota (`quota_limit - used`, saturating). [`QUOTA_UNLIMITED`]
-    /// stays unlimited. This is the budget a delegation may draw against (§36.4
-    /// quota monotonicity).
+    /// Remaining quota: `quota_limit − used − reserved`, saturating.
+    /// [`QUOTA_UNLIMITED`] stays unlimited. This is the budget left for either a
+    /// further own allocation **or** a new delegation — it excludes quota already
+    /// reserved for live children, so a parent can never delegate (or allocate)
+    /// more than it holds (§36.4 quota monotonicity / budget partition). A
+    /// delegation reserving `r` reduces `remaining_quota` by `r` until the child
+    /// is destroyed.
     pub const fn remaining_quota(&self) -> u64 {
         if self.quota_limit == QUOTA_UNLIMITED {
             QUOTA_UNLIMITED
         } else {
-            self.quota_limit.saturating_sub(self.used)
+            self.quota_limit
+                .saturating_sub(self.used)
+                .saturating_sub(self.reserved)
         }
     }
 }
@@ -726,8 +740,21 @@ struct ArenaAtomics {
     generation: AtomicU32,
     /// Reset generation (§22.5): bumped on reset, independent of incarnation.
     reset_gen: AtomicU32,
-    /// Bytes currently charged (the §36.17 `used` counter).
-    used: AtomicU64,
+    /// Bytes **committed** against the quota: own live bytes **plus** the quota
+    /// reserved for live delegated children (§36.4 budget partition). This is the
+    /// single counter the allocation gate compare-exchanges against
+    /// [`quota_limit`](Self::quota_limit), so reserving a child's quota and
+    /// charging an own allocation contend on the *same* atomic — the only way two
+    /// lock-free writers can keep `committed ≤ quota_limit` race-free. The §36.17
+    /// own-live `used` a caller sees ([`ArenaStats::used`]) is `committed −
+    /// reserved`; reservations are budget holds, not live bytes.
+    committed: AtomicU64,
+    /// Quota currently **reserved** for live delegated children — the sum of each
+    /// live child's `quota_limit` (§36.4). A subset of [`committed`](Self::committed);
+    /// mutated only under the table lock (delegate adds, a child's destroy returns
+    /// it to this parent). Tracked so `used = committed − reserved` reconciles
+    /// (§8.6) and so `remaining_quota` excludes already-delegated budget.
+    reserved: AtomicU64,
     /// Quota ceiling ([`QUOTA_UNLIMITED`] for ambient).
     quota_limit: AtomicU64,
     /// NUMA binding-failure counter (§15.5 stats visibility).
@@ -736,14 +763,16 @@ struct ArenaAtomics {
 
 impl ArenaAtomics {
     /// An unused slot: `Destroyed` (not allocatable), generation `0`
-    /// (never-used sentinel), no rights, zero used, unlimited ceiling.
+    /// (never-used sentinel), no rights, nothing committed or reserved, unlimited
+    /// ceiling.
     const fn empty() -> ArenaAtomics {
         ArenaAtomics {
             state: AtomicU8::new(ArenaState::Destroyed as u8),
             rights: AtomicU8::new(0),
             generation: AtomicU32::new(0),
             reset_gen: AtomicU32::new(0),
-            used: AtomicU64::new(0),
+            committed: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             quota_limit: AtomicU64::new(QUOTA_UNLIMITED),
             numa_bind_failures: AtomicU64::new(0),
         }
@@ -760,6 +789,12 @@ struct ArenaMeta {
     cache_budget_bytes: u64,
     /// Delegating parent as `id + 1` (`0` ⇒ no parent / root arena).
     parent_plus1: u32,
+    /// The parent's **incarnation generation** at delegation time (§36.13). On
+    /// this arena's destroy, its reserved quota is returned to the parent only if
+    /// the parent slot still holds that same incarnation — so a parent that was
+    /// destroyed (and perhaps recreated at the same id) is never miscredited the
+    /// budget of a child it never delegated. Meaningless when `parent_plus1 == 0`.
+    parent_generation: u32,
     name: [u8; ARENA_NAME_LEN],
 }
 
@@ -772,6 +807,7 @@ impl ArenaMeta {
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
             parent_plus1: 0,
+            parent_generation: 0,
             name: [0u8; ARENA_NAME_LEN],
         }
     }
@@ -856,6 +892,7 @@ impl ArenaTable {
                 huge: p.huge,
                 cache_budget_bytes: p.cache_budget_bytes,
                 parent_plus1: 0,
+                parent_generation: 0,
                 name: p.name,
             };
         }
@@ -910,7 +947,7 @@ impl ArenaTable {
     pub fn create(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
         policy.validate()?;
         self.lock.acquire();
-        let result = self.create_locked(policy, 0);
+        let result = self.create_locked(policy, 0, 0);
         self.lock.release();
         result
     }
@@ -935,11 +972,15 @@ impl ArenaTable {
         result
     }
 
-    /// `create`, with the table lock held. `parent_plus1 == 0` ⇒ a root arena.
+    /// `create`, with the table lock held. `parent_plus1 == 0` ⇒ a root arena;
+    /// otherwise `parent_generation` is the parent's incarnation at delegation,
+    /// recorded so the child's destroy returns its reserved quota only to that
+    /// exact incarnation (§36.13).
     fn create_locked(
         &self,
         policy: &ArenaPolicy,
         parent_plus1: u32,
+        parent_generation: u32,
     ) -> Result<ArenaId, ArenaError> {
         let id = self.claim_slot_locked()?;
         let a = &self.atomics[id as usize];
@@ -951,7 +992,9 @@ impl ArenaTable {
         a.reset_gen
             .store(Generation::FIRST.next().0, Ordering::Relaxed);
         a.rights.store(policy.rights.bits(), Ordering::Relaxed);
-        a.used.store(0, Ordering::Relaxed);
+        // A fresh incarnation commits and reserves nothing.
+        a.committed.store(0, Ordering::Relaxed);
+        a.reserved.store(0, Ordering::Relaxed);
         a.quota_limit.store(policy.quota_limit, Ordering::Relaxed);
         a.numa_bind_failures.store(0, Ordering::Relaxed);
         // Initializing: descriptive fields written before the id is published.
@@ -967,6 +1010,7 @@ impl ArenaTable {
                 huge: policy.huge,
                 cache_budget_bytes: policy.cache_budget_bytes,
                 parent_plus1,
+                parent_generation,
                 name: policy.name,
             };
         }
@@ -1010,7 +1054,30 @@ impl ArenaTable {
             name: del.name,
         };
         policy.validate()?;
-        self.create_locked(&policy, parent.0 + 1)
+        // §36.4 budget partition: reserve the child's quota on the parent, so the
+        // parent's own allocations *and* any further delegations cannot, together
+        // with this child, exceed the parent's quota — the runtime image of the
+        // tree-wide bound proved in the Lean bridge (`subtree_used_le_quota`).
+        // Reservation bites only a *finite* parent: an unlimited parent has no
+        // budget to partition, and a finite parent cannot delegate an unlimited
+        // child (the remaining-quota check above rejects that), so the reserved
+        // amount is always finite here. The reserve runs through the same gated
+        // CAS the hot path uses, so a concurrent own allocation that consumed the
+        // budget after the snapshot check is caught — never silently overrun.
+        let parent_finite = pstats.quota_limit != QUOTA_UNLIMITED;
+        if parent_finite {
+            self.reserve_child_quota_locked(parent, del.quota_limit)?;
+        }
+        match self.create_locked(&policy, parent.0 + 1, pstats.generation.0) {
+            Ok(child) => Ok(child),
+            Err(e) => {
+                // A failed create must leak no reservation: give the budget back.
+                if parent_finite {
+                    self.release_child_quota_locked(parent, del.quota_limit);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Claim a free slot id (lock held). Prefers a never-used high-water slot;
@@ -1072,7 +1139,12 @@ impl ArenaTable {
         if !cur.can_transition(ArenaState::Active) {
             return Err(ArenaError::IllegalTransition);
         }
-        a.used.store(0, Ordering::Relaxed);
+        // Reset discards this arena's *own* objects (own-live → 0) but the arena
+        // and any delegated children persist, so its reserved child-quota stays:
+        // committed drops to exactly `reserved`. Quiescence + the `Resetting` state
+        // block `try_charge`, so committed is stable under this store.
+        a.committed
+            .store(a.reserved.load(Ordering::Relaxed), Ordering::Relaxed);
         let reset_gen = Generation(a.reset_gen.load(Ordering::Relaxed)).next();
         a.reset_gen.store(reset_gen.0, Ordering::Relaxed);
         a.state.store(ArenaState::Active as u8, Ordering::Release);
@@ -1112,7 +1184,13 @@ impl ArenaTable {
         if !cur.can_transition(ArenaState::Destroyed) {
             return Err(ArenaError::IllegalTransition);
         }
-        a.used.store(0, Ordering::Relaxed);
+        // Return this arena's reserved quota to its delegating parent before its
+        // own accounting is cleared (§36.4), so destroying a child frees the
+        // parent's budget for reuse. Generation-checked, so a parent that was
+        // itself destroyed/recycled is never miscredited.
+        self.return_reservation_to_parent_locked(arena);
+        a.committed.store(0, Ordering::Relaxed);
+        a.reserved.store(0, Ordering::Relaxed);
         a.rights.store(0, Ordering::Relaxed);
         let gen = Generation(a.generation.load(Ordering::Relaxed)).next();
         a.generation.store(gen.0, Ordering::Relaxed);
@@ -1140,7 +1218,13 @@ impl ArenaTable {
             if !cur.can_transition(ArenaState::ErrorQuarantined) {
                 return Err(ArenaError::IllegalTransition);
             }
-            a.used.store(0, Ordering::Relaxed);
+            // The drain retired every object (own-live → 0), but a quarantine is
+            // not a destroy: the arena persists pending operator recovery, so its
+            // reserved child-quota is kept and committed drops to exactly
+            // `reserved` (own-live zero — the terminal-state invariant in
+            // `check_invariants`).
+            a.committed
+                .store(a.reserved.load(Ordering::Relaxed), Ordering::Relaxed);
             a.state
                 .store(ArenaState::ErrorQuarantined as u8, Ordering::Release);
             Ok(())
@@ -1170,9 +1254,12 @@ impl ArenaTable {
     /// Charge `size` bytes against `arena`'s quota (§36.4 / §36.17), the
     /// allocation gate. Rejects when the arena is not `Active`
     /// ([`ArenaError::NotActive`]), lacks the [`CapRights::ALLOC`] right
-    /// ([`ArenaError::AuthorityDenied`]), or the charge would exceed the quota or
+    /// ([`ArenaError::AuthorityDenied`]), or the charge would push the
+    /// **committed** total (own bytes + reserved child quota) past the quota or
     /// overflow ([`ArenaError::QuotaExceeded`]). Lock-free: a state/rights load
-    /// plus a compare-exchange on `used`.
+    /// plus a compare-exchange on `committed` — the same atomic a delegation's
+    /// reservation contends on, so own bytes and reserved budget can never jointly
+    /// exceed the ceiling even under concurrency.
     ///
     /// SPEC-transition: arena quota charge (§36.4/§36.17)
     pub fn try_charge(&self, arena: ArenaId, size: u64) -> Result<(), ArenaError> {
@@ -1185,14 +1272,14 @@ impl ArenaTable {
             return Err(ArenaError::AuthorityDenied);
         }
         let limit = a.quota_limit.load(Ordering::Relaxed);
-        let mut cur = a.used.load(Ordering::Acquire);
+        let mut cur = a.committed.load(Ordering::Acquire);
         loop {
             let next = cur.checked_add(size).ok_or(ArenaError::QuotaExceeded)?;
             if next > limit {
                 return Err(ArenaError::QuotaExceeded);
             }
             match a
-                .used
+                .committed
                 .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => return Ok(()),
@@ -1201,28 +1288,134 @@ impl ArenaTable {
         }
     }
 
-    /// Credit `size` bytes back to `arena`'s quota on free (§36.17), saturating
-    /// at zero so a stale/double free can never underflow the counter. A no-op
-    /// for an unregistered id (the free path tolerates a torn arena read). Does
-    /// **not** require the arena be `Active`: bytes are credited as objects are
-    /// reclaimed during draining too.
+    /// Credit `size` bytes of **own** live storage back to `arena` on free
+    /// (§36.17): lowers `committed` (own bytes + reserved), saturating at zero so
+    /// a stale/double free can never underflow the counter, and never touching the
+    /// reserved portion (a child's quota is returned only by the child's destroy,
+    /// not by freeing the parent's own objects). A no-op for an unregistered id
+    /// (the free path tolerates a torn arena read). Does **not** require the arena
+    /// be `Active`: bytes are credited as objects are reclaimed during draining too.
     ///
     /// SPEC-transition: arena quota credit (§36.17)
     pub fn credit(&self, arena: ArenaId, size: u64) {
         let Some(a) = self.slot(arena) else {
             return;
         };
-        let mut cur = a.used.load(Ordering::Acquire);
+        let mut cur = a.committed.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_sub(size);
             match a
-                .used
+                .committed
                 .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => return,
                 Err(observed) => cur = observed,
             }
         }
+    }
+
+    /// Reserve `amount` of `parent`'s quota for a child being delegated (§36.4
+    /// budget partition). Called only under the table lock, but contends on
+    /// `committed` through the **same** gated compare-exchange the lock-free
+    /// [`try_charge`](Self::try_charge) uses, so the reservation and any racing own
+    /// allocation jointly respect `committed ≤ quota_limit`. Returns
+    /// [`ArenaError::Attenuation`] if the parent's budget cannot absorb the
+    /// reservation (a concurrent allocation consumed it after the caller's
+    /// snapshot check) — the same monotonicity failure the snapshot check reports.
+    fn reserve_child_quota_locked(&self, parent: ArenaId, amount: u64) -> Result<(), ArenaError> {
+        let a = self.slot(parent).ok_or(ArenaError::NotFound)?;
+        let limit = a.quota_limit.load(Ordering::Relaxed);
+        let mut cur = a.committed.load(Ordering::Acquire);
+        loop {
+            let next = cur.checked_add(amount).ok_or(ArenaError::Attenuation)?;
+            if next > limit {
+                return Err(ArenaError::Attenuation);
+            }
+            match a
+                .committed
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    // `reserved` is only ever mutated under the table lock (here
+                    // and in the release below), so a plain add is race-free.
+                    a.reserved.fetch_add(amount, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Return `amount` of reserved quota to `parent` (§36.4): a child's destroy
+    /// gives its reservation back, or a failed delegation rolls its reservation
+    /// back. Lowers both `committed` and `reserved`, saturating at zero so a torn
+    /// read can never underflow. `committed` uses the gated compare-exchange
+    /// (`try_charge` may be racing on the parent); `reserved` is lock-held.
+    fn release_child_quota_locked(&self, parent: ArenaId, amount: u64) {
+        let Some(a) = self.slot(parent) else {
+            return;
+        };
+        let mut cur = a.committed.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(amount);
+            match a
+                .committed
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        let mut r = a.reserved.load(Ordering::Relaxed);
+        loop {
+            let next = r.saturating_sub(amount);
+            match a
+                .reserved
+                .compare_exchange_weak(r, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(observed) => r = observed,
+            }
+        }
+    }
+
+    /// Give a destroyed child's reserved quota back to its parent (§36.4). The
+    /// amount is the child's own `quota_limit` — exactly what [`delegate`] reserved
+    /// on the parent. A no-op for a root arena (no parent), for an unlimited parent
+    /// (which reserved nothing), or for a parent that has since been
+    /// destroyed/recycled: the generation check ensures only the *exact*
+    /// incarnation that granted the delegation is credited, so a recycled slot's
+    /// new occupant is never handed budget it never lent. Called under the table
+    /// lock from [`finish_destroy_locked`](Self::finish_destroy_locked).
+    fn return_reservation_to_parent_locked(&self, child: ArenaId) {
+        // SAFETY: the table lock is held by every caller (finish_destroy).
+        let m = unsafe { (*self.meta.get())[child.0 as usize] };
+        if m.parent_plus1 == 0 {
+            return; // root arena: nothing was reserved on a parent
+        }
+        let parent = ArenaId(m.parent_plus1 - 1);
+        let Some(pa) = self.slot(parent) else {
+            return;
+        };
+        // An unlimited parent partitions no budget, so it reserved nothing.
+        if pa.quota_limit.load(Ordering::Relaxed) == QUOTA_UNLIMITED {
+            return;
+        }
+        // Credit only the exact incarnation that delegated this child; a
+        // destroyed/recreated parent (generation bumped) is already gone.
+        if pa.generation.load(Ordering::Relaxed) != m.parent_generation {
+            return;
+        }
+        let Some(ca) = self.slot(child) else {
+            return;
+        };
+        let amount = ca.quota_limit.load(Ordering::Relaxed);
+        // A finite parent never had an unlimited child reserved (delegation
+        // rejects that); guard anyway so an impossible torn read can't mis-return.
+        if amount == QUOTA_UNLIMITED {
+            return;
+        }
+        self.release_child_quota_locked(parent, amount);
     }
 
     /// Record a NUMA binding failure for `arena` (§15.5 "NUMA binding failures
@@ -1255,7 +1448,14 @@ impl ArenaTable {
             rights: CapRights(a.rights.load(Ordering::Relaxed)),
             label: m.label,
             quota_limit: a.quota_limit.load(Ordering::Relaxed),
-            used: a.used.load(Ordering::Relaxed),
+            // The §36.17 own-live counter is committed minus reserved
+            // child-quota; reservations are budget holds, not live bytes, so
+            // `Σ used == live_bytes` still reconciles (§8.6).
+            used: a
+                .committed
+                .load(Ordering::Relaxed)
+                .saturating_sub(a.reserved.load(Ordering::Relaxed)),
+            reserved: a.reserved.load(Ordering::Relaxed),
             generation: Generation(a.generation.load(Ordering::Relaxed)),
             reset_generation: Generation(a.reset_gen.load(Ordering::Relaxed)),
             numa: m.numa,
@@ -1386,12 +1586,20 @@ impl ArenaTable {
         for i in 0..hw {
             let a = &self.atomics[i];
             let st = ArenaState::from_u8(a.state.load(Ordering::Acquire));
-            let used = a.used.load(Ordering::Relaxed);
+            let committed = a.committed.load(Ordering::Relaxed);
+            let reserved = a.reserved.load(Ordering::Relaxed);
             let limit = a.quota_limit.load(Ordering::Relaxed);
-            if used > limit {
+            // The gate invariant: committed (own bytes + reserved child quota)
+            // never exceeds the quota (§36.4). Every committing op checks this
+            // before its compare-exchange, so it holds even mid-update.
+            if committed > limit {
                 return false;
             }
-            if st.is_terminal() && used != 0 {
+            // A terminal arena holds zero *own* live bytes (own = committed −
+            // reserved): the drain retired every object before reaching
+            // Destroyed/ErrorQuarantined. A quarantined arena's reservations
+            // persist (it is not destroyed), so we check own-live, not committed.
+            if st.is_terminal() && committed.saturating_sub(reserved) != 0 {
                 return false;
             }
         }
@@ -1623,6 +1831,116 @@ mod tests {
             t.delegate(parent, &Delegation::inheriting(&pstats, 301, "no")),
             Err(ArenaError::Attenuation)
         );
+    }
+
+    #[test]
+    fn delegation_reserves_parent_quota_so_the_subtree_cannot_over_commit() {
+        // The PR #13 P1: without reservation a finite parent and its child could
+        // *each* allocate the full quota (Σ descendants > parent). Delegation now
+        // reserves the child's quota on the parent (§36.4 budget partition), so
+        // the parent's own budget shrinks and the whole subtree's live bytes stay
+        // within the parent's quota — the runtime image of the Lean
+        // `subtree_used_le_quota` theorem.
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
+
+        let pstats = t.stats(parent).unwrap();
+        let child = t
+            .delegate(parent, &Delegation::inheriting(&pstats, 100, "c"))
+            .unwrap();
+        let ps = t.stats(parent).unwrap();
+        assert_eq!(
+            ps.reserved, 100,
+            "the child's quota is reserved on the parent"
+        );
+        assert_eq!(ps.used, 0, "a reservation is not own-live bytes (§8.6)");
+        assert_eq!(
+            ps.remaining_quota(),
+            0,
+            "no budget left to allocate or delegate"
+        );
+
+        // The parent can no longer allocate a single byte: its budget is fully
+        // delegated. (Before the fix it could still allocate the whole 100, so the
+        // subtree would hold 200 against a 100 quota.)
+        assert_eq!(t.try_charge(parent, 1), Err(ArenaError::QuotaExceeded));
+        // The child may allocate up to *its* quota, and no further.
+        t.try_charge(child, 100).unwrap();
+        assert_eq!(t.try_charge(child, 1), Err(ArenaError::QuotaExceeded));
+        // Σ subtree own-live (parent 0 + child 100) == 100 == parent quota.
+        assert_eq!(
+            t.stats(parent).unwrap().used + t.stats(child).unwrap().used,
+            100,
+            "the tree-wide bound holds: Σ own-live ≤ root quota"
+        );
+        assert!(t.check_invariants());
+
+        // Destroying the child returns its reservation; the parent can allocate
+        // its full quota again.
+        t.begin_destroy(child).unwrap();
+        t.finish_destroy(child).unwrap();
+        let ps = t.stats(parent).unwrap();
+        assert_eq!(ps.reserved, 0, "destroy returns the child's reservation");
+        assert_eq!(ps.remaining_quota(), 100, "the parent's budget is restored");
+        t.try_charge(parent, 100).unwrap();
+        assert!(t.check_invariants());
+    }
+
+    #[test]
+    fn delegation_reservation_partitions_budget_across_siblings() {
+        // Sibling children cannot together reserve more than the parent's quota —
+        // the partition is shared, not per-child (§36.4).
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
+        let p0 = t.stats(parent).unwrap();
+        let a = t
+            .delegate(parent, &Delegation::inheriting(&p0, 60, "a"))
+            .unwrap();
+        let p1 = t.stats(parent).unwrap();
+        assert_eq!(p1.remaining_quota(), 40, "60 reserved, 40 remains");
+        // A 50-byte sibling no longer fits the remaining 40...
+        assert_eq!(
+            t.delegate(parent, &Delegation::inheriting(&p1, 50, "b50")),
+            Err(ArenaError::Attenuation)
+        );
+        // ...but a 40-byte sibling exactly fills it.
+        let b = t
+            .delegate(parent, &Delegation::inheriting(&p1, 40, "b"))
+            .unwrap();
+        assert_eq!(t.stats(parent).unwrap().remaining_quota(), 0);
+        // Each child uses its own quota; the parent's own budget is exhausted.
+        t.try_charge(a, 60).unwrap();
+        t.try_charge(b, 40).unwrap();
+        assert_eq!(t.try_charge(parent, 1), Err(ArenaError::QuotaExceeded));
+        let sum =
+            t.stats(parent).unwrap().used + t.stats(a).unwrap().used + t.stats(b).unwrap().used;
+        assert_eq!(sum, 100, "Σ subtree own-live == parent quota");
+        assert!(t.check_invariants());
+    }
+
+    #[test]
+    fn destroying_a_parent_before_its_child_keeps_accounting_sound() {
+        // The reservation is returned only to the parent incarnation that granted
+        // it (generation-checked, §36.13). Destroying the parent first bumps its
+        // generation, so the orphaned child's later destroy finds a mismatch and
+        // safely *skips* the return — no underflow, the table stays well-formed.
+        // (The orphaned child is a lifecycle the caller owns; this asserts only
+        // that the quota accounting cannot be corrupted by it.)
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
+        let p0 = t.stats(parent).unwrap();
+        let child = t
+            .delegate(parent, &Delegation::inheriting(&p0, 40, "c"))
+            .unwrap();
+        assert_eq!(t.stats(parent).unwrap().reserved, 40);
+
+        t.begin_destroy(parent).unwrap();
+        t.finish_destroy(parent).unwrap();
+        // The parent incarnation is gone (generation bumped); destroying the child
+        // must not panic, underflow, or break the invariants.
+        t.begin_destroy(child).unwrap();
+        t.finish_destroy(child).unwrap();
+        assert!(t.check_invariants());
     }
 
     #[test]

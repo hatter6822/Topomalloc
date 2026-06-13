@@ -216,7 +216,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 
 | Module | Charter |
 |--------|---------|
-| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4) |
+| `SeLe4n/CapBackedArena.lean` | capability-backed arenas, rights/quota/label attenuation (§36.4); the `ArenaTree` reservation model + tree-wide quota bound |
 | `SeLe4n/UntypedProvider.lean` | §36.6 backing-provider state machine + provenance |
 | `SeLe4n/VSpaceProvider.lean` / `CSpaceProvider.lean` | VSpace/CSlot provider contracts |
 | `SeLe4n/Bridge.lean` | abstraction relation `R` + `TopoSeLe4nWellFormed` (§36.3.3) |
@@ -235,6 +235,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Coupled alloc preserves invariants | `allocStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Coupled free preserves invariants | `freeStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Exact byte accounting | `ArenaQuotaExact` | `SeLe4n/Refinement.lean` |
+| Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
 | SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |

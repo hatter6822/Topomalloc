@@ -356,13 +356,17 @@ fn w8_span_retirement_is_claimed_exactly_once() {
 }
 
 /// The W9 arena quota protocol (plan 06; `arena.rs` `ArenaTable::try_charge` /
-/// `credit`): under any interleaving of two concurrent charges against a fixed
-/// quota, the used counter **never exceeds the quota** and two charges that
-/// together overflow it can never *both* succeed — the §36.4/§36.17 guarantee
-/// the lock-free allocation gate must keep under contention. The model uses the
-/// identical CAS loop and orderings the real `try_charge` uses (Acquire load,
-/// AcqRel/Acquire compare-exchange on the `used` counter), so it pins the
-/// ordering logic, not the literal code.
+/// `credit` / `reserve_child_quota_locked`): under any interleaving of two
+/// concurrent committing operations against a fixed quota, the committed counter
+/// **never exceeds the quota** and two operations that together overflow it can
+/// never *both* succeed — the §36.4/§36.17 guarantee the lock-free allocation
+/// gate must keep under contention. The model uses the identical CAS loop and
+/// orderings the real `try_charge` uses (Acquire load, AcqRel/Acquire
+/// compare-exchange on the `committed` counter), so it pins the ordering logic,
+/// not the literal code. Because a delegation's quota *reservation*
+/// (`reserve_child_quota_locked`) commits through the **same** CAS on the same
+/// atomic, this also covers an own-allocation racing a reservation: the two
+/// chargers below stand for {charge, reserve} equally (PR #13).
 #[test]
 fn w9_arena_quota_charge_never_exceeds_under_contention() {
     use loom::sync::atomic::AtomicU64;

@@ -151,8 +151,10 @@ typedef uint64_t topo_flags_t;
 #define TOPO_COLD TOPO_HOT(0)
 #define TOPO_ARENA(id) (((topo_flags_t) (id) + 1) << 21)
 
-/* Allocate with extended flags. NULL + EINVAL on an invalid flag word;
- * NULL + ENOMEM on allocation failure. */
+/* Allocate with extended flags. NULL + EINVAL on an invalid flag word or a
+ * TOPO_ARENA naming no such (active) arena; NULL + EACCES if the named arena's
+ * capability lacks the alloc right (§36.4, as topo_mallocx_arena); NULL + ENOMEM
+ * on allocation failure (quota/storage). */
 void *topo_mallocx(size_t size, topo_flags_t flags);
 
 /* Reallocate with flags under the §25 contract (failure leaves the original

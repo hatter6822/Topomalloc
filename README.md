@@ -50,7 +50,9 @@ seLe4n simulator (G-sim).
 **Capability-backed arenas (W9)** ride on top: a live multi-arena data path with
 per-arena isolation (§22.7), the full §22.3/§36.13 lifecycle
 (create / delegate / reset / destroy / revocation), attenuation-only delegation
-of rights / quota / label (§36.4), NUMA policy modes (§15.5), and a C arena API
+of rights / quota / label (§36.4) — with each child's quota **reserved** on its
+parent so a delegated subtree's live bytes stay within the root's quota (proved
+in Lean by `subtree_used_le_quota`) — NUMA policy modes (§15.5), and a C arena API
 (`topo_arena_create` / `delegate` / `reset` / `destroy`). The arena lifecycle
 state machine is modeled and proof-checked in Lean. Front-end caches (M2) and
 the remaining M1 pieces land per the plan.
@@ -144,6 +146,7 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 | 14-clause WellFormed preservation (per transition) | `Theorems/*.lean` |
 | Arena lifecycle: alloc only in Active; partial failure never Destroyed | `ArenaLifecycle.lean` |
 | Capability delegation is attenuation-only (`DelegatesFrom`) | `SeLe4n/CapBackedArena.lean` |
+| Delegated subtree's live bytes stay within the root quota (`subtree_used_le_quota`) | `SeLe4n/CapBackedArena.lean` |
 | Coupled alloc/free preserves combined invariants | `SeLe4n/Refinement.lean` |
 | Exact byte accounting (`ArenaQuotaExact`) | `SeLe4n/Refinement.lean` |
 | SMP correctness (every interleaving) | `SeLe4n/SMP.lean` |

@@ -901,15 +901,18 @@ A deliberate completeness pass closed every item the first pass deferred:
   main `xtask ci` clippy — was fixed.)
 * **Documented boundaries (not avoidance).** Cross-label scrub *recording* is
   plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena stats
-  *rendering* is W17 (M6); label *restriction* (vs. the sound equality) and quota
-  *budget-partition* (vs. the ceiling) would re-open the proven Lean
-  `DelegatesFrom`, so they are M7 model refinements; the full combined
-  phase×`State` refinement is M7 formal hardening.
+  *rendering* is W17 (M6); label *restriction* (vs. the sound equality) would
+  re-open the proven Lean `DelegatesFrom`, so it is an M7 model refinement; the
+  full combined phase×`State` refinement is M7 formal hardening. (Quota
+  *budget-partition* was once deferred here too; it was **pulled forward** — see
+  the third pass below.)
 
 ### W9 third pass (PR #13 review hardening)
 
-A round of automated review surfaced four real defects on the live data path;
-each is fixed with a test that pins the corrected behavior:
+A round of automated review surfaced five real issues on the live data path —
+four defects and one deliberately-deferred refinement pulled forward; each is
+fixed with a test (and, for the refinement, a Lean theorem) that pins the
+corrected behavior:
 
 * **Every vendable arena id is flag-routable (off-by-one).** `MAX_ARENAS` was
   `256`, one past the flag-encodable range, so `create`/`delegate` could hand
@@ -945,3 +948,24 @@ each is fixed with a test that pins the corrected behavior:
   handle path, which maps the authority denial to `EACCES`. The front door now
   consults the arena's rights: `EACCES` for the denial, `EINVAL` for "no such
   arena", matching `topo_mallocx_arena` (§36.4).
+* **Delegation reserves the child's quota on the parent (P1; budget-partition
+  pulled forward from M7).** The first two passes used the *ceiling* model: a
+  child's quota was checked `≤ parent.remaining` at delegation but never reserved,
+  so a finite parent that delegated a finite child let **both** allocate the full
+  quota — Σ descendants could reach 2× the parent's authority. Delegation now
+  **reserves** the child's quota on the parent: a per-arena `committed` counter
+  (own bytes + reserved child quota) is the single atomic the allocation gate and
+  the reservation both compare-exchange against, so they can never jointly exceed
+  the quota even under concurrency; `reserved` is tracked separately so the
+  §36.17 `used` a caller sees stays own-live and `Σ used == live_bytes` still
+  reconciles (§8.6). Reservation bites only a *finite* parent (an unlimited parent
+  partitions nothing, and a finite parent cannot delegate an unlimited child). A
+  child's destroy returns its reservation to the parent — **generation-checked**,
+  so a destroyed/recycled parent slot is never miscredited; reset keeps the child
+  alive, so its reservation stays. The Lean bridge gains `ArenaTree` +
+  `subtree_used_le_quota` (`SeLe4n/CapBackedArena.lean`): under the reservation
+  discipline the **whole subtree's** own-used bytes are bounded by the root's
+  quota — the tree-wide monotonicity the per-edge `DelegatesFrom.quota` alone
+  cannot give. New unit + property tests (`delegation_reserves_parent_quota_…`,
+  `delegated_subtree_never_exceeds_parent_quota`) and the loom quota model (the
+  reservation commits through the same gate CAS) pin it.
