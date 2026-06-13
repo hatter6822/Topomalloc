@@ -982,6 +982,22 @@ impl ArenaTable {
         parent_plus1: u32,
         parent_generation: u32,
     ) -> Result<ArenaId, ArenaError> {
+        self.create_locked_inner(policy, parent_plus1, parent_generation, true)
+    }
+
+    /// `create_locked`, but with explicit publish control: `publish == false`
+    /// leaves the arena `Initializing` (not yet allocatable), so a caller that must
+    /// install per-arena state **before** the id is allocatable (§22.4 "install
+    /// hooks before first extent allocation", plan 06 W10) can do so and then call
+    /// [`publish`](Self::publish). The arena id is private to the caller until
+    /// published, so the unpublished window is race-free.
+    fn create_locked_inner(
+        &self,
+        policy: &ArenaPolicy,
+        parent_plus1: u32,
+        parent_generation: u32,
+        publish: bool,
+    ) -> Result<ArenaId, ArenaError> {
         let id = self.claim_slot_locked()?;
         let a = &self.atomics[id as usize];
         // Bump the *incarnation* generation off whatever the (possibly recycled)
@@ -1015,9 +1031,60 @@ impl ArenaTable {
             };
         }
         // Publish: the release store pairs with the acquire loads in `is_active`
-        // / `try_charge`, so a thread that sees `Active` also sees the fields.
-        a.state.store(ArenaState::Active as u8, Ordering::Release);
+        // / `try_charge`, so a thread that sees `Active` also sees the fields. When
+        // `publish` is false the arena stays `Initializing` until [`publish`].
+        if publish {
+            a.state.store(ArenaState::Active as u8, Ordering::Release);
+        }
         Ok(ArenaId(id))
+    }
+
+    /// Create an arena left in `Initializing` (not yet allocatable), returning its
+    /// id (private to the caller). The caller installs any per-arena state, then
+    /// calls [`publish`](Self::publish) to make it `Active`, or
+    /// [`abandon_pending`](Self::abandon_pending) to discard it (plan 06 W10).
+    ///
+    /// SPEC-transition: arena create (pending half, §22.4)
+    pub fn create_pending(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
+        policy.validate()?;
+        self.lock.acquire();
+        let r = self.create_locked_inner(policy, 0, 0, false);
+        self.lock.release();
+        r
+    }
+
+    /// Publish a [`create_pending`](Self::create_pending) arena: `Initializing →
+    /// Active`. Rejects an arena not in `Initializing`.
+    ///
+    /// SPEC-transition: arena create (publish half, §22.4)
+    pub fn publish(&self, arena: ArenaId) -> Result<(), ArenaError> {
+        let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+        if ArenaState::from_u8(a.state.load(Ordering::Acquire)) != ArenaState::Initializing {
+            return Err(ArenaError::IllegalTransition);
+        }
+        a.state.store(ArenaState::Active as u8, Ordering::Release);
+        Ok(())
+    }
+
+    /// Discard a [`create_pending`](Self::create_pending) arena whose initialization
+    /// failed: `Initializing → Destroyed` with a generation bump, releasing the slot
+    /// (§B.5). Rejects an arena not in `Initializing`.
+    pub fn abandon_pending(&self, arena: ArenaId) -> Result<(), ArenaError> {
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            if ArenaState::from_u8(a.state.load(Ordering::Acquire)) != ArenaState::Initializing {
+                return Err(ArenaError::IllegalTransition);
+            }
+            let gen = Generation(a.generation.load(Ordering::Relaxed)).next();
+            a.generation.store(gen.0, Ordering::Relaxed);
+            a.rights.store(0, Ordering::Relaxed);
+            a.state
+                .store(ArenaState::Destroyed as u8, Ordering::Release);
+            Ok(())
+        })();
+        self.lock.release();
+        r
     }
 
     /// `delegate`, with the table lock held.

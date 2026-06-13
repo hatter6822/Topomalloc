@@ -1972,6 +1972,63 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     }
 }
 
+/// A **type-erased view** of an [`ExtentManager`] as a span-extent source (plan 06
+/// W10 per-arena hooked regions). The allocator's span path reserves and frees
+/// backing extents through this seam so it can route an arena to its **own** backing
+/// region (a [`HookProvider`](crate::HookProvider)-backed manager) without being
+/// generic over the provider type at the call site: the shared default backend and a
+/// per-arena hooked backend are different `ExtentManager<P>` instantiations, but both
+/// are `&dyn ExtentBacking`. The seam is exactly the methods the span create/retire
+/// and stats paths need; the default backend's behaviour is unchanged (one `dyn`
+/// call on the slow span-create path).
+pub trait ExtentBacking {
+    /// Allocate a committed backing extent of at least `size` bytes at `align`.
+    fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError>;
+    /// Free a backing extent (retain/unmap per policy), coalescing.
+    fn free(&self, r: ExtentRef) -> Result<(), ExtentError>;
+    /// Revoke the extent's descendants for `arena`, **then** free it (§36.6/§36.13).
+    fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError>;
+    /// The backing [`Region`] of `r`, or `None` if stale.
+    fn region_of(&self, r: ExtentRef) -> Option<Region>;
+    /// The §20.1 physical-state byte breakdown (stats reconciliation, §8.6).
+    fn state_bytes(&self) -> StateBytes;
+    /// Bytes physically committed across the region.
+    fn committed_bytes(&self) -> usize;
+    /// Whether the back-end is well-formed (the W4-5 oracle).
+    fn check_invariants(&self) -> bool;
+}
+
+impl<P: TopoBackingProvider> ExtentBacking for ExtentManager<P> {
+    #[inline]
+    fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError> {
+        ExtentManager::alloc(self, size, align, fit)
+    }
+    #[inline]
+    fn free(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        ExtentManager::free(self, r)
+    }
+    #[inline]
+    fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError> {
+        ExtentManager::free_revoking(self, r, arena)
+    }
+    #[inline]
+    fn region_of(&self, r: ExtentRef) -> Option<Region> {
+        ExtentManager::region_of(self, r)
+    }
+    #[inline]
+    fn state_bytes(&self) -> StateBytes {
+        ExtentManager::state_bytes(self)
+    }
+    #[inline]
+    fn committed_bytes(&self) -> usize {
+        ExtentManager::committed_bytes(self)
+    }
+    #[inline]
+    fn check_invariants(&self) -> bool {
+        ExtentManager::check_invariants(self)
+    }
+}
+
 impl<P: TopoBackingProvider> Drop for ExtentManager<P> {
     fn drop(&mut self) {
         // Return the whole reserved region to the provider. A failure here cannot be

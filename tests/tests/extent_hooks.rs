@@ -95,6 +95,16 @@ impl HostHooks {
             live: Mutex::new(Vec::new()),
         }
     }
+    /// Whether `p` falls within one of the regions this backing handed out — i.e.
+    /// the allocation was served from these hooks (per-arena routing check, W10).
+    fn contains(&self, p: *mut u8) -> bool {
+        let a = p as usize;
+        self.live
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(b, l)| a >= b && a < b + l.size())
+    }
 }
 
 impl Drop for HostHooks {
@@ -805,4 +815,186 @@ fn hook_backing_is_behaviourally_coequal_with_posix() {
         run_posix(&ops),
         "the hook backing diverged from POSIX in abstract outcomes"
     );
+}
+
+// ===========================================================================
+// W10 / §22.2–§22.4: per-arena hooked backing regions.
+// ===========================================================================
+
+use topo_backend_posix::PosixBackingProvider;
+use topo_core::{ArenaPolicy, MAX_HOOK_BACKENDS};
+
+/// Leak a host-hook backing as `&'static dyn ExtentHooks` (the caller-owned,
+/// allocator-outliving lifetime the per-arena API requires), returning the hooks
+/// reference and a handle to its stats.
+fn leak_hooks() -> (&'static HostHooks, Arc<HookStats>) {
+    let stats = Arc::new(HookStats::default());
+    let hooks: &'static HostHooks = Box::leak(Box::new(HostHooks::new(stats.clone())));
+    (hooks, stats)
+}
+
+/// A POSIX-backed allocator (the shared/default backend) over leaked metadata +
+/// pagemap, so an arena can be given its *own* hooked region alongside it.
+fn posix_allocator() -> Allocator<'static, PosixBackingProvider> {
+    let arena = meta(16 * 1024 * 1024);
+    let pm: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+    Allocator::new(
+        PosixBackingProvider::new(),
+        PosixBackingProvider::new(),
+        arena,
+        arena,
+        pm,
+        ArenaId::DEFAULT,
+        hook_cfg(),
+    )
+    .expect("posix allocator")
+}
+
+#[test]
+fn hooked_arena_serves_from_its_own_region_and_isolates() {
+    let a = posix_allocator();
+    let (hooks, stats) = leak_hooks();
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+    // The backing reserved its span + large regions via the hooks (§22.4: hooks
+    // installed before first extent).
+    assert!(
+        stats.allocs.load(Ordering::Relaxed) >= 2,
+        "hooked arena reserved its own regions via the hooks"
+    );
+
+    // A small allocation from the hooked arena is served from the hooks' region.
+    let small = a.allocate_in(arena, 100, 16, RequestFlags::NONE);
+    assert!(!small.is_null());
+    assert!(
+        hooks.contains(small),
+        "small object is in the hooked region"
+    );
+    // SAFETY: `small` is a live allocation of >= 100 bytes.
+    unsafe { std::ptr::write_bytes(small, 0xab, 100) };
+
+    // A large allocation from the hooked arena, likewise.
+    let large = a.allocate_in(arena, 4 * 1024 * 1024, 16, RequestFlags::NONE);
+    assert!(!large.is_null());
+    assert!(
+        hooks.contains(large),
+        "large object is in the hooked region"
+    );
+    // SAFETY: live 4 MiB allocation.
+    unsafe { large.write(0x5a) };
+
+    // §22.7 isolation: a *default-arena* allocation is NOT in the hooked region
+    // (it comes from the shared POSIX backend) — the two arenas' memory is disjoint.
+    let shared = a.malloc(100);
+    assert!(!shared.is_null());
+    assert!(
+        !hooks.contains(shared),
+        "default-arena object must not fall in the hooked arena's region (§22.7)"
+    );
+
+    // Frees route back to the owning backend; the §8.6 identity holds.
+    // SAFETY: all three are live allocations of `a`.
+    unsafe {
+        assert_eq!(a.free(small), FreeOutcome::Freed);
+        assert_eq!(a.free(large), FreeOutcome::Freed);
+        assert_eq!(a.free(shared), FreeOutcome::Freed);
+    }
+    assert!(a.check_invariants(), "all backends well-formed");
+    let st = a.stats();
+    assert_eq!(st.live_bytes, 0);
+}
+
+#[test]
+fn hooked_arena_destroy_returns_the_region_to_the_hooks() {
+    let a = posix_allocator();
+    let (hooks, stats) = leak_hooks();
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+    let reserved = stats.allocs.load(Ordering::Relaxed);
+    assert!(reserved >= 2);
+
+    // Allocate, then destroy with the objects still live (§22.5: destroy discards
+    // outstanding allocations); the drain retires them and the teardown returns the
+    // hooked regions to the backing via `dealloc`.
+    let p = a.allocate_in(arena, 200, 16, RequestFlags::NONE);
+    assert!(!p.is_null() && hooks.contains(p));
+    let _big = a.allocate_in(arena, 5 * 1024 * 1024, 16, RequestFlags::NONE);
+
+    // SAFETY: the arena is quiesced (single-threaded test, no outstanding ops).
+    unsafe { a.arena_destroy(arena) }.expect("destroy hooked arena");
+
+    // Every region the hooks handed out was returned (dealloc count == alloc count).
+    assert_eq!(
+        stats.deallocs.load(Ordering::Relaxed),
+        stats.allocs.load(Ordering::Relaxed),
+        "destroy returned every hooked region to the backing"
+    );
+    assert!(a.check_invariants());
+
+    // A second hooked arena can now reuse the freed registry slot.
+    let (hooks2, _s2) = leak_hooks();
+    let arena2 = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks2, hook_cfg())
+        .expect("registry slot reused after destroy");
+    let q = a.allocate_in(arena2, 64, 16, RequestFlags::NONE);
+    assert!(!q.is_null() && hooks2.contains(q));
+    // SAFETY: live allocation.
+    unsafe { assert_eq!(a.free(q), FreeOutcome::Freed) };
+}
+
+#[test]
+fn hooked_arena_reset_keeps_the_region_and_reuses_it() {
+    let a = posix_allocator();
+    let (hooks, stats) = leak_hooks();
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+    let reserved = stats.allocs.load(Ordering::Relaxed);
+
+    let _p = a.allocate_in(arena, 300, 16, RequestFlags::NONE);
+    // SAFETY: quiesced single-threaded reset.
+    unsafe { a.arena_reset(arena) }.expect("reset hooked arena");
+    // Reset keeps the region (no new reserve, no dealloc of the region).
+    assert_eq!(
+        stats.allocs.load(Ordering::Relaxed),
+        reserved,
+        "reset reserved nothing new"
+    );
+    assert_eq!(
+        stats.deallocs.load(Ordering::Relaxed),
+        0,
+        "reset kept the region"
+    );
+
+    // The arena is still usable and still served from the same hooked region.
+    let r = a.allocate_in(arena, 128, 16, RequestFlags::NONE);
+    assert!(!r.is_null() && hooks.contains(r));
+    // SAFETY: live allocation.
+    unsafe { assert_eq!(a.free(r), FreeOutcome::Freed) };
+    assert!(a.check_invariants());
+}
+
+#[test]
+fn hooked_arena_registry_full_fails_cleanly() {
+    let a = posix_allocator();
+    // Fill the registry.
+    for _ in 0..MAX_HOOK_BACKENDS {
+        let (hooks, _s) = leak_hooks();
+        a.arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+            .expect("fill the hooked-backend registry");
+    }
+    // One more must fail cleanly (Exhausted) — and must not have reserved a region.
+    let (extra, extra_stats) = leak_hooks();
+    let r = a.arena_create_hooked(&ArenaPolicy::explicit(), extra, hook_cfg());
+    assert!(matches!(r, Err(topo_core::ArenaError::Exhausted)));
+    // The over-limit attempt left no orphaned reservation (build-then-insert: the
+    // region it built was returned when no slot was free).
+    assert_eq!(
+        extra_stats.allocs.load(Ordering::Relaxed),
+        extra_stats.deallocs.load(Ordering::Relaxed),
+        "a rejected create leaks no region"
+    );
+    assert!(a.check_invariants());
 }

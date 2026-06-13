@@ -52,6 +52,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Convenience re-exports for the common surface.
 pub use allocator::{
     predicted_usable_size, Allocator, AllocatorConfig, AllocatorStats, FreeOutcome, MetaArena,
+    MAX_HOOK_BACKENDS,
 };
 pub use arena::{
     ArenaConfig, ArenaError, ArenaPolicy, ArenaState, ArenaStats, ArenaTable, CapRights,
@@ -68,14 +69,14 @@ pub use classify::{classify, Request, RequestKind};
 pub use compat::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use error::BackendError;
 pub use extent::{
-    Extent, ExtentError, ExtentFlags, ExtentId, ExtentManager, ExtentMap, ExtentNotify, ExtentRef,
-    ExtentState, Fit, HugeRange, NoNotify, NoRegionCache, RegionCacheHook, RetainPolicy,
-    StateBytes,
+    Extent, ExtentBacking, ExtentError, ExtentFlags, ExtentId, ExtentManager, ExtentMap,
+    ExtentNotify, ExtentRef, ExtentState, Fit, HugeRange, NoNotify, NoRegionCache, RegionCacheHook,
+    RetainPolicy, StateBytes,
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use hooks::{ExtentHooks, HookProvider};
 pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
-pub use large::{LargeAllocator, LargeConfig};
+pub use large::{LargeAllocator, LargeBacking, LargeConfig};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{
