@@ -33,7 +33,7 @@ use crate::policy::{zero_size_policy, ZeroSizePolicy};
 /// §36.14 `TOPO_ERR_*` classes a C caller can read after a failed arena call:
 /// authority denials are `EACCES`, a draining/inactive arena is `EBUSY`, a quota
 /// overrun is `ENOMEM`, and every malformed/illegal request is `EINVAL`.
-fn arena_errno(e: ArenaError) -> i32 {
+pub(crate) fn arena_errno(e: ArenaError) -> i32 {
     match e {
         ArenaError::AuthorityDenied => EACCES,
         ArenaError::NotActive => EBUSY,

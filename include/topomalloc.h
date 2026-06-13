@@ -27,6 +27,7 @@
 #ifndef TOPOMALLOC_H
 #define TOPOMALLOC_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -250,6 +251,46 @@ topo_arena_t topo_arena_id(topo_arena_handle_t handle);
  * topo_mallocx. Allocation failure maps through the arena taxonomy
  * (EACCES/EBUSY/ENOMEM). */
 void *topo_mallocx_arena(topo_arena_handle_t handle, size_t size, topo_flags_t flags);
+
+/* ------------------------------------------------------------------------
+ * Extent hooks & custom backing (§23 — W10)
+ * --------------------------------------------------------------------- */
+
+/* The §23.2 extent-hook vtable: a custom memory source / OS policy an arena's
+ * span and large allocations are served from. `alloc` and `dealloc` are
+ * required; a NULL `commit`/`decommit`/`purge_*`/`split`/`merge` means "use the
+ * default" (a no-op — a backing that returns committed, never-reclaimed memory
+ * and does not track sub-extent boundaries). The bool-returning hooks follow the
+ * jemalloc convention: return `true` on FAILURE.
+ *
+ * Contracts (§23.3, enforced by the allocator): a returned range is aligned to
+ * the request and at least the requested size; commit/decommit/purge affect only
+ * the requested subrange; a hook does not call TopoMalloc recursively. */
+typedef struct topo_extent_hooks_s {
+  void *(*alloc)(void *ctx, size_t size, size_t alignment, bool *zero, bool *commit);
+  bool (*dealloc)(void *ctx, void *addr, size_t size, bool committed);
+  bool (*commit)(void *ctx, void *addr, size_t size, size_t offset, size_t length);
+  bool (*decommit)(void *ctx, void *addr, size_t size, size_t offset, size_t length);
+  bool (*purge_lazy)(void *ctx, void *addr, size_t size, size_t offset, size_t length);
+  bool (*purge_forced)(void *ctx, void *addr, size_t size, size_t offset, size_t length);
+  bool (*split)(void *ctx, void *addr, size_t size, size_t size_a, size_t size_b, bool committed);
+  bool (*merge)(void *ctx, void *addr_a, size_t size_a, void *addr_b, size_t size_b, bool committed);
+} topo_extent_hooks_t;
+
+/* Create an explicit arena whose span/large allocations are served from the
+ * custom backing `*hooks` (with opaque `ctx`), §22.2/§22.4/§23.2. The arena's
+ * memory is isolated from every other arena's by construction (§22.7).
+ * `span_region_bytes` / `large_region_bytes` size its backing (0 = a sensible
+ * default). The vtable's function pointers are copied, so `hooks` need not
+ * persist; `ctx` and any memory the hooks manage must. Returns the new arena id
+ * (>= 1, routable via TOPO_ARENA(id)), or 0 on failure (EINVAL for a
+ * NULL/incomplete vtable; ENOMEM if the hooked-backend registry is full or the
+ * backing cannot be reserved). */
+topo_arena_t topo_arena_create_hooked(const topo_extent_hooks_t *hooks, void *ctx,
+                                      size_t span_region_bytes, size_t large_region_bytes);
+
+/* The maximum number of arenas that can carry their own extent hooks at once. */
+size_t topo_max_hook_backends(void);
 
 /* ------------------------------------------------------------------------
  * Identification
