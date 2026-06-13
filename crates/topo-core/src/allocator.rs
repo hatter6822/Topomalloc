@@ -634,6 +634,28 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
 
     // -- per-arena hooked backing routing (W10) -------------------------------
 
+    /// Raw pointer to hooked-backend registry slot `i` (`i < MAX_HOOK_BACKENDS`).
+    /// **Per-element** raw access is load-bearing for soundness: it keeps a borrow
+    /// of one slot disjoint from a concurrent mutation of another, so a thread
+    /// holding `&backend_X` (slot i) while a *different* arena's destroy clears slot
+    /// j never has its borrow invalidated by a whole-array `&mut`. This is the same
+    /// slot-pool discipline `ExtentMap`/`SpanPool`/`ArenaTable` use — never form a
+    /// `&[Option; N]` / `&mut [Option; N]` over the registry.
+    #[inline]
+    fn hook_slot(&self, i: usize) -> *mut Option<ArenaHookBackend<'a>> {
+        debug_assert!(i < MAX_HOOK_BACKENDS);
+        // SAFETY: `i < MAX_HOOK_BACKENDS` (the array length); casting `*mut [T; N]`
+        // to `*mut T` views the first element, and `.add(i)` indexes element `i`,
+        // all within the same allocation.
+        unsafe {
+            self.hooks
+                .slots
+                .get()
+                .cast::<Option<ArenaHookBackend<'a>>>()
+                .add(i)
+        }
+    }
+
     /// The hooked backend serving `arena`, or `None` (the shared backend serves
     /// it). Fast path: with no hooked arenas the atomic `count` short-circuits
     /// before any lock. The returned reference is valid for the current op under
@@ -644,19 +666,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             return None;
         }
         self.hooks.lock.acquire();
-        // SAFETY: the registry lock is held, granting exclusive access to the slot
-        // array for the search.
-        let slots = unsafe { &*self.hooks.slots.get() };
-        let found = slots
-            .iter()
-            .flatten()
-            .find(|b| b.arena == arena)
-            .map(|b| b as *const ArenaHookBackend<'a>);
+        let mut found: *const ArenaHookBackend<'a> = ptr::null();
+        for i in 0..MAX_HOOK_BACKENDS {
+            // SAFETY: the registry lock is held (no concurrent mutator of slot `i`);
+            // `(*slot).as_ref()` borrows only element `i`.
+            if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                if b.arena == arena {
+                    found = b as *const ArenaHookBackend<'a>;
+                    break;
+                }
+            }
+        }
         self.hooks.lock.release();
-        // SAFETY: the slot is stable for this op — an arena's create/destroy does
-        // not race its own alloc/free (§22.5/§36.13), and slots are cleared in
-        // place, so a *different* arena's concurrent destroy cannot move or free it.
-        found.map(|p| unsafe { &*p })
+        if found.is_null() {
+            None
+        } else {
+            // SAFETY: the matched slot is stable for this op — an arena's
+            // create/destroy does not race its own alloc/free (§22.5/§36.13), and a
+            // *different* arena's destroy mutates only its own slot (per-element), so
+            // it cannot move or invalidate this one.
+            Some(unsafe { &*found })
+        }
     }
 
     /// The span-extent backing for `arena`: its own hooked region, or the shared.
@@ -690,18 +720,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             return &self.large;
         }
         self.hooks.lock.acquire();
-        // SAFETY: registry lock held ⇒ exclusive slot-array access for the search.
-        let slots = unsafe { &*self.hooks.slots.get() };
-        let owner = slots
-            .iter()
-            .flatten()
-            .find(|b| b.large.arena_of(ptr).is_some())
-            .map(|b| &b.large as *const LargeAllocator<'a, HookProvider<ArenaHooks<'a>>>);
+        let mut owner: *const LargeAllocator<'a, HookProvider<ArenaHooks<'a>>> = ptr::null();
+        for i in 0..MAX_HOOK_BACKENDS {
+            // SAFETY: registry lock held; borrows only element `i`.
+            if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                if b.large.arena_of(ptr).is_some() {
+                    owner = &b.large as *const LargeAllocator<'a, HookProvider<ArenaHooks<'a>>>;
+                    break;
+                }
+            }
+        }
         self.hooks.lock.release();
-        match owner {
-            // SAFETY: the owning backend is stable for this free under quiescence.
-            Some(p) => unsafe { &*p },
-            None => &self.large,
+        if owner.is_null() {
+            &self.large
+        } else {
+            // SAFETY: the owning backend is stable for this free under quiescence
+            // (see `hook_backend`).
+            unsafe { &*owner }
         }
     }
 
@@ -1225,7 +1260,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
                 Some(size_class::usable_size(span.size_class()))
             }
-            Ok(FreeTarget::Large { .. }) => self.large.usable_size(ptr),
+            // Route to the backend that owns `ptr` (shared or a hooked arena's),
+            // since each resolves only its own descriptor pool (W10).
+            Ok(FreeTarget::Large { .. }) => self.large_owner(ptr).usable_size(ptr),
             _ => None,
         }
     }
@@ -1348,10 +1385,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     (row.size as usize, span_ref.arena())
                 }
                 PointerClass::Large { .. } => {
+                    // Route to the backend that owns `ptr` — the shared large region
+                    // or the original arena's own hooked region (W10); each resolves
+                    // only its own descriptor pool, so the shared one would miss a
+                    // hooked-arena large object.
+                    let owner = self.large_owner(ptr);
                     // The pointer is live (the caller's contract for realloc; a
                     // racing free of the same pointer is C UB and is caught by
                     // the lock-validated read here).
-                    let Some(usable) = self.large.usable_size(ptr) else {
+                    let Some(usable) = owner.usable_size(ptr) else {
                         return ptr::null_mut();
                     };
                     // In-place fast path: the new request is still medium/large
@@ -1371,7 +1413,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     }
                     // A live large always has an owning arena; fall back to the
                     // engine's region arena if a concurrent retire raced the read.
-                    (usable, self.large.arena_of(ptr).unwrap_or(self.arena))
+                    (usable, owner.arena_of(ptr).unwrap_or(self.arena))
                 }
                 _ => return ptr::null_mut(),
             };
@@ -1491,28 +1533,35 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             },
         )
         .map_err(|_| ArenaError::Exhausted)?;
-        let backend = ArenaHookBackend {
+        // Held in an `Option` so a failed insert (registry full) drops the built
+        // backing here, returning its regions to the hooks — and so the move into a
+        // slot is a single, unconditional `take`.
+        let mut backend = Some(ArenaHookBackend {
             arena: id,
             span_extents,
             large,
-        };
+        });
         self.hooks.lock.acquire();
-        // SAFETY: registry lock held ⇒ exclusive slot-array access.
-        let slots = unsafe { &mut *self.hooks.slots.get() };
-        let pos = slots.iter().position(Option::is_none);
-        let result = match pos {
-            Some(i) => {
-                slots[i] = Some(backend);
+        for i in 0..MAX_HOOK_BACKENDS {
+            let slot = self.hook_slot(i);
+            // SAFETY: registry lock held ⇒ no concurrent access to slot `i`; the
+            // per-element borrow never forms a whole-array reference.
+            if unsafe { (*slot).is_none() } {
+                // SAFETY: as above; overwrites the `None` slot with the backing.
+                unsafe { *slot = backend.take() };
                 // Release: pairs with the `Acquire` in `hook_backend`; the later
                 // arena `publish` (a Release on the arena state) program-orders after
                 // this, so a thread that sees the arena `Active` also sees the slot.
                 self.hooks.count.fetch_add(1, Ordering::Release);
-                Ok(())
+                break;
             }
-            None => Err(ArenaError::Exhausted), // `backend` drops here → regions freed
-        };
+        }
         self.hooks.lock.release();
-        result
+        if backend.is_none() {
+            Ok(()) // inserted
+        } else {
+            Err(ArenaError::Exhausted) // registry full; `backend` drops → regions freed
+        }
     }
 
     /// Remove and **drop** `arena`'s hooked backing if it has one (returning its
@@ -1525,14 +1574,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             return;
         }
         self.hooks.lock.acquire();
-        // SAFETY: registry lock held ⇒ exclusive slot-array access.
-        let slots = unsafe { &mut *self.hooks.slots.get() };
-        let taken = slots
-            .iter_mut()
-            .find(|s| s.as_ref().is_some_and(|b| b.arena == arena))
-            .and_then(Option::take);
-        if taken.is_some() {
-            self.hooks.count.fetch_sub(1, Ordering::Release);
+        let mut taken: Option<ArenaHookBackend<'a>> = None;
+        for i in 0..MAX_HOOK_BACKENDS {
+            let slot = self.hook_slot(i);
+            // SAFETY: registry lock held; per-element borrow of slot `i` only.
+            let matches = unsafe { (*slot).as_ref().is_some_and(|b| b.arena == arena) };
+            if matches {
+                // SAFETY: as above; moves the backing out of its slot (leaving `None`).
+                taken = unsafe { (*slot).take() };
+                self.hooks.count.fetch_sub(1, Ordering::Release);
+                break;
+            }
         }
         self.hooks.lock.release();
         drop(taken); // releases the regions via `hooks.dealloc`, outside the lock
@@ -1723,10 +1775,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             && self.arenas.check_invariants();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
-            // SAFETY: registry lock held ⇒ exclusive slot-array access.
-            let slots = unsafe { &*self.hooks.slots.get() };
-            for b in slots.iter().flatten() {
-                ok = ok && b.span_extents.check_invariants() && b.large.check_invariants();
+            for i in 0..MAX_HOOK_BACKENDS {
+                // SAFETY: registry lock held; per-element borrow of slot `i` only.
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    ok = ok && b.span_extents.check_invariants() && b.large.check_invariants();
+                }
             }
             self.hooks.lock.release();
         }

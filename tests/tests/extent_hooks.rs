@@ -893,6 +893,28 @@ fn hooked_arena_serves_from_its_own_region_and_isolates() {
         "default-arena object must not fall in the hooked arena's region (§22.7)"
     );
 
+    // Introspection + realloc of a hooked-arena *large* object must route to the
+    // OWNING (hooked) backend, not the shared one (regression: the shared large pool
+    // cannot resolve a hooked-arena descriptor, so usable_size/realloc would
+    // spuriously return None/NULL).
+    assert!(
+        a.usable_size(large).is_some_and(|u| u >= 4 * 1024 * 1024),
+        "usable_size of a hooked-arena large object resolves via its owner"
+    );
+    // SAFETY: `large` is a live allocation of this allocator; grow it.
+    let grown = unsafe { a.realloc(large, 6 * 1024 * 1024, 16, RequestFlags::NONE) };
+    assert!(
+        !grown.is_null(),
+        "realloc of a hooked-arena large object succeeds"
+    );
+    assert!(
+        hooks.contains(grown),
+        "the grown object stays in the hooked region"
+    );
+    // SAFETY: `grown` preserves the prefix and owns >= 6 MiB.
+    unsafe { assert_eq!(grown.read(), 0x5a, "realloc preserved the prefix") };
+    let large = grown;
+
     // Frees route back to the owning backend; the §8.6 identity holds.
     // SAFETY: all three are live allocations of `a`.
     unsafe {
@@ -997,4 +1019,60 @@ fn hooked_arena_registry_full_fails_cleanly() {
         "a rejected create leaks no region"
     );
     assert!(a.check_invariants());
+}
+
+#[test]
+fn concurrent_hooked_and_default_arena_allocation_is_sound() {
+    // Stresses the per-arena registry under concurrency: worker threads hammer a
+    // hooked arena AND the default arena (so they hold registry references for the
+    // hooked one), while another thread creates + destroys *other* hooked arenas —
+    // clearing *different* registry slots. This is exactly the cross-arena scenario
+    // the per-element (not whole-array) registry access keeps sound; it must never
+    // corrupt state, and every backend stays well-formed.
+    let a = posix_allocator();
+    let (hooks, _stats) = leak_hooks();
+    let harena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("hooked arena");
+    let ar = &a;
+    std::thread::scope(|s| {
+        for t in 0..4u64 {
+            s.spawn(move || {
+                for i in 0..3000u64 {
+                    let arena = if (i + t).is_multiple_of(2) {
+                        harena
+                    } else {
+                        ArenaId::DEFAULT
+                    };
+                    let sz = 16 + (i as usize % 600);
+                    let p = ar.allocate_in(arena, sz, 16, RequestFlags::NONE);
+                    if !p.is_null() {
+                        // SAFETY: `p` is a live allocation of >= `sz` bytes we own.
+                        unsafe {
+                            std::ptr::write_bytes(p, 0xA5, sz);
+                            assert_eq!(p.read(), 0xA5);
+                            assert_eq!(ar.free(p), FreeOutcome::Freed);
+                        }
+                    }
+                }
+            });
+        }
+        // Churn other hooked arenas (no worker allocates from them, so destroy is
+        // quiescent for them) — clearing their slots while workers hold a reference
+        // into the registry for `harena`.
+        s.spawn(move || {
+            for _ in 0..16 {
+                let (h2, _s2) = leak_hooks();
+                if let Ok(id2) = ar.arena_create_hooked(&ArenaPolicy::explicit(), h2, hook_cfg()) {
+                    // SAFETY: no other thread allocates from or frees into `id2`.
+                    let _ = unsafe { ar.arena_destroy(id2) };
+                }
+            }
+        });
+    });
+    assert!(
+        a.check_invariants(),
+        "all backends well-formed after the storm"
+    );
+    assert_eq!(a.stats().live_bytes, 0, "no leaks: everything freed");
 }
