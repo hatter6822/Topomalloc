@@ -1041,11 +1041,65 @@ follows from the existing architecture rather than adding a parallel mechanism:
   A proptest (`tests/tests/extent_hooks.rs`) and the `extent_hooks` fuzz target
   assert `check_invariants` after every step under randomized per-hook failures.
 
-* **Boundary: the arena `hooks` *descriptor field* is deferred with the
-  shared-backend architecture.** §22.2 lists a per-arena `hooks` field, but the
-  M1/M4 data path achieves §22.7 isolation through one **shared, arena-tagged**
-  backend, not per-arena regions (§27.5 keeps metadata bounded). Per-arena hook
-  *selection* would require per-arena regions; the W10 deliverable is the hook
-  **mechanism** (construct an allocator over a `HookProvider`), and per-arena
-  descriptor wiring stays deferred with that architecture choice — documented, not
-  avoided.
+### W10 optimal pass (per-arena hooked regions + C ABI + hardening)
+
+A deliberate completeness pass closed every gap the first pass deferred:
+
+* **§23.3 stateful enforcement moved into `HookProvider` (not just test
+  backings).** A fixed-capacity, lock-guarded reservation set (`ReservationSet`,
+  allocation-free, cap 16 — a provider backs one manager ⇒ ≤ 1 live reservation)
+  detects an `alloc` result that overlaps a live reservation, and a `dealloc` of a
+  region never handed out — rejected *and* debug-aborted. A per-provider
+  reentrancy guard (`in_hook` flag) catches a hook that re-enters an op on the same
+  provider (refuse with `Unsupported` + debug-abort) instead of deadlocking on the
+  held back-end lock — clean detection, the documented enforcement of §23.3's "no
+  recursive TopoMalloc calls" for the common same-provider case (cross-provider
+  re-entry still hits the lock).
+* **Per-arena hooked regions — the full §22.2/§22.4 `hooks` descriptor field.**
+  This is the re-architecture the first pass deferred (and the user later
+  requested). An arena created with `Allocator::arena_create_hooked` serves its
+  span **and** large allocations from its own `HookProvider`-backed region,
+  **isolated** from every other arena's region by construction (§22.7 — proven in
+  Lean by `perArena_disjoint_regions_isolate`: disjoint regions ⇒ disjoint
+  allocations). The design keeps the proven shared path byte-identical:
+  - The span/large paths route the *extent source* through new type-erased seams
+    `ExtentBacking` / `LargeBacking` (impl'd by `ExtentManager<P>` /
+    `LargeAllocator<P>`), so the call sites are not generic over the provider; a
+    fixed-capacity `HookRegistry` (`MAX_HOOK_BACKENDS`) holds the per-arena
+    backends, and a **lock-free `count == 0` fast path** means a program with no
+    hooked arenas pays nothing. Hooks are **borrowed** (`&'a dyn ExtentHooks`), not
+    boxed, so the core stays allocation-free (no re-entrant `Box::new` through the
+    global allocator); a hooked arena's hooks outlive the allocator like the
+    metadata/pagemap do.
+  - Routing: span create/retire route by `span.arena()`; large alloc by arena;
+    large **free finds the owner** (the one backend whose descriptor pool resolves
+    the pointer — the shared pagemap is global, so the descriptor is found by
+    trying the shared backend then each hooked one); drain routes by arena.
+  - Lifecycle (§22.4 order): the hooked backing is reserved + **registered before**
+    the arena id is published `Active` (the id is private to the create call until
+    then, so the window is race-free). `arena.rs` gains
+    `create_pending`/`publish`/`abandon_pending` for that split. Destroy tears the
+    region down (returns it to the hooks via `dealloc`, *outside* the registry lock
+    so the hook never runs under it); reset keeps it. Registry slots are cleared in
+    place (never moved), so a backend reference is stable for an arena's op under
+    the §22.5/§36.13 quiescence contract.
+* **The C `topo_extent_hooks_t` ABI (§23.2's C-struct surface).** `topo-abi`
+  exposes the vtable + `topo_arena_create_hooked(hooks, ctx, span_bytes,
+  large_bytes)` + `topo_max_hook_backends()`; a `CHooks` adapter maps the C
+  function pointers (jemalloc bool convention: `true` ⇒ failure; NULL op ⇒ the
+  no-op default) to the Rust trait. The vtable is copied (the caller's struct need
+  not persist); the adapter is leaked (`'static`, bounded by `MAX_HOOK_BACKENDS`).
+  `include/topomalloc.h` declares it; the C and C++ ABI harnesses drive a real
+  custom backing end to end; the `nm` header↔symbol cross-check balances at 30.
+  (A hook backing must honour the requested `PAGE_SIZE` alignment — the §23.3 guard
+  correctly rejects a plain-`malloc` backing, so the harnesses use `aligned_alloc`.)
+* **Deeper Lean + a 7th gate.** `ExtentHooks.lean` now connects the §23.4 contract
+  to the **real** `WfRangesDisjoint` clause of the abstract `State`
+  (`allocContract_preserves_rangesDisjoint`), not just `Range` geometry; decidable
+  mirrors of the Rust `HookProvider` checks (`alignedOk`/`atLeastOk`/`subrangeOk`)
+  are tied to the contract props and gated by a new `lake exe check`
+  `hookContractGate`, so the model and the runtime enforcement cannot drift.
+* **Stronger tests.** The **full** central-path allocator (malloc/free/realloc, not
+  just the extent manager) is fuzzed under injected hook failures asserting the
+  §8.6 identity + non-aliasing; a hook-vs-POSIX behavioural-equivalence test; and
+  per-arena routing/isolation/lifecycle/registry-full integration tests.

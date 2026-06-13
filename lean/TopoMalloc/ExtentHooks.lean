@@ -177,6 +177,22 @@ theorem subrange_touches_no_other {sub region other : Range}
   hdisj.of_subset_right hsub
 
 -- ---------------------------------------------------------------------------
+-- Per-arena hooked regions: §22.7 isolation, geometrically (W10)
+-- ---------------------------------------------------------------------------
+
+/-- **§22.7 isolation for per-arena hooked regions (W10).** When two arenas serve
+their allocations from **disjoint** backing regions (each arena's own
+[`HookProvider`](`Allocator::arena_create_hooked`) region), any allocation of one is
+disjoint from any allocation of the other: each allocation is a sub-range of its
+arena's region (`a ⊆ regionA`, `b ⊆ regionB`), and disjoint regions have disjoint
+sub-ranges. So per-arena hooked regions realise the §22.7 "no extent/span belongs to
+two arenas" invariant by construction — no shared-backend bookkeeping needed. -/
+theorem perArena_disjoint_regions_isolate {regionA regionB a b : Range}
+    (hAB : Disjoint regionA regionB) (ha : Subset a regionA) (hb : Subset b regionB) :
+    Disjoint a b :=
+  (hAB.of_subset_left ha).of_subset_right hb
+
+-- ---------------------------------------------------------------------------
 -- Non-vacuity: the contracts are satisfiable (nothing above is proved vacuously)
 -- ---------------------------------------------------------------------------
 

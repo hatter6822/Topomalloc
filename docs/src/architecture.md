@@ -281,12 +281,24 @@ transitions the allocator actually runs cannot drift from the model.
   bookkeeping, §23.3/§23.4), dispatched from carve/coalesce through the `ExtentNotify`
   sink (default `NoNotify` ⇒ POSIX/seLe4n unchanged). `HookProvider` **enforces** the
   load-bearing §23.3 output contracts (alignment, size, sub-range) — rejecting *and*
-  debug-aborting a violation (§2.4) rather than trusting it. The §23.4 "allocator
-  correctness assumes hook correctness" assumption is modeled in
+  debug-aborting a violation (§2.4) rather than trusting it — including the
+  *stateful* contracts (no-overlap with a live reservation, dealloc-pairing) via a
+  lock-guarded reservation set, and **reentrancy** (a hook re-entering an op on the
+  same provider is refused, not deadlocked). The §23.4 "allocator correctness
+  assumes hook correctness" assumption is modeled in
   `lean/TopoMalloc/ExtentHooks.lean`: given the §23.3 contracts, alloc/split/merge/
-  subrange preserve range disjointness and the region tiling. A proptest and the
-  `fuzz/fuzz_targets/extent_hooks.rs` target assert the back-end stays well-formed
-  under arbitrary hook failures (W10-3).
+  subrange preserve range disjointness and the region tiling (tied to the real
+  `WfRangesDisjoint`), gated by `lake exe check`'s `hookContractGate`. A proptest and
+  the `fuzz/fuzz_targets/extent_hooks.rs` target assert the back-end stays
+  well-formed under arbitrary hook failures (W10-3).
+
+  The **full §22.2 per-arena `hooks` field** is wired (`Allocator::arena_create_hooked`,
+  C `topo_arena_create_hooked`): an arena serves its span/large allocations from its
+  **own** `HookProvider`-backed region (the `ExtentBacking`/`LargeBacking` seams + a
+  fixed-capacity `HookRegistry` with a lock-free no-hooked-arena fast path), isolated
+  from every other arena's region by construction (§22.7, proven in Lean by
+  `perArena_disjoint_regions_isolate`). The hooked region is reserved + registered
+  before the arena id is published (§22.4), and returned to the hooks on destroy.
 
 ## Front-end: per-CPU caches & the RSEQ fast path (plan 05 W6/W7)
 

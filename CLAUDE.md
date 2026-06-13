@@ -154,12 +154,15 @@ lifecycle (create / delegate / reset / destroy / revocation), a live multi-arena
 per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA policy modes (§15.5).
 Extent hooks & custom backing (W10) are implemented ahead of their M4 slot too: the §23.2
 `ExtentHooks` interface + the `HookProvider` backing-seam adapter (six physical ops + the `split`/
-`merge` advisory notifications), §23.3 contract enforcement, §34.8 hook failure injection, and the
-§23.4 conditional-correctness Lean model.
+`merge` advisory notifications), §23.3 contract enforcement (alignment/size/subrange + no-overlap/
+dealloc-pairing + reentrancy), §34.8 hook failure injection, the §23.4 conditional-correctness Lean
+model, **the full §22.2/§22.4 per-arena `hooks` descriptor field** (`arena_create_hooked` — an arena
+served from its own `HookProvider`-backed region, §22.7-isolated), and the **C `topo_extent_hooks_t`
+ABI**.
 
 **Test counts:**
-- Rust: ~500 tests across 12 crates (`cargo test --workspace`)
-- Lean: 83 build jobs including proof-checking every module (`lake build`) + 6 executable gates (`lake exe check`)
+- Rust: ~525 tests across 12 crates (`cargo test --workspace`)
+- Lean: 83 build jobs including proof-checking every module (`lake build`) + 7 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 6 targets (`fuzz/fuzz_targets/`, incl. `arena_api` and `extent_hooks`)
 
@@ -170,6 +173,7 @@ Extent hooks & custom backing (W10) are implemented ahead of their M4 slot too: 
 - Provider state machine OK (§36.6, W4-1)
 - Extent state machine OK (§20.1, W4-2d)
 - Arena lifecycle OK (§22.3/§36.13 transitions + revocation chain; pins Rust `ArenaState`/`RevocationPhase`, W9)
+- Extent-hook contracts OK (§23.3 alignment/size/subrange checks match `HookProvider`; §23.4 model, W10)
 
 The arena lifecycle state machine (§22.3/§36.13) is modeled in `lean/TopoMalloc/ArenaLifecycle.lean`
 (proof-checked by `lake build`, mirroring the runtime `ArenaState`/`RevocationPhase`); the
@@ -180,7 +184,7 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
 | `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10) | MIT | Yes |
-| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, errno, Rust `GlobalAlloc` | MIT | No |
+| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
@@ -210,12 +214,12 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | `TopoMalloc/WellFormed.lean` | the **14** named `WellFormed` clauses + preservation |
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions |
 | `TopoMalloc/ExtentState.lean` | §20.1 extent physical-backing state machine (pinned 1:1 to Rust) |
-| `TopoMalloc/ExtentHooks.lean` | §23.4 formal hook assumption: §23.3 contracts ⇒ alloc/split/merge/subrange preserve disjointness (conditional correctness, W10) |
+| `TopoMalloc/ExtentHooks.lean` | §23.4 hook assumption: §23.3 contracts ⇒ alloc/split/merge/subrange preserve disjointness (tied to the real `WfRangesDisjoint`); §22.7 per-arena-region isolation; the `hookContractGate` decidable checks (W10) |
 | `TopoMalloc/Rseq.lean` | RSEQ contract — trusted primitive + frame condition (§33.5) |
 | `TopoMalloc/Boundaries.lean` | trust-boundary scaffolding for the RSEQ hardware boundary |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family (SizeClass, Malloc, Free, Realloc, Cache, Central, Span, Pagemap, PagemapExec, Release, Extent, Arena, Allocate, Demo) |
 | `TopoMalloc/Exec.lean` | executable model + §33.7 text-grammar trace replay |
-| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent differentials |
+| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent/arena differentials, the §23.3 hook-contract gate |
 
 ### seLe4n bridge (GPL-3.0-or-later)
 
@@ -242,6 +246,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Exact byte accounting | `ArenaQuotaExact` | `SeLe4n/Refinement.lean` |
 | Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Hooks preserve disjointness (given §23.3) | `alloc_preserves_disjoint` | `ExtentHooks.lean` |
+| Per-arena hooked regions isolate (§22.7) | `perArena_disjoint_regions_isolate` | `ExtentHooks.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
 | SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |
