@@ -211,11 +211,12 @@ pub struct LargeAllocator<'a, P: TopoBackingProvider> {
 static NO_REGION_CACHE: NoRegionCache = NoRegionCache;
 
 // SAFETY: all access to `pool` goes through `lock`; `extents`/`pagemap` carry their
-// own synchronization; `meta` is `Sync`; `arena` is immutable. So concurrent
+// own synchronization; `meta` is `Sync`; `arena` is immutable; `region_cache` is a
+// shared reference to a `Sync` hook (immutable after construction). So concurrent
 // `&self` use is data-race-free.
 unsafe impl<P: TopoBackingProvider + Send + Sync> Sync for LargeAllocator<'_, P> {}
 // SAFETY: the allocator owns its pool (metadata-backed, never aliased) and a `Send`
-// extent manager; the borrowed `pagemap`/`meta` are `Sync`.
+// extent manager; the borrowed `pagemap`/`meta`/`region_cache` references are `Sync`.
 unsafe impl<P: TopoBackingProvider + Send> Send for LargeAllocator<'_, P> {}
 
 impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {

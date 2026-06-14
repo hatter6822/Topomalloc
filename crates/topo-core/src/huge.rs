@@ -2745,6 +2745,7 @@ mod backend_tests {
         owned: Mutex<Vec<(usize, Layout)>>,
         fail_commit: AtomicU32,
         fail_revoke: AtomicU32,
+        fail_decommit: AtomicU32,
         commits: AtomicU32,
         decommits: AtomicU32,
         revokes: AtomicU32,
@@ -2756,6 +2757,7 @@ mod backend_tests {
                 owned: Mutex::new(Vec::new()),
                 fail_commit: AtomicU32::new(0),
                 fail_revoke: AtomicU32::new(0),
+                fail_decommit: AtomicU32::new(0),
                 commits: AtomicU32::new(0),
                 decommits: AtomicU32::new(0),
                 revokes: AtomicU32::new(0),
@@ -2766,6 +2768,9 @@ mod backend_tests {
         }
         fn fail_next_revoke(&self) {
             self.fail_revoke.store(1, O::Relaxed);
+        }
+        fn fail_next_decommit(&self) {
+            self.fail_decommit.store(1, O::Relaxed);
         }
     }
 
@@ -2793,6 +2798,10 @@ mod backend_tests {
         }
         fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
             self.decommits.fetch_add(1, O::Relaxed);
+            // Fail *before* discarding (a failed decommit leaves contents intact).
+            if self.fail_decommit.swap(0, O::Relaxed) == 1 {
+                return Err(BackendError::OutOfMemory);
+            }
             // Model MADV_DONTNEED: discard the contents (a later read faults a fresh
             // zero page). Bounds: `[offset, offset+len) <= region.len`.
             // SAFETY: in-bounds sub-range of the committed reservation.
@@ -2979,6 +2988,66 @@ mod backend_tests {
             .expect("recovers");
         touch(r);
         assert!(b.free_region(r));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn multi_hugepage_run_commit_failure_rolls_back() {
+        // W4-5 for the whole-hugepage-run path: an injected commit failure on a
+        // multi-hugepage reservation rolls the filler back (no hugepage left live or
+        // half-committed), and a later allocation succeeds.
+        let b = backend(4);
+        b.provider().fail_next_commit();
+        let bytes = HUGEPAGE_SIZE + PAGE_SIZE; // rounds to a 2-hugepage run
+        assert!(
+            b.allocate(bytes, PAGE_SIZE, PlaceHints::default())
+                .is_none(),
+            "commit failure on the run path ⇒ allocation fails cleanly"
+        );
+        assert_eq!(b.coverage().live_total_bytes, 0, "no hugepage left live");
+        assert_eq!(
+            b.touched_hugepages(),
+            2,
+            "the two reserved hugepages are now empty"
+        );
+        assert!(b.check_invariants());
+        // Recovery: a later run reuses the rolled-back hugepages.
+        let r = b
+            .allocate(bytes, PAGE_SIZE, PlaceHints::default())
+            .expect("recovers");
+        touch(r);
+        assert!(b.free_region(r));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn subrelease_decommit_failure_recommits_and_refuses() {
+        // W4-5: if the provider `decommit` fails *after* a successful revoke, the
+        // backend recommits (undoes the subrelease) and reports 0 bytes — the run is
+        // backed-free again and the filler is well-formed (no released-but-still-mapped
+        // page, no live page disturbed).
+        let b = backend(1);
+        let a = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        let c = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("c");
+        touch(a);
+        touch(c);
+        assert!(b.free_region(c));
+        b.provider().fail_next_decommit();
+        assert_eq!(
+            b.subrelease(c.base as usize, 8, /*pressure*/ false),
+            0,
+            "a decommit failure rolls the subrelease back"
+        );
+        // The run is backed-free again (no partial subrelease recorded).
+        assert_eq!(b.coverage().partial_subreleased_bytes, 0);
+        assert!(b.check_invariants());
+        // A retry (no injected failure) now succeeds and decommits.
+        assert_eq!(b.subrelease(c.base as usize, 8, false), 8 * PAGE_SIZE);
+        assert!(b.free_region(a));
         assert!(b.check_invariants());
     }
 
