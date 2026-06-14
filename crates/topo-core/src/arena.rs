@@ -152,27 +152,60 @@ impl CapRights {
 // Decay policy (§20.5/§22.2) — a carried descriptor field
 // ---------------------------------------------------------------------------
 
-/// Per-arena decay timing (§22.2 `DecayConfig`, Appendix C): how long freed
-/// backing lingers *dirty* (physically backed, reusable cheaply) before it is
-/// lazily purged to *muzzy*, and how long *muzzy* lingers before being returned
-/// to the OS. Carried on the arena descriptor from M1 (D2); the **release
-/// controller that consumes it is plan 04 W12 (M5)** — at M4 the field is
-/// recorded and reconfigurable, not yet acted on, so an arena that wants
-/// low-RSS behavior can already express it.
+/// Per-arena decay & background-purge configuration (§20.2/§22.2 `DecayConfig`,
+/// Appendix C, plan 04 W12-1a): how long freed backing lingers *dirty* (physically
+/// backed, reusable cheaply) before it is lazily purged to *muzzy*, how long *muzzy*
+/// lingers before being returned to the OS, the rate cap on release, and whether the
+/// background-purge pump does routine work for this arena. Carried on the arena
+/// descriptor from M1 (D2) and **consumed by the release controller**
+/// ([`ReleaseController`](crate::release::ReleaseController), W12): the controller
+/// reads these to gate the §21.3 ladder and bound its per-tick release rate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DecayConfig {
-    /// Milliseconds a freed extent stays *dirty* before lazy purge (§20.1).
+    /// Milliseconds a freed extent stays *dirty* before lazy purge (§20.1/§20.2).
     pub dirty_decay_ms: u64,
-    /// Milliseconds a *muzzy* extent stays before being returned to the OS.
+    /// Milliseconds a *muzzy* extent stays before being returned to the OS (§20.2).
     pub muzzy_decay_ms: u64,
+    /// Upper bound on bytes returned to the OS per second (§20.2); `0` ⇒ unlimited.
+    /// The cap is what keeps a large idle drop from stalling on a burst of
+    /// `madvise`/`decommit`; the unmet remainder becomes release-controller backlog.
+    pub release_rate_bytes_per_sec: u64,
+    /// Whether the background-purge pump does any non-emergency work for this arena
+    /// (§20.2/§20.3). `false` suppresses routine decay (Emergency release still acts).
+    pub background_purge_enabled: bool,
 }
 
 impl DecayConfig {
-    /// The Appendix-C server defaults (10 s dirty, 10 s muzzy).
+    /// The Appendix-C / §32.3 server defaults (10 s dirty, 10 s muzzy, unlimited rate,
+    /// background purging on).
     pub const DEFAULT: DecayConfig = DecayConfig {
         dirty_decay_ms: 10_000,
         muzzy_decay_ms: 10_000,
+        release_rate_bytes_per_sec: 0,
+        background_purge_enabled: true,
     };
+
+    /// The latency-first server preset (the [`DEFAULT`](Self::DEFAULT)).
+    pub const fn server() -> Self {
+        Self::DEFAULT
+    }
+
+    /// The RSS-minimizing preset (the `low_rss` profile, §30.1): zero decay so dirty
+    /// and muzzy memory are purged/released promptly, trading reuse cost for footprint.
+    pub const fn low_rss() -> Self {
+        DecayConfig {
+            dirty_decay_ms: 0,
+            muzzy_decay_ms: 0,
+            release_rate_bytes_per_sec: 0,
+            background_purge_enabled: true,
+        }
+    }
+
+    /// The debug preset: prompt release (returns memory quickly so use-after-free is
+    /// caught sooner, §20.5) — the same aggressive decay as [`low_rss`](Self::low_rss).
+    pub const fn debug() -> Self {
+        Self::low_rss()
+    }
 }
 
 impl Default for DecayConfig {
@@ -2217,6 +2250,7 @@ mod tests {
             .with_decay(DecayConfig {
                 dirty_decay_ms: 1,
                 muzzy_decay_ms: 2,
+                ..DecayConfig::DEFAULT
             })
             .with_numa(NumaPolicy::Interleave)
             .with_huge(HugepagePolicy::Prefer);

@@ -37,6 +37,7 @@ pub mod pagemap;
 pub mod pinned;
 pub mod profile;
 pub mod ptr_class;
+pub mod release;
 pub mod size_class;
 pub mod skeleton;
 pub mod slab;
@@ -88,6 +89,10 @@ pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{
     classify_ptr, validate_free, AnyMetadataRegion, FreeTarget, InvalidFree, MetadataRegion,
     NoMetadata, PointerClass,
+};
+pub use release::{
+    demand_reserve, LatencyClass, PressureMode, PressureThresholds, ReleaseController,
+    ReleaseInputs, ReleasePlan, ReleaseStats,
 };
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
