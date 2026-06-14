@@ -29,6 +29,7 @@ pub mod fe;
 pub mod flags;
 pub mod generated;
 pub mod hooks;
+pub mod huge;
 pub mod ids;
 pub mod large;
 pub mod overflow;
@@ -75,6 +76,10 @@ pub use extent::{
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use hooks::{ExtentHooks, HookProvider};
+pub use huge::{
+    classify_bin, FreeReport, Hotness, HugeBin, HugeConfig, HugeError, HugePageBackend,
+    HugePageFiller, HugeRun, HugeStats, Placement, Subrelease, HUGEPAGE_SIZE, PAGES_PER_HUGEPAGE,
+};
 pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
 pub use large::{LargeAllocator, LargeBacking, LargeConfig};
 pub use pagemap::{PageEntry, PageMap, PagemapError};

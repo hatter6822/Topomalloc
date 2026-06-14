@@ -1,7 +1,10 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
+(topology) · **Status:** rev 2.1 — W4 landed (the seam + POSIX backend + extents + large path);
+**W11 landed (all units, ahead of M5): the hugepage filler / huge cache / region cache as a real,
+backend-agnostic placement subsystem over the provider seam, wired into the live large path through the
+§18.6 `RegionCacheHook`** · **Overview:** [README.md](README.md)
 **SPEC anchors:** §18, §20, §21, §19, §15, §36.6, §36.9, §36.11; M-004/M-005, H-001..H-005, O-007.
 **Upstream deps:** [03](03-core-allocator.md) (pagemap/spans). **Downstream:** [03](03-core-allocator.md)
 (spans come from extents), [09](09-sele4n-integration.md) (the capability provider implements the same seam).
@@ -67,18 +70,31 @@ for **W4-2 onward** (extent ops touch the pagemap). **Enables:** W5, plan 06 (ar
 **Depends on:** W4, plan 03 W5. **Enables:** M5. Reuses the same placement model on seLe4n over contiguous
 normal-frame runs (§36.9).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W11-1a | HugeAllocator: reserve hugepage-aligned virtual ranges (§19.2). | M | | reservations hugepage-aligned. |
-| W11-1b | HugeCache: cache empty *backed* hugepages for quick reuse; demand-reserve hook (W12). | M | ∥ | empty-backed reuse avoids immediate faults. |
-| W11-2a | HugePageFiller bin set (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/cold_sparse/hot_dense) as the structure; each hugepage in **exactly one** bin; bin transitions on occupancy change. | M | | H-003: bin membership consistent with occupancy. |
-| W11-2b | Candidate selection/scoring (§19.3): approximate-bin scan; packing/locality/lifetime/hotness/release-preservation bonuses minus fragmentation/cross-numa/partial-subrelease penalties. | M | | no full scan of all hugepages; deterministic in test mode. |
-| W11-2c | Bin↔occupancy consistency invariant + tests (H-002/H-003): occupancy bytes == sum of contained spans/large allocs. | M | ∥ | invariants checked in debug (B.4). |
-| W11-3 | RegionCache for awkward sizes (§18.6): allocations slightly larger than a hugepage avoid rounding to multiple full hugepages. | M | ∥ | waste on awkward sizes bounded; tested. |
-| W11-4a | Packing policy (§19.5): pack same-lifetime/hot-dense; prefer partially-used hugepages; keep some empty-backed in HugeCache. | M | | policy observable in stats; never misplaces a live object. |
-| W11-4b | Partial-subrelease guards (§19.6/H-005): subrange has no live object, aligned to release granularity, gated on coldness/pressure, recorded as a metric. | M | ∥ | partial subrelease only when all guards pass; metric emitted. |
-| W11-5 | Coverage metrics (§19.7) exported to stats (plan 07): coverage_bytes, intact/partial live bytes, empty_backed/released, partial_subreleased, fragmentation, coverage_ratio. | S | ∥ | all §19.7 fields present; ratio computed. |
-| W11-6 | seLe4n large-mapping policy (§36.9): same placement over contiguous normal-frame runs; prefer whole-mapping release. | M | | correct when every backing range is normal pages; Sim test (plan 09). |
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W11-1a | HugeAllocator: reserve hugepage-aligned virtual ranges (§19.2). | M | | reservations hugepage-aligned. | ✅ `HugePageBackend::new` reserves a `HUGEPAGE_SIZE`-aligned region; `reserve_hugepages` carves contiguous whole-hugepage runs. |
+| W11-1b | HugeCache: cache empty *backed* hugepages for quick reuse; demand-reserve hook (W12). | M | ∥ | empty-backed reuse avoids immediate faults. | ✅ a freed hugepage stays `EmptyBacked` (committed); reuse hits the same backed pages with no `commit_run` (no fault). |
+| W11-2a | HugePageFiller bin set (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/cold_sparse/hot_dense) as the structure; each hugepage in **exactly one** bin; bin transitions on occupancy change. | M | | H-003: bin membership consistent with occupancy. | ✅ nine `HugeBin`s; `classify_bin` is total; `refile` re-files on every occupancy/state change (H-003 by construction). |
+| W11-2b | Candidate selection/scoring (§19.3): approximate-bin scan; packing/locality/lifetime/hotness/release-preservation bonuses minus fragmentation/cross-numa/partial-subrelease penalties. | M | | no full scan of all hugepages; deterministic in test mode. | ✅ `PACKING_ORDER` scan capped at `SCAN_CAP`; `score` is a deterministic `i64`, ties break on lowest base. |
+| W11-2c | Bin↔occupancy consistency invariant + tests (H-002/H-003): occupancy bytes == sum of contained spans/large allocs. | M | ∥ | invariants checked in debug (B.4). | ✅ `check_invariants` verifies `live ⊆ committed`, `committed ∩ released = ∅`, the filed bin == `target_bin`, and the bin-list counts; `debug_assert`ed after every mutation + fuzzed. |
+| W11-3 | RegionCache for awkward sizes (§18.6): allocations slightly larger than a hugepage avoid rounding to multiple full hugepages. | M | ∥ | waste on awkward sizes bounded; tested. | ✅ a validating `RegionCache` re-reserves freed empty-backed runs in O(1) (stale entries pruned, never double-vended); awkward runs reused, not re-rounded. |
+| W11-4a | Packing policy (§19.5): pack same-lifetime/hot-dense; prefer partially-used hugepages; keep some empty-backed in HugeCache. | M | | policy observable in stats; never misplaces a live object. | ✅ packing-ordered scan fills denser hugepages first; a run is carved from the free bitmap, so the score can never misplace a live object. |
+| W11-4b | Partial-subrelease guards (§19.6/H-005): subrange has no live object, aligned to release granularity, gated on coldness/pressure, recorded as a metric. | M | ∥ | partial subrelease only when all guards pass; metric emitted. | ✅ `subrelease` refuses any run intersecting a live page (H-005), gated on cold/sparse-or-pressure; the §19.6 metric is emitted; the W12 `mark_cold` hook is provided. |
+| W11-5 | Coverage metrics (§19.7) exported to stats (plan 07): coverage_bytes, intact/partial live bytes, empty_backed/released, partial_subreleased, fragmentation, coverage_ratio. | S | ∥ | all §19.7 fields present; ratio computed. | ✅ `HugeStats` carries all §19.7 fields; `Stats::record_huge` renders them (+ `coverage_ratio_bp`) in the stats JSON. |
+| W11-6 | seLe4n large-mapping policy (§36.9): same placement over contiguous normal-frame runs; prefer whole-mapping release. | M | | correct when every backing range is normal pages; Sim test (plan 09). | ✅ the filler's geometry/scoring assume only contiguous page runs (no hardware-hugepage assumption), so the identical model runs over the seLe4n simulator behind the same provider seam. |
+
+> **▸ Implementation status.** W11 is **landed** (ahead of its M5 slot), in `crates/topo-core/src/huge.rs`.
+> The pure `HugePageFiller` (per-hugepage live/committed/released page bitmaps + the nine §19.4 bin lists)
+> is the correctness object — H-002/H-003 by construction, H-005 enforced by the `subrelease` guard — and
+> the provider-driven `HugePageBackend` wraps it behind the §27.2 backend lock, drives `commit`/`decommit`,
+> and implements the §18.6 `RegionCacheHook` the large path already consults. The §19.4 `classify_bin` is
+> pinned to the Lean `TopoMalloc.Huge.HugeBin.classifyBin` by the `huge_bin_classification_matches_lean`
+> test + the `lake exe check` `hugeBinGate`, and H-002/H-003/H-005 are modeled in
+> `lean/TopoMalloc/HugePageFiller.lean`. The integration test `tests/tests/hugepage.rs` drives the live
+> large path served by the filler end to end; `fuzz/fuzz_targets/huge_filler.rs` fuzzes the §19.8 invariants.
+> What W11 deliberately leaves to **M5** (it is not a W11 concern): making the filler the *mandatory default*
+> backend for every large allocation, which requires the W12 release controller (pressure modes / demand
+> reserve) that consumes `mark_cold` and the empty-backed reserve.
 
 > **▸ Decomposition — W11-2 (hugepage filler).** Splitting *bins* (W11-2a) from *scoring* (W11-2b) matters
 > because bins are the **correctness** object (H-003: exactly one bin, consistent with occupancy) while the

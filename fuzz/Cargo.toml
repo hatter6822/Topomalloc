@@ -57,5 +57,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "huge_filler"
+path = "fuzz_targets/huge_filler.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]

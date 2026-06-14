@@ -61,6 +61,12 @@ pub struct Stats {
     /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
     /// per kind (§23, plan 06 W10).
     pub hook_failures: topo_core::HookFailureStats,
+
+    // --- hugepage coverage (§19.7, plan 04 W11-5) ---------------------------
+    /// The §19.7 hugepage coverage metrics, summed over the hugepage backend(s).
+    /// All zero unless a hugepage backend is in use; populated via
+    /// [`record_huge`](Self::record_huge).
+    pub hugepage: topo_core::HugeStats,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -149,6 +155,18 @@ impl Stats {
         self.record_backend(combined);
     }
 
+    /// Record the §19.7 hugepage coverage metrics (plan 04 W11-5) from a hugepage
+    /// backend's [`HugeStats`](topo_core::HugeStats) (its
+    /// [`coverage`](topo_core::HugePageBackend::coverage) snapshot). The backend is a
+    /// separate component from the central path, so its coverage is recorded
+    /// alongside [`record_allocator`](Self::record_allocator); several backends'
+    /// coverage sums with [`HugeStats::add`](topo_core::HugeStats::add) before being
+    /// recorded. The §19.7 `coverage_ratio` is rendered (computed, not stored) from
+    /// the recorded fields.
+    pub fn record_huge(&mut self, hs: topo_core::HugeStats) {
+        self.hugepage = hs;
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -190,6 +208,16 @@ impl Stats {
                 "    \"pageheap_free_bytes\": {pageheap},\n",
                 "    \"virtual_bytes\": {virtual_b}\n",
                 "  }},\n",
+                "  \"hugepage\": {{\n",
+                "    \"coverage_bytes\": {hp_coverage},\n",
+                "    \"live_bytes_on_intact_hugepages\": {hp_intact},\n",
+                "    \"live_bytes_on_partial_hugepages\": {hp_partial},\n",
+                "    \"empty_backed_bytes\": {hp_empty_backed},\n",
+                "    \"empty_released_bytes\": {hp_empty_released},\n",
+                "    \"partial_subreleased_bytes\": {hp_subreleased},\n",
+                "    \"fragmentation_bytes\": {hp_fragmentation},\n",
+                "    \"coverage_ratio_bp\": {hp_ratio_bp}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -216,6 +244,14 @@ impl Stats {
             released = self.released_bytes,
             pageheap = self.pageheap_free_bytes,
             virtual_b = self.virtual_bytes,
+            hp_coverage = self.hugepage.coverage_bytes,
+            hp_intact = self.hugepage.live_bytes_on_intact,
+            hp_partial = self.hugepage.live_bytes_on_partial,
+            hp_empty_backed = self.hugepage.empty_backed_bytes,
+            hp_empty_released = self.hugepage.empty_released_bytes,
+            hp_subreleased = self.hugepage.partial_subreleased_bytes,
+            hp_fragmentation = self.hugepage.fragmentation_bytes,
+            hp_ratio_bp = self.hugepage.coverage_ratio_bp(),
             metadata = self.metadata_bytes,
         )
     }
@@ -267,6 +303,41 @@ mod tests {
         assert_eq!(v["backend"]["dirty_bytes"], 2048);
         assert_eq!(v["backend"]["released_bytes"], 512);
         assert_eq!(v["backend"]["virtual_bytes"], 15872);
+    }
+
+    #[test]
+    fn hugepage_coverage_reconciles_into_stats_and_json() {
+        // W11-5: the §19.7 coverage metrics flow into the stats snapshot and the JSON,
+        // and the coverage ratio is computed from the recorded fields.
+        let hs = topo_core::HugeStats {
+            coverage_bytes: 4 * 2 * 1024 * 1024, // 4 hugepages
+            live_bytes_on_intact: 3 * 1024 * 1024,
+            live_bytes_on_partial: 1024 * 1024,
+            empty_backed_bytes: 2 * 1024 * 1024,
+            empty_released_bytes: 512 * 1024,
+            partial_subreleased_bytes: 256 * 1024,
+            fragmentation_bytes: 128 * 1024,
+            live_total_bytes: 4 * 1024 * 1024,
+        };
+        let mut s = Stats::default();
+        s.record_huge(hs);
+        assert_eq!(s.hugepage.coverage_bytes, 4 * 2 * 1024 * 1024);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["hugepage"]["coverage_bytes"], 4u64 * 2 * 1024 * 1024);
+        assert_eq!(
+            v["hugepage"]["live_bytes_on_intact_hugepages"],
+            3u64 * 1024 * 1024
+        );
+        assert_eq!(
+            v["hugepage"]["live_bytes_on_partial_hugepages"],
+            1024u64 * 1024
+        );
+        assert_eq!(v["hugepage"]["empty_backed_bytes"], 2u64 * 1024 * 1024);
+        assert_eq!(v["hugepage"]["empty_released_bytes"], 512u64 * 1024);
+        assert_eq!(v["hugepage"]["partial_subreleased_bytes"], 256u64 * 1024);
+        assert_eq!(v["hugepage"]["fragmentation_bytes"], 128u64 * 1024);
+        // ratio = intact / total = 3 MiB / 4 MiB = 7500 bp.
+        assert_eq!(v["hugepage"]["coverage_ratio_bp"], 7500);
     }
 
     #[test]

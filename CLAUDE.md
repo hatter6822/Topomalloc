@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. Front-end caches (M2) and the remaining M1 pieces land per the plan.
+**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. The hugepage-aware backend (W11) rides on the §18.6 region-cache seam: the four §19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a real, backend-agnostic placement subsystem over the provider seam — nine §19.4 occupancy bins (each hugepage in exactly one, H-003), packing-scored placement (§19.3), partial subrelease guarded by H-005, §19.7 coverage metrics in stats, and the §19.8 H-001..H-005 invariants checked in debug — wired into the live large path through the existing `RegionCacheHook`, identical over POSIX and the seLe4n simulator. Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Essential Build Commands
 
@@ -161,11 +161,24 @@ served from its own `HookProvider`-backed region, §22.7-isolated, with **O(1)**
 `topo_extent_hooks_t` ABI**, and **per-arena + global hook-failure observability** (`ArenaStats::hooks`
 / `AllocatorStats::hook_failures` / stats JSON).
 
+The hugepage-aware backend (W11) is implemented ahead of its M5 slot, in `crates/topo-core/src/huge.rs`:
+the pure, single-threaded `HugePageFiller` (per-hugepage live/committed/released page bitmaps + the
+nine §19.4 bin lists) and the provider-driven `HugePageBackend` that wraps it behind the §27.2 backend
+lock, drives `commit`/`decommit`, and implements the §18.6 `RegionCacheHook` the large path already
+consults. It covers W11-1a (HugeAllocator: hugepage-aligned reservations), W11-1b (HugeCache:
+empty-backed reuse), W11-2a/b (nine bins + packing-ordered scored placement, no full scan), W11-2c
+(B.4 bin↔occupancy oracle), W11-3 (validating RegionCache for awkward sizes — bounded waste, no
+double-vend), W11-4a (packing), W11-4b (H-005-guarded partial subrelease with a cold/sparse/pressure
+gate + the W12 `mark_cold` hook), W11-5 (§19.7 coverage metrics → `topo-stats` JSON), and W11-6
+(backend-agnostic: the model assumes only contiguous page runs, so the seLe4n slice reuses it). The
+`huge::classify_bin` (§19.4) is pinned to the Lean model by `huge_bin_classification_matches_lean` and
+the `lake exe check` `hugeBinGate`.
+
 **Test counts:**
-- Rust: ~535 tests across 12 crates (`cargo test --workspace`)
-- Lean: 83 build jobs including proof-checking every module (`lake build`) + 7 executable gates (`lake exe check`)
+- Rust: ~557 tests across 12 crates (`cargo test --workspace`)
+- Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 6 targets (`fuzz/fuzz_targets/`, incl. `arena_api` and `extent_hooks`)
+- Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
@@ -175,6 +188,7 @@ served from its own `HookProvider`-backed region, §22.7-isolated, with **O(1)**
 - Extent state machine OK (§20.1, W4-2d)
 - Arena lifecycle OK (§22.3/§36.13 transitions + revocation chain; pins Rust `ArenaState`/`RevocationPhase`, W9)
 - Extent-hook contracts OK (§23.3 alignment/size/subrange checks match `HookProvider`; §23.4 model, W10)
+- Hugepage filler OK (§19.4 bins match `classifyBin`; H-002/H-003/H-005 model, W11)
 
 The arena lifecycle state machine (§22.3/§36.13) is modeled in `lean/TopoMalloc/ArenaLifecycle.lean`
 (proof-checked by `lake build`, mirroring the runtime `ArenaState`/`RevocationPhase`); the
@@ -184,7 +198,7 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10) | MIT | Yes |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
@@ -216,11 +230,12 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions |
 | `TopoMalloc/ExtentState.lean` | §20.1 extent physical-backing state machine (pinned 1:1 to Rust) |
 | `TopoMalloc/ExtentHooks.lean` | §23.4 hook assumption: §23.3 contracts ⇒ alloc/split/merge/subrange preserve disjointness (tied to the real `WfRangesDisjoint`); §22.7 per-arena-region isolation; the `hookContractGate` decidable checks (W10) |
+| `TopoMalloc/HugePageFiller.lean` | §19.4 `classifyBin` (the nine bins, H-003 by construction); H-002 occupancy-is-sum; H-005 partial-subrelease preserves live backing (over the `Range` geometry); the `hugeBinGate` decidable checks (W11) |
 | `TopoMalloc/Rseq.lean` | RSEQ contract — trusted primitive + frame condition (§33.5) |
 | `TopoMalloc/Boundaries.lean` | trust-boundary scaffolding for the RSEQ hardware boundary |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family (SizeClass, Malloc, Free, Realloc, Cache, Central, Span, Pagemap, PagemapExec, Release, Extent, Arena, Allocate, Demo) |
 | `TopoMalloc/Exec.lean` | executable model + §33.7 text-grammar trace replay |
-| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent/arena differentials, the §23.3 hook-contract gate |
+| `Check.lean` | `lake exe check`: G-table gate, trace-oracle gate, pagemap/provider/extent/arena differentials, the §23.3 hook-contract gate, the §19.4 hugepage-bin gate |
 
 ### seLe4n bridge (GPL-3.0-or-later)
 
@@ -248,6 +263,8 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Hooks preserve disjointness (given §23.3) | `alloc_preserves_disjoint` | `ExtentHooks.lean` |
 | Per-arena hooked regions isolate (§22.7) | `perArena_disjoint_regions_isolate` | `ExtentHooks.lean` |
+| Partial subrelease preserves live backing (H-005) | `subrelease_preserves_live_backing` | `HugePageFiller.lean` |
+| Hugepage bin matches occupancy (H-003) | `partialSubreleased_iff_subreleased` | `HugePageFiller.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
 | SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |
@@ -268,7 +285,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 ```text
 topomalloc/
 ├── crates/
-│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents)
+│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, hugepage filler)
 │   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc)
 │   ├── topo-backend-posix/    (mmap/madvise/mprotect — the POSIX backend)
 │   ├── topo-backend-sele4n/   (Sele4nSim + real seLe4n ABI — GPL-3.0-or-later)

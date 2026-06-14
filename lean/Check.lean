@@ -79,6 +79,13 @@ cases and rejects the violations the `HookProvider` tests exercise — a runtime
 witness that the §23.4 contract model and the runtime enforcement agree. -/
 def hookContractGate : Bool := TopoMalloc.ExtentHooks.hookContractGate
 
+/-- The §19.4 hugepage-bin gate (W11): the §19.4 `classifyBin` returns the expected
+bin for one representative input per bin. The Rust test
+`huge_bin_classification_matches_lean` pins `huge::classify_bin` to the *same* inputs,
+so the runtime filler's bin assignment and this model cannot drift (the §19.4 analogue
+of `extentStateGate`). H-003 ("bin matches occupancy/state") holds by construction. -/
+def hugeBinGate : Bool := TopoMalloc.Huge.hugeBinGate
+
 /-- The §22.3/§36.13 arena-lifecycle edge set (the single source of truth the
 Rust `ArenaState::can_transition` is pinned to, plan 06 W9). -/
 def arenaLifecycleEdges : List (ArenaPhase × ArenaPhase) :=
@@ -143,5 +150,10 @@ def main : IO UInt32 := do
     IO.println "lake check: extent-hook contracts OK (§23.3 alignment/size/subrange checks match HookProvider; §23.4 conditional-correctness model, W10)"
   else
     IO.eprintln "lake check: extent-hook contracts FAILED (§23.3 contract drift, W10)"
+    ok := false
+  if hugeBinGate then
+    IO.println "lake check: hugepage filler OK (§19.4 bins match classifyBin; H-002/H-003/H-005 model, W11)"
+  else
+    IO.eprintln "lake check: hugepage filler FAILED (§19.4 bin drift, W11)"
     ok := false
   return if ok then 0 else 1

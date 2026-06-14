@@ -64,8 +64,22 @@ never trusted) and the §23.4 "allocator correctness assumes hook correctness"
 assumption modeled and proof-checked in Lean (`ExtentHooks.lean`). The full §22.2
 per-arena `hooks` field is wired: `topo_arena_create_hooked` gives an arena its
 **own** custom-backed region, isolated from every other arena's by construction
-(§22.7), reachable from C through the `topo_extent_hooks_t` ABI. Front-end caches
-(M2) and the remaining M1 pieces land per the plan.
+(§22.7), reachable from C through the `topo_extent_hooks_t` ABI.
+
+**Hugepage-aware backend (W11)** rides on the §18.6 region-cache seam: the four
+§19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a
+real, backend-agnostic placement subsystem over the provider seam. A
+`HugePageFiller` packs sub-hugepage page-runs into hugepages over the nine §19.4
+occupancy bins (each hugepage in **exactly one**, H-003) with packing-ordered,
+scored placement (§19.3, no full scan); a provider-driven `HugePageBackend`
+implements the `RegionCacheHook` the large path already consults, so a
+medium/large request is packed or served as a whole-hugepage run — over POSIX or
+the seLe4n simulator alike. Partial subrelease is guarded so it can **never**
+intersect a live object (H-005, proved in Lean by
+`subrelease_preserves_live_backing`); the §19.7 coverage metrics reconcile into
+the stats JSON; and the §19.4 bin classification is pinned to the Lean model by a
+`lake exe check` differential gate. Front-end caches (M2) and the remaining M1
+pieces land per the plan.
 
 ## Quick start
 
@@ -147,6 +161,8 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 - Provider state machine differential (§36.6)
 - Extent state machine differential (§20.1)
 - Arena lifecycle differential (§22.3/§36.13 transitions + revocation chain)
+- Extent-hook contract differential (§23.3 alignment/size/sub-range checks)
+- Hugepage-bin differential (§19.4 `classifyBin` ↔ Rust `classify_bin`)
 
 **Selected headline theorems:**
 
@@ -154,6 +170,7 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 |----------|--------|
 | Size-class table covers all small requests | `Theorems/SizeClass.lean` |
 | 14-clause WellFormed preservation (per transition) | `Theorems/*.lean` |
+| Partial subrelease never strands a live object (H-005) | `HugePageFiller.lean` |
 | Arena lifecycle: alloc only in Active; partial failure never Destroyed | `ArenaLifecycle.lean` |
 | Capability delegation is attenuation-only (`DelegatesFrom`) | `SeLe4n/CapBackedArena.lean` |
 | Delegated subtree's live bytes stay within the root quota (`subtree_used_le_quota`) | `SeLe4n/CapBackedArena.lean` |
