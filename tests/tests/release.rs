@@ -189,3 +189,66 @@ fn release_stats_reconcile_into_the_stats_snapshot() {
     assert!(json.contains("\"pressure_mode\": \"soft\""), "{json}");
     assert!(json.contains("\"ticks\": 2"), "{json}");
 }
+
+/// W12 / §36.9 backend-agnosticism: the controller is pure policy, so the **identical**
+/// release workload driven through [`HugePageBackend::release_tick`] yields the
+/// **identical** decision (plan + bytes released + resulting coverage) over the POSIX
+/// provider and the seLe4n simulator — the G-sim slice for the release controller.
+#[cfg(feature = "sele4n-sim")]
+mod sele4n {
+    use super::*;
+    use topo_backend_sele4n::Sele4nSim;
+    use topo_core::TopoBackingProvider;
+
+    fn build_supply<P: TopoBackingProvider>(hp: &HugePageBackend<P>, n: usize) {
+        let regions: Vec<_> = (0..n)
+            .map(|_| {
+                hp.allocate(HUGEPAGE_SIZE, PAGE, PlaceHints::default())
+                    .expect("hugepage alloc")
+            })
+            .collect();
+        for r in regions {
+            assert!(hp.free_region(r));
+        }
+    }
+
+    /// The address-independent abstract outcome of an idle-release workload: the plan,
+    /// the bytes released, and the resulting coverage. Deterministic, so the two
+    /// providers must agree exactly.
+    fn release_workload<P: TopoBackingProvider>(
+        hp: &HugePageBackend<P>,
+    ) -> (topo_core::ReleasePlan, u64, topo_core::HugeStats) {
+        build_supply(hp, 4);
+        let mut ctl = ReleaseController::new(DecayConfig::default());
+        let _ = hp.release_tick(&mut ctl, 0, normal_baseline());
+        let (plan, released) = hp.release_tick(&mut ctl, 10_000, soft_inputs(0));
+        (plan, released, hp.coverage())
+    }
+
+    fn sim_backend(capacity: usize) -> HugePageBackend<Sele4nSim> {
+        let pool = (capacity + 1) * HUGEPAGE_SIZE;
+        HugePageBackend::new(
+            Sele4nSim::new(pool),
+            meta(1 << 20),
+            ArenaId::DEFAULT,
+            HugeConfig::with_capacity(capacity),
+        )
+        .expect("sim hugepage backend")
+    }
+
+    #[test]
+    fn release_outcome_is_identical_over_posix_and_the_sele4n_simulator() {
+        let posix = huge_backend(8);
+        let sim = sim_backend(8);
+        let posix_outcome = release_workload(&posix);
+        let sim_outcome = release_workload(&sim);
+        assert_eq!(
+            posix_outcome, sim_outcome,
+            "the release controller must decide identically over POSIX and the seLe4n \
+             simulator (W12 backend-agnostic, §36.9)"
+        );
+        // And the decision actually released the idle supply on both.
+        assert_eq!(posix_outcome.1, 4 * HUGEPAGE_SIZE as u64);
+        assert!(posix.check_invariants() && sim.check_invariants());
+    }
+}

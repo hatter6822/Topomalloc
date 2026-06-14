@@ -22,7 +22,10 @@ use topo_core::{
     classify, trace, usable_size, ArenaPolicy, ArenaTable, CapRights, Delegation, RequestFlags,
     SkeletonAllocator,
 };
-use topo_core::{Hotness, HugePageFiller, Lifetime, PlaceHints, HUGEPAGE_SIZE};
+use topo_core::{
+    DecayConfig, Hotness, HugePageFiller, Lifetime, PlaceHints, PressureMode, ReleaseController,
+    ReleaseInputs, HUGEPAGE_SIZE,
+};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -525,6 +528,89 @@ proptest! {
         prop_assert_ne!(rg1, rg0, "reset must bump the reset generation (§22.5)");
         prop_assert_eq!(t.stats(id).unwrap().generation, inc0, "reset keeps the incarnation");
         prop_assert!(t.is_active(id), "reset returns the arena to Active (§22.5)");
+    }
+}
+
+proptest! {
+    /// **Release-controller safety invariants under arbitrary op streams (§20–§21,
+    /// plan 04 W12).** Across any sequence of ticks (varying time, supply, churn, and
+    /// pressure), the [`ReleaseController`] never plans to release more than exists,
+    /// honors the Emergency trigger, and keeps its accounting monotonic — the policy
+    /// can be arbitrarily *tuned* but must never over-promise a rung's supply (a
+    /// release-safety analogue of §2.4: a bad policy never releases memory it lacks).
+    #[test]
+    fn release_controller_plan_never_exceeds_supply(
+        ops in prop::collection::vec(
+            (
+                0u32..5_000,            // dt_ms between ticks
+                0u64..16,               // empty-backed hugepages (units)
+                0u64..(8 << 20),        // dirty bytes
+                0u64..(8 << 20),        // idle cache bytes
+                0u64..(8 << 20),        // cold-sparse bytes
+                0u64..(8 << 20),        // muzzy bytes
+                0u64..(128 << 20),      // allocation delta since the last tick
+                0u32..=100,             // cgroup utilization %
+                any::<bool>(),          // alloc_failed
+            ),
+            0..120,
+        ),
+    ) {
+        let mut c = ReleaseController::new(DecayConfig::low_rss());
+        let mut now: u64 = 0;
+        let mut allocated_total: u64 = 0;
+        let mut prev_planned: u64 = 0;
+
+        for (dt, empty_hp, dirty, idle, cold_sparse, muzzy, alloc_delta, cg, failed) in ops {
+            now += dt as u64;
+            allocated_total = allocated_total.saturating_add(alloc_delta);
+            let empty_backed = empty_hp * HUGEPAGE_SIZE as u64;
+            let inputs = ReleaseInputs {
+                dirty_bytes: dirty,
+                idle_cache_bytes: idle,
+                cold_sparse_bytes: cold_sparse,
+                muzzy_bytes: muzzy,
+                empty_backed_hugepage_bytes: empty_backed,
+                allocated_bytes_total: allocated_total,
+                cgroup_current: cg as u64,
+                cgroup_max: 100,
+                alloc_failed: failed,
+                ..ReleaseInputs::default()
+            };
+            let plan = c.tick(now, inputs);
+
+            // No rung over-promises its supply (the §21.3 mechanisms could not honor it).
+            prop_assert!(plan.drain_caches_bytes <= idle, "drain ≤ idle cache");
+            prop_assert!(
+                plan.release_empty_hugepages_bytes <= empty_backed,
+                "release ≤ empty-backed supply"
+            );
+            prop_assert!(plan.purge_dirty_bytes <= dirty, "purge ≤ dirty");
+            prop_assert!(plan.dirty_to_muzzy_bytes <= dirty, "dirty→muzzy ≤ dirty");
+            prop_assert!(
+                plan.subrelease_cold_sparse_bytes <= cold_sparse,
+                "subrelease ≤ cold-sparse supply"
+            );
+            prop_assert!(plan.emergency_shrink_bytes <= muzzy, "emergency shrink ≤ muzzy");
+            // Purge and the dirty→muzzy lazy conversion partition the dirty supply: the
+            // two together never exceed it (no double-counting the same dirty bytes).
+            prop_assert!(
+                plan.purge_dirty_bytes + plan.dirty_to_muzzy_bytes <= dirty,
+                "purge + dirty→muzzy ≤ dirty (no double count)"
+            );
+            // The Emergency trigger (O-007) is honored, and only then is the reserve
+            // dropped to zero by mode (idle may also yield a zero reserve).
+            if failed {
+                prop_assert_eq!(plan.mode, PressureMode::Emergency, "alloc failure ⇒ Emergency");
+                prop_assert!(plan.disable_hugecache_reserve, "Emergency disables the reserve");
+                prop_assert_eq!(plan.demand_reserve_bytes, 0, "Emergency reserves nothing");
+            }
+            // The plan mode matches the controller's tracked mode.
+            prop_assert_eq!(plan.mode, c.mode());
+            // Cumulative planned bytes never decrease (a monotonic activity counter).
+            let s = c.stats();
+            prop_assert!(s.planned_bytes_total >= prev_planned, "planned total monotonic");
+            prev_planned = s.planned_bytes_total;
+        }
     }
 }
 
