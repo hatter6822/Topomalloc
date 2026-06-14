@@ -26,8 +26,8 @@ use topo_core::bootstrap::BumpArena;
 use topo_core::generated::tables::PAGE_SIZE;
 use topo_core::ids::ArenaId;
 use topo_core::{
-    HugeConfig, HugePageBackend, LargeAllocator, LargeConfig, PageMap, RegionCacheHook,
-    HUGEPAGE_SIZE, PAGES_PER_HUGEPAGE,
+    Allocator, AllocatorConfig, FreeOutcome, HugeConfig, HugePageBackend, LargeAllocator,
+    LargeConfig, PageMap, RegionCacheHook, RequestFlags, HUGEPAGE_SIZE, PAGES_PER_HUGEPAGE,
 };
 
 const PAGE: usize = PAGE_SIZE;
@@ -298,7 +298,9 @@ fn declined_request_falls_through_to_the_extent_manager() {
     let (lo, hi) = hp.reserved_region().addr_range();
 
     // The hugepage backend cannot satisfy align > HUGEPAGE_SIZE within a hugepage.
-    assert!(hp.try_alloc(64 * 1024, HUGEPAGE_SIZE * 2).is_none());
+    assert!(hp
+        .try_alloc(64 * 1024, HUGEPAGE_SIZE * 2, topo_core::Hints::default())
+        .is_none());
     // Through the large path, the same request is served by the extent manager.
     let p = la.allocate_with(64 * 1024, HUGEPAGE_SIZE * 2, &hp);
     assert!(!p.is_null());
@@ -316,4 +318,218 @@ fn declined_request_falls_through_to_the_extent_manager() {
     assert!(unsafe { la.free_with(p, &hp) });
     assert!(hp.check_invariants());
     assert!(la.check_invariants());
+}
+
+#[test]
+fn engine_large_path_is_served_by_the_hugepage_backend_when_wired() {
+    // W11 live wiring (C8/C9): an `Allocator` built with `new_with_huge` (the
+    // `hugepage_optimized` configuration) serves its medium/large allocations from the
+    // hugepage filler — through the *real engine* (`malloc`/`free`), not just the
+    // `LargeAllocator` directly. The small path and free path are unchanged.
+    let m: &'static BumpArena = meta(4 << 20);
+    let pm = pagemap();
+    // The hugepage backend is a sibling of the allocator (caller-owned, process-lived).
+    let huge: &'static HugePageBackend<PosixBackingProvider> = Box::leak(Box::new(huge_backend(8)));
+    let (hlo, hhi) = huge.reserved_region().addr_range();
+    let alloc = Allocator::new_with_huge(
+        PosixBackingProvider::new(),
+        PosixBackingProvider::new(),
+        huge,
+        m,
+        m,
+        pm,
+        topo_core::ids::ArenaId::DEFAULT,
+        AllocatorConfig::small(),
+    )
+    .expect("hugepage-backed allocator");
+
+    // A medium request (256 KiB > small_max) routes through the large path → the
+    // filler. The returned pointer lies in the hugepage backend's region.
+    let p = alloc.allocate_in(
+        topo_core::ids::ArenaId::DEFAULT,
+        256 * 1024,
+        PAGE,
+        RequestFlags::NONE,
+    );
+    assert!(!p.is_null());
+    let a = p as usize;
+    assert!(
+        a >= hlo && a < hhi,
+        "engine large alloc served from the hugepage region"
+    );
+    assert_eq!(alloc.usable_size(p), Some(256 * 1024));
+    assert_eq!(huge.coverage().live_total_bytes, 256 * 1024);
+    // SAFETY: `p` is a live allocation of at least 256 KiB committed bytes.
+    unsafe {
+        std::ptr::write_bytes(p, 0x6c, 256 * 1024);
+        assert_eq!(*p.add(256 * 1024 - 1), 0x6c);
+    }
+    // A small request still uses the small path (not the hugepage region).
+    let s = alloc.allocate_in(topo_core::ids::ArenaId::DEFAULT, 64, 16, RequestFlags::NONE);
+    assert!(!s.is_null());
+    assert!(
+        (s as usize) < hlo || (s as usize) >= hhi,
+        "small alloc not in the hugepage region"
+    );
+
+    // Free routes the hugepage-served allocation back to the filler (coverage drops).
+    // SAFETY: `p` is a live base pointer just handed out.
+    let freed_p = unsafe { alloc.free(p) };
+    assert_eq!(freed_p, FreeOutcome::Freed);
+    assert_eq!(
+        huge.coverage().live_total_bytes,
+        0,
+        "freed back to the filler"
+    );
+    // SAFETY: `s` is a live base pointer just handed out.
+    let freed_s = unsafe { alloc.free(s) };
+    assert_eq!(freed_s, FreeOutcome::Freed);
+    assert!(huge.check_invariants());
+}
+
+#[test]
+fn request_hints_reach_the_region_cache_through_the_engine() {
+    // W11 B5: the engine's large path carries the request's hotness/lifetime hints to
+    // the §18.6 region-cache seam, so a wired hugepage backend can pack by them
+    // (§19.3/§19.5). A recording hook captures the hints it is asked with.
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use topo_core::{Hints, Lifetime, Region};
+
+    struct Recorder {
+        hotness: AtomicU8,
+        lifetime: AtomicU8,
+    }
+    impl RegionCacheHook for Recorder {
+        fn try_alloc(&self, _bytes: usize, _align: usize, hints: Hints) -> Option<Region> {
+            self.hotness.store(hints.hotness, Ordering::Relaxed);
+            self.lifetime.store(
+                match hints.lifetime {
+                    Lifetime::Unspecified => 0,
+                    Lifetime::Short => 1,
+                    Lifetime::Medium => 2,
+                    Lifetime::Long => 3,
+                },
+                Ordering::Relaxed,
+            );
+            None // decline → fall through to the extents (we only assert on the hints)
+        }
+    }
+
+    let rec: &'static Recorder = Box::leak(Box::new(Recorder {
+        hotness: AtomicU8::new(0),
+        lifetime: AtomicU8::new(0),
+    }));
+    let m: &'static BumpArena = meta(2 << 20);
+    let pm = pagemap();
+    let alloc = Allocator::new_with_huge(
+        PosixBackingProvider::new(),
+        PosixBackingProvider::new(),
+        rec,
+        m,
+        m,
+        pm,
+        topo_core::ids::ArenaId::DEFAULT,
+        AllocatorConfig::small(),
+    )
+    .expect("hint-recording allocator");
+
+    // A medium request with a hot, long-lived hint.
+    let flags = RequestFlags::NONE
+        .with_hotness(200)
+        .with_lifetime(Lifetime::Long);
+    let p = alloc.allocate_in(topo_core::ids::ArenaId::DEFAULT, 256 * 1024, PAGE, flags);
+    assert!(
+        !p.is_null(),
+        "served by the extents after the hook declined"
+    );
+    assert_eq!(
+        rec.hotness.load(Ordering::Relaxed),
+        200,
+        "hotness hint reached the seam"
+    );
+    assert_eq!(
+        rec.lifetime.load(Ordering::Relaxed),
+        3,
+        "lifetime (Long) reached the seam"
+    );
+    // SAFETY: `p` is a live base pointer just handed out.
+    assert_eq!(unsafe { alloc.free(p) }, FreeOutcome::Freed);
+}
+
+/// W11-6 / §36.9 backend-agnosticism: the **identical** workload run over the POSIX
+/// provider and the seLe4n simulator yields the **identical** abstract outcome. The
+/// filler assumes only contiguous page runs (no hardware-hugepage assumption), so it
+/// runs unchanged over the simulator's normal-frame pool — the G-sim slice for W11.
+#[cfg(feature = "sele4n-sim")]
+mod sele4n {
+    use super::*;
+    use topo_backend_sele4n::Sele4nSim;
+    use topo_core::{Hotness, PlaceHints, Region, TopoBackingProvider};
+
+    /// Write a pattern over a region and read it back (committed backing).
+    fn touch(region: Region) {
+        // SAFETY: `region` is committed backing of `region.len` bytes from the backend.
+        unsafe {
+            std::ptr::write_bytes(region.base, 0x33, region.len);
+            assert_eq!(*region.base, 0x33);
+            assert_eq!(*region.base.add(region.len - 1), 0x33);
+        }
+    }
+
+    /// A representative hugepage workload — packing, a multi-hugepage run, a sparse
+    /// subrelease, a free, and a demand-reserve shrink — returning the
+    /// **address-independent** abstract outcome (coverage + touched + subrelease bytes
+    /// + invariant). Deterministic, so POSIX and the simulator must agree exactly.
+    fn workload<P: TopoBackingProvider>(
+        b: &HugePageBackend<P>,
+    ) -> (topo_core::HugeStats, usize, usize, bool) {
+        let a = b
+            .allocate(256 * 1024, PAGE, PlaceHints::hot(Hotness::Neutral))
+            .unwrap(); // 16 pages
+        let c = b.allocate(128 * 1024, PAGE, PlaceHints::default()).unwrap(); // 8 pages, packs with a
+        let run = b
+            .allocate(HUGEPAGE_SIZE + PAGE, PAGE, PlaceHints::default())
+            .unwrap(); // 2-hp run
+        touch(a);
+        touch(c);
+        touch(run);
+        assert!(b.free_region(c)); // hugepage 0 now sparse (16 live)
+        let sub = b.subrelease(c.base as usize, 8, /*pressure*/ false); // sparse ⇒ allowed
+        assert!(b.free_region(run)); // → cached / empty-backed
+        let released = b.release_empty_excess(0); // demand-reserve shrink to zero
+        let outcome = (
+            b.coverage(),
+            b.touched_hugepages(),
+            sub + released,
+            b.check_invariants(),
+        );
+        assert!(b.free_region(a));
+        outcome
+    }
+
+    fn sim_backend(capacity: usize) -> HugePageBackend<Sele4nSim> {
+        // The simulator charges the whole hugepage-aligned reservation eagerly, so the
+        // authorized-untyped pool must cover it (plus headroom).
+        let pool = (capacity + 1) * HUGEPAGE_SIZE;
+        HugePageBackend::new(
+            Sele4nSim::new(pool),
+            meta(1 << 20),
+            ArenaId::DEFAULT,
+            HugeConfig::with_capacity(capacity),
+        )
+        .expect("sim hugepage backend")
+    }
+
+    #[test]
+    fn filler_outcome_is_identical_over_posix_and_the_sele4n_simulator() {
+        let posix = huge_backend(4);
+        let sim = sim_backend(4);
+        let posix_outcome = workload(&posix);
+        let sim_outcome = workload(&sim);
+        assert_eq!(
+            posix_outcome, sim_outcome,
+            "the hugepage filler must behave identically over POSIX and the seLe4n simulator (W11-6)"
+        );
+        assert!(posix_outcome.3 && sim_outcome.3, "both well-formed");
+    }
 }

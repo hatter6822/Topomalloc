@@ -65,6 +65,7 @@ use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
 use crate::error::BackendError;
 use crate::extent::{BackendLock, RegionCacheHook};
+use crate::flags::{Hints, Lifetime};
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
 use crate::ids::ArenaId;
 use crate::overflow::pages_for;
@@ -155,7 +156,70 @@ impl Hotness {
     }
 }
 
-/// The nine §19.4 hugepage bins (filler classes), by free space **and** state. Each
+/// Encode a [`Lifetime`] hint as the `u8` a [`HugePageSlot`] stores (the join axis is
+/// `Unspecified < Short < Medium < Long`).
+#[inline]
+fn lifetime_to_u8(l: Lifetime) -> u8 {
+    match l {
+        Lifetime::Unspecified => 0,
+        Lifetime::Short => 1,
+        Lifetime::Medium => 2,
+        Lifetime::Long => 3,
+    }
+}
+
+/// Decode a stored lifetime byte (total: an unknown value reads as
+/// [`Unspecified`](Lifetime::Unspecified)).
+#[inline]
+fn lifetime_from_u8(v: u8) -> Lifetime {
+    match v {
+        1 => Lifetime::Short,
+        2 => Lifetime::Medium,
+        3 => Lifetime::Long,
+        _ => Lifetime::Unspecified,
+    }
+}
+
+/// Join two lifetime hints, taking the **longer** (a hugepage's lifetime is the
+/// longest-lived resident, so a long-lived object keeps its hugepage long-lived —
+/// §19.5 "pack same-lifetime objects together").
+#[inline]
+fn lifetime_join(a: Lifetime, b: Lifetime) -> Lifetime {
+    if lifetime_to_u8(a) >= lifetime_to_u8(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Advisory **placement hints** for the filler (§19.3/§19.5, W11-2b/W11-4a): the
+/// request's hotness and expected lifetime. Backend-agnostic and **never a safety
+/// input** — they only steer the placement score (DD-2: "the score is policy"), so a
+/// wrong hint can hurt fragmentation but can never misplace a live object. The §18.6
+/// [`RegionCacheHook`] seam carries no hints, so a request routed through it places
+/// with [`PlaceHints::default`] ([`Neutral`](Hotness::Neutral)/
+/// [`Unspecified`](Lifetime::Unspecified)); the richer
+/// [`HugePageBackend::allocate`] entry point (used by the engine's large path under
+/// the `hugepage_optimized` profile) carries the real hints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PlaceHints {
+    /// Hotness class (§19.3 `hotness_match` / §19.5 dense packing).
+    pub hotness: Hotness,
+    /// Expected lifetime (§19.5 same-lifetime grouping).
+    pub lifetime: Lifetime,
+}
+
+impl PlaceHints {
+    /// Hints with the given hotness and an unspecified lifetime (the common case).
+    #[inline]
+    pub const fn hot(hotness: Hotness) -> PlaceHints {
+        PlaceHints {
+            hotness,
+            lifetime: Lifetime::Unspecified,
+        }
+    }
+}
+
 /// hugepage is in **exactly one** (H-003); [`classify_bin`] is the total function
 /// that decides, and the filler re-files a hugepage whenever its occupancy or state
 /// changes. The numeric order is the `repr(u8)` the bin lists index by — it is *not*
@@ -440,12 +504,13 @@ struct HugePageSlot {
     bin_next: u32,
     /// Joined [`Hotness`] of the hugepage's residents (`u8`).
     hotness: u8,
+    /// Joined [`Lifetime`] of the hugepage's residents (`u8`, longest-lived — §19.5).
+    lifetime: u8,
     /// The filed [`HugeBin`] (`u8`) when `touched == 1`.
     bin: u8,
     /// `1` once the hugepage has been opened into a bin (and stays, as the
     /// HugeCache, until reclaimed); `0` while untouched (reserved, in no bin).
     touched: u8,
-    _pad: u8,
 }
 
 impl HugePageSlot {
@@ -774,6 +839,18 @@ impl HugePageFiller {
         n
     }
 
+    /// The base address of a hugepage currently in `bin` (the list head), or `None`
+    /// if the bin is empty — used by the demand-reserve path (W11-1b) to pick an
+    /// empty-backed hugepage to release.
+    pub fn first_in_bin(&self, bin: HugeBin) -> Option<usize> {
+        let head = self.bins[bin as usize];
+        if head == NIL {
+            None
+        } else {
+            Some(self.huge_base(head))
+        }
+    }
+
     // --- placement (W11-2b candidate selection, W11-4a packing) --------------
 
     /// Whether `align` (a power of two ≤ [`HUGEPAGE_SIZE`]) admits an in-hugepage
@@ -795,18 +872,42 @@ impl HugePageFiller {
 
     /// **§19.3 placement score (policy, DD-2).** A deterministic `i64` ranking a
     /// candidate hugepage for a `pages`-page run at `run_offset`, combining the §19.3
-    /// terms over **backend-agnostic** inputs (page counts + hotness, never "is a
-    /// hardware hugepage" — so W11-6/seLe4n reuse it). Higher is better; ties break
-    /// on lower base in [`place`](Self::place). A wrong score never misplaces a live
-    /// object (the run is carved from the free bitmap regardless).
-    fn score(s: &HugePageSlot, req_hotness: Hotness, run_offset: usize, pages: usize) -> i64 {
+    /// terms over **backend-agnostic** inputs (page counts + the hotness/lifetime
+    /// hints, never "is a hardware hugepage" — so W11-6/seLe4n reuse it). Higher is
+    /// better; ties break on lower base in [`place`](Self::place). A wrong score never
+    /// misplaces a live object (the run is carved from the free bitmap regardless).
+    ///
+    /// The §19.3 terms (locality/cross-NUMA are deferred to W13 topology and scored 0
+    /// until then — keeping the inputs backend-agnostic, DD-2):
+    /// `packing + hotness_match + lifetime_match + release_preservation + commit_bonus
+    ///  − fragmentation − lifetime_mismatch − partial_subrelease`.
+    fn score(s: &HugePageSlot, hints: PlaceHints, run_offset: usize, pages: usize) -> i64 {
         let used = s.used() as i64;
+        let total = PAGES_PER_HUGEPAGE as i64;
         let subreleased = s.subreleased() as i64;
+        let committed = popcount(&s.committed) as i64;
         // packing_bonus (§19.5): prefer fuller hugepages — fill partially-used over
         // opening new, so emptier hugepages stay releasable.
         let packing = used;
         // hotness_match_bonus: matching hotness keeps hot objects together (§19.5).
-        let hotness_match = if s.hotness == req_hotness as u8 { 4 } else { 0 };
+        let hotness_match = if s.hotness == hints.hotness as u8 {
+            4
+        } else {
+            0
+        };
+        // lifetime grouping (§19.5): bonus for same-lifetime placement, penalty for
+        // mixing very short-lived with long-lived objects (which fragments the
+        // long-lived hugepage as the short-lived ones churn).
+        let hp_life = lifetime_from_u8(s.lifetime);
+        let life_gap =
+            (lifetime_to_u8(hp_life) as i64 - lifetime_to_u8(hints.lifetime) as i64).abs();
+        let lifetime_match = if used == 0 {
+            0 // an empty hugepage has no resident lifetime to match
+        } else if life_gap == 0 {
+            3
+        } else {
+            -life_gap // larger gap (short vs long) ⇒ larger mixing penalty
+        };
         // release_preservation_bonus: avoid disturbing an empty hugepage held for
         // release/reuse (the HugeCache reserve) — a small penalty for opening one.
         let release_pres = if used == 0 { -3 } else { 0 };
@@ -817,17 +918,23 @@ impl HugePageFiller {
         } else {
             0
         };
-        // fragmentation_penalty: a run that does not abut page 0 or the live frontier
-        // leaves a hole; approximate by the gap before the run.
-        let fragmentation = (run_offset as i64).min(8);
+        // fragmentation_penalty: prefer a placement that leaves the hugepage tightly
+        // packed — penalize the backed-but-free pages that would remain after the run
+        // (a tight fit strands less reusable-but-idle backing), capped so it never
+        // dominates packing. A run abutting the live frontier (low `run_offset`)
+        // strands no gap before it; account that too.
+        let backed_free_after = (committed - used - pages as i64).max(0).min(total);
+        let fragmentation = (backed_free_after / 8) + (run_offset as i64).min(8);
         // partial_subrelease_penalty (§19.3): avoid re-filling a subreleased hugepage.
         let subrelease_pen = subreleased;
-        packing + hotness_match + release_pres + commit_bonus - fragmentation - subrelease_pen
+        packing + hotness_match + lifetime_match + release_pres + commit_bonus
+            - fragmentation
+            - subrelease_pen
     }
 
-    /// **Place a `pages`-page run** at `align` with `hotness` (§19.3/§19.5, W11-2b/
-    /// W11-4a). Scans the bins in [`PACKING_ORDER`] (fullest-fitting first — **no
-    /// full scan of all hugepages**, W11-2b), scores the fitting candidates, and
+    /// **Place a `pages`-page run** at `align` with placement `hints` (§19.3/§19.5,
+    /// W11-2b/W11-4a). Scans the bins in [`PACKING_ORDER`] (fullest-fitting first —
+    /// **no full scan of all hugepages**, W11-2b), scores the fitting candidates, and
     /// carves the best (deterministic: best score, then lowest base). Opens a fresh
     /// hugepage only if no touched one fits. Marks the run **live** and re-files the
     /// bin; the caller commits [`Placement::commit_run`] and confirms with
@@ -837,7 +944,7 @@ impl HugePageFiller {
     /// filler is **unchanged** on failure (W4-5).
     ///
     /// SPEC-transition: hugepage span placement (§19.3 filler)
-    pub fn place(&mut self, pages: usize, align: usize, hotness: Hotness) -> Option<Placement> {
+    pub fn place(&mut self, pages: usize, align: usize, hints: PlaceHints) -> Option<Placement> {
         if pages == 0 || pages > PAGES_PER_HUGEPAGE {
             return None;
         }
@@ -854,7 +961,7 @@ impl HugePageFiller {
                 let s = self.get(i);
                 if let Some(off) = find_run_aligned(&s.live, pages, stride) {
                     found_in_bin = true;
-                    let sc = Self::score(&s, hotness, off, pages);
+                    let sc = Self::score(&s, hints, off, pages);
                     let better = match best {
                         None => true,
                         Some((bi, _, bsc)) => {
@@ -889,7 +996,7 @@ impl HugePageFiller {
                 (fresh, 0)
             }
         };
-        Some(self.carve(hp, off, pages, hotness))
+        Some(self.carve(hp, off, pages, hints))
     }
 
     /// Open the next never-touched hugepage into the [`EmptyBacked`](HugeBin::EmptyBacked)
@@ -905,6 +1012,7 @@ impl HugePageFiller {
         debug_assert_eq!(s.touched, 0, "opening an already-touched hugepage");
         s.touched = 1;
         s.hotness = Hotness::Neutral as u8;
+        s.lifetime = lifetime_to_u8(Lifetime::Unspecified);
         self.put(i, s);
         // used == 0, no subrelease ⇒ EmptyBacked (H-003).
         self.bin_insert(i, HugeBin::EmptyBacked);
@@ -913,8 +1021,9 @@ impl HugePageFiller {
 
     /// Mark the `pages`-page run at page offset `off` of hugepage `hp` live and
     /// re-file the bin, returning the [`Placement`] (with the `commit_run` the caller
-    /// must back). Pure bookkeeping (the caller drives the provider).
-    fn carve(&mut self, hp: u32, off: usize, pages: usize, hotness: Hotness) -> Placement {
+    /// must back). Joins the request's hotness/lifetime into the hugepage's (§19.5).
+    /// Pure bookkeeping (the caller drives the provider).
+    fn carve(&mut self, hp: u32, off: usize, pages: usize, hints: PlaceHints) -> Placement {
         let mut s = self.get(hp);
         debug_assert!(run_is_clear(&s.live, off, pages), "carving over a live run");
         // Does any page in the run need committing (uncommitted or subreleased)?
@@ -924,7 +1033,8 @@ impl HugePageFiller {
             bit_set(&mut s.live, k);
             k += 1;
         }
-        s.hotness = Hotness::from_u8(s.hotness).join(hotness) as u8;
+        s.hotness = Hotness::from_u8(s.hotness).join(hints.hotness) as u8;
+        s.lifetime = lifetime_to_u8(lifetime_join(lifetime_from_u8(s.lifetime), hints.lifetime));
         self.put(hp, s);
         self.refile(hp);
         let base = self.huge_base(hp) + off * PAGE_SIZE;
@@ -997,9 +1107,10 @@ impl HugePageFiller {
         }
         let now_empty = popcount(&s.live) == 0;
         if now_empty {
-            // An emptied hugepage forgets its hotness (it has no residents); the next
-            // resident sets it afresh.
+            // An emptied hugepage forgets its hotness/lifetime (no residents); the
+            // next resident sets them afresh.
             s.hotness = Hotness::Neutral as u8;
+            s.lifetime = lifetime_to_u8(Lifetime::Unspecified);
         }
         self.put(hp, s);
         self.refile(hp);
@@ -1069,10 +1180,14 @@ impl HugePageFiller {
         if !(cold_or_sparse || pressure_high) {
             return None;
         }
-        // Predicted benefit (pages returned) vs predicted cost (≥ 1): the §19.6
-        // cost/benefit gate. `pages >= 1` here, so this holds, but it is the explicit
-        // comparison the policy requires.
-        if pages < 1 {
+        // §19.6 cost/benefit gate: predicted RSS benefit (`pages` reclaimed) vs
+        // predicted fragmentation cost. The cost scales with the hugepage's live
+        // coverage (`used`): subreleasing from a denser hugepage risks more TLB
+        // coverage and is repaid only by a larger run, while a near-empty hugepage's
+        // coverage is already low so even a small run is worthwhile. So subrelease
+        // only when `benefit ≥ cost` — unless pressure forces every byte back.
+        let predicted_cost = s.used() / FRAGMENTATION_COST_DIVISOR;
+        if !pressure_high && pages < predicted_cost {
             return None;
         }
         // Commit the subrelease: mark the run released (committed → released).
@@ -1155,7 +1270,7 @@ impl HugePageFiller {
                 self.bin_insert(j, HugeBin::EmptyBacked);
             }
             // Carve the whole hugepage live (a `Full` page run).
-            let p = self.carve(j, 0, PAGES_PER_HUGEPAGE, Hotness::Neutral);
+            let p = self.carve(j, 0, PAGES_PER_HUGEPAGE, PlaceHints::default());
             needs_commit |= p.commit_run.is_some();
             j += 1;
         }
@@ -1198,7 +1313,7 @@ impl HugePageFiller {
         let mut needs_commit = false;
         let mut j = start;
         while j < start + n as u32 {
-            let p = self.carve(j, 0, PAGES_PER_HUGEPAGE, Hotness::Neutral);
+            let p = self.carve(j, 0, PAGES_PER_HUGEPAGE, PlaceHints::default());
             needs_commit |= p.commit_run.is_some();
             j += 1;
         }
@@ -1281,6 +1396,7 @@ impl HugePageFiller {
             let mut s = self.get(j);
             s.live = [0; BITMAP_WORDS];
             s.hotness = Hotness::Neutral as u8;
+            s.lifetime = lifetime_to_u8(Lifetime::Unspecified);
             self.put(j, s);
             self.refile(j);
             j += 1;
@@ -1470,11 +1586,29 @@ fn bin_from_u8(v: u8) -> HugeBin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Filler tuning constants (§19.3/§19.6 policy — centralized, not scattered).
+//
+// These steer *placement and release policy only*; none is a safety input (DD-2),
+// so a different value can change fragmentation/RSS behaviour but never correctness.
+// They are gathered here (rather than buried at use sites) so the policy surface is
+// auditable in one place; unlike the size-class table (DD-1) they are not machine-
+// checked, because the §33.4 theorems hold for *any* value (the score/gate are
+// pure policy). The release controller (plan 04 W12) may make some of these dynamic.
+// ---------------------------------------------------------------------------
+
 /// The per-placement candidate-scan cap (§19.3 "MAY use approximate bins rather than
 /// scanning all hugepages"): a single [`place`](HugePageFiller::place) examines at
 /// most this many hugepages across the packing-ordered bins, so placement is bounded
 /// regardless of how many hugepages exist (W11-2b "no full scan").
 const SCAN_CAP: usize = 64;
+
+/// The §19.6 cost/benefit divisor: a subrelease's predicted fragmentation cost is the
+/// hugepage's live page count divided by this, so a near-empty hugepage (low live
+/// coverage) admits even small subreleases while a denser one needs a larger run to
+/// repay the lost coverage. `8` makes a fully-live hugepage cost `PAGES_PER_HUGEPAGE/8`
+/// (16 pages) — i.e. only a substantial run is worth disrupting a dense hugepage.
+const FRAGMENTATION_COST_DIVISOR: usize = 8;
 
 // ===========================================================================
 // §18.6 region cache for awkward sizes (W11-3)
@@ -1808,8 +1942,8 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         self.region
     }
 
-    /// **Allocate `bytes` at `align` with a `hotness` hint** (the richer entry point;
-    /// the [`RegionCacheHook`] seam uses [`Hotness::Neutral`]). Packs a sub-hugepage
+    /// **Allocate `bytes` at `align` with placement `hints`** (the richer entry point;
+    /// the [`RegionCacheHook`] seam uses [`PlaceHints::default`]). Packs a sub-hugepage
     /// request into a hugepage via the filler, or serves a whole-hugepage run
     /// (large/awkward) from the region cache or a fresh reservation. Commits the
     /// backing through the provider; on a commit failure the placement is rolled back
@@ -1817,13 +1951,13 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// caller falls through to the plain extent path).
     ///
     /// SPEC-transition: `huge_allocate` (§18.5 large path / §19 filler)
-    pub fn allocate(&self, bytes: usize, align: usize, hotness: Hotness) -> Option<Region> {
+    pub fn allocate(&self, bytes: usize, align: usize, hints: PlaceHints) -> Option<Region> {
         let pages = pages_for(bytes, PAGE_SIZE)?;
         if pages == 0 || !align.is_power_of_two() || align > HUGEPAGE_SIZE {
             return None;
         }
         if pages <= PAGES_PER_HUGEPAGE {
-            self.allocate_packed(pages, align, hotness)
+            self.allocate_packed(pages, align, hints)
         } else {
             self.allocate_run(pages)
         }
@@ -1831,9 +1965,9 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 
     /// Sub-hugepage packing (`pages <= PAGES_PER_HUGEPAGE`): place via the filler and
     /// commit the run.
-    fn allocate_packed(&self, pages: usize, align: usize, hotness: Hotness) -> Option<Region> {
+    fn allocate_packed(&self, pages: usize, align: usize, hints: PlaceHints) -> Option<Region> {
         let g = self.lock();
-        let p = g.inner.filler.place(pages, align, hotness)?;
+        let p = g.inner.filler.place(pages, align, hints)?;
         if let Some((offset, len)) = p.commit_run {
             if self.provider.commit(self.region, offset, len).is_err() {
                 // Roll back the placement so the filler is unchanged (W4-5).
@@ -1910,17 +2044,33 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 
     /// **Partial subrelease** of the `pages`-page run at `base` (§19.6, W11-4b): the
     /// filler decides under the §19.6 guards (H-005 etc.), and on success this
-    /// `decommit`s the run through the provider, dropping RSS. `pressure_high` is the
-    /// release controller's pressure signal (plan 04 W12). Returns the bytes
-    /// subreleased (`0` if a guard refused or the decommit failed and was rolled back).
+    /// **revokes the run's descendant capabilities then `decommit`s it** through the
+    /// provider, dropping RSS. `pressure_high` is the release controller's pressure
+    /// signal (plan 04 W12). Returns the bytes subreleased (`0` if a guard refused, a
+    /// revoke failed, or the decommit failed and was rolled back).
     ///
-    /// SPEC-transition: partial subrelease + decommit (§19.6/§20.4)
+    /// **§36.6 revoke-before-recycle:** decommit returns the run's physical frames to
+    /// a provider pool that could re-type them for another authority domain, so the
+    /// run's derived frame/mapping capabilities are revoked **first** (a no-op on
+    /// POSIX — single ambient authority — and real capability revocation on the
+    /// seLe4n provider, plan 09; mirrors [`ExtentManager::release`](crate::ExtentManager::release)).
+    /// A revoke failure leaves the run committed and the filler well-formed (W4-5).
+    ///
+    /// SPEC-transition: partial subrelease + revoke + decommit (§19.6/§20.4/§36.6)
     pub fn subrelease(&self, base: usize, pages: usize, pressure_high: bool) -> usize {
         let g = self.lock();
         let sr = match g.inner.filler.subrelease(base, pages, pressure_high) {
             Some(sr) => sr,
             None => return 0,
         };
+        let sub = self.subregion(self.region.base as usize + sr.region_offset, sr.len);
+        // §36.6: revoke derived capabilities before the frames return to the pool.
+        if self.provider.revoke_descendants(self.arena, sub).is_err() {
+            // Revoke failed: undo the subrelease (recommit) and refuse.
+            g.inner.filler.unsubrelease(&sr);
+            debug_assert!(g.inner.filler.check_invariants());
+            return 0;
+        }
         if self
             .provider
             .decommit(self.region, sr.region_offset, sr.len)
@@ -1933,6 +2083,43 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         }
         debug_assert!(g.inner.filler.check_invariants());
         sr.len
+    }
+
+    /// **Demand-reserve shrink (W11-1b's "demand-reserve hook (W12)").** Return the
+    /// backing of empty-backed hugepages held beyond `reserve` to the OS, keeping at
+    /// most `reserve` empty-backed hugepages cached for fast burst reuse (the
+    /// HugeCache) and reclaiming the rest of the RSS. Returns the bytes released.
+    ///
+    /// Each released hugepage is fully [`subrelease`](Self::subrelease)d (revoke +
+    /// decommit of all its pages), so it leaves the `EmptyBacked` bin (its virtual
+    /// range is retained for recommit-on-reuse, §20.5). The **policy** — what
+    /// `reserve` to choose and when to call this — belongs to the release controller
+    /// (plan 04 W12); this is the **mechanism** it drives. Bounds the HugeCache so a
+    /// churny workload's empty hugepages do not pin RSS indefinitely.
+    pub fn release_empty_excess(&self, reserve: usize) -> usize {
+        let mut released = 0usize;
+        loop {
+            // Pick an empty-backed hugepage to release if over the reserve (under the
+            // lock); release it (re-acquires the lock) outside. A concurrent change
+            // just makes the subrelease a no-op, which ends the loop safely.
+            let target = {
+                let g = self.lock();
+                if g.inner.filler.bin_len(HugeBin::EmptyBacked) <= reserve {
+                    None
+                } else {
+                    g.inner.filler.first_in_bin(HugeBin::EmptyBacked)
+                }
+            };
+            match target {
+                // Release the whole empty hugepage (all its pages) under pressure.
+                Some(base) => match self.subrelease(base, PAGES_PER_HUGEPAGE, true) {
+                    0 => break, // could not release (e.g. a revoke failure) — stop
+                    bytes => released += bytes,
+                },
+                None => break,
+            }
+        }
+        released
     }
 
     /// The §19.7 coverage metrics (W11-5) for this backend's hugepages.
@@ -1981,10 +2168,19 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 
 impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
     #[inline]
-    fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
-        // The §18.6 seam carries no hotness hint, so placement is neutral; the richer
-        // `allocate` entry point takes a hint for callers that have one.
-        self.allocate(bytes, align, Hotness::Neutral)
+    fn try_alloc(&self, bytes: usize, align: usize, hints: Hints) -> Option<Region> {
+        // Translate the request's advisory hints (§10.4) into the filler's placement
+        // hints (§19.3/§19.5): the `0..=255` hotness hint maps to cold/neutral/hot,
+        // the lifetime passes through. So the engine's large path packs by hotness and
+        // lifetime through the seam (W11 B5).
+        self.allocate(
+            bytes,
+            align,
+            PlaceHints {
+                hotness: Hotness::from_hint(hints.hotness),
+                lifetime: hints.lifetime,
+            },
+        )
     }
 
     #[inline]
@@ -2030,7 +2226,9 @@ mod filler_tests {
     /// Place + immediately confirm the commit (the backend's success path), so the
     /// filler is settled (`live ⊆ committed`). Returns the placement.
     fn place_ok(f: &mut HugePageFiller, pages: usize, align: usize, hot: Hotness) -> Placement {
-        let p = f.place(pages, align, hot).expect("placement");
+        let p = f
+            .place(pages, align, PlaceHints::hot(hot))
+            .expect("placement");
         f.mark_committed(&p);
         assert!(f.check_invariants());
         p
@@ -2122,11 +2320,15 @@ mod filler_tests {
         // W11-1b: a fresh hugepage's pages need committing; after free+reuse the same
         // pages are still backed, so the reuse is a HugeCache hit (no commit_run).
         let mut f = filler(2);
-        let p = f.place(2, PAGE_SIZE, Hotness::Neutral).expect("place");
+        let p = f
+            .place(2, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("place");
         assert!(p.commit_run.is_some(), "fresh pages need a commit");
         f.mark_committed(&p);
         assert!(f.free(p.base, 2).valid);
-        let q = f.place(2, PAGE_SIZE, Hotness::Neutral).expect("reuse");
+        let q = f
+            .place(2, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("reuse");
         assert_eq!(q.base, p.base, "empty-backed reuse hits the same pages");
         assert!(
             q.commit_run.is_none(),
@@ -2226,6 +2428,67 @@ mod filler_tests {
     }
 
     #[test]
+    fn placement_groups_by_lifetime_overriding_the_base_tiebreak() {
+        // §19.5 lifetime grouping: with two equally-occupied candidate hugepages —
+        // a Long-lived one at the *lower* base and a Short-lived one at the higher
+        // base — a new Short request prefers the Short hugepage, even though the
+        // deterministic base tie-break alone would pick the lower-base (Long) one.
+        // So the lifetime-match score genuinely steers placement.
+        let short = PlaceHints {
+            hotness: Hotness::Neutral,
+            lifetime: Lifetime::Short,
+        };
+        let long = PlaceHints {
+            hotness: Hotness::Neutral,
+            lifetime: Lifetime::Long,
+        };
+        let mut f = filler(4);
+        // Fill hugepage 0 (Long) and hugepage 1 (Short) completely, then free most of
+        // each so both sit in the same NearlyEmpty bin with the same occupancy.
+        let a = f.place(PAGES_PER_HUGEPAGE, PAGE_SIZE, long).unwrap();
+        f.mark_committed(&a);
+        let b = f.place(PAGES_PER_HUGEPAGE, PAGE_SIZE, short).unwrap();
+        f.mark_committed(&b);
+        assert_eq!(a.hugepage, 0);
+        assert_eq!(b.hugepage, 1);
+        assert!(f.free(a.base, PAGES_PER_HUGEPAGE - 8).valid); // hugepage 0: 8 live, Long
+        assert!(f.free(b.base, PAGES_PER_HUGEPAGE - 8).valid); // hugepage 1: 8 live, Short
+        assert_eq!(f.bin_of(a.base), Some(HugeBin::NearlyEmpty));
+        assert_eq!(f.bin_of(b.base), Some(HugeBin::NearlyEmpty));
+        // A new Short request: lifetime match (hugepage 1) must beat the lower-base
+        // tie-break (hugepage 0, Long).
+        let p = f.place(8, PAGE_SIZE, short).expect("placement");
+        assert_eq!(
+            p.hugepage, 1,
+            "the Short request grouped with the Short hugepage, not the lower-base Long one"
+        );
+        f.mark_committed(&p);
+        assert!(f.check_invariants());
+    }
+
+    #[test]
+    fn subrelease_cost_benefit_scales_with_hugepage_density() {
+        // §19.6 cost/benefit gate: a small subrelease from a DENSE (cold) hugepage is
+        // refused (predicted fragmentation cost > benefit), but the same run passes
+        // under pressure, and a large run passes regardless. (The sparse-hugepage case
+        // — small runs always worthwhile — is covered by the sparse tests above.)
+        let mut f = filler(1);
+        let a = place_ok(&mut f, 120, PAGE_SIZE, Hotness::Neutral);
+        let b = place_ok(&mut f, 8, PAGE_SIZE, Hotness::Neutral);
+        assert!(f.free(b.base, 8).valid); // used = 120, 8 free pages
+        assert!(f.mark_cold(a.base)); // the controller marks it cold (else not subreleasable)
+                                      // cost = used/8 = 120/8 = 15; benefit = 8 < 15 ⇒ refused without pressure.
+        assert!(
+            f.subrelease(b.base, 8, /*pressure*/ false).is_none(),
+            "a small run from a dense hugepage: cost outweighs benefit"
+        );
+        // Under pressure, every byte is reclaimed.
+        assert!(f.subrelease(b.base, 8, /*pressure*/ true).is_some());
+        let _ = a;
+        assert!(f.check_invariants());
+    }
+
+    #[test]
     fn placement_prefers_partially_used_hugepage_over_opening_new() {
         // W11-4a packing: with one partially-used hugepage and capacity to spare, a
         // new small request fills the existing hugepage rather than opening a new one.
@@ -2254,12 +2517,20 @@ mod filler_tests {
     #[test]
     fn place_rejects_zero_oversized_and_unsatisfiable_alignment() {
         let mut f = filler(1);
-        assert!(f.place(0, PAGE_SIZE, Hotness::Neutral).is_none());
         assert!(f
-            .place(PAGES_PER_HUGEPAGE + 1, PAGE_SIZE, Hotness::Neutral)
+            .place(0, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .is_none());
+        assert!(f
+            .place(
+                PAGES_PER_HUGEPAGE + 1,
+                PAGE_SIZE,
+                PlaceHints::hot(Hotness::Neutral)
+            )
             .is_none());
         // Alignment larger than a hugepage cannot be satisfied within one.
-        assert!(f.place(1, HUGEPAGE_SIZE * 2, Hotness::Neutral).is_none());
+        assert!(f
+            .place(1, HUGEPAGE_SIZE * 2, PlaceHints::hot(Hotness::Neutral))
+            .is_none());
         assert!(f.check_invariants());
     }
 
@@ -2270,7 +2541,9 @@ mod filler_tests {
         let mut f = filler(1);
         let n = PAGES_PER_HUGEPAGE;
         let _a = place_ok(&mut f, n, PAGE_SIZE, Hotness::Neutral);
-        assert!(f.place(1, PAGE_SIZE, Hotness::Neutral).is_none());
+        assert!(f
+            .place(1, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .is_none());
         assert!(f.check_invariants());
     }
 
@@ -2356,7 +2629,9 @@ mod filler_tests {
         let sr = f.subrelease(b.base, 8, true).expect("subrelease");
         assert_eq!(f.bin_of(a.base), Some(HugeBin::PartialSubreleased));
         // A new placement reuses the subreleased pages (needs recommit) and heals it.
-        let c = f.place(8, PAGE_SIZE, Hotness::Cold).expect("refill");
+        let c = f
+            .place(8, PAGE_SIZE, PlaceHints::hot(Hotness::Cold))
+            .expect("refill");
         assert_eq!(c.base, b.base, "the freed/subreleased run is reused");
         assert!(
             c.commit_run.is_some(),
@@ -2424,7 +2699,7 @@ mod filler_tests {
             let alloc = live.is_empty() || (rng & 1 == 0);
             if alloc {
                 let pages = 1 + (rng as usize % 8);
-                if let Some(p) = f.place(pages, PAGE_SIZE, Hotness::Neutral) {
+                if let Some(p) = f.place(pages, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral)) {
                     f.mark_committed(&p);
                     live.push((p.base, pages));
                 }
@@ -2469,8 +2744,10 @@ mod backend_tests {
     struct HostProvider {
         owned: Mutex<Vec<(usize, Layout)>>,
         fail_commit: AtomicU32,
+        fail_revoke: AtomicU32,
         commits: AtomicU32,
         decommits: AtomicU32,
+        revokes: AtomicU32,
     }
 
     impl HostProvider {
@@ -2478,12 +2755,17 @@ mod backend_tests {
             Self {
                 owned: Mutex::new(Vec::new()),
                 fail_commit: AtomicU32::new(0),
+                fail_revoke: AtomicU32::new(0),
                 commits: AtomicU32::new(0),
                 decommits: AtomicU32::new(0),
+                revokes: AtomicU32::new(0),
             }
         }
         fn fail_next_commit(&self) {
             self.fail_commit.store(1, O::Relaxed);
+        }
+        fn fail_next_revoke(&self) {
+            self.fail_revoke.store(1, O::Relaxed);
         }
     }
 
@@ -2515,6 +2797,13 @@ mod backend_tests {
             // zero page). Bounds: `[offset, offset+len) <= region.len`.
             // SAFETY: in-bounds sub-range of the committed reservation.
             unsafe { ptr::write_bytes(region.base.add(offset), 0, len) };
+            Ok(())
+        }
+        fn revoke_descendants(&self, _a: ArenaId, _r: Region) -> Result<(), BackendError> {
+            self.revokes.fetch_add(1, O::Relaxed);
+            if self.fail_revoke.swap(0, O::Relaxed) == 1 {
+                return Err(BackendError::InvalidRequest);
+            }
             Ok(())
         }
         fn release(&self, _a: ArenaId, region: Region) -> Result<(), BackendError> {
@@ -2568,7 +2857,7 @@ mod backend_tests {
     fn packed_allocation_is_writable_and_frees() {
         let b = backend(2);
         let r = b
-            .allocate(64 * 1024, PAGE_SIZE, Hotness::Neutral)
+            .allocate(64 * 1024, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("alloc");
         assert_eq!(r.len, 64 * 1024); // page-rounded (4 pages of 16 KiB)
         assert_eq!(r.base as usize % PAGE_SIZE, 0);
@@ -2587,7 +2876,9 @@ mod backend_tests {
     fn region_cache_hook_round_trips_through_the_trait() {
         // The §18.6 RegionCacheHook seam: try_alloc serves, try_cache returns.
         let b = backend(2);
-        let r = b.try_alloc(96 * 1024, PAGE_SIZE).expect("hook alloc");
+        let r = b
+            .try_alloc(96 * 1024, PAGE_SIZE, Hints::default())
+            .expect("hook alloc");
         touch(r);
         assert!(b.try_cache(r), "hook free returns the region");
         // A foreign region is declined.
@@ -2608,7 +2899,9 @@ mod backend_tests {
         let b = backend(4);
         // 1 hugepage + 1 page ⇒ rounds to 2 hugepages (the awkward case).
         let bytes = HUGEPAGE_SIZE + PAGE_SIZE;
-        let r = b.allocate(bytes, PAGE_SIZE, Hotness::Neutral).expect("run");
+        let r = b
+            .allocate(bytes, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("run");
         assert_eq!(
             r.len, bytes,
             "usable is the page-rounded request, not rounded up"
@@ -2621,7 +2914,7 @@ mod backend_tests {
         // A second awkward allocation of the same rounded size reuses the cached run
         // (no new hugepages opened — waste is bounded).
         let r2 = b
-            .allocate(bytes, PAGE_SIZE, Hotness::Neutral)
+            .allocate(bytes, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("reuse");
         assert_eq!(r2.base, r.base, "region-cache hit reuses the same run");
         assert_eq!(
@@ -2641,11 +2934,13 @@ mod backend_tests {
         // out a hugepage that is already live.
         let b = backend(4);
         let big = HUGEPAGE_SIZE + PAGE_SIZE; // rounds to a 2-hugepage run
-        let r = b.allocate(big, PAGE_SIZE, Hotness::Neutral).expect("run");
+        let r = b
+            .allocate(big, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("run");
         assert!(b.free_region(r), "freed → empty-backed + cached");
         // A whole-hugepage allocation reuses the empty run's head via the scan path.
         let one = b
-            .allocate(HUGEPAGE_SIZE, PAGE_SIZE, Hotness::Neutral)
+            .allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("1-hp");
         assert_eq!(
             one.base, r.base,
@@ -2653,7 +2948,9 @@ mod backend_tests {
         );
         // The cached 2-hugepage entry is now stale; a 2-hugepage allocation prunes it
         // and reserves a fresh run that does NOT alias the live whole-hugepage alloc.
-        let r2 = b.allocate(big, PAGE_SIZE, Hotness::Neutral).expect("run2");
+        let r2 = b
+            .allocate(big, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("run2");
         assert_ne!(
             r2.base, one.base,
             "fresh run does not alias the live allocation"
@@ -2670,14 +2967,15 @@ mod backend_tests {
         let b = backend(2);
         b.provider().fail_next_commit();
         assert!(
-            b.allocate(64 * 1024, PAGE_SIZE, Hotness::Neutral).is_none(),
+            b.allocate(64 * 1024, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+                .is_none(),
             "commit failure ⇒ allocation fails cleanly"
         );
         assert_eq!(b.coverage().live_total_bytes, 0, "nothing left live");
         assert!(b.check_invariants());
         // Recovery: the next allocation succeeds.
         let r = b
-            .allocate(64 * 1024, PAGE_SIZE, Hotness::Neutral)
+            .allocate(64 * 1024, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("recovers");
         touch(r);
         assert!(b.free_region(r));
@@ -2689,10 +2987,10 @@ mod backend_tests {
         let b = backend(1);
         // A sparsely-occupied hugepage: a small live object `a` plus a freed run `c`.
         let a = b
-            .allocate(8 * PAGE_SIZE, PAGE_SIZE, Hotness::Neutral)
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("a");
         let c = b
-            .allocate(8 * PAGE_SIZE, PAGE_SIZE, Hotness::Neutral)
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("c");
         touch(a);
         touch(c);
@@ -2720,10 +3018,18 @@ mod backend_tests {
         let b = backend(1);
         let n = PAGES_PER_HUGEPAGE;
         let a = b
-            .allocate((n / 2) * PAGE_SIZE, PAGE_SIZE, Hotness::Neutral)
+            .allocate(
+                (n / 2) * PAGE_SIZE,
+                PAGE_SIZE,
+                PlaceHints::hot(Hotness::Neutral),
+            )
             .expect("a");
         let c = b
-            .allocate((n / 2) * PAGE_SIZE, PAGE_SIZE, Hotness::Neutral)
+            .allocate(
+                (n / 2) * PAGE_SIZE,
+                PAGE_SIZE,
+                PlaceHints::hot(Hotness::Neutral),
+            )
             .expect("c");
         touch(a);
         touch(c);
@@ -2741,10 +3047,89 @@ mod backend_tests {
     }
 
     #[test]
+    fn subrelease_revokes_before_decommit_and_a_revoke_failure_refuses() {
+        // §36.6 revoke-before-recycle: subrelease revokes the run's descendants before
+        // decommitting; a revoke failure refuses the subrelease (no decommit), leaving
+        // the backend well-formed (W4-5).
+        let b = backend(1);
+        let a = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        let c = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("c");
+        touch(a);
+        touch(c);
+        assert!(b.free_region(c));
+        let decommits_before = b.provider().decommits.load(O::Relaxed);
+        // Inject a revoke failure: the subrelease must refuse and NOT decommit.
+        b.provider().fail_next_revoke();
+        assert_eq!(
+            b.subrelease(c.base as usize, 8, /*pressure*/ false),
+            0,
+            "a revoke failure refuses the subrelease"
+        );
+        assert_eq!(
+            b.provider().decommits.load(O::Relaxed),
+            decommits_before,
+            "no decommit after a failed revoke"
+        );
+        assert!(
+            b.provider().revokes.load(O::Relaxed) >= 1,
+            "revoke was attempted"
+        );
+        // A normal subrelease revokes then decommits.
+        assert_eq!(b.subrelease(c.base as usize, 8, false), 8 * PAGE_SIZE);
+        assert!(
+            b.provider().decommits.load(O::Relaxed) > decommits_before,
+            "decommit followed a successful revoke"
+        );
+        assert!(b.free_region(a));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn release_empty_excess_shrinks_the_hugecache_to_the_reserve() {
+        // W11-1b demand-reserve mechanism: freeing whole hugepages fills the HugeCache
+        // (empty-backed); `release_empty_excess(reserve)` returns the excess backing to
+        // the OS, keeping `reserve` empty-backed hugepages for burst reuse.
+        let b = backend(4);
+        let regions: Vec<Region> = (0..4)
+            .map(|_| {
+                b.allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+                    .expect("whole hugepage")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        // Four empty-backed hugepages, nothing released yet.
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 4 * HUGEPAGE_SIZE as u64);
+        assert_eq!(cov.empty_released_bytes, 0);
+        // Shrink the reserve to one: releases the other three.
+        let released = b.release_empty_excess(1);
+        assert_eq!(
+            released,
+            3 * HUGEPAGE_SIZE,
+            "three hugepages' backing returned"
+        );
+        let cov = b.coverage();
+        assert_eq!(cov.empty_released_bytes, 3 * HUGEPAGE_SIZE as u64);
+        assert_eq!(
+            cov.empty_backed_bytes, HUGEPAGE_SIZE as u64,
+            "one kept as reserve"
+        );
+        // Idempotent at the reserve.
+        assert_eq!(b.release_empty_excess(1), 0);
+        assert!(b.check_invariants());
+    }
+
+    #[test]
     fn teardown_releases_exactly_once() {
         let mut b = backend(2);
         let r = b
-            .allocate(32 * 1024, PAGE_SIZE, Hotness::Neutral)
+            .allocate(32 * 1024, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
             .expect("alloc");
         touch(r);
         assert!(b.free_region(r));

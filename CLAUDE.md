@@ -164,18 +164,24 @@ served from its own `HookProvider`-backed region, §22.7-isolated, with **O(1)**
 The hugepage-aware backend (W11) is implemented ahead of its M5 slot, in `crates/topo-core/src/huge.rs`:
 the pure, single-threaded `HugePageFiller` (per-hugepage live/committed/released page bitmaps + the
 nine §19.4 bin lists) and the provider-driven `HugePageBackend` that wraps it behind the §27.2 backend
-lock, drives `commit`/`decommit`, and implements the §18.6 `RegionCacheHook` the large path already
+lock, drives `revoke`/`commit`/`decommit`, and implements the §18.6 `RegionCacheHook` the large path
 consults. It covers W11-1a (HugeAllocator: hugepage-aligned reservations), W11-1b (HugeCache:
-empty-backed reuse), W11-2a/b (nine bins + packing-ordered scored placement, no full scan), W11-2c
-(B.4 bin↔occupancy oracle), W11-3 (validating RegionCache for awkward sizes — bounded waste, no
+empty-backed reuse + a `release_empty_excess` demand-reserve hook for W12), W11-2a/b (nine bins +
+packing-ordered scored placement carrying hotness **and** lifetime hints, §19.3/§19.5, no full scan),
+W11-2c (B.4 bin↔occupancy oracle), W11-3 (validating RegionCache for awkward sizes — bounded waste, no
 double-vend), W11-4a (packing), W11-4b (H-005-guarded partial subrelease with a cold/sparse/pressure
-gate + the W12 `mark_cold` hook), W11-5 (§19.7 coverage metrics → `topo-stats` JSON), and W11-6
-(backend-agnostic: the model assumes only contiguous page runs, so the seLe4n slice reuses it). The
-`huge::classify_bin` (§19.4) is pinned to the Lean model by `huge_bin_classification_matches_lean` and
-the `lake exe check` `hugeBinGate`.
+gate, a real §19.6 cost/benefit gate, §36.6 revoke-before-decommit, and the W12 `mark_cold` hook),
+W11-5 (§19.7 coverage metrics → `topo-stats` JSON), and W11-6 (backend-agnostic: a §36.9 G-sim slice
+proves the *identical* outcome over POSIX and `Sele4nSim`). It is wired **live** through the engine:
+`Allocator::new_with_huge` (the `hugepage_optimized` configuration) routes every medium/large
+allocation through the filler — carrying the request's hotness/lifetime hints — with the small/free
+paths unchanged; the default `Allocator::new` keeps the M1 extent path. The `huge::classify_bin`
+(§19.4) is pinned to the Lean model by `huge_bin_classification_matches_lean` and the `lake exe check`
+`hugeBinGate`, and the filler's place/free/subrelease are modeled as a per-page state machine with
+H-001/H-004/H-005 preservation proved in `lean/TopoMalloc/HugePageFiller.lean`.
 
 **Test counts:**
-- Rust: ~557 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~564 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
@@ -230,7 +236,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions |
 | `TopoMalloc/ExtentState.lean` | §20.1 extent physical-backing state machine (pinned 1:1 to Rust) |
 | `TopoMalloc/ExtentHooks.lean` | §23.4 hook assumption: §23.3 contracts ⇒ alloc/split/merge/subrange preserve disjointness (tied to the real `WfRangesDisjoint`); §22.7 per-arena-region isolation; the `hookContractGate` decidable checks (W10) |
-| `TopoMalloc/HugePageFiller.lean` | §19.4 `classifyBin` (the nine bins, H-003 by construction); H-002 occupancy-is-sum; H-005 partial-subrelease preserves live backing (over the `Range` geometry); the `hugeBinGate` decidable checks (W11) |
+| `TopoMalloc/HugePageFiller.lean` | §19.4 `classifyBin` (the nine bins, H-003 by construction); H-002 occupancy-is-sum; the filler as a per-page state machine with H-001/H-004/H-005 preservation (`subrelease_preserves_live`); H-005 over the `Range` geometry; the `hugeBinGate` decidable checks (W11) |
 | `TopoMalloc/Rseq.lean` | RSEQ contract — trusted primitive + frame condition (§33.5) |
 | `TopoMalloc/Boundaries.lean` | trust-boundary scaffolding for the RSEQ hardware boundary |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family (SizeClass, Malloc, Free, Realloc, Cache, Central, Span, Pagemap, PagemapExec, Release, Extent, Arena, Allocate, Demo) |

@@ -152,13 +152,24 @@ fn large_path_rounds_overflow_safely_and_bypasses_small_path() {
     let mgr = manager(64, 4096);
     // §18.5 / §9.7: an awkward size rounds up to whole pages, never wrapping.
     let (region, r) = mgr
-        .alloc_large(5 * PAGE + 7, PAGE, &NoRegionCache)
+        .alloc_large(
+            5 * PAGE + 7,
+            PAGE,
+            topo_core::Hints::default(),
+            &NoRegionCache,
+        )
         .expect("large");
     assert_eq!(region.len, 6 * PAGE, "rounded up to whole pages");
     assert!(r.is_some());
     // A size that would overflow the page rounding fails safely (null, not a wrap).
     assert_eq!(
-        mgr.alloc_large(usize::MAX, PAGE, &NoRegionCache).err(),
+        mgr.alloc_large(
+            usize::MAX,
+            PAGE,
+            topo_core::Hints::default(),
+            &NoRegionCache
+        )
+        .err(),
         Some(topo_core::ExtentError::Overflow)
     );
     assert!(mgr.check_invariants());

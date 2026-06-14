@@ -30,7 +30,7 @@ single-source check is fully constructive. Verify with `#print axioms <thm>`.
 | `TopoMalloc/Transitions.lean` | malloc/free/cache/central/release/arena as **total** functions | W1-5 |
 | `TopoMalloc/ExtentState.lean` | the §20.1 extent physical-backing state machine + `canTransition` (pinned 1:1 to Rust) | W4-2d |
 | `TopoMalloc/ExtentHooks.lean` | the §23.4 hook assumption: §23.3 contracts ⇒ alloc/split/merge/subrange preserve disjointness + tiling (tied to the real `WfRangesDisjoint`); §22.7 per-arena-region isolation; `hookContractGate` decidable checks | W10 |
-| `TopoMalloc/HugePageFiller.lean` | the §19.4 `classifyBin` (nine bins, H-003 by construction); H-002 occupancy-is-sum; H-005 partial-subrelease preserves live backing (over the `Range` geometry); `hugeBinGate` decidable checks (pins Rust `classify_bin`) | W11 |
+| `TopoMalloc/HugePageFiller.lean` | the §19.4 `classifyBin` (nine bins, H-003 by construction); H-002 occupancy-is-sum; the filler as a per-page state machine (place/free/subrelease) with H-001/H-004/H-005 preservation; H-005 over the `Range` geometry; `hugeBinGate` decidable checks (pins Rust `classify_bin`) | W11 |
 | `TopoMalloc/Rseq.lean` | the RSEQ contract — trusted primitive + frame condition (§33.5) | W1-7 |
 | `TopoMalloc/Theorems/*.lean` | one file per §33.4 family, incl. `Demo.lean` (a concrete non-empty witness) | W1-4e/6/8/9 |
 | `TopoMalloc/Exec.lean` | executable model + §33.7 **text-grammar** trace replay; flags injected violations | W1-10 |

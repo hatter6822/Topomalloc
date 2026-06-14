@@ -40,6 +40,7 @@ use crate::bootstrap::MetadataAlloc;
 use crate::extent::{
     BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, NoRegionCache, RegionCacheHook,
 };
+use crate::flags::Hints;
 use crate::ids::{ArenaId, LargeId};
 use crate::pagemap::PageMap;
 use crate::span::LargeDescriptor;
@@ -193,7 +194,21 @@ pub struct LargeAllocator<'a, P: TopoBackingProvider> {
     arena: ArenaId,
     lock: BackendLock,
     pool: UnsafeCell<LargePool>,
+    /// The §18.6 region cache consulted by the implicit-hook paths
+    /// ([`allocate`](Self::allocate) / [`allocate_in`](Self::allocate_in) /
+    /// [`free`](Self::free)). Defaults to [`NoRegionCache`] (the M1 behaviour — no
+    /// hugepage backend); a caller wires the hugepage backend in with
+    /// [`with_region_cache`](Self::with_region_cache) under the `hugepage_optimized`
+    /// profile, and then the large path is served by the filler with **no other
+    /// change** (W11 live wiring). The explicit-hook paths
+    /// ([`allocate_with`](Self::allocate_with) / [`free_with`](Self::free_with)) still
+    /// override per call.
+    region_cache: &'a (dyn RegionCacheHook + Sync),
 }
+
+/// The process-static no-op region cache — the default for a [`LargeAllocator`] not
+/// wired to a hugepage backend (a ZST, so the default is zero-overhead).
+static NO_REGION_CACHE: NoRegionCache = NoRegionCache;
 
 // SAFETY: all access to `pool` goes through `lock`; `extents`/`pagemap` carry their
 // own synchronization; `meta` is `Sync`; `arena` is immutable. So concurrent
@@ -229,7 +244,19 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             arena,
             lock: BackendLock::new(),
             pool: UnsafeCell::new(pool),
+            region_cache: &NO_REGION_CACHE,
         })
+    }
+
+    /// Install a §18.6 [`RegionCacheHook`] (e.g. a `HugePageBackend`) as this large
+    /// allocator's default region cache, so the implicit-hook paths
+    /// ([`allocate`](Self::allocate)/[`allocate_in`](Self::allocate_in)/
+    /// [`free`](Self::free)) route through it (W11 live wiring, selected by the
+    /// `hugepage_optimized` profile). Consumes and returns `self` (a builder step at
+    /// construction). The default (unwired) large allocator uses [`NoRegionCache`].
+    pub fn with_region_cache(mut self, hook: &'a (dyn RegionCacheHook + Sync)) -> Self {
+        self.region_cache = hook;
+        self
     }
 
     /// The number of large allocations currently live.
@@ -290,7 +317,20 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large_allocate` (§18.5) + pagemap publish (§17.2 P-Map-006)
     pub fn allocate_with(&self, bytes: usize, align: usize, hook: &dyn RegionCacheHook) -> *mut u8 {
-        self.allocate_with_in(self.arena, bytes, align, hook)
+        self.allocate_with_in(self.arena, bytes, align, Hints::default(), hook)
+    }
+
+    /// Allocate from `arena` with the installed region cache and explicit placement
+    /// `hints` (the engine's large path, so a wired hugepage backend packs by
+    /// hotness/lifetime, §19.3/§19.5, W11). Tags the descriptor with `arena` (W9).
+    pub fn allocate_in_hinted(
+        &self,
+        arena: ArenaId,
+        bytes: usize,
+        align: usize,
+        hints: Hints,
+    ) -> *mut u8 {
+        self.allocate_with_in(arena, bytes, align, hints, self.region_cache)
     }
 
     /// As [`allocate_with`](Self::allocate_with), but tags the resulting
@@ -298,15 +338,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// large allocation retains its arena identity for isolation (§22.7) and for
     /// per-arena reset/destroy ([`free_arena`](Self::free_arena)). The shared
     /// region is still reserved under the manager's region arena; only the
-    /// per-allocation descriptor carries `arena`.
+    /// per-allocation descriptor carries `arena`. `hints` are forwarded to the
+    /// region cache (W11 hugepage placement).
     pub fn allocate_with_in(
         &self,
         arena: ArenaId,
         bytes: usize,
         align: usize,
+        hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> *mut u8 {
-        let (region, backing) = match self.extents.alloc_large(bytes, align, hook) {
+        let (region, backing) = match self.extents.alloc_large(bytes, align, hints, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
         };
@@ -363,14 +405,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         region.base
     }
 
-    /// Allocate with the default (no-op) region cache.
+    /// Allocate with this allocator's installed region cache (the default
+    /// [`NoRegionCache`], or a wired hugepage backend, W11).
     pub fn allocate(&self, bytes: usize, align: usize) -> *mut u8 {
-        self.allocate_with(bytes, align, &NoRegionCache)
+        self.allocate_with(bytes, align, self.region_cache)
     }
 
-    /// Allocate from arena `arena` with the default region cache (plan 06 W9).
+    /// Allocate from arena `arena` with the installed region cache and default hints
+    /// (plan 06 W9; the hugepage backend when wired, W11). The engine's main path
+    /// uses [`allocate_in_hinted`](Self::allocate_in_hinted) to carry real hints.
     pub fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
-        self.allocate_with_in(arena, bytes, align, &NoRegionCache)
+        self.allocate_with_in(arena, bytes, align, Hints::default(), self.region_cache)
     }
 
     /// The owning arena of the live large allocation based at `ptr`, or `None`
@@ -513,8 +558,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// As [`free_with`](Self::free_with).
     pub unsafe fn free_revoking(&self, ptr: *mut u8, arena: ArenaId) -> (bool, bool) {
-        // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first.
-        unsafe { self.free_inner(ptr, &NoRegionCache, Some(arena)) }
+        // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first. The
+        // installed region cache (the hugepage backend when wired, W11) routes a
+        // cache-served arena-drain free back to it rather than dropping it.
+        unsafe { self.free_inner(ptr, self.region_cache, Some(arena)) }
     }
 
     /// The shared body of the large-free paths. `revoke` selects whether the
@@ -606,8 +653,9 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// As [`free_with`](Self::free_with).
     pub unsafe fn free(&self, ptr: *mut u8) -> bool {
-        // SAFETY: identical contract, forwarded.
-        unsafe { self.free_with(ptr, &NoRegionCache) }
+        // SAFETY: identical contract, forwarded; the installed region cache (the
+        // hugepage backend when wired, W11) routes a cache-served free back to it.
+        unsafe { self.free_with(ptr, self.region_cache) }
     }
 
     /// The usable size of the large allocation at base `ptr`, or `None` if `ptr` is
@@ -901,7 +949,7 @@ mod tests {
         }
     }
     impl RegionCacheHook for OneShotCache {
-        fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
+        fn try_alloc(&self, bytes: usize, align: usize, _hints: Hints) -> Option<Region> {
             if !self.served.get() && bytes <= self.len && align <= PAGE {
                 self.served.set(true);
                 Some(Region {

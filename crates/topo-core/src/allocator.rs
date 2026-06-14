@@ -57,7 +57,8 @@ use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, RequestKind};
 use crate::error::BackendError;
 use crate::extent::{
-    BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, StateBytes,
+    BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit,
+    RegionCacheHook, StateBytes,
 };
 use crate::flags::RequestFlags;
 use crate::generated::tables::PAGE_SIZE;
@@ -682,6 +683,68 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         arena: ArenaId,
         cfg: AllocatorConfig,
     ) -> Result<Self, ExtentError> {
+        Self::new_inner(
+            span_provider,
+            large_provider,
+            None,
+            meta,
+            meta_region,
+            pagemap,
+            arena,
+            cfg,
+        )
+    }
+
+    /// Build an allocator whose **medium/large path is served by a hugepage backend**
+    /// (W11, the `hugepage_optimized` profile). `huge` is a §18.6
+    /// [`RegionCacheHook`] — typically a
+    /// [`HugePageBackend`](crate::HugePageBackend) — owned by the caller and living at
+    /// least as long as the allocator (like the pagemap/metadata), so the engine and
+    /// the hugepage backend are siblings, not a self-reference. Every medium/large
+    /// allocation is then packed into hugepages (or served as a whole-hugepage run);
+    /// the small-object path, the free path, and arenas are **unchanged** — the
+    /// hugepage backend rides the existing large region-cache seam. The default
+    /// [`new`](Self::new) keeps the M1 extent-backed large path.
+    ///
+    /// The caller reads the §19.7 coverage from its `huge` backend
+    /// ([`HugePageBackend::coverage`](crate::HugePageBackend::coverage)) and records it
+    /// into the stats snapshot ([`Stats::record_huge`](https://docs.rs/topo-stats)) —
+    /// the hugepage backend is a sibling component, so its coverage is composed
+    /// alongside [`stats`](Self::stats), as the W11 integration tests show.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_huge(
+        span_provider: P,
+        large_provider: P,
+        huge: &'a (dyn RegionCacheHook + Sync),
+        meta: &'a dyn MetadataAlloc,
+        meta_region: &'a (dyn MetadataRegion + Sync),
+        pagemap: &'a PageMap,
+        arena: ArenaId,
+        cfg: AllocatorConfig,
+    ) -> Result<Self, ExtentError> {
+        Self::new_inner(
+            span_provider,
+            large_provider,
+            Some(huge),
+            meta,
+            meta_region,
+            pagemap,
+            arena,
+            cfg,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        span_provider: P,
+        large_provider: P,
+        large_region_cache: Option<&'a (dyn RegionCacheHook + Sync)>,
+        meta: &'a dyn MetadataAlloc,
+        meta_region: &'a (dyn MetadataRegion + Sync),
+        pagemap: &'a PageMap,
+        arena: ArenaId,
+        cfg: AllocatorConfig,
+    ) -> Result<Self, ExtentError> {
         let span_extents = ExtentManager::new(
             span_provider,
             meta,
@@ -690,7 +753,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             PAGE_SIZE,
             cfg.span_extent_slots,
         )?;
-        let large = LargeAllocator::new(
+        let mut large = LargeAllocator::new(
             large_provider,
             meta,
             pagemap,
@@ -702,6 +765,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 large_slots: cfg.large_slots,
             },
         )?;
+        if let Some(hook) = large_region_cache {
+            large = large.with_region_cache(hook);
+        }
         let spans = SpanPool::new(meta, cfg.span_slots).ok_or(ExtentError::Exhausted)?;
         Ok(Self {
             meta,
@@ -896,9 +962,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let p = match req.kind {
             RequestKind::Small { sc, .. } => self.alloc_small(arena, sc),
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                // Route to the arena's own hooked large backing if it has one (W10).
-                self.large_backing(arena)
-                    .allocate_in(arena, usable, req.align)
+                // Route to the arena's own hooked large backing if it has one (W10);
+                // otherwise the shared backend, carrying the request's placement hints
+                // so a wired hugepage backend packs by hotness/lifetime (W11). A hooked
+                // arena's custom backing does not place by hints (it is the user's
+                // memory source), so it takes the hint-less trait path.
+                match self.hook_backend(arena) {
+                    Some(b) => b.large.allocate_in(arena, usable, req.align),
+                    None => {
+                        self.large
+                            .allocate_in_hinted(arena, usable, req.align, req.flags.hints())
+                    }
+                }
             }
         };
         if p.is_null() {

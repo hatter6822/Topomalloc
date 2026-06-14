@@ -54,6 +54,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
 use crate::error::BackendError;
+use crate::flags::Hints;
 use crate::generated::tables::PAGE_SIZE;
 use crate::ids::ArenaId;
 use crate::overflow::{align_up, pages_for};
@@ -1431,9 +1432,12 @@ impl RetainPolicy {
 pub trait RegionCacheHook {
     /// Try to satisfy a `bytes`/`align` large request from cached awkward-sized
     /// regions (§18.6), returning a region the cache now considers handed out, or
-    /// `None` to fall through to the extent manager. Default: `None`.
-    fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
-        let _ = (bytes, align);
+    /// `None` to fall through to the extent manager. `hints` carries the request's
+    /// advisory placement preferences (hotness/lifetime, §19.3/§19.5) so a hugepage
+    /// backend can pack hot/cold and same-lifetime objects together (W11); a cache
+    /// that does not place by hints simply ignores them. Default: `None`.
+    fn try_alloc(&self, bytes: usize, align: usize, hints: Hints) -> Option<Region> {
+        let _ = (bytes, align, hints);
         None
     }
 
@@ -1804,6 +1808,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         &self,
         bytes: usize,
         align: usize,
+        hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> Result<(Region, Option<ExtentRef>), ExtentError> {
         if bytes == 0 || !align.is_power_of_two() {
@@ -1813,8 +1818,10 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         // smaller region. (The hugepage rounding lands with W11; the hook handles
         // the awkward-size case it exists for.)
         let rounded = align_up(bytes, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
-        // §18.6 region cache first refusal for awkward (just-over-a-hugepage) sizes.
-        if let Some(region) = hook.try_alloc(rounded, align) {
+        // §18.6 region cache first refusal for awkward (just-over-a-hugepage) sizes,
+        // carrying the placement hints so a hugepage backend can pack by hotness/
+        // lifetime (§19.3/§19.5, W11).
+        if let Some(region) = hook.try_alloc(rounded, align, hints) {
             return Ok((region, None));
         }
         let r = self.alloc(rounded, align, Fit::Best)?;
@@ -2791,7 +2798,7 @@ mod tests {
         let mgr = manager(64);
         // An "awkward" size (just over 2 pages) rounds up to whole pages, no wrap.
         let (region, r) = mgr
-            .alloc_large(2 * PAGE + 1, PAGE, &NoRegionCache)
+            .alloc_large(2 * PAGE + 1, PAGE, Hints::default(), &NoRegionCache)
             .expect("large");
         assert_eq!(region.len, 3 * PAGE, "rounded up to whole pages");
         assert!(r.is_some(), "served from the extent manager (no cache)");

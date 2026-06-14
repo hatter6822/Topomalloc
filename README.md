@@ -71,15 +71,21 @@ per-arena `hooks` field is wired: `topo_arena_create_hooked` gives an arena its
 real, backend-agnostic placement subsystem over the provider seam. A
 `HugePageFiller` packs sub-hugepage page-runs into hugepages over the nine §19.4
 occupancy bins (each hugepage in **exactly one**, H-003) with packing-ordered,
-scored placement (§19.3, no full scan); a provider-driven `HugePageBackend`
-implements the `RegionCacheHook` the large path already consults, so a
-medium/large request is packed or served as a whole-hugepage run — over POSIX or
-the seLe4n simulator alike. Partial subrelease is guarded so it can **never**
-intersect a live object (H-005, proved in Lean by
-`subrelease_preserves_live_backing`); the §19.7 coverage metrics reconcile into
-the stats JSON; and the §19.4 bin classification is pinned to the Lean model by a
-`lake exe check` differential gate. Front-end caches (M2) and the remaining M1
-pieces land per the plan.
+scored placement carrying the request's hotness **and** lifetime hints (§19.3/
+§19.5, no full scan); a provider-driven `HugePageBackend` implements the
+`RegionCacheHook` the large path consults, so a medium/large request is packed or
+served as a whole-hugepage run. It is wired **live** through the engine —
+`Allocator::new_with_huge` (the `hugepage_optimized` configuration) routes every
+medium/large allocation through the filler with the small/free paths unchanged —
+and a §36.9 G-sim slice proves the *identical* outcome over POSIX and the seLe4n
+simulator. Partial subrelease is guarded so it can **never** intersect a live
+object (H-005, proved in Lean both over the `Range` geometry and as a per-page
+state machine), gated by a real §19.6 cost/benefit test and §36.6
+revoke-before-decommit; an empty-hugepage demand-reserve (`release_empty_excess`)
+returns excess RSS. The §19.7 coverage metrics reconcile into the stats JSON, and
+the §19.4 bin classification is pinned to the Lean model by a `lake exe check`
+differential gate. Front-end caches (M2) and the remaining M1 pieces land per the
+plan.
 
 ## Quick start
 

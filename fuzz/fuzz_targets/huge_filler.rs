@@ -13,7 +13,7 @@ use libfuzzer_sys::fuzz_target;
 
 use topo_core::bootstrap::BumpArena;
 use topo_core::generated::tables::PAGE_SIZE;
-use topo_core::{Hotness, HugePageFiller, HUGEPAGE_SIZE};
+use topo_core::{Hotness, HugePageFiller, Lifetime, PlaceHints, HUGEPAGE_SIZE};
 
 const PAGE: usize = PAGE_SIZE;
 const CAPACITY: usize = 8;
@@ -33,10 +33,18 @@ fuzz_target!(|data: &[u8]| {
     };
     assert!(f.check_invariants());
 
-    let hotness = |b: u8| match b % 3 {
-        0 => Hotness::Cold,
-        1 => Hotness::Hot,
-        _ => Hotness::Neutral,
+    let hints = |b: u8| PlaceHints {
+        hotness: match b % 3 {
+            0 => Hotness::Cold,
+            1 => Hotness::Hot,
+            _ => Hotness::Neutral,
+        },
+        lifetime: match (b / 3) % 4 {
+            0 => Lifetime::Short,
+            1 => Lifetime::Medium,
+            2 => Lifetime::Long,
+            _ => Lifetime::Unspecified,
+        },
     };
 
     // Currently-live (allocated) runs, so frees target real allocations.
@@ -47,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
             // place a 1..=16 page run (then confirm its commit, as the backend does)
             0 | 1 => {
                 let pages = (b / 4) as usize % 16 + 1;
-                if let Some(p) = f.place(pages, PAGE, hotness(b)) {
+                if let Some(p) = f.place(pages, PAGE, hints(b)) {
                     f.mark_committed(&p);
                     live.push((p.base, p.pages));
                 }

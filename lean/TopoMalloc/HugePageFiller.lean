@@ -194,6 +194,138 @@ theorem subrelease_target_is_not_live
   exact (not_disjoint_self hsub) ((hguard sub hmem).symm)
 
 -- ---------------------------------------------------------------------------
+-- The filler as a per-page state machine (H-001 / H-004 / H-005 preservation)
+-- ---------------------------------------------------------------------------
+--
+-- The `Range`-geometry H-005 above is the disjointness form; this section models the
+-- filler's place/free/subrelease as transitions of a per-page state machine — the
+-- direct analogue of the §20.1 `ExtentState`/§22.3 `ArenaPhase` machines — and proves
+-- the H-001/H-004/H-005 invariants are *preserved*. It mirrors the Rust filler's three
+-- per-page bitmaps (`live`/`committed`/`released`) collapsed to one state per page.
+
+namespace Filler
+
+/-- The per-page state of a hugepage (the Rust filler's three bitmaps as one state):
+`reserved` = never committed; `free` = committed, not live; `live` = committed and
+live; `released` = subreleased (was committed). Each page is in exactly one. -/
+inductive PageState where
+  /-- Virtual page reserved, never committed (¬committed, ¬live, ¬released). -/
+  | reserved
+  /-- Committed and free (backed, reusable — "dirty"). -/
+  | free
+  /-- Committed and live (a live object occupies it). -/
+  | live
+  /-- Subreleased — was committed, now decommitted (¬committed, ¬live). -/
+  | released
+  deriving Repr, DecidableEq
+
+namespace PageState
+
+/-- Whether the page is physically backed (committed) — the H-001 `committed` side. -/
+def committed : PageState → Bool
+  | .free => true
+  | .live => true
+  | _ => false
+
+/-- Whether a live object occupies the page. -/
+def isLive : PageState → Bool
+  | .live => true
+  | _ => false
+
+/-- **H-001 (coupling).** A live page is always committed: the model makes `live` a
+committed state distinct from `released`, so a live object is, by construction, in a
+committed non-released subrange. -/
+theorem live_is_committed (s : PageState) (h : isLive s = true) : committed s = true := by
+  cases s <;> simp_all [isLive, committed]
+
+/-- **H-001 (no live in released).** A live page is never the `released` state. -/
+theorem live_ne_released (s : PageState) (h : isLive s = true) : s ≠ .released := by
+  cases s <;> simp_all [isLive]
+
+end PageState
+
+/-- A hugepage as a map from page index to state (the Rust per-page bitmaps; pages
+outside the hugepage are `reserved`). -/
+def HugePageState := Nat → PageState
+
+/-- Page `p` lies in the run `[off, off + len)`. -/
+def inRun (off len p : Nat) : Prop := off ≤ p ∧ p < off + len
+
+instance (off len p : Nat) : Decidable (inRun off len p) := by unfold inRun; infer_instance
+
+/-- **place**: the run's pages become `live` (the filler's carve + commit, M-005). -/
+def place (hp : HugePageState) (off len : Nat) : HugePageState :=
+  fun p => if inRun off len p then .live else hp p
+
+/-- **free**: the run's `live` pages become `free` (committed retained — the HugeCache
+retain policy). -/
+def freeRun (hp : HugePageState) (off len : Nat) : HugePageState :=
+  fun p => if inRun off len p ∧ hp p = .live then .free else hp p
+
+/-- **subrelease**: the run's `free` pages become `released`. It touches **only**
+`free` pages — never `live` — so the H-005 guard is *structural*. -/
+def subrelease (hp : HugePageState) (off len : Nat) : HugePageState :=
+  fun p => if inRun off len p ∧ hp p = .free then .released else hp p
+
+/-- **H-005 (the headline, page form).** `subrelease` never releases a live page: any
+page `live` before is still `live` after, **whatever** the run. The §19.6 "must never
+release a subpage intersecting a live object" holds structurally — the operation only
+converts `free` pages, so it can never strand a live object's backing. -/
+theorem subrelease_preserves_live (hp : HugePageState) (off len p : Nat)
+    (h : hp p = .live) : subrelease hp off len p = .live := by
+  unfold subrelease
+  split
+  · rename_i hcond
+    rw [h] at hcond
+    exact absurd hcond.2 (by decide)
+  · exact h
+
+/-- **H-005 (set form).** The live-page predicate is unchanged by `subrelease` — the
+set of live pages is invariant, so no live object loses backing. -/
+theorem subrelease_preserves_isLive (hp : HugePageState) (off len p : Nat) :
+    (subrelease hp off len p).isLive = (hp p).isLive := by
+  unfold subrelease
+  split
+  · rename_i hcond
+    rw [hcond.2]
+    decide
+  · rfl
+
+/-- **H-004.** An empty-hugepage release is the whole-hugepage `subrelease` `[0, total)`;
+by `subrelease_preserves_live` it keeps every live page live, so a hugepage holding a
+live object never has that object released — "empty hugepages may be released only
+after all contained spans are empty and detached." -/
+theorem release_preserves_live_anywhere (hp : HugePageState) (total p : Nat)
+    (h : hp p = .live) : subrelease hp 0 total p = .live :=
+  subrelease_preserves_live hp 0 total p h
+
+/-- **H-001 (place).** After `place`, every page of the run is `live` — hence committed
+(`PageState.live_is_committed`), the H-001 "live object in a committed subrange". -/
+theorem place_run_is_live (hp : HugePageState) (off len p : Nat)
+    (hin : inRun off len p) : place hp off len p = .live := by
+  unfold place
+  rw [if_pos hin]
+
+/-- **`free` is the inverse of `place` on the run's live pages**: a freed page is no
+longer live, so the freed run can be re-placed (the filler's reuse). -/
+theorem freeRun_clears_live (hp : HugePageState) (off len p : Nat)
+    (hin : inRun off len p) (h : hp p = .live) : (freeRun hp off len p).isLive = false := by
+  unfold freeRun
+  rw [if_pos ⟨hin, h⟩]
+  rfl
+
+/-- The page state machine is **inhabited and non-trivial**: placing then subreleasing
+a free page reaches `released`, while a concurrently-live page stays `live`. -/
+example :
+    let hp : HugePageState := fun p => if p = 0 then .live else .free
+    subrelease hp 1 1 0 = .live ∧ subrelease hp 1 1 1 = .released := by
+  refine ⟨?_, ?_⟩
+  · exact subrelease_preserves_live _ 1 1 0 rfl
+  · decide
+
+end Filler
+
+-- ---------------------------------------------------------------------------
 -- Non-vacuity: the model is about real subdivisions / classifications
 -- ---------------------------------------------------------------------------
 
