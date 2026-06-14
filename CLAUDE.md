@@ -218,7 +218,7 @@ not modeled transitions, so there is no Lean obligation. The §15.2 node/LLC cou
 `topo-stats` JSON and the `topo.numa.*` control namespace; NUMA bind failures remain visible (§15.5).
 
 **Test counts:**
-- Rust: ~613 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~623 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)

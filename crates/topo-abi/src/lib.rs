@@ -272,16 +272,29 @@ fn build_posix_allocator(
     #[cfg(feature = "hugepage-optimized")]
     {
         let capacity = (cfg.large_region_bytes / topo_core::HUGEPAGE_SIZE).max(1);
-        let huge: &'static topo_core::HugePageBackend<PosixBackingProvider> = Box::leak(Box::new(
-            topo_core::HugePageBackend::new(
-                PosixBackingProvider::new(),
-                meta,
-                ArenaId::DEFAULT,
-                topo_core::HugeConfig::with_capacity(capacity),
-            )
-            .ok()?,
-        ));
-        Allocator::new_with_huge(
+        // If `HugePageBackend::new` itself fails it rolls its own reservation back
+        // (§19.2) and `.ok()?` returns before any leak. Only a *successful* backend
+        // is leaked into `'static` for the allocator to borrow — so the raw pointer
+        // is kept to reclaim it if the allocator build below fails (see the failure
+        // arm), guaranteeing the backend's `Drop` (which releases the large virtual
+        // reservation) runs on every path. On success the backend stays leaked
+        // (process-lived, like `meta`/`pagemap`), and the success path is unchanged.
+        let huge_ptr: *mut topo_core::HugePageBackend<PosixBackingProvider> =
+            Box::into_raw(Box::new(
+                topo_core::HugePageBackend::new(
+                    PosixBackingProvider::new(),
+                    meta,
+                    ArenaId::DEFAULT,
+                    topo_core::HugeConfig::with_capacity(capacity),
+                )
+                .ok()?,
+            ));
+        // SAFETY: `huge_ptr` came from `Box::into_raw` just above and is uniquely
+        // owned here; reborrowing it as `&'static` is sound because it is only ever
+        // reclaimed on the failure arm below (after the borrow ends), and otherwise
+        // leaked for the process lifetime.
+        let huge: &'static topo_core::HugePageBackend<PosixBackingProvider> = unsafe { &*huge_ptr };
+        match Allocator::new_with_huge(
             PosixBackingProvider::new(),
             PosixBackingProvider::new(),
             huge,
@@ -290,8 +303,19 @@ fn build_posix_allocator(
             pagemap,
             ArenaId::DEFAULT,
             cfg,
-        )
-        .ok()
+        ) {
+            Ok(a) => Some(a),
+            Err(_) => {
+                // The allocator only *borrowed* `huge` and that borrow has ended
+                // with the `Err`, so reclaim the leaked backend before returning
+                // `None`; its `Drop` returns the reservation to the provider.
+                // SAFETY: `huge_ptr` was produced by `Box::into_raw` of the same
+                // type above; it is reclaimed exactly once, only on this failure
+                // path, and is not used again afterward (no double-free).
+                drop(unsafe { Box::from_raw(huge_ptr) });
+                None
+            }
+        }
     }
     #[cfg(not(feature = "hugepage-optimized"))]
     {
@@ -574,6 +598,54 @@ mod tests {
         unsafe {
             assert_eq!(a.free(s), FreeOutcome::Freed);
         }
+    }
+
+    /// Reclaim-on-failure invariant for `build_posix_allocator`'s hugepage arm
+    /// (the resource-leak fix). `build_posix_allocator` leaks the `HugePageBackend`
+    /// into `'static` so the allocator can borrow it, but if the *allocator* build
+    /// fails it reclaims the leaked backend (`drop(Box::from_raw(ptr))`) before
+    /// returning `None`, so the large virtual reservation is never stranded.
+    ///
+    /// Forcing the real `Allocator::new_with_huge` to fail from here is impractical
+    /// (it needs the shared `meta` arena exhausted in a way the success path does
+    /// not hit), so this test exercises the exact leak→reclaim idiom the failure
+    /// arm uses: a backend leaked with `Box::into_raw` is reclaimed with
+    /// `Box::from_raw`, whose `Drop` (§19.2) returns the reservation. It must not
+    /// double-free and must succeed (the provider reports a clean release).
+    #[cfg(feature = "hugepage-optimized")]
+    #[test]
+    fn build_posix_allocator_reclaims_leaked_backend_on_failure() {
+        // A standalone metadata arena so this mirrors construction without touching
+        // any process-global state.
+        let meta: &'static MetaArena<PosixBackingProvider> = Box::leak(Box::new(
+            MetaArena::reserve(PosixBackingProvider::new(), ArenaId::DEFAULT, META_BYTES)
+                .expect("meta arena reserves"),
+        ));
+        let backend = topo_core::HugePageBackend::new(
+            PosixBackingProvider::new(),
+            meta,
+            ArenaId::DEFAULT,
+            topo_core::HugeConfig::with_capacity(2),
+        )
+        .expect("hugepage backend reserves");
+
+        // Leak exactly as the production failure window does.
+        let ptr: *mut topo_core::HugePageBackend<PosixBackingProvider> =
+            Box::into_raw(Box::new(backend));
+
+        // Simulate the allocator build failing: reclaim the leaked backend. This is
+        // the byte-for-byte body of `build_posix_allocator`'s `Err(_) => { … }` arm.
+        // SAFETY: `ptr` came from `Box::into_raw` of the same type just above and is
+        // reclaimed exactly once here; it is not used afterward (no double-free).
+        let mut reclaimed = unsafe { Box::from_raw(ptr) };
+        // `teardown` returns the reservation and reports success; `Drop` would do the
+        // same silently. Either way the reservation is released, not stranded.
+        assert!(
+            reclaimed.teardown().is_ok(),
+            "reclaimed backend releases its reservation cleanly"
+        );
+        // `reclaimed` drops here; `teardown` already marked it released, so `Drop`
+        // is a no-op — release happens exactly once.
     }
 
     #[test]

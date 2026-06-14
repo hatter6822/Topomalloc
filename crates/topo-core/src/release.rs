@@ -29,9 +29,10 @@
 //!
 //! 1. drain idle CPU/thread caches,
 //! 2. release completely-empty hugepages **beyond the demand reserve**,
-//! 3. purge dirty spans **not on hot hugepages**,
-//! 4. convert dirty → muzzy where cheap,
+//! 3. purge dirty spans **not on hot hugepages** (after `dirty_decay_ms`),
+//! 4. convert aged dirty → muzzy where cheap (also gated by `dirty_decay_ms`),
 //! 5. subrelease cold-sparse partial hugepages (H-005-guarded by the mechanism),
+//!    5b. release muzzy back to the OS once it ages past `muzzy_decay_ms`,
 //! 6. emergency shrink (Emergency only).
 //!
 //! The total bytes planned per tick are capped by the arena's
@@ -240,7 +241,13 @@ pub struct ReleasePlan {
     pub dirty_to_muzzy_bytes: u64,
     /// Rung 5 — cold-sparse partial-hugepage bytes to subrelease (H-005-guarded).
     pub subrelease_cold_sparse_bytes: u64,
-    /// Rung 6 — emergency shrink bytes (Emergency only): forced global cache shrink.
+    /// Rung 5b — *muzzy* bytes to release to the OS (`MADV_DONTNEED`) once they have
+    /// aged past `muzzy_decay_ms`, or under Hard pressure (§20.2 muzzy decay). Lets
+    /// muzzy memory actually return to the OS outside Emergency — without it,
+    /// `muzzy_decay_ms` would never reclaim. Emergency releases muzzy via
+    /// [`emergency_shrink_bytes`](Self::emergency_shrink_bytes) instead (no overlap).
+    pub release_muzzy_bytes: u64,
+    /// Rung 6 — emergency shrink bytes (Emergency only): forced muzzy/global shrink.
     pub emergency_shrink_bytes: u64,
     /// Whether the HugeCache empty-backed reserve must be disabled for this tick
     /// (§21.5/§36.5 Emergency): the backend should release *all* empty hugepages.
@@ -256,6 +263,7 @@ impl ReleasePlan {
             .saturating_add(self.purge_dirty_bytes)
             .saturating_add(self.dirty_to_muzzy_bytes)
             .saturating_add(self.subrelease_cold_sparse_bytes)
+            .saturating_add(self.release_muzzy_bytes)
             .saturating_add(self.emergency_shrink_bytes)
     }
 
@@ -348,6 +356,12 @@ pub struct ReleaseController {
     /// Whether dirty memory was present on the previous tick (so the decay clock
     /// measures *continuous* dirtiness and a `now_ms == 0` start is not ambiguous).
     dirty_present: bool,
+    /// Timestamp muzzy memory was last observed to (re)appear, for the muzzy-decay
+    /// gate (§20.2); meaningful only while `muzzy_present`. The analogue of
+    /// `dirty_since_ms` for the second decay stage (muzzy → released).
+    muzzy_since_ms: u64,
+    /// Whether muzzy memory was present on the previous tick (continuous-muzzy clock).
+    muzzy_present: bool,
     last_allocated_total: u64,
     last_freed_total: u64,
     last_pressure_notifications: u64,
@@ -396,6 +410,8 @@ impl ReleaseController {
             started: false,
             dirty_since_ms: 0,
             dirty_present: false,
+            muzzy_since_ms: 0,
+            muzzy_present: false,
             last_allocated_total: 0,
             last_freed_total: 0,
             last_pressure_notifications: 0,
@@ -536,6 +552,15 @@ impl ReleaseController {
             self.dirty_present = true;
             self.dirty_since_ms = now_ms;
         }
+        // The muzzy-decay clock (the second decay stage), tracked exactly like dirty so
+        // the gate measures *continuous* muzzy residency (§20.2).
+        if inputs.muzzy_bytes == 0 {
+            self.muzzy_present = false;
+            self.muzzy_since_ms = now_ms;
+        } else if !self.muzzy_present {
+            self.muzzy_present = true;
+            self.muzzy_since_ms = now_ms;
+        }
 
         // §21.5 pressure mode with hysteresis (escalate immediately, de-escalate only
         // past the margin). A rise in pressure notifications forces at least Soft.
@@ -556,8 +581,12 @@ impl ReleaseController {
         // the timer (accelerated purge, §21.5).
         let dirty_aged = self.mode.severity() >= PressureMode::Hard.severity()
             || now_ms.saturating_sub(self.dirty_since_ms) >= self.config.dirty_decay_ms;
+        // The muzzy-decay gate (§20.2, the second stage): release muzzy once it has
+        // been continuously resident past `muzzy_decay_ms`; Hard/Emergency accelerate.
+        let muzzy_aged = self.mode.severity() >= PressureMode::Hard.severity()
+            || now_ms.saturating_sub(self.muzzy_since_ms) >= self.config.muzzy_decay_ms;
 
-        let mut plan = self.plan_ladder(&inputs, reserve, dirty_aged);
+        let mut plan = self.plan_ladder(&inputs, reserve, dirty_aged, muzzy_aged);
 
         // Per-tick rate budget (§20.2): bytes allowed this interval, plus any backlog
         // carried from prior under-served ticks. `0` rate ⇒ unlimited.
@@ -568,7 +597,13 @@ impl ReleaseController {
             let budget = rate_budget(self.config.release_rate_bytes_per_sec, elapsed_ms);
             let granted = budget.min(desired);
             scale_plan_to_budget(&mut plan, granted);
-            self.backlog_bytes = desired.saturating_sub(granted);
+            // The backlog carries everything desired that was NOT actually planned this
+            // tick. `scale_plan_to_budget` only fills the plan up to the work that
+            // currently exists, so when `granted` exceeds the available work the plan
+            // totals less than `granted`; crediting the full `granted` would silently
+            // forgive the unplanned remainder (RSS stays high while the controller
+            // reports progress). Credit only what was actually planned (§20.3).
+            self.backlog_bytes = desired.saturating_sub(plan.total_bytes());
         } else {
             // Unlimited (or Emergency, which bypasses the cap): clear the backlog.
             self.backlog_bytes = 0;
@@ -643,7 +678,13 @@ impl ReleaseController {
 
     /// Build the §21.3 ladder plan (pre-rate-cap), each rung gated by the mode and the
     /// latency ceiling (§36.11). `dirty_aged` is the §20.2 decay-gate result.
-    fn plan_ladder(&self, inputs: &ReleaseInputs, reserve: u64, dirty_aged: bool) -> ReleasePlan {
+    fn plan_ladder(
+        &self,
+        inputs: &ReleaseInputs,
+        reserve: u64,
+        dirty_aged: bool,
+        muzzy_aged: bool,
+    ) -> ReleasePlan {
         let mut plan = ReleasePlan {
             mode: self.mode,
             demand_reserve_bytes: reserve,
@@ -692,11 +733,12 @@ impl ReleaseController {
             plan.purge_dirty_bytes = inputs.purgeable_dirty();
         }
 
-        // Rung 4 — convert dirty→muzzy where cheap (BoundedSlow lazy purge): the dirty
-        // we did *not* fully purge this tick is marked discardable. Always eligible
-        // when the lazy path is permitted; bytes already counted under rung 3 are
-        // excluded so the two rungs do not double-count the same dirty bytes.
-        if LatencyClass::BoundedSlow.permitted_under(self.max_latency) {
+        // Rung 4 — convert dirty→muzzy where cheap (BoundedSlow lazy purge): the (aged)
+        // dirty we did *not* fully purge this tick is marked discardable. Gated by the
+        // dirty-decay timer (`dirty_aged`) like rung 3, so dirty is RETAINED for reuse
+        // until `dirty_decay_ms` elapses (not lazily purged on the first background
+        // tick); bytes already counted under rung 3 are excluded (no double-count).
+        if dirty_aged && LatencyClass::BoundedSlow.permitted_under(self.max_latency) {
             plan.dirty_to_muzzy_bytes = inputs
                 .purgeable_dirty()
                 .saturating_sub(plan.purge_dirty_bytes);
@@ -709,6 +751,16 @@ impl ReleaseController {
             && LatencyClass::BoundedSlow.permitted_under(self.max_latency)
         {
             plan.subrelease_cold_sparse_bytes = inputs.cold_sparse_bytes;
+        }
+
+        // Rung 5b — release aged muzzy to the OS (MayBlock): muzzy continuously resident
+        // past `muzzy_decay_ms`, or under Hard pressure, is returned (`MADV_DONTNEED`),
+        // so the second decay stage actually reclaims RSS *outside* Emergency (without
+        // this, `muzzy_decay_ms` never reclaims — the muzzy would linger until an alloc
+        // failure or cgroup-critical event). Excludes Emergency, which shrinks muzzy via
+        // rung 6 instead, so the two never double-count the same bytes.
+        if muzzy_aged && !emergency && LatencyClass::MayBlock.permitted_under(self.max_latency) {
+            plan.release_muzzy_bytes = inputs.muzzy_bytes;
         }
 
         // Rung 6 — emergency shrink (Emergency only, MayBlock): force the global caches
@@ -751,6 +803,7 @@ fn scale_plan_to_budget(plan: &mut ReleasePlan, budget: u64) {
         &mut plan.purge_dirty_bytes,
         &mut plan.dirty_to_muzzy_bytes,
         &mut plan.subrelease_cold_sparse_bytes,
+        &mut plan.release_muzzy_bytes,
         &mut plan.emergency_shrink_bytes,
     ] {
         let take = (*slot).min(remaining);
@@ -1242,5 +1295,81 @@ mod tests {
         assert!(s.active_ticks >= 1);
         assert!(s.planned_bytes_total > 0);
         assert_eq!(s.mode, c.mode());
+    }
+
+    #[test]
+    fn dirty_is_retained_not_lazily_purged_before_decay() {
+        // #5: in Normal/Soft, dirty must be RETAINED (neither purged nor lazily
+        // converted to muzzy) until `dirty_decay_ms` elapses. Before the fix, rung 4
+        // converted all purgeable dirty to muzzy on the very first background tick,
+        // ignoring the decay policy and raising refault risk.
+        let mut c = ReleaseController::new(DecayConfig::default()); // 10s dirty decay
+        let plan = c.tick(0, base_inputs());
+        assert_eq!(plan.mode, PressureMode::Normal);
+        assert_eq!(plan.purge_dirty_bytes, 0, "no forced purge before decay");
+        assert_eq!(
+            plan.dirty_to_muzzy_bytes, 0,
+            "dirty retained, not lazily converted before dirty_decay_ms"
+        );
+        let plan = c.tick(5_000, base_inputs());
+        assert_eq!(plan.dirty_to_muzzy_bytes, 0, "still retained at 5s");
+    }
+
+    #[test]
+    fn muzzy_is_released_after_its_decay_interval() {
+        // #10: muzzy must return to the OS once it has aged past `muzzy_decay_ms`, not
+        // only under Emergency — otherwise the muzzy-decay knob never reclaims RSS.
+        let mut c = ReleaseController::new(DecayConfig::default()); // 10s muzzy decay
+        let plan = c.tick(0, base_inputs()); // establishes the muzzy clock
+        assert_eq!(plan.mode, PressureMode::Normal);
+        assert_eq!(plan.release_muzzy_bytes, 0, "muzzy retained before decay");
+        let plan = c.tick(5_000, base_inputs());
+        assert_eq!(plan.release_muzzy_bytes, 0, "still retained at 5s");
+        let plan = c.tick(11_000, base_inputs());
+        assert_eq!(
+            plan.release_muzzy_bytes, 500_000,
+            "aged muzzy is released to the OS, with no pressure at all"
+        );
+        assert_eq!(plan.mode, PressureMode::Normal);
+    }
+
+    #[test]
+    fn backlog_survives_a_tick_that_plans_less_than_the_budget() {
+        // #11: a deferred backlog must be reduced only by what is ACTUALLY planned, not
+        // by the full granted budget. Before the fix, a later tick whose current work
+        // was below the budget silently forgave real pending release work (RSS stayed
+        // high while the controller reported progress).
+        let cfg = DecayConfig {
+            release_rate_bytes_per_sec: 1024 * 1024,
+            ..DecayConfig::low_rss()
+        };
+        let mut c = ReleaseController::new(cfg);
+        // Accrue a backlog: large work under Hard, rate-capped to ~1 MiB/s.
+        c.tick(
+            0,
+            ReleaseInputs {
+                cgroup_current: 95,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        c.tick(
+            1_000,
+            ReleaseInputs {
+                cgroup_current: 95,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        let backlog = c.backlog_bytes();
+        assert!(backlog > 0, "backlog accrued under the rate cap");
+        // A later tick with NO current work but a generous budget must NOT forgive it.
+        let plan = c.tick(100_000, ReleaseInputs::default());
+        assert_eq!(plan.total_bytes(), 0, "no current work to plan");
+        assert_eq!(
+            c.backlog_bytes(),
+            backlog,
+            "the backlog is not forgiven by an idle, well-budgeted tick"
+        );
     }
 }

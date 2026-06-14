@@ -1447,6 +1447,19 @@ pub trait RegionCacheHook {
         let _ = region;
         false
     }
+
+    /// Like [`try_cache`](Self::try_cache), but for an **arena drain** (destroy/reset):
+    /// **revoke** the region's descendant capabilities for `arena` before it re-enters
+    /// the cache for reuse by another authority domain (§36.6/§36.13
+    /// revoke-before-recycle). Returns `true` if the cache took ownership; `false` if
+    /// it declined **or a revoke failed** (the region is then not recycled — the §36.13
+    /// partial-failure signal). The default forwards to [`try_cache`](Self::try_cache):
+    /// a cache with no capability backing (POSIX single ambient authority) has nothing
+    /// to revoke, so caching is already isolation-safe.
+    fn try_cache_revoking(&self, region: Region, arena: ArenaId) -> bool {
+        let _ = arena;
+        self.try_cache(region)
+    }
 }
 
 /// The no-op region cache used until W11-3 supplies a real one (§18.6).

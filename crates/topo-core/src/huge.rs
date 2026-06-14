@@ -65,7 +65,7 @@ use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
 use crate::error::BackendError;
 use crate::extent::{BackendLock, RegionCacheHook};
-use crate::flags::{Hints, Lifetime};
+use crate::flags::{Hints, HugepagePolicy, Lifetime};
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
 use crate::ids::{ArenaId, NodeId};
 use crate::overflow::pages_for;
@@ -527,9 +527,26 @@ struct HugePageSlot {
     /// Subreleased pages (were committed, now decommitted; need recommit, M-005).
     /// Invariant `committed ∩ released == ∅`.
     released: [u64; BITMAP_WORDS],
+    /// **Allocation-start pages.** Bit `off` is set iff a live packed allocation
+    /// *starts* at page `off` (set by [`carve`](HugePageFiller::carve), cleared by
+    /// [`free`](HugePageFiller::free)). `heads ⊆ live`. Lets [`free`](HugePageFiller::free)
+    /// reject a forged/partial [`Region`] that names an interior subrange of a live
+    /// allocation instead of its exact extent (M-004/S-007), which would otherwise
+    /// leave a live remainder and alias on reuse.
+    heads: [u64; BITMAP_WORDS],
     /// Bin-list links (when `touched == 1`).
     bin_prev: u32,
     bin_next: u32,
+    /// Whole-hugepage **run length** (hugepages) when this hugepage *starts* a
+    /// multi-hugepage run ([`reserve_hugepages`](HugePageFiller::reserve_hugepages)),
+    /// else `0`. [`free_hugepages`](HugePageFiller::free_hugepages) requires the freed
+    /// count to equal it exactly — rejecting a forged partial-run free.
+    run_len: u32,
+    /// `1` iff this hugepage belongs to a multi-hugepage run (every hugepage of the
+    /// run, not just its start). The packed [`free`](HugePageFiller::free) refuses a
+    /// run member (it must be freed as a whole run), so a forged sub-hugepage `Region`
+    /// can never partially free a run.
+    in_run: u8,
     /// Joined [`Hotness`] of the hugepage's residents (`u8`).
     hotness: u8,
     /// Joined [`Lifetime`] of the hugepage's residents (`u8`, longest-lived — §19.5).
@@ -744,21 +761,29 @@ impl HugePageFiller {
 
     // --- slot pool accessors (the only `unsafe` in the bookkeeping) ----------
 
-    /// Read slot `i` by value (`i < capacity`, a caller invariant).
+    /// Read slot `i` by value (`i < capacity`). The bounds check is a load-bearing
+    /// `assert!` (not `debug_assert!`): [`Placement`]/[`HugeRun`]/[`Subrelease`] are
+    /// public, copyable confirmation tokens, so a downstream crate could pass a forged
+    /// one to a safe `pub fn` ([`mark_committed`](Self::mark_committed) etc.); the
+    /// assert turns an out-of-range index into a clean panic instead of an
+    /// out-of-bounds metadata read from safe code (S-007 — no safe path to UB).
     #[inline]
     fn get(&self, i: u32) -> HugePageSlot {
-        debug_assert!(i < self.capacity, "hugepage slot index out of range");
-        // SAFETY: `i < capacity`, the slot memory is initialized (zeroed then only
-        // overwritten with valid slots), `&self` precludes a concurrent writer, and
-        // `HugePageSlot: Copy` so the read leaves the pool untouched.
+        assert!(i < self.capacity, "hugepage slot index out of range");
+        // SAFETY: the `assert!` above establishes `i < capacity`; the slot memory is
+        // initialized (zeroed then only overwritten with valid slots), `&self`
+        // precludes a concurrent writer, and `HugePageSlot: Copy` so the read leaves
+        // the pool untouched.
         unsafe { self.slots.as_ptr().add(i as usize).read() }
     }
 
-    /// Write slot `i`.
+    /// Write slot `i` (`i < capacity`). Load-bearing `assert!` as in [`get`](Self::get)
+    /// — a forged public token can never drive an out-of-bounds metadata write.
     #[inline]
     fn put(&mut self, i: u32, s: HugePageSlot) {
-        debug_assert!(i < self.capacity, "hugepage slot index out of range");
-        // SAFETY: `i < capacity` and `&mut self` guarantees exclusive pool access.
+        assert!(i < self.capacity, "hugepage slot index out of range");
+        // SAFETY: the `assert!` establishes `i < capacity` and `&mut self` guarantees
+        // exclusive pool access.
         unsafe { self.slots.as_ptr().add(i as usize).write(s) };
     }
 
@@ -898,6 +923,26 @@ impl HugePageFiller {
         } else {
             Some(self.huge_base(head))
         }
+    }
+
+    /// The next **empty-backed** hugepage at slot index `>= from` — `(index, base,
+    /// committed_pages)` — or `None` if none remains in `[from, touched)`. "Empty
+    /// backed" = touched, `used == 0`, no subreleased page (i.e. in the
+    /// [`EmptyBacked`](HugeBin::EmptyBacked) bin). The committed-page count is its live
+    /// RSS (the pages the HugeCache holds backed for reuse). The demand-reserve shrink
+    /// (W11-1b) walks this by ascending index so it deterministically visits every
+    /// empty hugepage exactly once and always makes progress — unlike repeatedly
+    /// taking the bin head, which can stall on a hugepage that cannot be released.
+    fn next_empty_backed(&self, from: u32) -> Option<(u32, usize, usize)> {
+        let mut i = from;
+        while i < self.next_untouched {
+            let s = self.get(i);
+            if s.touched != 0 && s.used() == 0 && s.subreleased() == 0 {
+                return Some((i, self.huge_base(i), popcount(&s.committed)));
+            }
+            i += 1;
+        }
+        None
     }
 
     // --- placement (W11-2b candidate selection, W11-4a packing) --------------
@@ -1149,6 +1194,9 @@ impl HugePageFiller {
             bit_set(&mut s.live, k);
             k += 1;
         }
+        // Mark the allocation's first page so `free` can reject a partial/interior
+        // [`Region`] (exact-extent validation, M-004/S-007).
+        bit_set(&mut s.heads, off);
         s.hotness = Hotness::from_u8(s.hotness).join(hints.hotness) as u8;
         s.lifetime = lifetime_to_u8(lifetime_join(lifetime_from_u8(s.lifetime), hints.lifetime));
         self.put(hp, s);
@@ -1167,12 +1215,37 @@ impl HugePageFiller {
         }
     }
 
+    /// Validate a **public, forgeable confirmation token**'s `(hugepage, base, pages)`
+    /// against the region geometry, returning the in-hugepage page offset iff it names
+    /// a real, in-bounds, page-aligned run of hugepage `hp` — else `None`.
+    /// [`Placement`]/[`HugeRun`]/[`Subrelease`] are `pub` with `pub` fields, so a
+    /// downstream crate could hand a forged one to a safe `pub fn`; the confirmation
+    /// methods run this first so a bad token is ignored, never resolved into an
+    /// out-of-bounds slot or a wrapping address (S-007 — no safe path to UB).
+    fn validate_run(&self, hp: u32, base: usize, pages: usize) -> Option<usize> {
+        if hp >= self.capacity || pages == 0 {
+            return None;
+        }
+        let byte_off = base.checked_sub(self.huge_base(hp))?;
+        if !byte_off.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        let off = byte_off / PAGE_SIZE;
+        if off >= PAGES_PER_HUGEPAGE || pages > PAGES_PER_HUGEPAGE - off {
+            return None;
+        }
+        Some(off)
+    }
+
     /// Confirm a [`Placement`]'s backing after the caller's `commit` succeeded
     /// (M-005): mark every page of the run committed and clear any subreleased bit
     /// (the pages are backed again). Restores `live ⊆ committed` and
-    /// `committed ∩ released == ∅` (H-001).
+    /// `committed ∩ released == ∅` (H-001). A forged/foreign token is ignored
+    /// ([`validate_run`](Self::validate_run)).
     pub fn mark_committed(&mut self, p: &Placement) {
-        let off = (p.base - self.huge_base(p.hugepage)) / PAGE_SIZE;
+        let Some(off) = self.validate_run(p.hugepage, p.base, p.pages) else {
+            return;
+        };
         let mut s = self.get(p.hugepage);
         let mut k = off;
         while k < off + p.pages {
@@ -1215,7 +1288,33 @@ impl HugePageFiller {
         if run_popcount(&s0.live, off, pages) != pages {
             return FreeReport::INVALID;
         }
+        // Exact-extent validation (M-004/S-007): `Region` is a public, copyable
+        // descriptor, so a forged one could name a *partial/interior* subrange of a
+        // live allocation; freeing it would clear only some of the allocation's live
+        // bits, leaving a live remainder that aliases when the freed pages are reused.
+        // Require `base` to be an allocation start, `pages` its exact length, and the
+        // hugepage not part of a multi-hugepage run (which frees via `free_hugepages`).
+        if s0.in_run != 0 || !bit_get(&s0.heads, off) {
+            return FreeReport::INVALID;
+        }
+        let mut e = off + 1;
+        while e < off + pages {
+            if bit_get(&s0.heads, e) {
+                return FreeReport::INVALID; // `pages` spans into a later allocation
+            }
+            e += 1;
+        }
+        // `pages` must not stop short of the allocation's real end: the page at
+        // `off + pages` must be a boundary — the hugepage edge, a later allocation's
+        // head, or a non-live page — never the live interior of *this* allocation.
+        if off + pages < PAGES_PER_HUGEPAGE
+            && bit_get(&s0.live, off + pages)
+            && !bit_get(&s0.heads, off + pages)
+        {
+            return FreeReport::INVALID;
+        }
         let mut s = self.get(hp);
+        bit_clear(&mut s.heads, off);
         let mut k = off;
         while k < off + pages {
             bit_clear(&mut s.live, k);
@@ -1331,9 +1430,14 @@ impl HugePageFiller {
     /// (mark it committed again, clear released). Leaves the filler well-formed
     /// (W4-5) — the pages are simply backed-free once more.
     pub fn unsubrelease(&mut self, sr: &Subrelease) {
-        let base = self.region_base + sr.region_offset;
-        let off = (base - self.huge_base(sr.hugepage)) / PAGE_SIZE;
         let pages = sr.len / PAGE_SIZE;
+        // Validate the forgeable token before touching the slot pool (S-007).
+        let Some(base) = self.region_base.checked_add(sr.region_offset) else {
+            return;
+        };
+        let Some(off) = self.validate_run(sr.hugepage, base, pages) else {
+            return;
+        };
         let mut s = self.get(sr.hugepage);
         let mut k = off;
         while k < off + pages {
@@ -1393,6 +1497,7 @@ impl HugePageFiller {
             needs_commit |= p.commit_run.is_some();
             j += 1;
         }
+        self.mark_run(start, n);
         let base = self.huge_base(start);
         let commit_run = if needs_commit {
             Some((self.region_offset(base), n * HUGEPAGE_SIZE))
@@ -1404,6 +1509,23 @@ impl HugePageFiller {
             hugepages: n,
             commit_run,
         })
+    }
+
+    /// Mark hugepages `[start, start + n)` as one multi-hugepage **run**: every hugepage
+    /// is a member ([`in_run`](HugePageSlot::in_run)), and the start records the run
+    /// length `n` ([`run_len`](HugePageSlot::run_len)). Lets
+    /// [`free_hugepages`](Self::free_hugepages) validate an *exact-run* free and the
+    /// packed [`free`](Self::free) refuse a run member — so a forged sub-hugepage
+    /// [`Region`] can never partially free a run (M-004/S-007).
+    fn mark_run(&mut self, start: u32, n: usize) {
+        let mut j = start;
+        while j < start + n as u32 {
+            let mut s = self.get(j);
+            s.in_run = 1;
+            s.run_len = if j == start { n as u32 } else { 0 };
+            self.put(j, s);
+            j += 1;
+        }
     }
 
     /// Re-reserve `n` contiguous whole hugepages **at a specific `base`** — the
@@ -1436,6 +1558,7 @@ impl HugePageFiller {
             needs_commit |= p.commit_run.is_some();
             j += 1;
         }
+        self.mark_run(start, n);
         let commit_run = if needs_commit {
             Some((self.region_offset(base), n * HUGEPAGE_SIZE))
         } else {
@@ -1470,9 +1593,20 @@ impl HugePageFiller {
 
     /// Confirm a [`HugeRun`]'s backing after the caller's `commit` succeeded (M-005):
     /// mark every page of the run committed and clear any subreleased bit, then
-    /// re-file each hugepage. Restores `live ⊆ committed` (H-001).
+    /// re-file each hugepage. Restores `live ⊆ committed` (H-001). A forged/foreign
+    /// token (base not a real hugepage start, or a run running past the region) is
+    /// ignored rather than resolved into an out-of-bounds slot (S-007).
     pub fn mark_run_committed(&mut self, run: &HugeRun) {
-        let start = self.index_of(run.base).expect("run base in region");
+        let start = match self.index_of(run.base) {
+            Some(s) if run.base == self.huge_base(s) => s,
+            _ => return,
+        };
+        if run.hugepages == 0
+            || run.hugepages > self.capacity as usize
+            || start as usize > self.capacity as usize - run.hugepages
+        {
+            return;
+        }
         let mut j = start;
         while j < start + run.hugepages as u32 {
             let mut s = self.get(j);
@@ -1501,11 +1635,18 @@ impl HugePageFiller {
         {
             return FreeReport::INVALID;
         }
-        // Validate every hugepage of the run is fully live (else a wrong/partial run).
+        // Exact-run validation (M-004/S-007): `base` must START a run of EXACTLY `n`
+        // hugepages (`run_len == n`), and every hugepage of it must be a fully-live
+        // member. So a forged partial-run free (`n' ≠ n`, or a base that is an interior
+        // hugepage of a larger run) is rejected — it can never free a strict subset of
+        // a multi-hugepage allocation and leave a live remainder.
+        if self.get(start).run_len as usize != n {
+            return FreeReport::INVALID;
+        }
         let mut j = start;
         while j < start + n as u32 {
             let s = self.get(j);
-            if s.touched == 0 || s.used() != PAGES_PER_HUGEPAGE {
+            if s.touched == 0 || s.in_run == 0 || s.used() != PAGES_PER_HUGEPAGE {
                 return FreeReport::INVALID;
             }
             j += 1;
@@ -1514,6 +1655,9 @@ impl HugePageFiller {
         while j < start + n as u32 {
             let mut s = self.get(j);
             s.live = [0; BITMAP_WORDS];
+            s.heads = [0; BITMAP_WORDS];
+            s.in_run = 0;
+            s.run_len = 0;
             s.hotness = Hotness::Neutral as u8;
             s.lifetime = lifetime_to_u8(Lifetime::Unspecified);
             self.put(j, s);
@@ -1615,7 +1759,13 @@ impl HugePageFiller {
             let s = self.get(i);
             if i >= self.next_untouched {
                 // Beyond the touched frontier: must be a pristine untouched slot.
-                if s.touched != 0 || popcount(&s.live) != 0 || popcount(&s.committed) != 0 {
+                if s.touched != 0
+                    || popcount(&s.live) != 0
+                    || popcount(&s.committed) != 0
+                    || popcount(&s.heads) != 0
+                    || s.in_run != 0
+                    || s.run_len != 0
+                {
                     return false;
                 }
             } else if s.touched == 1 {
@@ -1631,7 +1781,18 @@ impl HugePageFiller {
                     if s.live[w] & s.released[w] != 0 {
                         return false; // a live page released (H-001/H-005)
                     }
+                    if s.heads[w] & !s.live[w] != 0 {
+                        return false; // an allocation head is not live (heads ⊆ live)
+                    }
                     w += 1;
+                }
+                // Run consistency (S-007 exact-extent metadata): a run member is fully
+                // live, and a `run_len` start is itself a member.
+                if s.in_run != 0 && s.used() != PAGES_PER_HUGEPAGE {
+                    return false;
+                }
+                if s.run_len != 0 && s.in_run == 0 {
+                    return false;
                 }
                 // H-003: filed bin == classify_bin(occupancy/state).
                 if bin_from_u8(s.bin) as u8 != s.target_bin() as u8 {
@@ -2105,6 +2266,16 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     ///
     /// SPEC-transition: `huge_allocate` (§18.5 large path / §19 filler)
     pub fn allocate(&self, bytes: usize, align: usize, hints: PlaceHints) -> Option<Region> {
+        // After `teardown` has returned the reservation to the provider, the filler's
+        // address bookkeeping still describes the (now-unmapped) region. Refuse to
+        // carve from it — otherwise a caller that reuses a torn-down backend would get
+        // a non-null pointer into unmapped memory (on POSIX `commit` is a no-op, so the
+        // fault would surface only on first access). `released` is written solely under
+        // the exclusive `&mut self` of `teardown`/`Drop`, so this `&self` read is
+        // race-free.
+        if self.released {
+            return None;
+        }
         let pages = pages_for(bytes, PAGE_SIZE)?;
         if pages == 0 || !align.is_power_of_two() || align > HUGEPAGE_SIZE {
             return None;
@@ -2243,33 +2414,49 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// most `reserve` empty-backed hugepages cached for fast burst reuse (the
     /// HugeCache) and reclaiming the rest of the RSS. Returns the bytes released.
     ///
-    /// Each released hugepage is fully [`subrelease`](Self::subrelease)d (revoke +
-    /// decommit of all its pages), so it leaves the `EmptyBacked` bin (its virtual
-    /// range is retained for recommit-on-reuse, §20.5). The **policy** — what
-    /// `reserve` to choose and when to call this — belongs to the release controller
-    /// (plan 04 W12); this is the **mechanism** it drives. Bounds the HugeCache so a
-    /// churny workload's empty hugepages do not pin RSS indefinitely.
+    /// Each released hugepage is [`subrelease`](Self::subrelease)d over exactly its
+    /// **committed** pages (revoke + decommit), so it leaves the `EmptyBacked` bin (its
+    /// virtual range is retained for recommit-on-reuse, §20.5). An empty hugepage that
+    /// only ever held a *packed sub-hugepage* allocation is only **partially**
+    /// committed, so releasing all `PAGES_PER_HUGEPAGE` would hit the §19.6
+    /// "whole-run-committed" guard and reclaim nothing — instead we release precisely
+    /// its committed prefix (its true RSS). The walk is by ascending slot index (not
+    /// the bin head), so one un-releasable hugepage never blocks reclaiming the others.
+    /// The **policy** — what `reserve` to choose and when to call this — belongs to the
+    /// release controller (plan 04 W12); this is the **mechanism** it drives. Bounds the
+    /// HugeCache so a churny workload's empty hugepages do not pin RSS indefinitely.
     pub fn release_empty_excess(&self, reserve: usize) -> usize {
         let mut released = 0usize;
+        let mut kept = 0usize;
+        let mut from = 0u32;
         loop {
-            // Pick an empty-backed hugepage to release if over the reserve (under the
-            // lock); release it (re-acquires the lock) outside. A concurrent change
-            // just makes the subrelease a no-op, which ends the loop safely.
-            let target = {
+            // Find the next empty-backed hugepage (and its committed footprint) under
+            // the lock; release it outside (re-acquiring). Advancing `from` past each
+            // visited hugepage guarantees the walk terminates and visits each once.
+            let next = {
                 let g = self.lock();
-                if g.inner.filler.bin_len(HugeBin::EmptyBacked) <= reserve {
-                    None
-                } else {
-                    g.inner.filler.first_in_bin(HugeBin::EmptyBacked)
-                }
+                g.inner.filler.next_empty_backed(from)
             };
-            match target {
-                // Release the whole empty hugepage (all its pages) under pressure.
-                Some(base) => match self.subrelease(base, PAGES_PER_HUGEPAGE, true) {
-                    0 => break, // could not release (e.g. a revoke failure) — stop
-                    bytes => released += bytes,
-                },
+            let (idx, base, committed) = match next {
+                Some(t) => t,
                 None => break,
+            };
+            from = idx + 1;
+            // Keep the first `reserve` empty hugepages backed for fast burst reuse.
+            if kept < reserve {
+                kept += 1;
+                continue;
+            }
+            // Release exactly this hugepage's committed prefix (its RSS). `committed
+            // == 0` (no backing) is already released — nothing to reclaim. A guard or
+            // revoke refusal returns 0; skip it and keep reclaiming the others (a
+            // concurrent change just makes the subrelease a re-validated no-op).
+            if committed == 0 {
+                continue;
+            }
+            match self.subrelease(base, committed, true) {
+                0 => continue,
+                bytes => released += bytes,
             }
         }
         released
@@ -2303,8 +2490,17 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         // rest. `release_empty_excess` takes a hugepage *count* to retain.
         let released = if plan.release_empty_hugepages_bytes > 0 {
             let hp = HUGEPAGE_SIZE as u64;
-            let empty_hp = (cov.empty_backed_bytes / hp) as usize;
-            let release_hp = (plan.release_empty_hugepages_bytes / hp) as usize;
+            // The actual empty-backed hugepage *count* (the §19.4 bin), not
+            // `empty_backed_bytes / HUGEPAGE_SIZE` — a packed-then-emptied hugepage is
+            // only partially committed, so the byte form would undercount it.
+            let empty_hp = cov.bins[HugeBin::EmptyBacked as usize] as usize;
+            // Round the rung-2 byte budget UP to whole hugepages: rung 2 releases in
+            // whole-hugepage units, so a positive *sub-hugepage* budget still makes
+            // progress (releasing one hugepage) instead of flooring to zero and planning
+            // release work forever while reclaiming nothing — the livelock. The rate
+            // cap's remainder is carried by the controller's §20.3 backlog; the
+            // per-tick overshoot is bounded by one hugepage.
+            let release_hp = plan.release_empty_hugepages_bytes.div_ceil(hp) as usize;
             let reserve_hp = empty_hp.saturating_sub(release_hp);
             self.release_empty_excess(reserve_hp) as u64
         } else {
@@ -2360,6 +2556,14 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
     #[inline]
     fn try_alloc(&self, bytes: usize, align: usize, hints: Hints) -> Option<Region> {
+        // Honor the request's §10.4 hugepage preference: a `NO_HUGEPAGE`
+        // ([`HugepagePolicy::Avoid`]) request must NOT be served from the hugepage
+        // backend even under the `hugepage_optimized` profile — decline so the large
+        // path falls through to the plain extent manager (the user-visible avoid flag
+        // is respected per allocation). `Default`/`Prefer` both use the backend.
+        if matches!(hints.hugepage, HugepagePolicy::Avoid) {
+            return None;
+        }
         // Translate the request's advisory hints (§10.4) into the filler's placement
         // hints (§19.3/§19.5): the `0..=255` hotness hint maps to cold/neutral/hot,
         // the lifetime passes through. So the engine's large path packs by hotness and
@@ -2379,6 +2583,21 @@ impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
 
     #[inline]
     fn try_cache(&self, region: Region) -> bool {
+        self.free_region(region)
+    }
+
+    fn try_cache_revoking(&self, region: Region, arena: ArenaId) -> bool {
+        // §36.6/§36.13 revoke-before-recycle: an arena-drain free of a cache-served
+        // large must revoke the draining arena's descendant capabilities to these
+        // frames BEFORE they re-enter the HugeCache for reuse by another authority
+        // domain — else a capability-backed arena destroy/reset would leak access to
+        // recycled pages. A revoke failure refuses the cache (returns `false`); the
+        // region stays owned (the §36.13 partial-failure signal). On POSIX (single
+        // ambient authority) `revoke_descendants` is a no-op, so this is exactly
+        // `try_cache`. Mirrors [`subrelease`](Self::subrelease)'s revoke-before-decommit.
+        if self.provider.revoke_descendants(arena, region).is_err() {
+            return false;
+        }
         self.free_region(region)
     }
 }
@@ -2639,16 +2858,25 @@ mod filler_tests {
             home_node: None,
         };
         let mut f = filler(4);
-        // Fill hugepage 0 (Long) and hugepage 1 (Short) completely, then free most of
-        // each so both sit in the same NearlyEmpty bin with the same occupancy.
-        let a = f.place(PAGES_PER_HUGEPAGE, PAGE_SIZE, long).unwrap();
+        // Build two equally-occupied candidates — hugepage 0 (Long) and hugepage 1
+        // (Short), each with one 8-page resident at the END of the hugepage — *without*
+        // a partial free (which exact-extent validation now forbids). Fill the hugepage
+        // with a separate filler allocation, place the resident in the last 8 pages,
+        // then free the filler *exactly*, leaving the resident of the intended lifetime
+        // at a high offset (so the next placement lands at offset 0, as the policy
+        // arithmetic this test pins expects).
+        let fill0 = f.place(PAGES_PER_HUGEPAGE - 8, PAGE_SIZE, long).unwrap(); // opens hp0
+        f.mark_committed(&fill0);
+        let a = f.place(8, PAGE_SIZE, long).unwrap(); // hp0: 8 Long, at [N-8, N)
         f.mark_committed(&a);
-        let b = f.place(PAGES_PER_HUGEPAGE, PAGE_SIZE, short).unwrap();
+        let fill1 = f.place(PAGES_PER_HUGEPAGE - 8, PAGE_SIZE, short).unwrap(); // hp0 full ⇒ hp1
+        f.mark_committed(&fill1);
+        let b = f.place(8, PAGE_SIZE, short).unwrap(); // hp1: 8 Short, at [N-8, N)
         f.mark_committed(&b);
         assert_eq!(a.hugepage, 0);
         assert_eq!(b.hugepage, 1);
-        assert!(f.free(a.base, PAGES_PER_HUGEPAGE - 8).valid); // hugepage 0: 8 live, Long
-        assert!(f.free(b.base, PAGES_PER_HUGEPAGE - 8).valid); // hugepage 1: 8 live, Short
+        assert!(f.free(fill0.base, PAGES_PER_HUGEPAGE - 8).valid); // hp0: 8 live, Long
+        assert!(f.free(fill1.base, PAGES_PER_HUGEPAGE - 8).valid); // hp1: 8 live, Short
         assert_eq!(f.bin_of(a.base), Some(HugeBin::NearlyEmpty));
         assert_eq!(f.bin_of(b.base), Some(HugeBin::NearlyEmpty));
         // A new Short request: lifetime match (hugepage 1) must beat the lower-base
@@ -3058,6 +3286,46 @@ mod filler_tests {
             "run double free rejected (the hugepage is now empty, not full)"
         );
         assert!(f.check_invariants(), "no mutation from any rejected input");
+    }
+
+    #[test]
+    fn forged_confirmation_tokens_are_ignored_not_out_of_bounds() {
+        // S-007 hardening: `Placement`/`HugeRun`/`Subrelease` are public, copyable
+        // confirmation tokens, so a downstream crate could forge one with an
+        // out-of-range index/base and hand it to a safe confirmation method. Each must
+        // be ignored (no mutation), never resolved into an out-of-bounds slot access or
+        // a wrapping address.
+        let mut f = filler(2);
+        let p = place_ok(&mut f, 4, PAGE_SIZE, Hotness::Neutral);
+        let hp0 = p.base - (p.base % HUGEPAGE_SIZE); // hugepage 0 base (= region base)
+        let live_before = f.used_pages_of(p.base);
+
+        // Out-of-range hugepage index.
+        f.mark_committed(&Placement {
+            hugepage: 9999,
+            base: hp0,
+            pages: 1,
+            commit_run: None,
+        });
+        // Valid base, absurd hugepage count (would overflow the slot walk).
+        f.mark_run_committed(&HugeRun {
+            base: hp0,
+            hugepages: usize::MAX,
+            commit_run: None,
+        });
+        // Out-of-range hugepage + wrapping region offset.
+        f.unsubrelease(&Subrelease {
+            hugepage: 9999,
+            region_offset: usize::MAX,
+            len: PAGE_SIZE,
+        });
+
+        assert_eq!(
+            f.used_pages_of(p.base),
+            live_before,
+            "no mutation from any forged token"
+        );
+        assert!(f.check_invariants());
     }
 }
 
@@ -3656,6 +3924,188 @@ mod backend_tests {
         assert_eq!(cov.empty_backed_bytes, 0, "nothing kept");
         assert_eq!(cov.empty_released_bytes, 3 * HUGEPAGE_SIZE as u64);
         assert_eq!(b.release_empty_excess(0), 0, "idempotent once drained");
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn release_empty_excess_reclaims_partially_committed_empties() {
+        // Regression for the demand-reserve bug: a hugepage that only ever held a
+        // *packed sub-hugepage* allocation is only PARTIALLY committed when emptied, so
+        // the old `subrelease(base, PAGES_PER_HUGEPAGE)` hit the "whole-run-committed"
+        // guard, reclaimed 0, AND broke the loop — stranding that RSS and every empty
+        // hugepage after it. Now we release each empty hugepage's committed prefix and
+        // walk by index, so partially-committed empties are reclaimed and one
+        // un-releasable hugepage never blocks the rest.
+        let b = backend(4);
+        // Two 120-page packed allocs land in separate hugepages (120 will not fit
+        // beside another 120 in one 128-page hugepage), each committing only 120/128.
+        let a = b
+            .allocate(120 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        let c = b
+            .allocate(120 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("c");
+        assert_ne!(
+            a.base as usize / HUGEPAGE_SIZE,
+            c.base as usize / HUGEPAGE_SIZE,
+            "the two 120-page allocs occupy separate hugepages"
+        );
+        touch(a);
+        touch(c);
+        assert!(b.free_region(a));
+        assert!(b.free_region(c));
+        // Two empty-backed hugepages, each with only 120 of 128 pages committed.
+        let cov = b.coverage();
+        assert_eq!(
+            cov.empty_backed_bytes,
+            2 * 120 * PAGE_SIZE as u64,
+            "partially-committed empties"
+        );
+        assert_eq!(cov.empty_released_bytes, 0);
+        // reserve = 0 must reclaim BOTH (not 0, and not just the first).
+        let released = b.release_empty_excess(0);
+        assert_eq!(
+            released,
+            2 * 120 * PAGE_SIZE,
+            "both partially-committed empties' committed RSS reclaimed"
+        );
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 0, "no committed RSS left");
+        assert_eq!(cov.empty_released_bytes, 2 * 120 * PAGE_SIZE as u64);
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn allocate_is_refused_after_teardown() {
+        // After `teardown` returns the reservation, the filler still describes the now
+        // -unmapped region; `allocate` must refuse rather than hand out a pointer into
+        // it (which, with POSIX's no-op commit, would fault only on first access).
+        let mut b = backend(2);
+        assert!(b.teardown().is_ok());
+        assert!(
+            b.allocate(64 * 1024, PAGE_SIZE, PlaceHints::default())
+                .is_none(),
+            "no allocation may be served after teardown"
+        );
+        // Idempotent with the eventual Drop (released exactly once).
+    }
+
+    #[test]
+    fn try_alloc_declines_a_no_hugepage_request() {
+        // §10.4: a NO_HUGEPAGE (`HugepagePolicy::Avoid`) request must be declined by the
+        // region-cache hook so the engine's large path falls through to the plain
+        // extent manager — the avoid flag is honored per allocation even under the
+        // hugepage profile. Default/Prefer are still served from the backend.
+        let b = backend(2);
+        let avoid = Hints {
+            hugepage: HugepagePolicy::Avoid,
+            ..Hints::default()
+        };
+        assert!(
+            b.try_alloc(96 * 1024, PAGE_SIZE, avoid).is_none(),
+            "NO_HUGEPAGE declines the hugepage backend (falls through)"
+        );
+        let r = b
+            .try_alloc(96 * 1024, PAGE_SIZE, Hints::default())
+            .expect("a default request is still served");
+        assert!(b.try_cache(r));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn free_region_rejects_a_partial_or_interior_region() {
+        // #3 (S-007): `Region` is a public, copyable descriptor, so a forged one could
+        // name a partial/interior subrange of a live allocation. `free_region` must
+        // reject it — freeing a subrange would clear only some of the allocation's live
+        // bits, leaving a live remainder that aliases when the freed pages are reused.
+        let b = backend(4);
+
+        // Packed path: a 16-page allocation.
+        let a = b
+            .allocate(16 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        touch(a);
+        let shortened = Region {
+            base: a.base,
+            len: 8 * PAGE_SIZE,
+        };
+        assert!(
+            !b.free_region(shortened),
+            "a shortened (partial-prefix) region is rejected"
+        );
+        let interior = Region {
+            base: (a.base as usize + 4 * PAGE_SIZE) as *mut u8,
+            len: 8 * PAGE_SIZE,
+        };
+        assert!(
+            !b.free_region(interior),
+            "an interior subrange region is rejected"
+        );
+        // The allocation is untouched by the rejected frees, and its exact region frees.
+        assert_eq!(b.coverage().live_total_bytes, 16 * PAGE_SIZE as u64);
+        assert!(b.free_region(a), "the exact region frees");
+
+        // Whole-run path: a 2-hugepage run (HUGEPAGE_SIZE + 1 page rounds up to 2 hp).
+        let run = b
+            .allocate(HUGEPAGE_SIZE + PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("run");
+        touch(run);
+        // A one-hugepage prefix routes to the packed free, which refuses a run member.
+        let run_prefix = Region {
+            base: run.base,
+            len: HUGEPAGE_SIZE,
+        };
+        assert!(
+            !b.free_region(run_prefix),
+            "a single-hugepage prefix of a multi-hugepage run is rejected"
+        );
+        // A region spanning more hugepages than the run routes to free_hugepages, whose
+        // exact run-length check rejects it.
+        let run_oversized = Region {
+            base: run.base,
+            len: 3 * HUGEPAGE_SIZE,
+        };
+        assert!(
+            !b.free_region(run_oversized),
+            "a region larger than the run is rejected"
+        );
+        assert!(b.free_region(run), "the exact run frees");
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn try_cache_revoking_revokes_before_recycling() {
+        // #6 (§36.6/§36.13): an arena-drain free of a cache-served large must revoke the
+        // region's descendant capabilities BEFORE it re-enters the HugeCache for reuse
+        // by another authority domain. A revoke failure refuses the cache (the region is
+        // not recycled — partial failure).
+        let b = backend(4);
+        let r = b
+            .allocate(HUGEPAGE_SIZE + PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("run");
+        touch(r);
+        let revokes_before = b.provider().revokes.load(O::Relaxed);
+        assert!(
+            b.try_cache_revoking(r, ArenaId::DEFAULT),
+            "the revoking cache path takes the region"
+        );
+        assert!(
+            b.provider().revokes.load(O::Relaxed) > revokes_before,
+            "the region's descendants were revoked before it was recycled"
+        );
+        assert!(b.check_invariants());
+
+        // A revoke failure refuses the cache: the region stays owned (not recycled).
+        let r2 = b
+            .allocate(HUGEPAGE_SIZE + PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("run2");
+        touch(r2);
+        b.provider().fail_next_revoke();
+        assert!(
+            !b.try_cache_revoking(r2, ArenaId::DEFAULT),
+            "a revoke failure refuses the cache (region not recycled)"
+        );
+        assert!(b.free_region(r2), "the still-owned region frees normally");
         assert!(b.check_invariants());
     }
 }

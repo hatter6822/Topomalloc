@@ -715,9 +715,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 }
             },
             None => {
-                // Cache-served (§18.6): offer it back; if the cache declines, the
-                // region is simply dropped (the cache owns its lifecycle).
-                let _ = hook.try_cache(region);
+                // Cache-served (§18.6): offer it back. For an arena drain
+                // (`revoke == Some`), the region's descendant capabilities must be
+                // revoked **before** it re-enters the cache for reuse by another
+                // authority domain (§36.6/§36.13 revoke-before-recycle) — otherwise a
+                // capability-backed arena destroy/reset could recycle cache-served pages
+                // without revocation. On POSIX (single ambient authority) the revoking
+                // variant is a no-op wrapper over `try_cache`. If the cache declines,
+                // the region is simply dropped (the cache owns its lifecycle).
+                match revoke {
+                    Some(arena) => {
+                        let _ = hook.try_cache_revoking(region, arena);
+                    }
+                    None => {
+                        let _ = hook.try_cache(region);
+                    }
+                }
                 true
             }
         }
