@@ -57,6 +57,14 @@ impl Control {
             // mutating arena-lifecycle control surface land with plan 07 W20.
             "topo.arena.count" => Some(self.stats.live_arenas.to_string()),
             "topo.arena.numa_bind_failures" => Some(self.stats.numa_bind_failures.to_string()),
+            // Release controller (§20.3/§21, plan 04 W12): the live pressure mode and
+            // the backlog/demand-reserve counters, read from the latest stats snapshot.
+            // The mutating decay knobs (`topo.dirty_decay_ms`, …) land with plan 07 W20.
+            "topo.release.pressure_mode" => Some(self.stats.release.mode.as_str().to_string()),
+            "topo.release.backlog_bytes" => Some(self.stats.release.backlog_bytes.to_string()),
+            "topo.release.demand_reserve_bytes" => {
+                Some(self.stats.release.demand_reserve_bytes.to_string())
+            }
             _ => None,
         }
     }
@@ -102,6 +110,28 @@ mod tests {
         });
         assert_eq!(c.get("topo.arena.count").as_deref(), Some("4"));
         assert_eq!(c.get("topo.arena.numa_bind_failures").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn reads_the_release_controller_summary() {
+        // Plan 04 W12: the release controller's pressure mode + backlog/reserve surface
+        // in the control namespace, sourced from the stats snapshot.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            release: topo_core::ReleaseStats {
+                mode: topo_core::PressureMode::Soft,
+                backlog_bytes: 8192,
+                demand_reserve_bytes: 4096,
+                ..topo_core::ReleaseStats::default()
+            },
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.release.pressure_mode").as_deref(), Some("soft"));
+        assert_eq!(c.get("topo.release.backlog_bytes").as_deref(), Some("8192"));
+        assert_eq!(
+            c.get("topo.release.demand_reserve_bytes").as_deref(),
+            Some("4096")
+        );
     }
 
     #[test]

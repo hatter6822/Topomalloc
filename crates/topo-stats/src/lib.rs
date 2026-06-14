@@ -67,6 +67,12 @@ pub struct Stats {
     /// All zero unless a hugepage backend is in use; populated via
     /// [`record_huge`](Self::record_huge).
     pub hugepage: topo_core::HugeStats,
+
+    // --- release controller (§20.3/§21, plan 04 W12) ------------------------
+    /// The release-controller / background-purge running counters (pressure mode,
+    /// backlog, planned bytes, demand reserve). All zero unless a release controller
+    /// is in use; populated via [`record_release`](Self::record_release).
+    pub release: topo_core::ReleaseStats,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -167,6 +173,14 @@ impl Stats {
         self.hugepage = hs;
     }
 
+    /// Record the release-controller running counters (§20.3/§21, plan 04 W12) from a
+    /// [`ReleaseController::stats`](topo_core::ReleaseController::stats) snapshot. The
+    /// controller is a host-owned sibling of the allocator (like the hugepage backend),
+    /// so its stats are recorded alongside [`record_allocator`](Self::record_allocator).
+    pub fn record_release(&mut self, rs: topo_core::ReleaseStats) {
+        self.release = rs;
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -231,6 +245,14 @@ impl Stats {
                 "    \"coverage_ratio_bp\": {hp_ratio_bp},\n",
                 "    \"bin_counts\": {hp_bins}\n",
                 "  }},\n",
+                "  \"release\": {{\n",
+                "    \"pressure_mode\": \"{rel_mode}\",\n",
+                "    \"backlog_bytes\": {rel_backlog},\n",
+                "    \"demand_reserve_bytes\": {rel_reserve},\n",
+                "    \"planned_bytes_total\": {rel_planned},\n",
+                "    \"ticks\": {rel_ticks},\n",
+                "    \"active_ticks\": {rel_active}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -266,6 +288,12 @@ impl Stats {
             hp_fragmentation = self.hugepage.fragmentation_bytes,
             hp_ratio_bp = self.hugepage.coverage_ratio_bp(),
             hp_bins = hp_bins,
+            rel_mode = self.release.mode.as_str(),
+            rel_backlog = self.release.backlog_bytes,
+            rel_reserve = self.release.demand_reserve_bytes,
+            rel_planned = self.release.planned_bytes_total,
+            rel_ticks = self.release.ticks,
+            rel_active = self.release.active_ticks,
             metadata = self.metadata_bytes,
         )
     }
@@ -363,6 +391,32 @@ mod tests {
         );
         let bin_sum: u64 = hs.bins.iter().map(|&c| c as u64).sum();
         assert_eq!(bin_sum, hs.coverage_bytes / (2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn release_controller_stats_reconcile_into_stats_and_json() {
+        // W12: the release-controller running counters flow into the snapshot and the
+        // JSON `release` block, with the pressure mode rendered as its stable string.
+        let rs = topo_core::ReleaseStats {
+            mode: topo_core::PressureMode::Hard,
+            backlog_bytes: 4096,
+            planned_bytes_total: 1_048_576,
+            ticks: 42,
+            demand_reserve_bytes: 65536,
+            active_ticks: 7,
+        };
+        let mut s = Stats::default();
+        s.record_release(rs);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["release"]["pressure_mode"], "hard");
+        assert_eq!(v["release"]["backlog_bytes"], 4096);
+        assert_eq!(v["release"]["demand_reserve_bytes"], 65536);
+        assert_eq!(v["release"]["planned_bytes_total"], 1_048_576);
+        assert_eq!(v["release"]["ticks"], 42);
+        assert_eq!(v["release"]["active_ticks"], 7);
+        // The default snapshot renders the no-pressure normal mode.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["release"]["pressure_mode"], "normal");
     }
 
     #[test]

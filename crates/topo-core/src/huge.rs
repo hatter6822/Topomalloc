@@ -69,6 +69,7 @@ use crate::flags::{Hints, Lifetime};
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
 use crate::ids::ArenaId;
 use crate::overflow::pages_for;
+use crate::release::{ReleaseController, ReleaseInputs, ReleasePlan};
 
 /// A sentinel "no slot" index for the intrusive bin links (`u32::MAX`).
 const NIL: u32 = u32::MAX;
@@ -2200,6 +2201,44 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             }
         }
         released
+    }
+
+    /// **Drive one release-controller tick against this backend (plan 04 W12 live
+    /// wiring).** Samples this backend's §19.7 coverage into the §21.2 `inputs`
+    /// (the empty-backed-hugepage supply and the coverage ratio — the rest the host
+    /// fills), ticks `controller` to get the §21.3 [`ReleasePlan`], then **executes the
+    /// rung-2 release live**: it returns empty-backed hugepages beyond the §21.4 demand
+    /// reserve to the OS via [`release_empty_excess`](Self::release_empty_excess) — the
+    /// exact W11-1b "demand-reserve hook (W12)" handoff. Honors the plan's (possibly
+    /// rate-capped, possibly Emergency-full) rung-2 byte budget by choosing the reserve
+    /// that releases precisely that many whole hugepages.
+    ///
+    /// Returns the plan (so the host can execute the remaining extent/cache rungs via
+    /// the existing §20.4 ops) and the bytes actually released here. The controller is
+    /// the host's; this method holds no controller state — the policy stays pure
+    /// ([`crate::release`]), this is only the mechanism it drives.
+    pub fn release_tick(
+        &self,
+        controller: &mut ReleaseController,
+        now_ms: u64,
+        mut inputs: ReleaseInputs,
+    ) -> (ReleasePlan, u64) {
+        let cov = self.coverage();
+        inputs.empty_backed_hugepage_bytes = cov.empty_backed_bytes;
+        inputs.hugepage_coverage_ratio_bp = cov.coverage_ratio_bp();
+        let plan = controller.tick(now_ms, inputs);
+        // Execute rung 2: keep exactly `empty − planned` empty hugepages, release the
+        // rest. `release_empty_excess` takes a hugepage *count* to retain.
+        let released = if plan.release_empty_hugepages_bytes > 0 {
+            let hp = HUGEPAGE_SIZE as u64;
+            let empty_hp = (cov.empty_backed_bytes / hp) as usize;
+            let release_hp = (plan.release_empty_hugepages_bytes / hp) as usize;
+            let reserve_hp = empty_hp.saturating_sub(release_hp);
+            self.release_empty_excess(reserve_hp) as u64
+        } else {
+            0
+        };
+        (plan, released)
     }
 
     /// The §19.7 coverage metrics (W11-5) for this backend's hugepages.
