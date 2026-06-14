@@ -314,6 +314,47 @@ theorem freeRun_clears_live (hp : HugePageState) (off len p : Nat)
   rw [if_pos ⟨hin, h⟩]
   rfl
 
+/-- **`place` leaves pages outside the run untouched** — so it never disturbs an
+existing allocation. The intra-hugepage analogue of "split/merge keep other extents
+fixed". -/
+theorem place_preserves_outside (hp : HugePageState) (off len p : Nat)
+    (hout : ¬ inRun off len p) : place hp off len p = hp p := by
+  unfold place
+  rw [if_neg hout]
+
+/-- **An existing live page survives `place`.** Under the placement precondition that
+the run is *clear of live pages* (the filler carves only clear pages), every
+previously-live page stays live: an in-run page was not live (so the case is vacuous),
+an out-of-run page is unchanged. So `place` adds the run to the live set without
+evicting any existing live object — the placement analogue of `subrelease_preserves_live`. -/
+theorem place_preserves_existing_live (hp : HugePageState) (off len p : Nat)
+    (hclear : ∀ q, inRun off len q → hp q ≠ .live) (h : hp p = .live) :
+    place hp off len p = .live := by
+  by_cases hin : inRun off len p
+  · exact absurd h (hclear p hin)
+  · rw [place_preserves_outside hp off len p hin]; exact h
+
+/-- **Intra-hugepage placement disjointness (the §18.4 / H-001 core for the filler).**
+Under the precondition that the run is clear of live pages, the pages live *after*
+`place` are exactly `(previously-live) ⊔ (run)`, and those two sets are **disjoint**.
+So two allocations placed into one hugepage can never share a page — the runtime
+guarantees this structurally by carving each run from the free bitmap (`find_run_aligned`
+requires `run_is_clear(live)`), and this is the proof that the structure suffices. -/
+theorem place_live_is_disjoint_union (hp : HugePageState) (off len p : Nat)
+    (hclear : ∀ q, inRun off len q → hp q ≠ .live) :
+    (place hp off len p = .live ↔ (hp p = .live ∨ inRun off len p))
+      ∧ ¬ (hp p = .live ∧ inRun off len p) := by
+  refine ⟨⟨?_, ?_⟩, ?_⟩
+  · intro hlive
+    by_cases hin : inRun off len p
+    · exact Or.inr hin
+    · rw [place_preserves_outside hp off len p hin] at hlive; exact Or.inl hlive
+  · rintro (hold | hin)
+    · exact place_preserves_existing_live hp off len p hclear hold
+    · exact place_run_is_live hp off len p hin
+  · rintro ⟨hold, hin⟩
+    exact (hclear p hin) hold
+
 /-- The page state machine is **inhabited and non-trivial**: placing then subreleasing
 a free page reaches `released`, while a concurrently-live page stays `live`. -/
 example :

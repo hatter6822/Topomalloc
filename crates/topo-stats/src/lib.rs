@@ -11,7 +11,7 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 use topo_core::VERSION;
 
@@ -172,6 +172,18 @@ impl Stats {
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
     /// identifiers, so no escaping is required.
     pub fn to_json(&self) -> String {
+        // §19.4 bin distribution (W11-4a), rendered as a compact JSON array. Built
+        // here rather than inline in the template so it tracks `HugeBin::COUNT`
+        // automatically; this is the slow stats surface, so the small per-element
+        // allocations are immaterial.
+        let mut hp_bins = String::from("[");
+        for (i, count) in self.hugepage.bins.iter().enumerate() {
+            if i > 0 {
+                hp_bins.push(',');
+            }
+            hp_bins.push_str(&count.to_string());
+        }
+        hp_bins.push(']');
         format!(
             concat!(
                 "{{\n",
@@ -216,7 +228,8 @@ impl Stats {
                 "    \"empty_released_bytes\": {hp_empty_released},\n",
                 "    \"partial_subreleased_bytes\": {hp_subreleased},\n",
                 "    \"fragmentation_bytes\": {hp_fragmentation},\n",
-                "    \"coverage_ratio_bp\": {hp_ratio_bp}\n",
+                "    \"coverage_ratio_bp\": {hp_ratio_bp},\n",
+                "    \"bin_counts\": {hp_bins}\n",
                 "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
@@ -252,6 +265,7 @@ impl Stats {
             hp_subreleased = self.hugepage.partial_subreleased_bytes,
             hp_fragmentation = self.hugepage.fragmentation_bytes,
             hp_ratio_bp = self.hugepage.coverage_ratio_bp(),
+            hp_bins = hp_bins,
             metadata = self.metadata_bytes,
         )
     }
@@ -318,6 +332,9 @@ mod tests {
             partial_subreleased_bytes: 256 * 1024,
             fragmentation_bytes: 128 * 1024,
             live_total_bytes: 4 * 1024 * 1024,
+            // Two empty-backed + one full + one partial-subreleased hugepage: a
+            // distribution that must reconcile to the 4-hugepage coverage above.
+            bins: [2, 0, 0, 0, 0, 1, 1, 0, 0],
         };
         let mut s = Stats::default();
         s.record_huge(hs);
@@ -338,6 +355,14 @@ mod tests {
         assert_eq!(v["hugepage"]["fragmentation_bytes"], 128u64 * 1024);
         // ratio = intact / total = 3 MiB / 4 MiB = 7500 bp.
         assert_eq!(v["hugepage"]["coverage_ratio_bp"], 7500);
+        // The §19.4 bin distribution renders as a compact array in HugeBin order and
+        // sums to the touched-hugepage count (4).
+        assert_eq!(
+            v["hugepage"]["bin_counts"],
+            serde_json::json!([2, 0, 0, 0, 0, 1, 1, 0, 0])
+        );
+        let bin_sum: u64 = hs.bins.iter().map(|&c| c as u64).sum();
+        assert_eq!(bin_sum, hs.coverage_bytes / (2 * 1024 * 1024));
     }
 
     #[test]

@@ -82,10 +82,14 @@ simulator. Partial subrelease is guarded so it can **never** intersect a live
 object (H-005, proved in Lean both over the `Range` geometry and as a per-page
 state machine), gated by a real §19.6 cost/benefit test and §36.6
 revoke-before-decommit; an empty-hugepage demand-reserve (`release_empty_excess`)
-returns excess RSS. The §19.7 coverage metrics reconcile into the stats JSON, and
+returns excess RSS. The §19.7 coverage metrics — plus the §19.4 per-bin
+distribution (`hugepage.bin_counts`) — reconcile into the stats JSON, and
 the §19.4 bin classification is pinned to the Lean model by a `lake exe check`
-differential gate. Front-end caches (M2) and the remaining M1 pieces land per the
-plan.
+differential gate. Under the `hugepage-optimized` feature the live C
+`malloc`/`free` already run over a `HugePageBackend`-backed engine
+(`topo-abi`'s `build_posix_allocator`), gated so the default MIT artifact is
+byte-for-byte the M1 extent path. Front-end caches (M2) and the remaining M1
+pieces land per the plan.
 
 ## Quick start
 

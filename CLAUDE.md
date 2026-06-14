@@ -169,19 +169,23 @@ consults. It covers W11-1a (HugeAllocator: hugepage-aligned reservations), W11-1
 empty-backed reuse + a `release_empty_excess` demand-reserve hook for W12), W11-2a/b (nine bins +
 packing-ordered scored placement carrying hotness **and** lifetime hints, §19.3/§19.5, no full scan),
 W11-2c (B.4 bin↔occupancy oracle), W11-3 (validating RegionCache for awkward sizes — bounded waste, no
-double-vend), W11-4a (packing), W11-4b (H-005-guarded partial subrelease with a cold/sparse/pressure
-gate, a real §19.6 cost/benefit gate, §36.6 revoke-before-decommit, and the W12 `mark_cold` hook),
-W11-5 (§19.7 coverage metrics → `topo-stats` JSON), and W11-6 (backend-agnostic: a §36.9 G-sim slice
+double-vend), W11-4a (packing — same-lifetime segregation by opening a fresh hugepage on a strong
+mismatch, with the §19.4 per-bin distribution surfaced in stats), W11-4b (H-005-guarded partial
+subrelease with a cold/sparse/pressure gate, a real §19.6 cost/benefit gate, §36.6
+revoke-before-decommit, and the W12 `mark_cold` hook),
+W11-5 (§19.7 coverage metrics + the §19.4 `bin_counts` distribution → `topo-stats` JSON), and W11-6 (backend-agnostic: a §36.9 G-sim slice
 proves the *identical* outcome over POSIX and `Sele4nSim`). It is wired **live** through the engine:
 `Allocator::new_with_huge` (the `hugepage_optimized` configuration) routes every medium/large
 allocation through the filler — carrying the request's hotness/lifetime hints — with the small/free
-paths unchanged; the default `Allocator::new` keeps the M1 extent path. The `huge::classify_bin`
+paths unchanged; the default `Allocator::new` keeps the M1 extent path. Under the `hugepage-optimized`
+feature, `topo-abi`'s `build_posix_allocator` serves the live C `malloc`/`free` over a
+`HugePageBackend`-backed engine, gated so the default MIT artifact is byte-for-byte the extent path. The `huge::classify_bin`
 (§19.4) is pinned to the Lean model by `huge_bin_classification_matches_lean` and the `lake exe check`
 `hugeBinGate`, and the filler's place/free/subrelease are modeled as a per-page state machine with
 H-001/H-004/H-005 preservation proved in `lean/TopoMalloc/HugePageFiller.lean`.
 
 **Test counts:**
-- Rust: ~566 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~567 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)

@@ -4,7 +4,7 @@
 //! The hugepage backend keeps live memory packed into a small number of
 //! **hugepages** (a `HUGEPAGE_SIZE`-byte unit — 2 MiB on x86-64, [`PAGES_PER_HUGEPAGE`]
 //! allocator pages) so that few hugepages hold the live set and empty hugepages
-//! release easily (§19.1, Temeraire [R3]). It has four §19.2 components:
+//! release easily (§19.1, Temeraire \[R3\]). It has four §19.2 components:
 //!
 //! * **HugeAllocator** — reserves hugepage-aligned virtual ranges (§19.2, W11-1a);
 //!   here the [`HugePageFiller`] tiles one provider-reserved, hugepage-aligned
@@ -17,12 +17,12 @@
 //!   approximate **bins** (§19.3/§19.4, W11-2): each hugepage sits in **exactly
 //!   one** of nine [`HugeBin`]s, consistent with its occupancy and state (H-003).
 //! * **RegionCache** — caches awkward (just-over-a-hugepage) sizes so they avoid
-//!   rounding to whole hugepages (§18.6, W11-3); see [`RegionCache`].
+//!   rounding to whole hugepages (§18.6, W11-3); see the `RegionCache` type below.
 //!
 //! **Bins are correctness; the score is policy (DD-2, §2.4).** [`classify_bin`] is a
 //! *total* function of `(used, total, subreleased, hotness)` — H-003 holds by
 //! construction because the filed bin is recomputed from occupancy on every change.
-//! The placement **score** ([`HugePageFiller::score`]) may be arbitrarily wrong
+//! The placement **score** (the private `HugePageFiller::score`) may be arbitrarily wrong
 //! without ever misplacing a live object: a run is carved from a hugepage's free
 //! bitmap, so two live objects can never overlap regardless of the score.
 //!
@@ -223,7 +223,7 @@ impl PlaceHints {
 /// hugepage is in **exactly one** (H-003); [`classify_bin`] is the total function
 /// that decides, and the filler re-files a hugepage whenever its occupancy or state
 /// changes. The numeric order is the `repr(u8)` the bin lists index by — it is *not*
-/// the packing-preference order (that is [`PACKING_ORDER`]).
+/// the packing-preference order (that is the private `PACKING_ORDER`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum HugeBin {
@@ -306,8 +306,13 @@ pub const fn classify_bin(
             _ => HugeBin::Full,
         };
     }
-    // 0 < used < total, so band ∈ {0,…,7}.
-    let band = used * 8 / total;
+    // 0 < used < total, so band ∈ {0,…,7}. `saturating_mul` hardens this public
+    // function against a caller passing a `used` so large that `used * 8` would wrap
+    // (every in-crate caller is bounded by `PAGES_PER_HUGEPAGE`, so for them this is
+    // an exact `used * 8`; saturation only ever caps the band at 7, never misclassifies
+    // a real hugepage). The Lean `classifyBin` uses `Nat` (unbounded), so the §19.4
+    // differential gate — which evaluates only bounded inputs — is unaffected.
+    let band = used.saturating_mul(8) / total;
     match band {
         0 => HugeBin::NearlyEmpty,
         1 | 2 => match hotness {
@@ -341,7 +346,7 @@ const PACKING_ORDER: [HugeBin; 8] = [
 ];
 
 /// The §19.7 hugepage coverage metrics (W11-5), summed over every managed hugepage.
-/// All byte counts; [`coverage_ratio`](Self::coverage_ratio) is computed, not
+/// All byte counts; [`coverage_ratio_bp`](Self::coverage_ratio_bp) is computed, not
 /// stored. Reconciled into [`AllocatorStats`](crate::AllocatorStats) and the stats
 /// JSON (plan 07). The default is all-zero (a backend with no touched hugepage).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -371,6 +376,11 @@ pub struct HugeStats {
     /// Total live bytes across all hugepages (denominator of the coverage ratio;
     /// not a named §19.7 field but the divisor it defines).
     pub live_total_bytes: u64,
+    /// Hugepage count in each of the nine §19.4 [`HugeBin`]s, indexed by `HugeBin as
+    /// usize` (W11-4a "policy observable in stats"): the packing policy's *effect* —
+    /// how the live set is distributed across empty/sparse/dense/subreleased
+    /// hugepages. Sums to the touched-hugepage count.
+    pub bins: [u32; HugeBin::COUNT],
 }
 
 impl HugeStats {
@@ -417,6 +427,15 @@ impl HugeStats {
                 .fragmentation_bytes
                 .saturating_add(o.fragmentation_bytes),
             live_total_bytes: self.live_total_bytes.saturating_add(o.live_total_bytes),
+            bins: {
+                let mut b = self.bins;
+                let mut i = 0;
+                while i < HugeBin::COUNT {
+                    b[i] = b[i].saturating_add(o.bins[i]);
+                    i += 1;
+                }
+                b
+            },
         }
     }
 }
@@ -897,7 +916,10 @@ impl HugePageFiller {
         };
         // lifetime grouping (§19.5): bonus for same-lifetime placement, penalty for
         // mixing very short-lived with long-lived objects (which fragments the
-        // long-lived hugepage as the short-lived ones churn).
+        // long-lived hugepage as the short-lived ones churn). Weighted so a *severe*
+        // mismatch (short vs long, gap 2) on a non-dense hugepage can lose to opening
+        // a fresh hugepage (`place`'s open-fresh-on-mismatch), realising §19.5 "avoid
+        // mixing ... when possible" without disturbing a dense hugepage's coverage.
         let hp_life = lifetime_from_u8(s.lifetime);
         let life_gap =
             (lifetime_to_u8(hp_life) as i64 - lifetime_to_u8(hints.lifetime) as i64).abs();
@@ -906,8 +928,14 @@ impl HugePageFiller {
         } else if life_gap == 0 {
             3
         } else {
-            -life_gap // larger gap (short vs long) ⇒ larger mixing penalty
+            -life_gap * LIFETIME_MISMATCH_WEIGHT
         };
+        // locality_bonus / cross_numa_penalty (§19.3): topology-aware placement is
+        // plan 04 W13 (NUMA/LLC discovery), so both score 0 here. They are named
+        // explicitly — keeping the score §19.3-structurally-complete and the inputs
+        // backend-agnostic — so W13 fills them in without touching the placement loop.
+        let locality_bonus: i64 = 0;
+        let cross_numa_penalty: i64 = 0;
         // release_preservation_bonus: avoid disturbing an empty hugepage held for
         // release/reuse (the HugeCache reserve) — a small penalty for opening one.
         let release_pres = if used == 0 { -3 } else { 0 };
@@ -927,13 +955,31 @@ impl HugePageFiller {
         let fragmentation = (backed_free_after / 8) + (run_offset as i64).min(8);
         // partial_subrelease_penalty (§19.3): avoid re-filling a subreleased hugepage.
         let subrelease_pen = subreleased;
-        packing + hotness_match + lifetime_match + release_pres + commit_bonus
+        packing + hotness_match + lifetime_match + locality_bonus + release_pres + commit_bonus
             - fragmentation
+            - cross_numa_penalty
             - subrelease_pen
     }
 
+    /// The score a **brand-new (fresh) hugepage** would get for this request — used by
+    /// [`place`](Self::place) to decide whether to open one rather than mix into a
+    /// poorly-matched existing candidate (§19.5 "avoid mixing when possible"). A fresh
+    /// hugepage has `used == 0` (so packing 0, no resident lifetime to match), is not
+    /// yet committed (no commit bonus), and carries the `release_preservation`
+    /// penalty for opening it.
+    fn fresh_score(hints: PlaceHints) -> i64 {
+        let hotness_match = if hints.hotness == Hotness::Neutral {
+            4
+        } else {
+            0
+        };
+        // packing(0) + hotness_match + lifetime_match(0) + locality(0) + release_pres(-3)
+        // + commit_bonus(0) − fragmentation(0) − cross_numa(0) − subrelease(0).
+        hotness_match - 3
+    }
+
     /// **Place a `pages`-page run** at `align` with placement `hints` (§19.3/§19.5,
-    /// W11-2b/W11-4a). Scans the bins in [`PACKING_ORDER`] (fullest-fitting first —
+    /// W11-2b/W11-4a). Scans the bins in `PACKING_ORDER` (fullest-fitting first —
     /// **no full scan of all hugepages**, W11-2b), scores the fitting candidates, and
     /// carves the best (deterministic: best score, then lowest base). Opens a fresh
     /// hugepage only if no touched one fits. Marks the run **live** and re-files the
@@ -988,7 +1034,22 @@ impl HugePageFiller {
         }
 
         let (hp, off) = match best {
-            Some((hp, off, _)) => (hp, off),
+            // §19.5 "avoid mixing ... when possible": if the best existing candidate
+            // scores *below* a fresh hugepage (a severe lifetime mismatch on a
+            // non-dense hugepage outweighs its packing bonus) and the region still has
+            // a fresh hugepage, open one to segregate lifetimes. A dense or
+            // well-matched candidate keeps a score above the fresh threshold and is
+            // used, preserving coverage and density.
+            Some((hp, off, sc)) => {
+                if sc < Self::fresh_score(hints) && self.next_untouched < self.capacity {
+                    match self.open_fresh() {
+                        Some(fresh) => (fresh, 0),
+                        None => (hp, off),
+                    }
+                } else {
+                    (hp, off)
+                }
+            }
             // No touched hugepage fits: open a fresh one (HugeAllocator, §19.2).
             None => {
                 let fresh = self.open_fresh()?;
@@ -1072,7 +1133,7 @@ impl HugePageFiller {
     // --- free (W11-4a return) ------------------------------------------------
 
     /// Free the `pages`-page run based at `base` (the inverse of a [`place`](Self::place)
-    /// /[`carve`](Self::carve)): clear its live bits and re-file the bin. The pages
+    /// / the private `carve`): clear its live bits and re-file the bin. The pages
     /// stay **committed** (retain — the HugeCache keeps them backed for cheap reuse,
     /// §19.2/§20.5). The run **must be fully live** (the base/length of a prior
     /// placement); a foreign/untouched/non-page-aligned base or a double free is
@@ -1454,6 +1515,7 @@ impl HugePageFiller {
                 let live_b = (used * PAGE_SIZE) as u64;
                 st.coverage_bytes += HUGEPAGE_SIZE as u64;
                 st.live_total_bytes += live_b;
+                st.bins[s.bin as usize] += 1; // §19.4 bin distribution (W11-4a)
                 if used == 0 {
                     // Empty hugepage: split its bytes into backed vs released — its
                     // released bytes are `empty_released`, not `partial_subreleased`
@@ -1609,6 +1671,14 @@ const SCAN_CAP: usize = 64;
 /// repay the lost coverage. `8` makes a fully-live hugepage cost `PAGES_PER_HUGEPAGE/8`
 /// (16 pages) — i.e. only a substantial run is worth disrupting a dense hugepage.
 const FRAGMENTATION_COST_DIVISOR: usize = 8;
+
+/// The §19.5 lifetime-mismatch weight: the placement score penalizes mixing objects
+/// of different lifetimes by `lifetime_gap × this`. `4` makes a severe mismatch
+/// (short vs long, gap 2 ⇒ −8) able to overcome the packing bonus of a *non-dense*
+/// hugepage (so it opens a fresh one and segregates), while a *dense* hugepage's
+/// larger packing bonus still wins (preserving its coverage) — "avoid mixing ... when
+/// possible".
+const LIFETIME_MISMATCH_WEIGHT: i64 = 4;
 
 // ===========================================================================
 // §18.6 region cache for awkward sizes (W11-3)
@@ -1807,7 +1877,7 @@ struct HugeInner {
     cache: RegionCache,
 }
 
-/// The §19 **hugepage backend**: a [`HugePageFiller`] + §18.6 [`RegionCache`] over a
+/// The §19 **hugepage backend**: a [`HugePageFiller`] + a §18.6 `RegionCache` over a
 /// provider-reserved, hugepage-aligned region, guarded by the §27.2 backend lock and
 /// driving the [`TopoBackingProvider`] for every physical-state transition (`commit`
 /// on placement, `decommit` on subrelease/release). It implements the §18.6
@@ -2467,6 +2537,40 @@ mod filler_tests {
     }
 
     #[test]
+    fn placement_opens_fresh_to_avoid_mixing_lifetimes() {
+        // §19.5 "avoid mixing very short-lived and long-lived objects when possible":
+        // a short-lived request prefers a fresh hugepage over mixing into a non-dense
+        // long-lived one, while a same-lifetime request still packs together.
+        let long = PlaceHints {
+            hotness: Hotness::Neutral,
+            lifetime: Lifetime::Long,
+        };
+        let short = PlaceHints {
+            hotness: Hotness::Neutral,
+            lifetime: Lifetime::Short,
+        };
+        let mut f = filler(4);
+        let a = f.place(1, PAGE_SIZE, long).unwrap();
+        f.mark_committed(&a);
+        assert_eq!(a.hugepage, 0);
+        // Short-lived ⇒ segregate into a fresh hugepage rather than mix into the long one.
+        let s = f.place(1, PAGE_SIZE, short).unwrap();
+        f.mark_committed(&s);
+        assert_ne!(
+            s.hugepage, a.hugepage,
+            "short-lived object segregated from the long-lived hugepage"
+        );
+        // Another long-lived request packs back into the long hugepage (same lifetime).
+        let b = f.place(1, PAGE_SIZE, long).unwrap();
+        f.mark_committed(&b);
+        assert_eq!(
+            b.hugepage, a.hugepage,
+            "same-lifetime objects pack together"
+        );
+        assert!(f.check_invariants());
+    }
+
+    #[test]
     fn subrelease_cost_benefit_scales_with_hugepage_density() {
         // §19.6 cost/benefit gate: a small subrelease from a DENSE (cold) hugepage is
         // refused (predicted fragmentation cost > benefit), but the same run passes
@@ -2562,6 +2666,15 @@ mod filler_tests {
         // No subrelease yet ⇒ all live is on intact hugepages ⇒ ratio 100%.
         assert_eq!(cov.partial_subreleased_bytes, 0);
         assert_eq!(cov.coverage_ratio_bp(), 10_000);
+        // §19.4/H-003: every touched hugepage is counted in exactly one bin, so the
+        // bin distribution sums to the touched-hugepage count (coverage_bytes /
+        // HUGEPAGE_SIZE). This holds regardless of how placement distributed the runs.
+        let binned: u32 = cov.bins.iter().sum();
+        assert_eq!(
+            binned as u64,
+            cov.coverage_bytes / HUGEPAGE_SIZE as u64,
+            "bin distribution must reconcile with touched-hugepage count"
+        );
         assert!(f.check_invariants());
     }
 

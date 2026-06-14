@@ -13,7 +13,7 @@ Cargo feature set that realizes it.
 | `debug` | the Appendix-B invariant checklist as runtime assertions (§30.2) | `topo-core/debug-checks` → `debug` (plan 08 W19) |
 | `deterministic_test` | seeded randomness, deterministic refill, force-slow-path, trace IDs (§30.4) | `topo-test-support` deterministic harness → `deterministic_test` (plan 08 W19-3) |
 | `low_rss` | aggressive release / unmap (§20.5) | `topo-core/low-rss` → `RetainPolicy::Unmap` via `from_profile` (plan 04 W4-3b) |
-| `hugepage_optimized` | hugepage-aware placement tuned up (§19) | *(planned)* plan 04 W11 |
+| `hugepage_optimized` | hugepage-aware placement tuned up (§19) | `topo-abi/hugepage-optimized` → `topo-core/hugepage-optimized`: live `malloc` over a `HugePageBackend` engine (`build_posix_allocator` + `Allocator::new_with_huge`, plan 04 W11) |
 
 ## Status at M0
 

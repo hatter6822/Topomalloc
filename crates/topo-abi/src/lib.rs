@@ -257,6 +257,57 @@ impl AnyAllocator {
     }
 }
 
+/// Build the POSIX engine — **extent-backed by default**, or **hugepage-backed under
+/// the `hugepage-optimized` profile** (plan 04 W11), where the medium/large path is
+/// served by a [`HugePageBackend`](topo_core::HugePageBackend). The hugepage backend
+/// is a process-lived sibling (leaked, like `meta`/`pagemap`), sized to one hugepage
+/// per `HUGEPAGE_SIZE` of the default large region; its ~tens-of-KiB descriptor pool
+/// is drawn from the same `meta` arena (well within `META_BYTES`). The small-object,
+/// free, and arena paths are unchanged either way.
+fn build_posix_allocator(
+    meta: &'static MetaArena<PosixBackingProvider>,
+    pagemap: &'static PageMap,
+) -> Option<Allocator<'static, PosixBackingProvider>> {
+    let cfg = AllocatorConfig::default();
+    #[cfg(feature = "hugepage-optimized")]
+    {
+        let capacity = (cfg.large_region_bytes / topo_core::HUGEPAGE_SIZE).max(1);
+        let huge: &'static topo_core::HugePageBackend<PosixBackingProvider> = Box::leak(Box::new(
+            topo_core::HugePageBackend::new(
+                PosixBackingProvider::new(),
+                meta,
+                ArenaId::DEFAULT,
+                topo_core::HugeConfig::with_capacity(capacity),
+            )
+            .ok()?,
+        ));
+        Allocator::new_with_huge(
+            PosixBackingProvider::new(),
+            PosixBackingProvider::new(),
+            huge,
+            meta,
+            meta,
+            pagemap,
+            ArenaId::DEFAULT,
+            cfg,
+        )
+        .ok()
+    }
+    #[cfg(not(feature = "hugepage-optimized"))]
+    {
+        Allocator::new(
+            PosixBackingProvider::new(),
+            PosixBackingProvider::new(),
+            meta,
+            meta,
+            pagemap,
+            ArenaId::DEFAULT,
+            cfg,
+        )
+        .ok()
+    }
+}
+
 /// Build an allocator for the named backend (the runtime flag, W0-14b).
 ///
 /// Returns `None` for an unknown name, or if a backend with that name is not
@@ -275,16 +326,7 @@ pub fn new_allocator_named(name: &str) -> Option<AnyAllocator> {
                     .ok()?,
             ));
             let pagemap: &'static PageMap = Box::leak(Box::new(PageMap::new()));
-            let a = Allocator::new(
-                PosixBackingProvider::new(),
-                PosixBackingProvider::new(),
-                meta,
-                meta,
-                pagemap,
-                ArenaId::DEFAULT,
-                AllocatorConfig::default(),
-            )
-            .ok()?;
+            let a = build_posix_allocator(meta, pagemap)?;
             Some(AnyAllocator::Posix(a))
         }
         #[cfg(feature = "sele4n-sim")]
@@ -506,6 +548,33 @@ unsafe impl GlobalAlloc for TopoMallocGlobal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W11 production wiring: under the `hugepage_optimized` profile the POSIX engine
+    /// constructs with a hugepage backend and serves medium/large allocations through
+    /// it, with the small/free paths unchanged. (Builds + runs only with the feature.)
+    #[cfg(feature = "hugepage-optimized")]
+    #[test]
+    fn hugepage_optimized_posix_engine_serves_large_and_small() {
+        let a = new_allocator_named("posix").expect("hugepage_optimized posix engine builds");
+        // A medium request (> small_max) flows through the hugepage-backed large path.
+        let size = 256 * 1024;
+        let p = a.allocate(size, 16, RequestFlags::NONE);
+        assert!(!p.is_null());
+        assert_eq!(a.usable_size(p), Some(size));
+        // SAFETY: `p` has `size` writable bytes.
+        unsafe {
+            std::ptr::write_bytes(p, 0xab, size);
+            assert_eq!(*p.add(size - 1), 0xab);
+            assert_eq!(a.free(p), FreeOutcome::Freed);
+        }
+        // The small path is unchanged.
+        let s = a.allocate(64, 16, RequestFlags::NONE);
+        assert!(!s.is_null());
+        // SAFETY: `s` is a live object just handed out.
+        unsafe {
+            assert_eq!(a.free(s), FreeOutcome::Freed);
+        }
+    }
 
     #[test]
     fn global_alloc_adapter_roundtrips_and_frees() {
