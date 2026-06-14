@@ -1084,7 +1084,9 @@ A deliberate completeness pass closed every gap the first pass deferred:
     then, so the window is race-free). `arena.rs` gains
     `create_pending`/`publish`/`abandon_pending` for that split. Destroy tears the
     region down (returns it to the hooks via `dealloc`, *outside* the registry lock
-    so the hook never runs under it); reset keeps it.
+    so the hook never runs under it) **before** the terminal step, so a backing that
+    refuses the return quarantines rather than reporting a clean destroy (the
+    strict-teardown hardening below); reset keeps it.
   - Concurrency (soundness): the registry is accessed **per element via raw
     pointers** — never a whole-array `&[Option; N]` / `&mut [Option; N]` — the same
     slot-pool discipline `ExtentMap`/`SpanPool`/`ArenaTable` use. A reference into
@@ -1101,7 +1103,10 @@ A deliberate completeness pass closed every gap the first pass deferred:
   large_bytes)` + `topo_max_hook_backends()`; a `CHooks` adapter maps the C
   function pointers (jemalloc bool convention: `true` ⇒ failure; NULL op ⇒ the
   no-op default) to the Rust trait. The vtable is copied (the caller's struct need
-  not persist); the adapter is leaked (`'static`, bounded by `MAX_HOOK_BACKENDS`).
+  not persist); the adapter is heap-owned with a `'static` borrow handed to the
+  allocator, tracked in `CHOOKS_REGISTRY` and **reclaimed on destroy** (freed on a
+  failed create) so a create/destroy loop stays bounded — see the PR-review
+  hardening below (it is *not* leaked, despite an earlier pass that left it so).
   `include/topomalloc.h` declares it; the C and C++ ABI harnesses drive a real
   custom backing end to end; the `nm` header↔symbol cross-check balances at 30.
   (A hook backing must honour the requested `PAGE_SIZE` alignment — the §23.3 guard
@@ -1128,3 +1133,37 @@ A deliberate completeness pass closed every gap the first pass deferred:
   like `free`. Both now have regression tests (a concurrent registry stress test
   and a hooked-arena large realloc test). The audit also closed the stats gap above
   (aggregate `live_large` + backend breakdown over the hooked regions).
+
+* **PR-review hardening (PR #14, four fixes).** A code review of the per-arena +
+  C-ABI work surfaced four issues, each fixed with a regression test:
+  - **Adapter lifetime (P2).** The C `CHooks` adapter was leaked on every create.
+    Now each adapter's box address is tracked in `CHOOKS_REGISTRY` keyed by arena
+    id and **reclaimed** on `topo_arena_destroy` (and freed on a failed create), so
+    a create/destroy loop no longer grows the heap. The reclaim runs only on a clean
+    `Ok` destroy — by then the arena's backend (and its `HookProvider<&CHooks>`
+    borrow) is gone, so the free is sound; a quarantined destroy keeps the adapter
+    (a bounded, terminal-failure retention, never a use-after-free).
+  - **Cross-region no-overlap (P2).** A hooked arena reserves its span and large
+    regions through **two** `HookProvider` instances, so neither tracker sees the
+    other's range. A buggy hook returning overlapping span/large regions would let
+    small spans and large allocations alias. `arena_create_hooked` now checks the
+    two reserved regions are disjoint at construction — debug-abort, release-reject
+    (`ArenaError::Exhausted`), with both built managers handing their regions back.
+  - **Reject-path hand-back (P2).** When a hook's `alloc` result fails the §23.3
+    geometry check, `HookProvider::reserve` now returns the range to the hook
+    (`dealloc`) before failing, so a rejected reservation never leaks the backing.
+    (The rejected range was never recorded as live, so the hand-back dispatches the
+    hook's `dealloc` directly, not `release` — which would trip the pairing check.)
+  - **Strict fallible teardown (P2, §36.13).** Previously a backing `dealloc`
+    failure during destroy was swallowed by the infallible `ExtentManager::drop`.
+    Now `ExtentManager`/`LargeAllocator` expose an explicit fallible `teardown()`
+    (release exactly once across it and `Drop`, via a `released` flag), and
+    `arena_destroy` returns the hooked region to the hooks **before** `finish_destroy`
+    — a refusal routes through the existing `Draining → ErrorQuarantined` edge
+    (returns `Err`, arena quarantined, never a clean `Destroyed`), exactly the
+    capability-revoke partial-failure shape. The failure is also counted for
+    observability (`HookProvider::release_hook_failures`, mirroring the
+    `split`/`merge` counters). No new abstract transition: the trigger rides the
+    already-proven quarantine edge, pinned by the named Lean obligation
+    `ArenaLifecycle.destroy_backing_release_failure_quarantines` (the Rust↔Lean
+    `state_machine_is_exactly_the_spec_graph` differential stays green).

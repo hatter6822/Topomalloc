@@ -236,7 +236,9 @@ M4, W10, plan 09.
 > arena case zero-overhead), isolated from every other arena's region by construction
 > (§22.7, proven in Lean by `perArena_disjoint_regions_isolate`). The §22.4 order is
 > honoured (reserve + register the backing **before** publishing the id `Active`);
-> destroy returns the region to the hooks, reset keeps it. **(3) The C
+> destroy returns the region to the hooks (a backing that **refuses** the return
+> quarantines the arena — §36.13 — rather than reporting a clean destroy), reset
+> keeps it. **(3) The C
 > `topo_extent_hooks_t` ABI** (§23.2's C-struct surface): `topo_arena_create_hooked`
 > + the vtable in [`topo-abi`](../../crates/topo-abi/src/hooks_api.rs) and
 > `include/topomalloc.h`, exercised end-to-end by the C and C++ ABI harnesses.
@@ -246,6 +248,22 @@ M4, W10, plan 09.
 > central-path allocator** (not just the extent manager) is fuzzed under hook
 > failures, and a hook-vs-POSIX behavioural-equivalence test. See
 > [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
+>
+> **▸ PR-review hardening (PR #14, closed).** A code review surfaced four fixes,
+> each with a regression test: **(1)** the C `CHooks` adapter is **reclaimed** on
+> destroy (tracked in `CHOOKS_REGISTRY`, freed on a failed create) instead of leaked,
+> so a create/destroy loop stays bounded; **(2)** `arena_create_hooked` checks its
+> **two** per-arena reservations (span + large, separate `HookProvider` trackers) are
+> disjoint, so a hook returning overlapping regions is rejected, not aliased;
+> **(3)** a hook `alloc` result that fails the §23.3 geometry check is **handed back**
+> (`dealloc`) before the reserve fails, leaking no backing; **(4)** **strict fallible
+> teardown** — `ExtentManager`/`LargeAllocator` gain an explicit `teardown()` (release
+> once across it and `Drop`), and `arena_destroy` returns the region to the hooks
+> before the terminal step, so a backing that refuses it routes through the existing
+> `Draining → ErrorQuarantined` edge (returns `Err`; the failure is also counted by
+> `HookProvider::release_hook_failures`). The §36.13 model gains the named obligation
+> `destroy_backing_release_failure_quarantines` (no new edge — the differential stays
+> green). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
 
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|

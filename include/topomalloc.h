@@ -223,7 +223,13 @@ int topo_arena_reset(topo_arena_t arena);
  *
  * Failures carry a mapped errno (the POSIX projection of §36.14's error
  * classes): EACCES (authority denied), EBUSY (arena draining), ENOMEM (quota
- * exceeded), EINVAL (no such arena / illegal request). */
+ * exceeded), EINVAL (no such arena / illegal request).
+ *
+ * For a hooked arena (topo_arena_create_hooked): if the custom backing's
+ * `dealloc` hook refuses to take a region back, the destroy is NOT clean — the
+ * arena is left quarantined (§36.13, never reused) and -1 is returned. Every
+ * object is still retired; only the backing's own memory is leaked (its hook
+ * chose so). */
 int topo_arena_destroy(topo_arena_t arena);
 
 /* Reconfigure arena `id`'s decay timing (§22.4 configure, F-005) — the headline

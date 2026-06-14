@@ -88,8 +88,10 @@ pub struct topo_extent_hooks_t {
 }
 
 /// Adapts a C [`topo_extent_hooks_t`] vtable + `ctx` to the Rust [`ExtentHooks`]
-/// trait. Leaked (`'static`) by [`topo_arena_create_hooked`] so it outlives the
-/// process-global allocator, exactly as the metadata/pagemap are.
+/// trait. Heap-owned by [`topo_arena_create_hooked`] with a `'static` borrow handed
+/// to the process-global allocator (so it outlives it, exactly as the metadata/
+/// pagemap do); tracked in `CHOOKS_REGISTRY` and **reclaimed on destroy** (freed on a
+/// failed create), so a create/destroy loop stays bounded rather than leaking.
 struct CHooks {
     vt: topo_extent_hooks_t,
     ctx: *mut c_void,
@@ -550,8 +552,10 @@ mod tests {
         // must free the adapter box on the failure path, not leak it (the P2 review
         // fix: failed/retry creates do not grow the heap). A failed create returns
         // id 0 and never tracks an entry (the registry is keyed by the granted id,
-        // which only exists on success), so retrying never accumulates entries;
-        // the box-free itself is verified leak-free by the CI Miri run.
+        // which only exists on success), so retrying never accumulates registry
+        // entries; the box itself is freed on the spot by the `Box::from_raw(raw)` on
+        // `topo_arena_create_hooked`'s error path — exactly one free per failed create,
+        // structurally (Rust ownership), since that is the only path on failure.
         let mut vt = c_vtable();
         vt.alloc = Some(c_alloc_fail);
         for _ in 0..4 {
@@ -562,5 +566,50 @@ mod tests {
                 "create fails (no leak/track) when the hook cannot allocate"
             );
         }
+    }
+
+    /// A backing whose `dealloc` always reports failure (jemalloc convention:
+    /// `true`), modeling a custom backing that refuses to take its region back.
+    unsafe extern "C" fn c_dealloc_fail(
+        _ctx: *mut c_void,
+        _addr: *mut c_void,
+        _size: usize,
+        _committed: bool,
+    ) -> bool {
+        true // failure
+    }
+
+    #[test]
+    fn destroy_surfaces_a_backing_release_failure() {
+        // W10 strict teardown (PR #14, thread #3) at the C ABI: when the custom
+        // backing's `dealloc` hook fails to take the arena's region back on destroy,
+        // `topo_arena_destroy` must NOT report success — it returns -1 and the arena
+        // is §36.13-quarantined (never cleanly destroyed). The adapter is retained
+        // (reclaim is gated on a clean `Ok` destroy — a conservative, safe rule that
+        // never frees a possibly-borrowed adapter): a bounded terminal-failure
+        // retention, never a use-after-free.
+        let mut vt = c_vtable();
+        vt.dealloc = Some(c_dealloc_fail);
+        // SAFETY: a valid vtable with the required alloc/dealloc.
+        let id = unsafe { topo_arena_create_hooked(&vt, core::ptr::null_mut(), 2 << 20, 4 << 20) };
+        assert!(id >= 1);
+        assert!(chooks_tracked(id));
+        // A live object so the drain does real work before the (failing) region return.
+        let p = topo_mallocx(128, topo_arena(id));
+        assert!(!p.is_null());
+        // SAFETY: `p` is a live allocation owned here.
+        unsafe { topomalloc_free(p) };
+        // Destroy: the C `dealloc` refuses both region returns ⇒ teardown fails ⇒
+        // quarantine ⇒ -1, not a clean success.
+        // SAFETY: quiesced; no live pointers into the arena remain.
+        let rc = unsafe { crate::topo_arena_destroy(id) };
+        assert_eq!(
+            rc, -1,
+            "a backing refusing its region return fails the destroy"
+        );
+        assert!(
+            chooks_tracked(id),
+            "the adapter is retained on a quarantined destroy (reclaim is Ok-only)"
+        );
     }
 }
