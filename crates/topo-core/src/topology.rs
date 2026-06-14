@@ -117,6 +117,16 @@ impl Topology {
         self.n_nodes <= 1 && self.n_llc <= 1
     }
 
+    /// **§15.2 periodic-mismatch check (W13-4).** Whether a freshly-observed
+    /// `(cpu, observed_node)` pair disagrees with this snapshot — the cheap probe a
+    /// background action runs when the platform gives no hotplug notification: a `true`
+    /// result means the host should rebuild the snapshot (via [`TopologyBuilder`]) and
+    /// swap it in. A single-domain snapshot never reports a mismatch (it claims nothing
+    /// to contradict).
+    pub fn detect_mismatch(&self, cpu: u32, observed_node: NodeId) -> bool {
+        !self.is_single_domain() && self.node_of_cpu(cpu) != observed_node
+    }
+
     /// The §15.4 distance between two nodes (10 = local; larger = more remote). Used by
     /// the rebalancer to prefer the nearest source. Out-of-range nodes read as remote.
     pub fn distance(&self, a: NodeId, b: NodeId) -> u8 {
@@ -261,6 +271,116 @@ impl TopologyBuilder {
     }
 }
 
+/// The §15.4 rebalancing tier a planned move uses, in preference order (lower is
+/// cheaper / more local). The cross-node tiers (4–5) are what the node-granularity
+/// [`Rebalancer`] plans; the same-node cache tiers (1–2) are the transfer/central cache
+/// layer's job (plan 05 W6) and are named here for completeness.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RebalanceTier {
+    /// 1. Move transfer-cache batches within the same NUMA node (cache layer, M2).
+    TransferCacheSameNode,
+    /// 2. Move central free-list batches within the same NUMA node (cache layer, M2).
+    CentralBatchSameNode,
+    /// 3. Move empty spans between arenas if policy permits.
+    EmptySpanCrossArena,
+    /// 4. Return memory to the backend and reallocate on the target node.
+    BackendReallocTargetNode,
+    /// 5. Remote reuse — only when cheaper than an OS allocation or pressure demands it.
+    RemoteReuse,
+}
+
+/// One node's movable-free / unmet-demand observation, the rebalancer input (§15.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct NodePressure {
+    /// Free, movable bytes currently parked on this node (empty spans / cached batches).
+    pub free_bytes: u64,
+    /// Unmet allocation demand (pressure) on this node — what it cannot satisfy locally.
+    pub demand_bytes: u64,
+}
+
+/// A planned cross-domain move (§15.4): take `bytes` of free memory from `src` to relieve
+/// pressure on `dst`, via the chosen [`RebalanceTier`]. The host executes it by draining
+/// `src` and re-providing on `dst`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RebalanceMove {
+    /// The donor node (has free memory).
+    pub src: NodeId,
+    /// The pressured node (has unmet demand).
+    pub dst: NodeId,
+    /// Bytes to move (bounded by the donor's free and the recipient's net need).
+    pub bytes: u64,
+    /// The §15.4 preference tier this move uses.
+    pub tier: RebalanceTier,
+}
+
+/// **The §15.4 cross-domain rebalancer (W13-3).** A pure policy that, given each node's
+/// free/demand and the topology, plans a move from the nearest donor to the most-pressured
+/// node so memory is **never permanently stranded** (§15.4): if any node has unmet demand
+/// it cannot satisfy locally *and* another node has free memory, [`plan`](Self::plan)
+/// returns a move. Node-granularity (same-node cache moves are the M2 cache layer's job).
+pub struct Rebalancer;
+
+impl Rebalancer {
+    /// Plan one move (the most valuable this round), or `None` if nothing is stranded —
+    /// every pressured node can satisfy itself locally, or no donor has free memory.
+    ///
+    /// `nodes[i]` is node `i`'s pressure; entries beyond [`Topology::node_count`] are
+    /// ignored. The recipient is the node with the greatest *net* unmet demand
+    /// (`demand − local free`); the donor is the **nearest** (by [`Topology::distance`])
+    /// other node with free memory, so a move prefers a close source (§15.4). The tier is
+    /// [`BackendReallocTargetNode`](RebalanceTier::BackendReallocTargetNode) normally, or
+    /// [`RemoteReuse`](RebalanceTier::RemoteReuse) when the recipient is under acute
+    /// pressure (its net need exceeds the donor's free — pressure "demands it", §15.4).
+    pub fn plan(nodes: &[NodePressure], topo: &Topology) -> Option<RebalanceMove> {
+        let n = (topo.node_count() as usize).min(nodes.len());
+        if n < 2 {
+            return None; // a single domain cannot strand across nodes
+        }
+        // Recipient: the greatest net unmet demand (demand beyond what it holds locally).
+        let mut dst = None;
+        let mut dst_need = 0u64;
+        for (i, p) in nodes.iter().enumerate().take(n) {
+            let need = p.demand_bytes.saturating_sub(p.free_bytes);
+            if need > dst_need {
+                dst_need = need;
+                dst = Some(i);
+            }
+        }
+        let dst = dst?; // nobody has net unmet demand ⇒ nothing stranded
+
+        // Donor: the nearest *other* node holding free memory (§15.4 prefer-close).
+        let mut src = None;
+        let mut best_dist = u8::MAX;
+        for (i, p) in nodes.iter().enumerate().take(n) {
+            if i == dst || p.free_bytes == 0 {
+                continue;
+            }
+            let d = topo.distance(NodeId(i as u32), NodeId(dst as u32));
+            if d < best_dist {
+                best_dist = d;
+                src = Some(i);
+            }
+        }
+        let src = src?; // no donor has free memory ⇒ cannot rebalance
+
+        let donor_free = nodes[src].free_bytes;
+        let bytes = dst_need.min(donor_free);
+        // Acute pressure (the donor cannot fully cover the need) justifies remote reuse;
+        // otherwise return-to-backend-and-realloc-on-target is the cheaper default.
+        let tier = if dst_need > donor_free {
+            RebalanceTier::RemoteReuse
+        } else {
+            RebalanceTier::BackendReallocTargetNode
+        };
+        Some(RebalanceMove {
+            src: NodeId(src as u32),
+            dst: NodeId(dst as u32),
+            bytes,
+            tier,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +491,125 @@ mod tests {
         let mut il = 0;
         assert_eq!(t.preferred_node(NumaPolicy::OsDefault, 0, &mut il), None);
         assert_eq!(t.preferred_node(NumaPolicy::ArenaPolicy, 0, &mut il), None);
+    }
+
+    /// A two-node topology helper.
+    fn two_node() -> Topology {
+        let mut b = TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0)
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 1, 1)
+            .set_cpu(3, 1, 1);
+        b.set_distance(0, 1, 21).set_distance(1, 0, 21);
+        b.build()
+    }
+
+    #[test]
+    fn rebalancer_moves_free_memory_to_a_stranded_node() {
+        // Node 0 holds free memory; node 1 has unmet demand and none free. The §15.4
+        // "never permanently stranded" invariant ⇒ a move 0 → 1 is planned.
+        let t = two_node();
+        let nodes = [
+            NodePressure {
+                free_bytes: 4 << 20,
+                demand_bytes: 0,
+            },
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 2 << 20,
+            },
+        ];
+        let m = Rebalancer::plan(&nodes, &t).expect("a stranded node ⇒ a move");
+        assert_eq!(m.src, NodeId(0));
+        assert_eq!(m.dst, NodeId(1));
+        assert_eq!(
+            m.bytes,
+            2 << 20,
+            "move the recipient's net need (donor has plenty)"
+        );
+        assert_eq!(m.tier, RebalanceTier::BackendReallocTargetNode);
+    }
+
+    #[test]
+    fn rebalancer_uses_remote_reuse_under_acute_pressure() {
+        // The recipient needs more than the donor can give ⇒ remote reuse (§15.4 tier 5).
+        let t = two_node();
+        let nodes = [
+            NodePressure {
+                free_bytes: 1 << 20,
+                demand_bytes: 0,
+            },
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 8 << 20,
+            },
+        ];
+        let m = Rebalancer::plan(&nodes, &t).unwrap();
+        assert_eq!(m.bytes, 1 << 20, "bounded by the donor's free");
+        assert_eq!(m.tier, RebalanceTier::RemoteReuse);
+    }
+
+    #[test]
+    fn rebalancer_plans_nothing_when_demand_is_locally_satisfiable() {
+        // Every node can satisfy its own demand ⇒ no stranding ⇒ no move.
+        let t = two_node();
+        let nodes = [
+            NodePressure {
+                free_bytes: 4 << 20,
+                demand_bytes: 1 << 20,
+            },
+            NodePressure {
+                free_bytes: 4 << 20,
+                demand_bytes: 2 << 20,
+            },
+        ];
+        assert_eq!(Rebalancer::plan(&nodes, &t), None);
+        // A single domain never rebalances across nodes.
+        assert_eq!(
+            Rebalancer::plan(
+                &[NodePressure {
+                    free_bytes: 0,
+                    demand_bytes: 9
+                }],
+                &Topology::single_domain(4)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rebalancer_prefers_the_nearest_donor() {
+        // Three nodes: node 2 is pressured; node 1 is nearer than node 0.
+        let mut b = TopologyBuilder::new(3);
+        b.set_cpu(0, 0, 0).set_cpu(1, 1, 1).set_cpu(2, 2, 2);
+        b.set_distance(0, 2, 30).set_distance(1, 2, 15); // node 1 closer to node 2
+        let t = b.build();
+        let nodes = [
+            NodePressure {
+                free_bytes: 8 << 20,
+                demand_bytes: 0,
+            }, // node 0: far donor
+            NodePressure {
+                free_bytes: 8 << 20,
+                demand_bytes: 0,
+            }, // node 1: near donor
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 4 << 20,
+            }, // node 2: pressured
+        ];
+        let m = Rebalancer::plan(&nodes, &t).unwrap();
+        assert_eq!(m.src, NodeId(1), "the nearer donor is chosen (§15.4)");
+        assert_eq!(m.dst, NodeId(2));
+    }
+
+    #[test]
+    fn detect_mismatch_flags_a_moved_cpu_and_ignores_single_domain() {
+        let t = two_node();
+        // CPU 2 is modeled on node 1; an observation of node 0 is a mismatch (W13-4).
+        assert!(t.detect_mismatch(2, NodeId(0)));
+        assert!(!t.detect_mismatch(2, NodeId(1)));
+        // A single-domain snapshot claims nothing, so never reports a mismatch.
+        assert!(!Topology::single_domain(4).detect_mismatch(0, NodeId(3)));
     }
 }

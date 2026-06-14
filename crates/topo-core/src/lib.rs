@@ -102,7 +102,10 @@ pub use span::{
     ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
     SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,
 };
-pub use topology::{Topology, TopologyBuilder, DISTANCE_LOCAL, DISTANCE_REMOTE, MAX_NODES};
+pub use topology::{
+    NodePressure, RebalanceMove, RebalanceTier, Rebalancer, Topology, TopologyBuilder,
+    DISTANCE_LOCAL, DISTANCE_REMOTE, MAX_NODES,
+};
 
 // W6 cache layer re-exports (plan 05).
 pub use budget::{CacheBudget, SlotStats};
