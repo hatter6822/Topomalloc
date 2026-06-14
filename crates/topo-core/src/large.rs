@@ -264,6 +264,14 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.extents.reserved_region()
     }
 
+    /// **Explicitly** return the backing region to the provider, surfacing the
+    /// result (delegates to the inner [`ExtentManager::teardown`]). Idempotent with
+    /// `Drop`. Used by the arena-destroy path to route a custom backing's refused
+    /// region return into §36.13 quarantine (W10 strict teardown).
+    pub fn teardown(&mut self) -> Result<(), crate::error::BackendError> {
+        self.extents.teardown()
+    }
+
     /// Allocate a large region of at least `bytes` aligned to `align`, install its
     /// [`LargeDescriptor`] in the pagemap, and return the base pointer (null on
     /// failure). Consults `hook` (the §18.6 region cache) first. **Bypasses the

@@ -56,12 +56,14 @@ struct HookStats {
     /// well-formed through (alloc/commit gate; decommit retains; split/merge are
     /// advisory).
     fail_alloc: AtomicU32,
+    fail_dealloc: AtomicU32,
     fail_commit: AtomicU32,
     fail_decommit: AtomicU32,
     fail_split: AtomicU32,
     fail_merge: AtomicU32,
     // call counters backing the period check (separate from the success counters).
     alloc_calls: AtomicU64,
+    dealloc_calls: AtomicU64,
     commit_calls: AtomicU64,
     decommit_calls: AtomicU64,
     split_calls: AtomicU64,
@@ -151,6 +153,12 @@ impl ExtentHooks for HostHooks {
 
     fn dealloc(&self, region: Region, _committed: bool) -> Result<(), BackendError> {
         self.stats.deallocs.fetch_add(1, Ordering::Relaxed);
+        if HookStats::trips(&self.stats.fail_dealloc, &self.stats.dealloc_calls) {
+            // Refuse to take the region back, keeping it live so this backing's own
+            // `Drop` still reclaims it (the test leaks nothing). Models a backing
+            // whose whole-region release fails on arena teardown (W10 strict teardown).
+            return Err(BackendError::OutOfMemory);
+        }
         let mut live = self.live.lock().unwrap();
         let base = region.base as usize;
         let idx = live
@@ -851,7 +859,7 @@ fn hook_backing_is_behaviourally_coequal_with_posix() {
 // ===========================================================================
 
 use topo_backend_posix::PosixBackingProvider;
-use topo_core::{ArenaPolicy, MAX_HOOK_BACKENDS};
+use topo_core::{ArenaPolicy, ArenaState, MAX_HOOK_BACKENDS};
 
 /// Leak a host-hook backing as `&'static dyn ExtentHooks` (the caller-owned,
 /// allocator-outliving lifetime the per-arena API requires), returning the hooks
@@ -1000,6 +1008,62 @@ fn hooked_arena_destroy_returns_the_region_to_the_hooks() {
     assert!(!q.is_null() && hooks2.contains(q));
     // SAFETY: live allocation.
     unsafe { assert_eq!(a.free(q), FreeOutcome::Freed) };
+}
+
+#[test]
+fn hooked_arena_destroy_quarantines_when_the_backing_refuses_its_region() {
+    // §36.13 partial-failure path for W10 (PR #14 review, thread #3 — strict
+    // teardown): destroying a hooked arena whose custom backing refuses to take its
+    // span/large region back (`dealloc` returns Err) must NOT report a clean
+    // success. The drain still retires every object, then the fallible teardown
+    // surfaces the backing failure, landing the arena in ErrorQuarantined — never
+    // Destroyed (the formal counterpart is
+    // `ArenaLifecycle.destroy_backing_release_failure_quarantines`).
+    let a = posix_allocator();
+    let (hooks, stats) = leak_hooks();
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+    // Real drain work: a small span object and a large (>= huge-threshold) object.
+    let p = a.allocate_in(arena, 200, 16, RequestFlags::NONE);
+    let big = a.allocate_in(arena, 5 * 1024 * 1024, 16, RequestFlags::NONE);
+    assert!(!p.is_null() && !big.is_null() && hooks.contains(p) && hooks.contains(big));
+
+    // Arm the backing to refuse every region return, then destroy. `dealloc` is only
+    // called on whole-region teardown (never during normal alloc/free), so this bites
+    // exactly the span and large region returns.
+    stats.fail_dealloc.store(1, Ordering::Relaxed);
+    // SAFETY: the arena is quiesced (single-threaded test; no outstanding ops).
+    let outcome = unsafe { a.arena_destroy(arena) };
+
+    assert!(
+        outcome.is_err(),
+        "a backing that refuses its region return must not report a clean destroy"
+    );
+    assert_eq!(
+        a.arena_stats(arena).unwrap().state,
+        ArenaState::ErrorQuarantined,
+        "§36.13: a teardown dealloc failure ⇒ ERROR_QUARANTINED, never DESTROYED"
+    );
+    // Every object was still retired on drain (only the backing region leaked, in the
+    // user's hooks), so no live bytes remain and the §8.6/§36.17 reconciliation holds.
+    assert_eq!(
+        a.arena_stats(arena).unwrap().used,
+        0,
+        "objects retired on drain"
+    );
+    assert!(
+        !a.owns(p) && !a.owns(big),
+        "the arena's objects are invalid"
+    );
+    // Both region returns were attempted (span + large) and both refused.
+    assert_eq!(
+        stats.deallocs.load(Ordering::Relaxed),
+        2,
+        "teardown attempted both the span and large region returns"
+    );
+    // The shared backend and registry stay well-formed after the quarantine.
+    assert!(a.check_invariants());
 }
 
 #[test]

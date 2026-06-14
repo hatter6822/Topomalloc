@@ -486,6 +486,20 @@ struct ArenaHookBackend<'a> {
     large: LargeAllocator<'a, HookProvider<ArenaHooks<'a>>>,
 }
 
+impl ArenaHookBackend<'_> {
+    /// **Explicitly** return both backing regions to the hooks (W10 strict
+    /// teardown), surfacing a refusal instead of letting `Drop` swallow it. Both
+    /// regions are torn down **even if the first refuses**, so neither is leaked
+    /// gratuitously; the first error is reported. `Drop` is a no-op afterward (each
+    /// manager has recorded its region as already released), so the hooks see each
+    /// region returned exactly once.
+    fn teardown(&mut self) -> Result<(), BackendError> {
+        let span = self.span_extents.teardown();
+        let large = self.large.teardown();
+        span.and(large)
+    }
+}
+
 /// The fixed-capacity registry of [`ArenaHookBackend`]s. Slots are assigned on
 /// arena-create-with-hooks and cleared **in place** on destroy (never moved), so a
 /// reference obtained for one arena's op stays valid under the §22.5/§36.13
@@ -1487,8 +1501,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             Ok(()) => match self.arenas.publish(id) {
                 Ok(()) => Ok(id),
                 Err(e) => {
-                    // Unreachable (id is Initializing), but stay leak-free.
-                    self.unregister_hook_backend(id);
+                    // Unreachable (id is Initializing), but stay leak-free. The
+                    // rollback ignores a teardown error: there is no clean arena to
+                    // quarantine here, and the regions are returned best-effort.
+                    let _ = self.teardown_hook_backend(id);
                     let _ = self.arenas.abandon_pending(id);
                     Err(e)
                 }
@@ -1582,14 +1598,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
-    /// Remove and **drop** `arena`'s hooked backing if it has one (returning its
-    /// regions to the hooks via `dealloc`). Called on a completed destroy, after
-    /// the drain retired every span/large of the arena. The backing is moved out
-    /// under the registry lock and dropped *outside* it, so the user `dealloc` hook
-    /// does not run while the lock is held.
-    fn unregister_hook_backend(&self, arena: ArenaId) {
+    /// Remove `arena`'s hooked backing from the registry (if any) and **tear it
+    /// down**, returning its span/large regions to the hooks via `dealloc` and
+    /// surfacing a refusal (W10 strict teardown). Called on a *completed* drain,
+    /// after every span/large of the arena was retired. The backing is moved out
+    /// under the registry lock and torn down *outside* it, so the user `dealloc`
+    /// hook never runs while the lock is held.
+    ///
+    /// Returns `Ok(())` for a non-hooked arena (a no-op) or a clean teardown, and
+    /// `Err` (the first backing error) if a hook refused a region return — the
+    /// destroy path routes that into the §36.13 quarantine; the (unreachable)
+    /// create-rollback path ignores it.
+    fn teardown_hook_backend(&self, arena: ArenaId) -> Result<(), BackendError> {
         if self.hooks.count.load(Ordering::Acquire) == 0 {
-            return;
+            return Ok(());
         }
         self.hooks.lock.acquire();
         let mut taken: Option<ArenaHookBackend<'a>> = None;
@@ -1605,7 +1627,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             }
         }
         self.hooks.lock.release();
-        drop(taken); // releases the regions via `hooks.dealloc`, outside the lock
+        // Tear the regions down (via `hooks.dealloc`) outside the lock; `Drop` then
+        // no-ops. `None` (non-hooked arena) is a clean no-op.
+        match taken {
+            Some(mut backend) => backend.teardown(),
+            None => Ok(()),
+        }
     }
 
     /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005):
@@ -1672,9 +1699,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// allocations/delegations, §36.13 step 1), drain caches + return/unmap +
     /// revoke + recycle (the internal `drain_arena` — the POSIX collapse of the
     /// §36.13 unmap→revoke→recycle order; real capability revocation drops in at
-    /// plan 09), then `Draining → Destroyed` on success or `→ ErrorQuarantined`
-    /// on partial failure — **never** `Destroyed` on failure (§36.13). Returns
-    /// the new generation.
+    /// plan 09), return any per-arena hooked backing region to its hooks (W10), then
+    /// `Draining → Destroyed` on success or `→ ErrorQuarantined` on partial failure
+    /// — **never** `Destroyed` on failure (§36.13). A partial failure is either a
+    /// drain that could not revoke a backing **or** a custom backing that refused
+    /// its region return on teardown. Returns the new generation.
     ///
     /// # Safety
     ///
@@ -1687,15 +1716,25 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // SAFETY: the arena is now `Draining` (no new allocations/delegations)
         // and the caller guarantees quiescence.
         if unsafe { self.drain_arena(arena) } {
-            let gen = self.arenas.finish_destroy(arena)?;
             // The drain retired every span/large of the arena (their backing extents
-            // are now free in its hooked region, if any); tear the region down,
-            // returning it to the hooks (W10). A no-op for a non-hooked arena.
-            self.unregister_hook_backend(arena);
+            // are now free in its hooked region, if any); return that region to the
+            // hooks **before** the terminal `Destroyed` step (W10 strict teardown),
+            // so a custom backing that refuses the return routes into the §36.13
+            // quarantine instead of being lost after a clean destroy. A no-op (Ok)
+            // for a non-hooked arena.
+            if self.teardown_hook_backend(arena).is_err() {
+                // Objects all drained, but the backing refused a region return:
+                // quarantine (Draining → ErrorQuarantined) rather than report a clean
+                // destroy (§36.13). The id is NOT retired/reused; the refused region
+                // is a leak confined to the user's backing (its `dealloc` chose so).
+                self.arenas.quarantine(arena)?;
+                return Err(ArenaError::IllegalTransition);
+            }
+            let gen = self.arenas.finish_destroy(arena)?;
             Ok(gen)
         } else {
-            // Partial failure: quarantine and KEEP the hooked backing for recovery
-            // (never tear it down on a non-clean destroy, §36.13).
+            // Partial drain failure: quarantine and KEEP the hooked backing for
+            // recovery (never tear it down on a non-clean drain, §36.13).
             self.arenas.quarantine(arena)?;
             Err(ArenaError::IllegalTransition)
         }

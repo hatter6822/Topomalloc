@@ -1523,6 +1523,12 @@ pub struct ExtentManager<P: TopoBackingProvider> {
     retain: RetainPolicy,
     lock: BackendLock,
     map: UnsafeCell<ExtentMap>,
+    /// Whether the region has already been returned to the provider — set by an
+    /// explicit [`teardown`](Self::teardown) or by `Drop`, so the `release` happens
+    /// exactly once. Only ever touched under exclusive access (`&mut self` / drop),
+    /// never through a shared `&self`, so it needs no synchronization (W10 fallible
+    /// teardown).
+    released: bool,
 }
 
 // SAFETY: every access to `map` goes through `lock` (the §27.2 backend lock),
@@ -1590,6 +1596,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
                     retain: RetainPolicy::from_profile(),
                     lock: BackendLock::new(),
                     map: UnsafeCell::new(map),
+                    released: false,
                 })
             }
             None => {
@@ -1624,6 +1631,24 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     #[inline]
     pub fn reserved_region(&self) -> Region {
         self.region
+    }
+
+    /// **Explicitly** return the reserved region to the provider, surfacing the
+    /// provider's result instead of discarding it the way `Drop` must (W10 strict
+    /// teardown). Idempotent: the region is released **exactly once** across this
+    /// call and the eventual `Drop`. A custom backing ([`HookProvider`](crate::HookProvider))
+    /// can refuse the return (a failing `dealloc` hook); the arena-destroy path routes
+    /// that `Err` into the §36.13 quarantine instead of reporting a clean destroy.
+    ///
+    /// The release is attempted only once even on failure: a refused return will
+    /// refuse again, and the provider's reservation set has already dropped the
+    /// region, so a retry from `Drop` would mis-account it.
+    pub fn teardown(&mut self) -> Result<(), BackendError> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        self.provider.release(self.arena, self.region)
     }
 
     /// Acquire the backend lock and expose the guarded map (RAII release).
@@ -2054,11 +2079,15 @@ impl<P: TopoBackingProvider> ExtentBacking for ExtentManager<P> {
 
 impl<P: TopoBackingProvider> Drop for ExtentManager<P> {
     fn drop(&mut self) {
-        // Return the whole reserved region to the provider. A failure here cannot be
-        // reported from `drop`, but providers must leave their state well-formed
-        // (§36.6); the metadata-backed slot pool is monotonic and simply goes away
-        // with its arena.
-        let _ = self.provider.release(self.arena, self.region);
+        // Return the whole reserved region to the provider — unless an explicit
+        // `teardown` already did (then this is a no-op, so the region is released
+        // exactly once). A failure here cannot be reported from `drop`, but providers
+        // must leave their state well-formed (§36.6); the metadata-backed slot pool
+        // is monotonic and simply goes away with its arena. Callers that must observe
+        // a release failure use `teardown` (W10).
+        if !self.released {
+            let _ = self.provider.release(self.arena, self.region);
+        }
     }
 }
 

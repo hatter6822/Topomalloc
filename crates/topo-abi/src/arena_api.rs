@@ -200,6 +200,13 @@ pub unsafe extern "C" fn topo_arena_destroy(id: u32) -> i32 {
             0
         }
         Err(e) => {
+            // Do NOT reclaim the C hook adapter on a failed/quarantined destroy. A
+            // drain-failure quarantine KEEPS the arena's backend registered, so its
+            // `HookProvider` still borrows the adapter — freeing it would be a
+            // use-after-free. A teardown-failure quarantine is a terminal §36.13
+            // failure (the backing refused its own region return); retaining the
+            // small adapter there is acceptable, not the unbounded per-cycle leak
+            // W10 closed (a clean create/destroy cycle still reclaims via `Ok`).
             set_errno(arena_errno(e));
             -1
         }
