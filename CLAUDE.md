@@ -190,8 +190,11 @@ slot, in `crates/topo-core/src/release.rs`: a **pure, `no_std`, host-driven** po
 memory returns to the OS (§20–§21). It covers the §20.2 decay config (W12-1a, consolidated onto
 `arena::DecayConfig`), the §21.2 observation vector (W12-2a), the §21.5 Normal/Soft/Hard/Emergency
 pressure modes with hysteresis (W12-3a, alloc-failure/cgroup-critical force Emergency, O-007), the
-§21.4 demand-reserve anti-oscillation brake (W12-2c), the §21.3 six-rung priority ladder gated by
-mode and the §36.11 latency ceiling (W12-2b), the background-purge pump with decay-timer gating /
+§21.4 demand-reserve anti-oscillation brake (W12-2c), the §21.3 priority ladder gated by
+mode and the §36.11 latency ceiling (W12-2b) — drain caches → release empty hugepages → purge
+aged dirty → convert aged dirty→muzzy → subrelease cold-sparse → release aged muzzy
+(`muzzy_decay_ms`) → emergency shrink, with dirty/muzzy each retained until their decay interval —
+the background-purge pump with decay-timer gating /
 CPU-pressure yield / fair multi-arena round-robin (W12-1b), a heap-independent emergency reserve
 (W12-3b), and the `LatencyClass` arena flag (W12-4, `ArenaPolicy::latency`). It is wired **live**
 through `HugePageBackend::release_tick`, which drives the W11 `release_empty_excess` demand-reserve
@@ -218,7 +221,7 @@ not modeled transitions, so there is no Lean obligation. The §15.2 node/LLC cou
 `topo-stats` JSON and the `topo.numa.*` control namespace; NUMA bind failures remain visible (§15.5).
 
 **Test counts:**
-- Rust: ~623 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~625 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)

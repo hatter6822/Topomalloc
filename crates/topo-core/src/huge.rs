@@ -2341,6 +2341,13 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     ///
     /// SPEC-transition: `huge free` (§19 filler return)
     pub fn free_region(&self, region: Region) -> bool {
+        // A torn-down backend is inert: the reservation is gone, so there is nothing to
+        // free (and nothing should mutate the abandoned bookkeeping). Mirrors the
+        // `allocate`/`subrelease` guards; `released` is written only under the exclusive
+        // `&mut self` of `teardown`/`Drop`, so this `&self` read is race-free.
+        if self.released {
+            return false;
+        }
         let base = region.base as usize;
         let (rlo, rhi) = self.region.addr_range();
         if base < rlo || base >= rhi || region.len == 0 {
@@ -2382,6 +2389,15 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     ///
     /// SPEC-transition: partial subrelease + revoke + decommit (§19.6/§20.4/§36.6)
     pub fn subrelease(&self, base: usize, pages: usize, pressure_high: bool) -> usize {
+        // After teardown the reservation has been `munmap`'d and the address range may
+        // have been re-mapped by the OS for something else; a `decommit`
+        // (`MADV_DONTNEED`) over it could then discard *unrelated* memory. Refuse once
+        // released (also makes `release_empty_excess`/`release_tick`, which drive this,
+        // inert after teardown). `released` is written only under `teardown`/`Drop`'s
+        // exclusive `&mut self`, so this `&self` read is race-free.
+        if self.released {
+            return 0;
+        }
         let g = self.lock();
         let sr = match g.inner.filler.subrelease(base, pages, pressure_high) {
             Some(sr) => sr,
@@ -3976,18 +3992,81 @@ mod backend_tests {
     }
 
     #[test]
-    fn allocate_is_refused_after_teardown() {
+    fn the_backend_is_inert_after_teardown() {
         // After `teardown` returns the reservation, the filler still describes the now
-        // -unmapped region; `allocate` must refuse rather than hand out a pointer into
-        // it (which, with POSIX's no-op commit, would fault only on first access).
+        // -unmapped region. Every mutating op must be inert: `allocate` must not hand
+        // out a pointer into unmapped space, and `subrelease`/`release_empty_excess`
+        // must not `decommit` an address the OS may have re-mapped (which could discard
+        // unrelated memory). Capture a live region + its base BEFORE teardown.
         let mut b = backend(2);
+        let r = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("alloc");
+        let base = r.base as usize;
         assert!(b.teardown().is_ok());
         assert!(
             b.allocate(64 * 1024, PAGE_SIZE, PlaceHints::default())
                 .is_none(),
             "no allocation may be served after teardown"
         );
+        assert_eq!(
+            b.subrelease(base, 8, /*pressure*/ true),
+            0,
+            "no decommit on the released (possibly re-mapped) region"
+        );
+        assert_eq!(
+            b.release_empty_excess(0),
+            0,
+            "the demand-reserve shrink is inert after teardown"
+        );
+        assert!(!b.free_region(r), "free is inert after teardown");
         // Idempotent with the eventual Drop (released exactly once).
+    }
+
+    #[test]
+    fn release_tick_rounds_a_sub_hugepage_budget_up_to_one_hugepage() {
+        // #4: when the controller's rate cap produces a positive rung-2 budget smaller
+        // than one hugepage, release_tick must still release one whole hugepage (the
+        // release granularity) rather than flooring to zero and reclaiming nothing on
+        // every tick forever. Drive it with a tiny rate cap over a full HugeCache.
+        use crate::arena::DecayConfig;
+        let b = backend(4);
+        let regions: Vec<Region> = (0..3)
+            .map(|_| {
+                b.allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+                    .expect("hp")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r)); // three empty-backed hugepages
+        }
+        // 1 KiB/s rate cap under Hard pressure (rung 2 active; reserve 0 at an idle
+        // alloc rate); every other input is zero, so rung 2 alone is rate-capped.
+        let cfg = DecayConfig {
+            release_rate_bytes_per_sec: 1024,
+            ..DecayConfig::low_rss()
+        };
+        let mut c = ReleaseController::new(cfg);
+        let inputs = ReleaseInputs {
+            cgroup_current: 95,
+            cgroup_max: 100,
+            ..ReleaseInputs::default()
+        };
+        let _ = b.release_tick(&mut c, 0, inputs); // establish the clock
+        let (plan, released) = b.release_tick(&mut c, 1, inputs); // +1s ⇒ ~1 KiB budget
+        assert!(
+            plan.release_empty_hugepages_bytes > 0,
+            "rung 2 wants to release"
+        );
+        assert!(
+            plan.release_empty_hugepages_bytes < HUGEPAGE_SIZE as u64,
+            "but the rate cap holds the budget below one hugepage"
+        );
+        assert_eq!(
+            released, HUGEPAGE_SIZE as u64,
+            "rounds up to release one whole hugepage — progress, not zero"
+        );
+        assert!(b.check_invariants());
     }
 
     #[test]

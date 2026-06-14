@@ -990,6 +990,68 @@ mod tests {
         }
     }
 
+    /// A `Sync` one-shot cache that distinguishes the plain ([`try_cache`]) vs the
+    /// **revoking** ([`try_cache_revoking`]) return path, so a test can prove an arena
+    /// drain routes a cache-served large through revoke-before-recycle (§36.6).
+    /// Installed via [`with_region_cache`] (which requires `Sync`), so it is leaked for
+    /// `'static` — its host allocation is intentionally never freed (a test).
+    ///
+    /// [`try_cache`]: RegionCacheHook::try_cache
+    /// [`try_cache_revoking`]: RegionCacheHook::try_cache_revoking
+    /// [`with_region_cache`]: LargeAllocator::with_region_cache
+    struct SyncOneShotCache {
+        base: *mut u8,
+        len: usize,
+        served: std::sync::atomic::AtomicBool,
+        plain_returns: std::sync::atomic::AtomicUsize,
+        revoking_returns: std::sync::atomic::AtomicUsize,
+    }
+    impl SyncOneShotCache {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, PAGE).unwrap();
+            // SAFETY: nonzero, page-aligned layout.
+            let base = unsafe { alloc(layout) };
+            assert!(!base.is_null());
+            Self {
+                base,
+                len,
+                served: std::sync::atomic::AtomicBool::new(false),
+                plain_returns: std::sync::atomic::AtomicUsize::new(0),
+                revoking_returns: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    // SAFETY: the cache exposes only atomics and an immutable `base`/`len` into a leaked
+    // host allocation (never freed during the test), so concurrent `&self` use is
+    // data-race-free.
+    unsafe impl Sync for SyncOneShotCache {}
+    // SAFETY: as for `Sync` — the cache owns only atomics and a leaked, never-aliased
+    // host pointer, so moving it across threads moves no shared mutable state.
+    unsafe impl Send for SyncOneShotCache {}
+    impl RegionCacheHook for SyncOneShotCache {
+        fn try_alloc(&self, bytes: usize, align: usize, _hints: Hints) -> Option<Region> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if bytes <= self.len && align <= PAGE && !self.served.swap(true, Relaxed) {
+                Some(Region {
+                    base: self.base,
+                    len: self.len,
+                })
+            } else {
+                None
+            }
+        }
+        fn try_cache(&self, _region: Region) -> bool {
+            self.plain_returns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        fn try_cache_revoking(&self, _region: Region, _arena: ArenaId) -> bool {
+            self.revoking_returns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+    }
+
     #[test]
     fn allocate_is_classifiable_and_freeable() {
         let la = large(64, 16);
@@ -1240,6 +1302,39 @@ mod tests {
         );
         assert_eq!(la.live_count(), 0);
         assert_eq!(la.usable_size(p), None);
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn cache_served_arena_drain_revokes_before_recycling() {
+        // §36.6/§36.13 (review #6): an arena drain (`free_revoking`) of a *cache-served*
+        // large must return the region through the REVOKING cache path
+        // (`try_cache_revoking`) — revoking the region's descendant capabilities before
+        // it re-enters the cache for reuse by another authority domain — NOT the plain
+        // `try_cache`, which would recycle the pages without revocation.
+        let cache: &'static SyncOneShotCache = Box::leak(Box::new(SyncOneShotCache::new(3 * PAGE)));
+        let la = large(64, 16).with_region_cache(cache);
+        // The installed cache serves the allocation (`backing == None`).
+        let p = la.allocate(3 * PAGE, PAGE);
+        assert!(!p.is_null());
+        assert_eq!(p, cache.base, "served from the cache region");
+        assert_eq!(la.live_count(), 1);
+        // Drain the arena: the cache-served region returns via `try_cache_revoking`.
+        // SAFETY: `p` is a live large of `ArenaId::DEFAULT` from this allocator.
+        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT) };
+        assert!(retired, "the cache-served large is retired on drain");
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            cache.revoking_returns.load(Relaxed),
+            1,
+            "returned via the revoking cache path (revoke-before-recycle)"
+        );
+        assert_eq!(
+            cache.plain_returns.load(Relaxed),
+            0,
+            "NOT the plain try_cache path (which skips revocation)"
+        );
+        assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
     }
 

@@ -97,9 +97,11 @@ classifies the §21.5 pressure mode (Normal/Soft/Hard/Emergency, with hysteresis
 allocation failure or cgroup-critical forces Emergency), computes the §21.4 demand
 reserve — the anti-oscillation brake that withholds release proportional to recent
 demand so freed memory is not faulted straight back (§21.1 R2) — and plans the §21.3
-six-rung priority ladder (drain caches → release empty hugepages beyond the reserve →
-purge dirty-not-on-hot → dirty→muzzy → subrelease cold-sparse → emergency shrink),
-each rung gated by mode and the §36.11 latency class, rate-capped (§20.2) with a
+priority ladder (drain caches → release empty hugepages beyond the reserve → purge aged
+dirty-not-on-hot → convert aged dirty→muzzy → subrelease cold-sparse → release aged
+muzzy → emergency shrink) — where dirty and muzzy are each retained for reuse until
+their `dirty_decay_ms`/`muzzy_decay_ms` interval elapses — each rung gated by mode and
+the §36.11 latency class, rate-capped (§20.2) with a
 backlog. It is wired **live** through `HugePageBackend::release_tick`, which drives the
 W11 `release_empty_excess` demand-reserve hook — so an idle backend returns its empty
 hugepages to the OS while a churning one holds them back — identical over POSIX and the
