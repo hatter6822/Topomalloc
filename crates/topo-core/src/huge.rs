@@ -3009,6 +3009,56 @@ mod filler_tests {
         assert_eq!(cov.live_total_bytes, 0);
         assert!(f.check_invariants());
     }
+
+    #[test]
+    fn invalid_inputs_are_rejected_without_mutation() {
+        // M-004 defense-in-depth: every filler entry point that takes an address/length
+        // rejects a malformed request (zero length, foreign/out-of-region address,
+        // untouched hugepage, or a double free) with **no** state change — so a stray or
+        // recycled pointer can never corrupt the bookkeeping. The whole `index_of`-None
+        // and `pages == 0` / re-free family in one place.
+        let mut f = filler(2);
+        let p = place_ok(&mut f, 4, PAGE_SIZE, Hotness::Cold);
+        let hp0_base = p.base - (p.base % HUGEPAGE_SIZE); // hugepage 0 base (region base)
+        let below = 0x1000usize; // far below the region
+        let beyond = hp0_base + 100 * HUGEPAGE_SIZE; // past the 2-hugepage capacity
+        let untouched = hp0_base + HUGEPAGE_SIZE; // hugepage 1: in region, never opened
+
+        // Zero-length requests are rejected.
+        assert!(!f.free(p.base, 0).valid, "zero-page free rejected");
+        assert!(
+            f.subrelease(p.base, 0, true).is_none(),
+            "zero-page subrelease rejected"
+        );
+        // Foreign / out-of-region addresses are rejected by every entry point.
+        for bad in [below, beyond] {
+            assert!(!f.free(bad, 4).valid);
+            assert!(f.subrelease(bad, 4, true).is_none());
+            assert!(!f.mark_cold(bad));
+            assert!(!f.free_hugepages(bad, 1).valid);
+        }
+        // An in-region but untouched hugepage is rejected (touched == 0 path).
+        assert!(!f.mark_cold(untouched));
+        assert!(!f.free(untouched, 1).valid);
+        assert!(f.subrelease(untouched, 1, true).is_none());
+
+        // A double free of a sub-hugepage run is rejected (the run is no longer live).
+        assert!(f.free(p.base, 4).valid, "first free succeeds");
+        assert!(!f.free(p.base, 4).valid, "double free rejected (M-004)");
+
+        // A double free of a whole-hugepage *run* is likewise rejected.
+        let run = f.reserve_hugepages(1).expect("1-hugepage run");
+        f.mark_run_committed(&run);
+        assert!(
+            f.free_hugepages(run.base, 1).valid,
+            "first run free succeeds"
+        );
+        assert!(
+            !f.free_hugepages(run.base, 1).valid,
+            "run double free rejected (the hugepage is now empty, not full)"
+        );
+        assert!(f.check_invariants(), "no mutation from any rejected input");
+    }
 }
 
 #[cfg(test)]
@@ -3034,6 +3084,7 @@ mod backend_tests {
     /// exercise the well-formed-on-failure rollback (W4-5).
     struct HostProvider {
         owned: Mutex<Vec<(usize, Layout)>>,
+        fail_reserve: AtomicU32,
         fail_commit: AtomicU32,
         fail_revoke: AtomicU32,
         fail_decommit: AtomicU32,
@@ -3046,6 +3097,7 @@ mod backend_tests {
         fn new() -> Self {
             Self {
                 owned: Mutex::new(Vec::new()),
+                fail_reserve: AtomicU32::new(0),
                 fail_commit: AtomicU32::new(0),
                 fail_revoke: AtomicU32::new(0),
                 fail_decommit: AtomicU32::new(0),
@@ -3053,6 +3105,9 @@ mod backend_tests {
                 decommits: AtomicU32::new(0),
                 revokes: AtomicU32::new(0),
             }
+        }
+        fn fail_next_reserve(&self) {
+            self.fail_reserve.store(1, O::Relaxed);
         }
         fn fail_next_commit(&self) {
             self.fail_commit.store(1, O::Relaxed);
@@ -3067,6 +3122,9 @@ mod backend_tests {
 
     impl TopoBackingProvider for HostProvider {
         fn reserve(&self, _a: ArenaId, size: usize, align: usize) -> Result<Region, BackendError> {
+            if self.fail_reserve.swap(0, O::Relaxed) == 1 {
+                return Err(BackendError::OutOfMemory);
+            }
             if size == 0 || !align.is_power_of_two() {
                 return Err(BackendError::InvalidRequest);
             }
@@ -3512,5 +3570,92 @@ mod backend_tests {
             HugeConfig::with_capacity(64),
         );
         assert!(matches!(r, Err(HugeError::NoSpace)));
+    }
+
+    #[test]
+    fn new_surfaces_a_provider_reserve_failure_without_taking_a_region() {
+        // §36.6/W4-5: when the provider's region reservation fails, `new` reports it
+        // as `HugeError::Backend` and takes no region (nothing to leak — the failure is
+        // upstream of the metadata allocation). The `Drop` of the discarded provider
+        // then finds an empty `owned` list (no double free). This is the `Backend`
+        // error channel that the metadata-exhaustion test (`NoSpace`) does not cover.
+        let prov = HostProvider::new();
+        prov.fail_next_reserve();
+        let r = HugePageBackend::new(
+            prov,
+            meta(1 << 20),
+            ArenaId::DEFAULT,
+            HugeConfig::with_capacity(4),
+        );
+        assert!(
+            matches!(r, Err(HugeError::Backend(BackendError::OutOfMemory))),
+            "a provider reserve failure surfaces as HugeError::Backend"
+        );
+    }
+
+    #[test]
+    fn exactly_one_hugepage_is_served_through_the_packed_path() {
+        // Boundary: a request of exactly HUGEPAGE_SIZE is `PAGES_PER_HUGEPAGE` pages, so
+        // `pages <= PAGES_PER_HUGEPAGE` routes it through the *packed* path (the filler's
+        // `place`), filling a single hugepage to `Full` — not the whole-hugepage *run*
+        // path (which serves `pages > PAGES_PER_HUGEPAGE`). One page more crosses to the
+        // run path. This pins the packed/run routing boundary in `allocate`.
+        let b = backend(3);
+        let exact = b
+            .allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::hot(Hotness::Neutral))
+            .expect("exactly one hugepage");
+        assert_eq!(exact.len, HUGEPAGE_SIZE);
+        assert_eq!(exact.base as usize % PAGE_SIZE, 0);
+        touch(exact);
+        assert_eq!(b.touched_hugepages(), 1, "served from a single hugepage");
+        let cov = b.coverage();
+        assert_eq!(cov.live_total_bytes, HUGEPAGE_SIZE as u64);
+        assert_eq!(cov.bins[HugeBin::Full as usize], 1, "filled to Full");
+        // One page over the boundary takes the run path (a second hugepage opens).
+        let over = b
+            .allocate(
+                HUGEPAGE_SIZE + PAGE_SIZE,
+                PAGE_SIZE,
+                PlaceHints::hot(Hotness::Neutral),
+            )
+            .expect("one page over ⇒ run path");
+        assert_eq!(
+            over.base as usize % HUGEPAGE_SIZE,
+            0,
+            "run is hugepage-aligned"
+        );
+        assert_eq!(b.touched_hugepages(), 3, "the run took two more hugepages");
+        assert!(b.free_region(exact));
+        assert!(b.free_region(over));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn release_empty_excess_zero_releases_the_whole_hugecache() {
+        // The reserve=0 edge: keep *no* empty-backed hugepage, so every empty hugepage's
+        // backing is returned to the OS. Complements the reserve=1 test, and confirms
+        // the loop terminates (each released empty hugepage leaves the EmptyBacked bin).
+        let b = backend(3);
+        let regions: Vec<Region> = (0..3)
+            .map(|_| {
+                b.allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+                    .expect("whole hugepage")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        assert_eq!(b.coverage().empty_backed_bytes, 3 * HUGEPAGE_SIZE as u64);
+        let released = b.release_empty_excess(0);
+        assert_eq!(
+            released,
+            3 * HUGEPAGE_SIZE,
+            "reserve 0 releases every empty hugepage"
+        );
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 0, "nothing kept");
+        assert_eq!(cov.empty_released_bytes, 3 * HUGEPAGE_SIZE as u64);
+        assert_eq!(b.release_empty_excess(0), 0, "idempotent once drained");
+        assert!(b.check_invariants());
     }
 }
