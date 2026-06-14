@@ -43,6 +43,7 @@ pub mod skeleton;
 pub mod slab;
 pub mod span;
 pub mod thread_cache;
+pub mod topology;
 pub mod trace;
 pub mod transfer_cache;
 
@@ -101,6 +102,7 @@ pub use span::{
     ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
     SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,
 };
+pub use topology::{Topology, TopologyBuilder, DISTANCE_LOCAL, DISTANCE_REMOTE, MAX_NODES};
 
 // W6 cache layer re-exports (plan 05).
 pub use budget::{CacheBudget, SlotStats};
