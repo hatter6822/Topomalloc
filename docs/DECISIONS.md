@@ -1215,12 +1215,20 @@ A final pass closed the remaining big-O / observability gaps a self-audit surfac
   was that the `HookProvider` failure counters were unreadable for a *hooked arena*
   (the provider is internal). Fixed at both granularities, mirroring
   `numa_bind_failures`:
-  - `HookProvider` gained `reserve` (alloc-hook error *or* §23.3-rejected result —
-    including the reject-path hand-back `dealloc` failure) and `commit`
-    (commit/decommit/purge) counters, alongside the existing release/split/merge.
+  - `HookProvider` gained a `commit` (commit/decommit/purge) counter alongside the
+    existing release/split/merge. Only **swallowed** failures are counted — those the
+    allocator handles internally (and so are otherwise invisible). A `reserve` failure
+    is deliberately *not* counted: it is **returned** to the caller (the alloc /
+    arena-create fails visibly) and drops the backing, so a counter would be redundant
+    *and* structurally always 0 in the aggregated view (a live/retired hooked arena
+    reserved successfully). The reject-path hand-back `dealloc` failure (a backing
+    refusing its *own* bad result back) counts as a **`release`** failure.
   - **Per-arena:** `ArenaStats::hooks: Option<HookFailureStats>` — aggregated over the
     arena's **two** providers (span + large) by `Allocator::arena_stats`; `None` for a
-    non-hooked arena.
+    non-hooked arena. Read **under the registry lock** (not via `hook_backend`, which
+    releases it): `arena_stats` is introspection and *can* race `arena_destroy`, so it
+    must block the teardown from dropping the backing mid-read — the alloc/free routing
+    is instead protected by the §22.5 quiescence contract.
   - **Global:** `AllocatorStats::hook_failures` and the stats-JSON
     `arenas.hook_failures` object (additive, §35.3) — the operator-facing surface that
     reaches C. It is a **cumulative** total: a persistent `AtomicHookFailures` on the

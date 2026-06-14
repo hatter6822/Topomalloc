@@ -1112,6 +1112,15 @@ fn hooked_arena_destroy_quarantines_when_the_backing_refuses_its_region() {
         2,
         "teardown attempted both the span and large region returns"
     );
+    // Those two `release` failures fired *during* teardown, when the backing is being
+    // dropped — yet they surface in the global cumulative stats, because the allocator
+    // folds the retiring backing's counts into a persistent total before it drops
+    // (W10 observability; the per-arena view is gone once the backing is dropped).
+    assert_eq!(
+        a.stats().hook_failures.release,
+        2,
+        "both refused region returns are observable in the global cumulative stats"
+    );
     // The shared backend and registry stay well-formed after the quarantine.
     assert!(a.check_invariants());
 }
@@ -1185,6 +1194,11 @@ fn concurrent_hooked_and_default_arena_allocation_is_sound() {
         .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
         .expect("hooked arena");
     let ar = &a;
+    // The id of the arena currently under destroy, published so a reader thread can
+    // race `arena_stats` against that destroy — exercising the W10 under-lock
+    // hook-stats read (it must never dereference a dropped backing).
+    let churning = AtomicU32::new(0);
+    let cref = &churning;
     std::thread::scope(|s| {
         for t in 0..4u64 {
             s.spawn(move || {
@@ -1214,9 +1228,21 @@ fn concurrent_hooked_and_default_arena_allocation_is_sound() {
             for _ in 0..16 {
                 let (h2, _s2) = leak_hooks();
                 if let Ok(id2) = ar.arena_create_hooked(&ArenaPolicy::explicit(), h2, hook_cfg()) {
-                    // SAFETY: no other thread allocates from or frees into `id2`.
+                    cref.store(id2.0, Ordering::Release);
+                    // SAFETY: no other thread allocates from or frees into `id2`
+                    // (a concurrent `arena_stats` read is *not* an alloc/free).
                     let _ = unsafe { ar.arena_destroy(id2) };
+                    cref.store(0, Ordering::Release);
                 }
+            }
+        });
+        // Read arena stats concurrently — racing a churned arena's destroy. With the
+        // under-lock hook-stats read (W10 audit), this never dereferences a dropped
+        // backing: it returns the live stats or resolves to no hook stats.
+        s.spawn(move || {
+            for _ in 0..8000 {
+                let _ = ar.arena_stats(ArenaId(cref.load(Ordering::Acquire)));
+                let _ = ar.arena_stats(harena);
             }
         });
     });

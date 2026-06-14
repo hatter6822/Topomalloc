@@ -177,7 +177,6 @@ impl Stats {
                 "    \"count\": {live_arenas},\n",
                 "    \"numa_bind_failures\": {numa_bind_failures},\n",
                 "    \"hook_failures\": {{\n",
-                "      \"reserve\": {hf_reserve},\n",
                 "      \"commit\": {hf_commit},\n",
                 "      \"release\": {hf_release},\n",
                 "      \"split\": {hf_split},\n",
@@ -208,7 +207,6 @@ impl Stats {
             central = self.central_free_bytes,
             live_arenas = self.live_arenas,
             numa_bind_failures = self.numa_bind_failures,
-            hf_reserve = self.hook_failures.reserve,
             hf_commit = self.hook_failures.commit,
             hf_release = self.hook_failures.release,
             hf_split = self.hook_failures.split,
@@ -306,7 +304,6 @@ mod tests {
             live_arenas: 3,
             numa_bind_failures: 7,
             hook_failures: topo_core::HookFailureStats {
-                reserve: 11,
                 commit: 12,
                 release: 13,
                 split: 14,
@@ -319,7 +316,7 @@ mod tests {
         assert_eq!(s.live_arenas, 3);
         assert_eq!(s.numa_bind_failures, 7);
         // Hook-failure counts (plan 06 W10) map through and render in the JSON.
-        assert_eq!(s.hook_failures.reserve, 11);
+        assert_eq!(s.hook_failures.commit, 12);
         assert_eq!(s.hook_failures.merge, 15);
         assert_eq!(s.live_bytes, 1000);
         assert_eq!(s.allocated_bytes_total, 1500);
@@ -343,7 +340,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["arenas"]["count"], 3);
         assert_eq!(v["arenas"]["numa_bind_failures"], 7);
-        assert_eq!(v["arenas"]["hook_failures"]["reserve"], 11);
         assert_eq!(v["arenas"]["hook_failures"]["commit"], 12);
         assert_eq!(v["arenas"]["hook_failures"]["release"], 13);
         assert_eq!(v["arenas"]["hook_failures"]["split"], 14);

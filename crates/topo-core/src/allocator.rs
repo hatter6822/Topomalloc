@@ -525,7 +525,6 @@ impl ArenaHookBackend<'_> {
         let sp = self.span_extents.provider();
         let lp = self.large.provider();
         HookFailureStats {
-            reserve: sp.reserve_hook_failures() + lp.reserve_hook_failures(),
             commit: sp.commit_hook_failures() + lp.commit_hook_failures(),
             release: sp.release_hook_failures() + lp.release_hook_failures(),
             split: sp.split_hook_failures() + lp.split_hook_failures(),
@@ -564,7 +563,6 @@ impl HookRegistry<'_> {
 /// they would otherwise be unobservable. Live backends' counts are added on top in
 /// [`Allocator::stats`].
 struct AtomicHookFailures {
-    reserve: AtomicU64,
     commit: AtomicU64,
     release: AtomicU64,
     split: AtomicU64,
@@ -574,7 +572,6 @@ struct AtomicHookFailures {
 impl AtomicHookFailures {
     const fn new() -> Self {
         Self {
-            reserve: AtomicU64::new(0),
             commit: AtomicU64::new(0),
             release: AtomicU64::new(0),
             split: AtomicU64::new(0),
@@ -584,7 +581,6 @@ impl AtomicHookFailures {
 
     /// Fold a retiring backend's counts in (relaxed — pure monotone counters).
     fn accumulate(&self, s: &HookFailureStats) {
-        self.reserve.fetch_add(s.reserve, Ordering::Relaxed);
         self.commit.fetch_add(s.commit, Ordering::Relaxed);
         self.release.fetch_add(s.release, Ordering::Relaxed);
         self.split.fetch_add(s.split, Ordering::Relaxed);
@@ -594,7 +590,6 @@ impl AtomicHookFailures {
     /// Read the cumulative counts so far.
     fn snapshot(&self) -> HookFailureStats {
         HookFailureStats {
-            reserve: self.reserve.load(Ordering::Relaxed),
             commit: self.commit.load(Ordering::Relaxed),
             release: self.release.load(Ordering::Relaxed),
             split: self.split.load(Ordering::Relaxed),
@@ -1767,8 +1762,28 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// hook-failure counts, aggregated over the arena's span + large providers.
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
         let mut s = self.arenas.stats(arena)?;
-        if let Some(b) = self.hook_backend(arena) {
-            s.hooks = Some(b.hook_failure_stats());
+        // Read the hooked backing's failure counts **under the registry lock** (unlike
+        // `hook_backend`, which releases it and returns a reference for the alloc/free
+        // path, safe only because an arena's own op cannot race its destroy, §22.5).
+        // `arena_stats` is introspection — it *can* race `arena_destroy(arena)` — so it
+        // must hold the lock across the read, which blocks the teardown from removing
+        // and dropping the backing mid-read (teardown takes the same lock to remove a
+        // slot before dropping its backing outside the lock).
+        if self.hooks.count.load(Ordering::Acquire) != 0 {
+            let slot_plus1 = self.arenas.hook_slot_of(arena);
+            if slot_plus1 != 0 && (slot_plus1 as usize) <= MAX_HOOK_BACKENDS {
+                let i = (slot_plus1 - 1) as usize;
+                self.hooks.lock.acquire();
+                // SAFETY: the registry lock is held (so no concurrent mutator of slot
+                // `i`, and no teardown can drop the backing during the read); borrows
+                // only element `i`, confirmed to be this arena's (fails closed).
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    if b.arena == arena {
+                        s.hooks = Some(b.hook_failure_stats());
+                    }
+                }
+                self.hooks.lock.release();
+            }
         }
         Some(s)
     }
@@ -1988,7 +2003,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     large_backend = large_backend.add(b.large.state_bytes());
                     live_large += b.large.live_count() as u64;
                     let s = b.hook_failure_stats();
-                    hf.reserve += s.reserve;
                     hf.commit += s.commit;
                     hf.release += s.release;
                     hf.split += s.split;

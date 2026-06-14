@@ -659,11 +659,12 @@ impl ArenaConfig {
 /// [`arena_create_hooked`](crate::Allocator::arena_create_hooked); the shared
 /// (POSIX/seLe4n) backend has no hooks to fail. All zero means the custom backing has
 /// served the arena without faulting.
+/// Only **swallowed** failures are counted (the allocator handles them internally,
+/// so they are otherwise invisible). A `reserve` failure is deliberately absent: it
+/// is *returned* to the caller (the alloc / arena-create fails visibly) and drops the
+/// backing, so it can never be non-zero for a live or retired hooked arena.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HookFailureStats {
-    /// `reserve` failures — the backing's `alloc` hook erred or returned a
-    /// §23.3-rejected (misaligned / undersized / overlapping) result.
-    pub reserve: u64,
     /// `commit` / `decommit` / `purge_*` hook failures (recovered while well-formed).
     pub commit: u64,
     /// Whole-region `release` (`dealloc`) failures — a backing refusing to take a

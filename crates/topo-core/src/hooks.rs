@@ -364,18 +364,15 @@ impl Drop for HookGuard<'_> {
 /// provider.
 ///
 /// It enforces the cheap §23.3 output contracts on every call (rejecting *and*
-/// debug-aborting on a violation — §2.4) and counts every kind of hook failure for
-/// observability ([`reserve`](Self::reserve_hook_failures) /
-/// [`commit`](Self::commit_hook_failures) / [`release`](Self::release_hook_failures)
-/// / advisory [`split`](Self::split_hook_failures) /
-/// [`merge`](Self::merge_hook_failures)) — surfaced per-arena in
-/// [`ArenaStats::hooks`](crate::ArenaStats) and globally in the stats snapshot.
+/// debug-aborting on a violation — §2.4) and counts every **swallowed** hook failure
+/// for observability ([`commit`](Self::commit_hook_failures) /
+/// [`release`](Self::release_hook_failures) / advisory
+/// [`split`](Self::split_hook_failures) / [`merge`](Self::merge_hook_failures)) —
+/// surfaced per-arena in [`ArenaStats::hooks`](crate::ArenaStats) and globally in the
+/// stats snapshot. (A `reserve` failure is *returned* to the caller — the alloc /
+/// arena-create fails visibly — so it needs no counter.)
 pub struct HookProvider<H: ExtentHooks> {
     hooks: H,
-    /// Count of `reserve` failures: the backing's `alloc` hook returned `Err`, or
-    /// its result was rejected by the §23.3 geometry / no-overlap checks. A
-    /// "could not obtain backing" signal (the allocation then fails cleanly).
-    reserve_hook_failures: AtomicU64,
     /// Count of physical-op failures: a `commit` / `decommit` / `purge_*` hook
     /// returning `Err`. The extent manager already recovers from these while staying
     /// well-formed (W4-5); counted so a backing that cannot back/return pages is
@@ -419,7 +416,6 @@ impl<H: ExtentHooks> HookProvider<H> {
     pub const fn new(hooks: H) -> Self {
         Self {
             hooks,
-            reserve_hook_failures: AtomicU64::new(0),
             commit_hook_failures: AtomicU64::new(0),
             split_hook_failures: AtomicU64::new(0),
             merge_hook_failures: AtomicU64::new(0),
@@ -460,13 +456,6 @@ impl<H: ExtentHooks> HookProvider<H> {
     #[inline]
     pub fn hooks(&self) -> &H {
         &self.hooks
-    }
-
-    /// Number of `reserve` failures recorded — the backing's `alloc` hook erred or
-    /// returned a §23.3-rejected result (W10 observability).
-    #[inline]
-    pub fn reserve_hook_failures(&self) -> u64 {
-        self.reserve_hook_failures.load(Ordering::Relaxed)
     }
 
     /// Number of `commit`/`decommit`/`purge_*` hook failures recorded (W10).
@@ -561,15 +550,11 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             let _guard = self.enter_hook()?;
             let mut zero = false;
             let mut commit = false;
-            match self.hooks.alloc(size, align, &mut zero, &mut commit) {
-                Ok(r) => r,
-                Err(e) => {
-                    // The backing could not obtain a region — count it (W10) and fail
-                    // the allocation cleanly (no memory is fabricated).
-                    self.reserve_hook_failures.fetch_add(1, Ordering::Relaxed);
-                    return Err(e);
-                }
-            }
+            // A backing that cannot obtain a region fails the allocation cleanly (no
+            // memory is fabricated). Not separately counted: the error is *returned*
+            // to the caller (the alloc/arena-create fails visibly), unlike the
+            // swallowed commit/release/split/merge failures the counters surface.
+            self.hooks.alloc(size, align, &mut zero, &mut commit)?
         };
         // §23.3 / §2.4: never trust the hook's geometry. Reject — and **hand the
         // range back** (so a failed reserve never leaks the backing) — if it fails
@@ -591,11 +576,10 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             false
         };
         if reject {
-            // A §23.3-violating result is a reserve failure too (W10 observability).
-            self.reserve_hook_failures.fetch_add(1, Ordering::Relaxed);
             let _guard = self.enter_hook();
             // Hand the rejected range back so a failed reserve never leaks the
-            // backing; if the backing *also* refuses its own bad result, count that
+            // backing (the rejection itself is returned to the caller, so it needs no
+            // counter); if the backing *also* refuses its own bad result, count that
             // as a release failure (the range then leaks in the backing, not in us).
             if self.hooks.dealloc(region, false).is_err() {
                 self.release_hook_failures.fetch_add(1, Ordering::Relaxed);
