@@ -1195,19 +1195,35 @@ impl Drop for OverlapBacking {
     }
 }
 
+/// A modest config for the overlap tests: the test only *creates* the arena (which
+/// reserves the two regions) and expects rejection — it never allocates from it — so
+/// the regions stay small (well above the 2 MiB huge threshold). Keeps the host
+/// backing block tiny, which also lightens this path under the qemu-aarch64 CI run.
+fn overlap_cfg() -> AllocatorConfig {
+    AllocatorConfig {
+        span_region_bytes: 4 * 1024 * 1024,
+        span_extent_slots: 64,
+        span_slots: 64,
+        large_region_bytes: 4 * 1024 * 1024,
+        large_extent_slots: 32,
+        large_slots: 32,
+    }
+}
+
+/// Block size for the overlap backing: comfortably covers either 4 MiB reservation.
+const OVERLAP_BLOCK: usize = 6 * 1024 * 1024;
+
 #[cfg(not(debug_assertions))]
 #[test]
 fn hooked_arena_with_overlapping_span_and_large_regions_is_rejected() {
     // §23.3 no-overlap ACROSS the two per-arena reservations (PR-review comment 2):
     // a hook returning overlapping span/large regions would let the arena's small
     // spans and large allocations alias. The cross-region disjointness check rejects
-    // it, and both built managers drop (returning the shared block to the hook). The
-    // `hook_cfg` large region is 16 MiB, so a 17 MiB block fits either reservation.
+    // it, and both built managers drop (returning the shared block to the hook).
     // (Release: in debug the check `debug_assert!`-aborts — see the companion test.)
     let a = posix_allocator();
-    let backing: &'static OverlapBacking =
-        Box::leak(Box::new(OverlapBacking::new(17 * 1024 * 1024)));
-    let r = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, hook_cfg());
+    let backing: &'static OverlapBacking = Box::leak(Box::new(OverlapBacking::new(OVERLAP_BLOCK)));
+    let r = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, overlap_cfg());
     assert!(
         matches!(r, Err(topo_core::ArenaError::Exhausted)),
         "overlapping span/large regions must be rejected, got {r:?}"
@@ -1230,7 +1246,6 @@ fn hooked_arena_with_overlapping_regions_debug_aborts() {
     // in debug, so this is the profile that actually exercises the abort. The two
     // built managers drop during unwinding, returning the shared block to the hook.
     let a = posix_allocator();
-    let backing: &'static OverlapBacking =
-        Box::leak(Box::new(OverlapBacking::new(17 * 1024 * 1024)));
-    let _ = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, hook_cfg());
+    let backing: &'static OverlapBacking = Box::leak(Box::new(OverlapBacking::new(OVERLAP_BLOCK)));
+    let _ = a.arena_create_hooked(&ArenaPolicy::explicit(), backing, overlap_cfg());
 }

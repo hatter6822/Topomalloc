@@ -362,8 +362,10 @@ impl Drop for HookGuard<'_> {
 ///
 /// It enforces the cheap §23.3 output contracts on every call (rejecting *and*
 /// debug-aborting on a violation — §2.4) and counts the advisory `split`/`merge`
-/// hook failures for observability ([`split_hook_failures`](Self::split_hook_failures)
-/// / [`merge_hook_failures`](Self::merge_hook_failures)).
+/// hook failures plus whole-region `release` (`dealloc`) failures for observability
+/// ([`split_hook_failures`](Self::split_hook_failures) /
+/// [`merge_hook_failures`](Self::merge_hook_failures) /
+/// [`release_hook_failures`](Self::release_hook_failures)).
 pub struct HookProvider<H: ExtentHooks> {
     hooks: H,
     /// Count of advisory §23.2 `split`-hook failures (W10-3 observability). These
@@ -373,6 +375,15 @@ pub struct HookProvider<H: ExtentHooks> {
     split_hook_failures: AtomicU64,
     /// Count of advisory §23.2 `merge`-hook failures (see above).
     merge_hook_failures: AtomicU64,
+    /// Count of whole-region `release` failures: a backing's `dealloc` refusing to
+    /// take a reserved region back. `release` is dispatched from the infallible
+    /// [`ExtentManager::drop`](crate::ExtentManager), so the error cannot propagate
+    /// to a caller (e.g. the arena-destroy result); it is **counted** here so a
+    /// backing that leaks region returns is observable rather than silent (§23.3
+    /// "reported"). It is never an allocator-visible fault — the region is gone from
+    /// the allocator's view, so a failed return is a leak in the user's backing, not
+    /// an aliasing/use-after-free.
+    release_hook_failures: AtomicU64,
     /// The §23.3 live-reservation set: detects an `alloc` result overlapping a live
     /// reservation, and a `dealloc` of a region this backing never handed out.
     live: ReservationSet,
@@ -397,6 +408,7 @@ impl<H: ExtentHooks> HookProvider<H> {
             hooks,
             split_hook_failures: AtomicU64::new(0),
             merge_hook_failures: AtomicU64::new(0),
+            release_hook_failures: AtomicU64::new(0),
             live: ReservationSet::new(),
             in_hook: AtomicBool::new(false),
         }
@@ -435,6 +447,15 @@ impl<H: ExtentHooks> HookProvider<H> {
     #[inline]
     pub fn merge_hook_failures(&self) -> u64 {
         self.merge_hook_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of whole-region `release` (`dealloc`) failures recorded — a backing
+    /// refusing to take a reserved region back. Surfaced for observability since the
+    /// failure is dispatched from the infallible `ExtentManager::drop` and so cannot
+    /// reach a caller; it is a leak in the user's backing, never an allocator fault.
+    #[inline]
+    pub fn release_hook_failures(&self) -> u64 {
+        self.release_hook_failures.load(Ordering::Relaxed)
     }
 
     /// Validate an [`alloc`](ExtentHooks::alloc) result against the §23.3 output
@@ -567,7 +588,20 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             "§23.3: extent-hook dealloc of a region never handed out (W10)"
         );
         let _guard = self.enter_hook()?;
-        self.hooks.dealloc(region, true)
+        match self.hooks.dealloc(region, true) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The backing refused the whole-region return. This is dispatched
+                // from the infallible `ExtentManager::drop`, so the error cannot
+                // propagate to the caller (e.g. the arena-destroy result); count it
+                // for observability (§23.3 "reported") rather than swallowing it
+                // silently. It is never an allocator-visible fault — the region is
+                // already out of the allocator's view, so a failed return is a leak
+                // in the user's backing, not an aliasing/use-after-free.
+                self.release_hook_failures.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     fn split(
@@ -638,6 +672,7 @@ mod tests {
         merges: AtomicU32,
         // one-shot failure injection (set the op to fail on its next call)
         fail_alloc: AtomicU32,
+        fail_dealloc: AtomicU32,
         fail_commit: AtomicU32,
         fail_decommit: AtomicU32,
         fail_split: AtomicU32,
@@ -657,6 +692,7 @@ mod tests {
                 splits: AtomicU32::new(0),
                 merges: AtomicU32::new(0),
                 fail_alloc: AtomicU32::new(0),
+                fail_dealloc: AtomicU32::new(0),
                 fail_commit: AtomicU32::new(0),
                 fail_decommit: AtomicU32::new(0),
                 fail_split: AtomicU32::new(0),
@@ -713,6 +749,12 @@ mod tests {
         }
         fn dealloc(&self, region: Region, _committed: bool) -> Result<(), BackendError> {
             self.deallocs.fetch_add(1, Ordering::Relaxed);
+            if Self::armed(&self.fail_dealloc) {
+                // Model a backing that refuses the release: keep the reservation
+                // (so `Drop` still reclaims it — the test leaks nothing) and report
+                // the failure, exercising the `release` failure counter.
+                return Err(BackendError::OutOfMemory);
+            }
             let mut live = self.live.lock().unwrap();
             let base = region.base as usize;
             // §23.3 self-check: dealloc must name a live reservation.
@@ -823,6 +865,34 @@ mod tests {
         assert!(p.merge(ArenaId::DEFAULT, left, right, true).is_err());
         assert_eq!(p.merge_hook_failures(), 1);
         p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[test]
+    fn release_counts_a_dealloc_hook_failure() {
+        // §23.3 "reported": a backing that refuses a whole-region release has the
+        // failure COUNTED for observability rather than silently swallowed — the
+        // release is dispatched from the infallible `ExtentManager::drop`, so the
+        // error cannot reach the destroy result. It is never an allocator-visible
+        // fault: the region is already out of the allocator's view, so a failed
+        // return is a leak in the user's backing, not an aliasing/use-after-free.
+        let p = HookProvider::new(TestHooks::new());
+        let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+        assert_eq!(p.release_hook_failures(), 0);
+        // Arm the dealloc to fail, then release: the failure is reported and counted.
+        p.hooks().fail_dealloc.store(1, Ordering::Relaxed);
+        assert!(matches!(
+            p.release(ArenaId::DEFAULT, r),
+            Err(BackendError::OutOfMemory)
+        ));
+        assert_eq!(
+            p.release_hook_failures(),
+            1,
+            "a failed whole-region release is counted, not silently swallowed"
+        );
+        // A subsequent clean release of a fresh reservation does not bump the count.
+        let r2 = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
+        p.release(ArenaId::DEFAULT, r2).expect("release ok");
+        assert_eq!(p.release_hook_failures(), 1);
     }
 
     #[test]
