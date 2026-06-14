@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::extent::BackendLock;
 use crate::flags::HugepagePolicy;
 use crate::ids::{ArenaId, Generation, Label, NodeId};
+use crate::release::LatencyClass;
 
 /// Maximum number of arenas a single [`ArenaTable`] tracks (ids `0..MAX_ARENAS`).
 ///
@@ -478,6 +479,14 @@ pub struct ArenaPolicy {
     /// `0` ⇒ the global default. Carried from M1; consumed by the cache layer at
     /// plan 05 W6 (M2).
     pub cache_budget_bytes: u64,
+    /// The slowest release/purge latency class this arena tolerates (§36.11, plan 04
+    /// W12-4). Subsumes the three SPEC flags: [`FastOnly`](LatencyClass::FastOnly) is
+    /// `no_ipc_fast_only` (a real-time arena — the release controller skips every
+    /// blocking ladder rung for it), [`BoundedSlow`](LatencyClass::BoundedSlow) is
+    /// `bounded_slow_path`, and [`MayBlock`](LatencyClass::MayBlock) (the default) is
+    /// `may_block`. Feeds [`ReleaseController`](crate::release::ReleaseController)'s
+    /// `max_latency`.
+    pub latency: LatencyClass,
     /// A short diagnostic name (truncated to [`ARENA_NAME_LEN`]).
     pub name: [u8; ARENA_NAME_LEN],
 }
@@ -500,6 +509,7 @@ impl ArenaPolicy {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: *b"default\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
         }
     }
@@ -516,6 +526,7 @@ impl ArenaPolicy {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: [0u8; ARENA_NAME_LEN],
         }
     }
@@ -536,6 +547,14 @@ impl ArenaPolicy {
     /// Set the quota ceiling.
     pub const fn with_quota(mut self, limit: u64) -> Self {
         self.quota_limit = limit;
+        self
+    }
+
+    /// Set the slowest release/purge latency class this arena tolerates (§36.11,
+    /// W12-4). A `FastOnly` (real-time, `no_ipc_fast_only`) arena makes the release
+    /// controller skip every blocking ladder rung.
+    pub const fn with_latency(mut self, latency: LatencyClass) -> Self {
+        self.latency = latency;
         self
     }
 
@@ -1188,6 +1207,7 @@ impl ArenaTable {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: del.name,
         };
         policy.validate()?;

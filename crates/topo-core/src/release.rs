@@ -401,6 +401,19 @@ impl ReleaseController {
         }
     }
 
+    /// Build a controller **for an arena** (W12-4 wiring): its §20.2 decay config and
+    /// its §36.11 [`latency`](crate::arena::ArenaPolicy::latency) tolerance are taken
+    /// from the policy, with the default §21.5 thresholds and no emergency reserve. A
+    /// `FastOnly` arena thus drives a controller that skips every blocking ladder rung.
+    pub fn for_arena(policy: &crate::arena::ArenaPolicy) -> Self {
+        Self::with(
+            policy.decay,
+            PressureThresholds::default(),
+            policy.latency,
+            0,
+        )
+    }
+
     /// The active decay configuration.
     pub fn config(&self) -> DecayConfig {
         self.config
@@ -1104,6 +1117,32 @@ mod tests {
     }
 
     // --- emergency reserve independence (§36.5, W12-3b) ---------------------
+
+    #[test]
+    fn for_arena_inherits_decay_and_latency_from_the_policy() {
+        use crate::arena::ArenaPolicy;
+        // A real-time (fast-only) arena with the low-RSS decay drives a controller that
+        // adopts both knobs: it skips the blocking rungs even under Hard pressure.
+        let policy = ArenaPolicy::explicit()
+            .with_latency(LatencyClass::FastOnly)
+            .with_decay(DecayConfig::low_rss());
+        let mut c = ReleaseController::for_arena(&policy);
+        assert_eq!(c.max_latency(), LatencyClass::FastOnly);
+        assert_eq!(c.config(), DecayConfig::low_rss());
+        let plan = c.tick(
+            1_000,
+            ReleaseInputs {
+                cgroup_current: 95,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        // FastOnly ⇒ cache drain only, no MayBlock release/purge or BoundedSlow subrelease.
+        assert!(plan.drain_caches_bytes > 0);
+        assert_eq!(plan.release_empty_hugepages_bytes, 0);
+        assert_eq!(plan.purge_dirty_bytes, 0);
+        assert_eq!(plan.subrelease_cold_sparse_bytes, 0);
+    }
 
     #[test]
     fn emergency_reserve_is_constant_and_heap_independent() {
