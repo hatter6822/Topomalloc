@@ -88,7 +88,25 @@ the §19.4 bin classification is pinned to the Lean model by a `lake exe check`
 differential gate. Under the `hugepage-optimized` feature the live C
 `malloc`/`free` already run over a `HugePageBackend`-backed engine
 (`topo-abi`'s `build_posix_allocator`), gated so the default MIT artifact is
-byte-for-byte the M1 extent path. Front-end caches (M2) and the remaining M1
+byte-for-byte the M1 extent path.
+
+**Release controller (W12)** rides on the W11 mechanisms: a **pure, `no_std`,
+host-driven** `ReleaseController` decides when and how much unused memory returns to
+the OS (§20–§21). A `tick(now_ms, inputs)` pump samples the §21.2 observation vector,
+classifies the §21.5 pressure mode (Normal/Soft/Hard/Emergency, with hysteresis;
+allocation failure or cgroup-critical forces Emergency), computes the §21.4 demand
+reserve — the anti-oscillation brake that withholds release proportional to recent
+demand so freed memory is not faulted straight back (§21.1 R2) — and plans the §21.3
+six-rung priority ladder (drain caches → release empty hugepages beyond the reserve →
+purge dirty-not-on-hot → dirty→muzzy → subrelease cold-sparse → emergency shrink),
+each rung gated by mode and the §36.11 latency class, rate-capped (§20.2) with a
+backlog. It is wired **live** through `HugePageBackend::release_tick`, which drives the
+W11 `release_empty_excess` demand-reserve hook — so an idle backend returns its empty
+hugepages to the OS while a churning one holds them back — identical over POSIX and the
+seLe4n simulator (§36.9). The controller adds **no abstract transition**: it sequences
+mechanisms already certified by the §21.6 release-safety theorem, so the proof stays
+discharged. Pressure mode, backlog, and demand reserve reconcile into the stats JSON
+and the `topo.release.*` control namespace. Front-end caches (M2) and the remaining M1
 pieces land per the plan.
 
 ## Quick start

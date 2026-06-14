@@ -1,10 +1,13 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.1 — W4 landed (the seam + POSIX backend + extents + large path);
+(topology) · **Status:** rev 2.2 — W4 landed (the seam + POSIX backend + extents + large path);
 **W11 landed (all units, ahead of M5): the hugepage filler / huge cache / region cache as a real,
 backend-agnostic placement subsystem over the provider seam, wired into the live large path through the
-§18.6 `RegionCacheHook`** · **Overview:** [README.md](README.md)
+§18.6 `RegionCacheHook`**; **W12 landed (all units, ahead of M5): the memory release controller &
+background-purge pump — the §21.3 ladder / §21.4 demand reserve / §21.5 pressure modes as a pure,
+host-driven policy, wired live into the W11 demand-reserve hook via `HugePageBackend::release_tick`** ·
+**Overview:** [README.md](README.md)
 **SPEC anchors:** §18, §20, §21, §19, §15, §36.6, §36.9, §36.11; M-004/M-005, H-001..H-005, O-007.
 **Upstream deps:** [03](03-core-allocator.md) (pagemap/spans). **Downstream:** [03](03-core-allocator.md)
 (spans come from extents), [09](09-sele4n-integration.md) (the capability provider implements the same seam).
@@ -133,7 +136,33 @@ normal-frame runs (§36.9).
 | W12-2c | Demand reserve (§21.4) + anti-oscillation: reserve = f(recent rate, peak, refill latency, pressure); prevents release-then-refault. | M | ∥ | refault-loop oscillation test passes. |
 | W12-3a | Pressure modes (§21.5): Normal / Soft / Hard / Emergency triggers + behaviors. | M | | mode transitions tested against simulated pressure. |
 | W12-3b | **Emergency mode** (O-007) + bounded emergency reserve (§36.5): bypass optional caches, release aggressively, disable HugeCache reserve; reserve never depends on the normal heap. | M | ∥ | emergency path tested; reserve independent. |
-| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. |
+| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. | ✅ `LatencyClass` (FastOnly/BoundedSlow/MayBlock) subsumes the three flags as `ArenaPolicy::latency`; `ReleaseController::for_arena` adopts it as `max_latency`, so a fast-only arena skips every blocking ladder rung. |
+
+> **▸ Implementation status (W12).** **Landed** (ahead of its M5 slot), in
+> `crates/topo-core/src/release.rs`: a **pure, `no_std`, host-driven** `ReleaseController` —
+> `tick(now_ms, inputs) -> ReleasePlan` with an injected clock, so it runs identically over POSIX and
+> seLe4n and is fully deterministic/unit-testable. **W12-1a** the §20.2 decay config is consolidated
+> onto `arena::DecayConfig` (extended with `release_rate_bytes_per_sec`/`background_purge_enabled` +
+> `low_rss`/`debug`/`server` presets) and wired into `ArenaPolicy`. **W12-2a** `ReleaseInputs` is the
+> §21.2 vector (rates derived from cumulative-counter deltas). **W12-3a** `PressureMode` is the §21.5
+> Normal/Soft/Hard/Emergency ladder with escalate-now / de-escalate-past-the-margin hysteresis
+> (alloc-failure / cgroup-critical force Emergency, O-007). **W12-2c** `demand_reserve` is the §21.4
+> anti-oscillation brake (grows with the alloc rate + refill cost, caps at recent peak free, attenuates
+> with pressure; Emergency reserves nothing, §36.5). **W12-2b** the §21.3 six-rung ladder is gated by
+> mode + the §36.11 latency ceiling and rate-capped (§20.2) with the unmet remainder accrued as backlog
+> (§20.3, W12-1b). **W12-3b** a heap-independent emergency reserve is fixed at construction. It is wired
+> **live** via `HugePageBackend::release_tick`, which drives the W11-1b `release_empty_excess`
+> demand-reserve hook from the plan — the W11→W12 handoff — and the §36.9 G-sim slice
+> (`release_outcome_is_identical_over_posix_and_the_sele4n_simulator`) proves it is backend-agnostic. The
+> running counters reconcile into `topo-stats` JSON + the `topo.release.*` control namespace. **No new
+> abstract transition:** the controller sequences mechanisms already certified by the §21.6
+> `release_to_os_preserves_live_objects` (`lean/TopoMalloc/Theorems/Release.lean`), so there is no new
+> Lean obligation. Tested by 18 `release` unit tests (incl. the §21.1 R2 oscillation property), the
+> `release_controller_plan_never_exceeds_supply` gating proptest, and the `tests/tests/release.rs` live
+> integration + G-sim slices. **What W12 leaves to M5/M6:** driving the extent-path rungs (purge dirty →
+> muzzy → release) and cold-sparse subrelease from a host pump over the live engine (the controller
+> *plans* them today; the §20.4 mechanisms execute them), and the mutating decay control surface
+> (`topo.dirty_decay_ms`, …) which is plan 07 W20.
 
 > **▸ Decomposition — W12-2 (release controller).** Split *inputs* (W12-2a, a pure read of the observation
 > vector), *the ladder* (W12-2b, the ordered policy), and *the demand reserve* (W12-2c, the anti-oscillation

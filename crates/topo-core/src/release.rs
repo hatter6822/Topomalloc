@@ -290,7 +290,7 @@ const RESERVE_WINDOW_MS: u64 = 1_000;
 
 /// The §21.4 demand reserve (W12-2c) — the anti-oscillation brake. Withholds from
 /// release roughly the bytes the application will allocate during one
-/// [`RESERVE_WINDOW_MS`] at `alloc_rate_bps`, enlarged when refills are expensive
+/// `RESERVE_WINDOW_MS` at `alloc_rate_bps`, enlarged when refills are expensive
 /// (`refill_miss_rate_ppk`) and capped at `recent_peak_free` (never reserve more free
 /// memory than has recently existed), then scaled **down** by pressure severity so a
 /// stressed system reclaims more (Emergency reserves nothing, §21.5/§36.5).

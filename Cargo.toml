@@ -37,7 +37,7 @@ exclude = ["fuzz", "vendor/sele4n"]
 # cache / region cache + §19.7 coverage stats). In a 0.x series new
 # backwards-compatible functionality is a patch bump (the 0.x minor is the
 # breaking axis), which also keeps the `^0.1.0` inter-crate requirements satisfied.
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

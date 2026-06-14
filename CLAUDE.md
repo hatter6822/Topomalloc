@@ -184,8 +184,26 @@ feature, `topo-abi`'s `build_posix_allocator` serves the live C `malloc`/`free` 
 `hugeBinGate`, and the filler's place/free/subrelease are modeled as a per-page state machine with
 H-001/H-004/H-005 preservation proved in `lean/TopoMalloc/HugePageFiller.lean`.
 
+The memory release controller & background-purge pump (W12) is implemented ahead of its M5
+slot, in `crates/topo-core/src/release.rs`: a **pure, `no_std`, host-driven** policy object —
+`ReleaseController::tick(now_ms, inputs) -> ReleasePlan` — that decides when and how much unused
+memory returns to the OS (§20–§21). It covers the §20.2 decay config (W12-1a, consolidated onto
+`arena::DecayConfig`), the §21.2 observation vector (W12-2a), the §21.5 Normal/Soft/Hard/Emergency
+pressure modes with hysteresis (W12-3a, alloc-failure/cgroup-critical force Emergency, O-007), the
+§21.4 demand-reserve anti-oscillation brake (W12-2c), the §21.3 six-rung priority ladder gated by
+mode and the §36.11 latency ceiling (W12-2b), the background-purge pump with decay-timer gating /
+CPU-pressure yield / fair multi-arena round-robin (W12-1b), a heap-independent emergency reserve
+(W12-3b), and the `LatencyClass` arena flag (W12-4, `ArenaPolicy::latency`). It is wired **live**
+through `HugePageBackend::release_tick`, which drives the W11 `release_empty_excess` demand-reserve
+hook from the plan — the exact W11→W12 handoff — identical over POSIX and the seLe4n simulator
+(§36.9 G-sim slice). The controller **adds no abstract transition**: it sequences mechanisms already
+certified by the §21.6 release-safety theorem (`release_to_os_preserves_live_objects`,
+`lean/TopoMalloc/Theorems/Release.lean`), so there is no new Lean obligation. Its running counters
+(pressure mode, backlog, demand reserve, planned bytes) reconcile into `topo-stats` JSON and the
+`topo.release.*` control namespace.
+
 **Test counts:**
-- Rust: ~568 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~593 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
@@ -208,7 +226,7 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11) | MIT | Yes |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
