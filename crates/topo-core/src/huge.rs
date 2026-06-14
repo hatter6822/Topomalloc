@@ -1241,7 +1241,7 @@ impl HugePageFiller {
     /// (M-005): mark every page of the run committed and clear any subreleased bit
     /// (the pages are backed again). Restores `live ⊆ committed` and
     /// `committed ∩ released == ∅` (H-001). A forged/foreign token is ignored
-    /// ([`validate_run`](Self::validate_run)).
+    /// (`validate_run`).
     pub fn mark_committed(&mut self, p: &Placement) {
         let Some(off) = self.validate_run(p.hugepage, p.base, p.pages) else {
             return;
