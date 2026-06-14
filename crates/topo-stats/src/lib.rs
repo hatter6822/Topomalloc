@@ -73,6 +73,13 @@ pub struct Stats {
     /// backlog, planned bytes, demand reserve). All zero unless a release controller
     /// is in use; populated via [`record_release`](Self::record_release).
     pub release: topo_core::ReleaseStats,
+
+    // --- topology (§15, plan 04 W13) ----------------------------------------
+    /// Discovered NUMA node count (§15.2); `1` for the single-domain fallback.
+    /// Populated via [`record_topology`](Self::record_topology).
+    pub numa_nodes: u32,
+    /// Discovered LLC-domain count (§15.2); `1` for the single-domain fallback.
+    pub llc_domains: u32,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -181,6 +188,15 @@ impl Stats {
         self.release = rs;
     }
 
+    /// Record the §15.2 topology summary (plan 04 W13) from a discovered
+    /// [`Topology`](topo_core::Topology): its NUMA-node and LLC-domain counts (both `1`
+    /// for the conservative single-domain fallback). The host records it once at
+    /// startup and on a refresh.
+    pub fn record_topology(&mut self, t: &topo_core::Topology) {
+        self.numa_nodes = t.node_count();
+        self.llc_domains = t.llc_count();
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -255,6 +271,10 @@ impl Stats {
                 "    \"alloc_rate_bps\": {rel_alloc_rate},\n",
                 "    \"free_rate_bps\": {rel_free_rate}\n",
                 "  }},\n",
+                "  \"topology\": {{\n",
+                "    \"numa_nodes\": {numa_nodes},\n",
+                "    \"llc_domains\": {llc_domains}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -298,6 +318,8 @@ impl Stats {
             rel_active = self.release.active_ticks,
             rel_alloc_rate = self.release.alloc_rate_bps,
             rel_free_rate = self.release.free_rate_bps,
+            numa_nodes = self.numa_nodes,
+            llc_domains = self.llc_domains,
             metadata = self.metadata_bytes,
         )
     }
@@ -425,6 +447,27 @@ mod tests {
         // The default snapshot renders the no-pressure normal mode.
         let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
         assert_eq!(d["release"]["pressure_mode"], "normal");
+    }
+
+    #[test]
+    fn topology_summary_reconciles_into_stats_and_json() {
+        // W13: the discovered §15.2 node/LLC counts flow into the snapshot + JSON.
+        let mut b = topo_core::TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0)
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 1, 1)
+            .set_cpu(3, 1, 1);
+        let t = b.build();
+        let mut s = Stats::default();
+        s.record_topology(&t);
+        assert_eq!(s.numa_nodes, 2);
+        assert_eq!(s.llc_domains, 2);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["topology"]["numa_nodes"], 2);
+        assert_eq!(v["topology"]["llc_domains"], 2);
+        // The default snapshot reports the conservative single domain.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["topology"]["numa_nodes"], 0); // unrecorded ⇒ 0 (no topology yet)
     }
 
     #[test]

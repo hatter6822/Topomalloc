@@ -202,8 +202,23 @@ certified by the §21.6 release-safety theorem (`release_to_os_preserves_live_ob
 (pressure mode, backlog, demand reserve, planned bytes) reconcile into `topo-stats` JSON and the
 `topo.release.*` control namespace.
 
+Topology awareness (W13) completes plan 04, in `crates/topo-core/src/topology.rs` (pure, `no_std`):
+the §15.2 `Topology` snapshot (CPU→LLC→NUMA maps + a node-distance matrix, all queries total) built by
+a `TopologyBuilder` that **falls back to a conservative single domain** on any missing/inconsistent
+data (W13-1); the §15.3/§15.5 `preferred_node` placement decision over the existing `NumaPolicy`
+(Local / Bind / Interleave / OsDefault / ArenaPolicy, W13-2); the §15.4 `Rebalancer` that plans a move
+from the nearest donor to the most-pressured node so memory is never permanently stranded (W13-3); and
+`detect_mismatch`, the §15.2 periodic-refresh probe (W13-4). `topo-backend-posix::discover_topology`
+parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same
+single-domain fallback. The W11 filler score's locality / cross-NUMA terms (stubbed at 0 "until W13")
+are now **filled**: `PlaceHints::home_node` (an explicit node preference) is rewarded on a region whose
+`HugeConfig::home_node` matches and penalized cross-node, neutral under no-preference — so the
+single-node case is unaffected and safety is never involved (§2.4). Placement/rebalancing are policy,
+not modeled transitions, so there is no Lean obligation. The §15.2 node/LLC counts reconcile into
+`topo-stats` JSON and the `topo.numa.*` control namespace; NUMA bind failures remain visible (§15.5).
+
 **Test counts:**
-- Rust: ~593 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~609 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
@@ -226,9 +241,9 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12) | MIT | Yes |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer (W13) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
-| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) | MIT | No |
+| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
 | `topo-stats` | statistics snapshot, additive JSON, version wiring | MIT | Yes |

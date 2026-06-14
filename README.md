@@ -106,8 +106,22 @@ hugepages to the OS while a churning one holds them back — identical over POSI
 seLe4n simulator (§36.9). The controller adds **no abstract transition**: it sequences
 mechanisms already certified by the §21.6 release-safety theorem, so the proof stays
 discharged. Pressure mode, backlog, and demand reserve reconcile into the stats JSON
-and the `topo.release.*` control namespace. Front-end caches (M2) and the remaining M1
-pieces land per the plan.
+and the `topo.release.*` control namespace.
+
+**Topology awareness (W13)** completes plan 04's "Backend, Hugepages, Release &
+Topology": a pure, `no_std` `Topology` snapshot models the §15 `CPU → LLC → NUMA node`
+hierarchy, built from Linux sysfs (`topo-backend-posix::discover_topology`) and
+**always falling back to a conservative single domain** on missing or inconsistent data
+(§15.2). `preferred_node` is the §15.3/§15.5 placement decision over the NUMA policy
+(local / bind / interleave / OS-default / arena), a `Rebalancer` plans nearest-donor →
+most-pressured-node moves so memory is never permanently stranded (§15.4), and
+`detect_mismatch` is the periodic-refresh probe. This fills the hugepage filler score's
+locality / cross-NUMA terms (W11 left them at 0 "until W13"): a request's explicit node
+preference is rewarded on a matching region and penalized cross-node, neutral with no
+preference — so the single-node case is unaffected and safety is never involved.
+Placement is policy, not a modeled transition, so it adds no proof obligation. The
+node/LLC counts reconcile into the stats JSON and the `topo.numa.*` control namespace.
+Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Quick start
 

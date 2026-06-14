@@ -1,12 +1,14 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.2 — W4 landed (the seam + POSIX backend + extents + large path);
+(topology) · **Status:** rev 2.3 — **plan 04 complete: W4 + W11 + W12 + W13 all landed.** W4 (the seam + POSIX backend + extents + large path);
 **W11 landed (all units, ahead of M5): the hugepage filler / huge cache / region cache as a real,
 backend-agnostic placement subsystem over the provider seam, wired into the live large path through the
 §18.6 `RegionCacheHook`**; **W12 landed (all units, ahead of M5): the memory release controller &
 background-purge pump — the §21.3 ladder / §21.4 demand reserve / §21.5 pressure modes as a pure,
-host-driven policy, wired live into the W11 demand-reserve hook via `HugePageBackend::release_tick`** ·
+host-driven policy, wired live into the W11 demand-reserve hook via `HugePageBackend::release_tick`**;
+**W13 landed (all units): the §15 CPU/LLC/NUMA topology model, placement policy, cross-domain
+rebalancer, and sysfs discovery — filling the W11 filler score's locality/cross-NUMA terms** ·
 **Overview:** [README.md](README.md)
 **SPEC anchors:** §18, §20, §21, §19, §15, §36.6, §36.9, §36.11; M-004/M-005, H-001..H-005, O-007.
 **Upstream deps:** [03](03-core-allocator.md) (pagemap/spans). **Downstream:** [03](03-core-allocator.md)
@@ -179,10 +181,27 @@ normal-frame runs (§36.9).
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. |
-| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. |
-| W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. |
-| W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. |
+| W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. | ✅ `topology::Topology`/`TopologyBuilder` (single-domain fallback on any inconsistency); `topo-backend-posix::discover_topology` parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same fallback. |
+| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. | ✅ `Topology::preferred_node` over `NumaPolicy` (Local/Bind/Interleave/OsDefault/ArenaPolicy); the W11 filler score's locality/cross-NUMA terms are filled from `PlaceHints::home_node` vs the region's `home_node`. |
+| W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. | ✅ `Rebalancer::plan` — nearest-donor → most-pressured-node moves with the §15.4 tiers; the stranded-memory test passes (same-node cache tiers are the M2 cache layer's job). |
+| W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. | ✅ `Topology::detect_mismatch` — the periodic-probe primitive the host runs to decide when to rebuild + swap the snapshot. |
+
+> **▸ Implementation status (W13).** **Landed**, in `crates/topo-core/src/topology.rs` (pure,
+> `no_std`, bounded). The §15.2 `Topology` snapshot (CPU→LLC→NUMA maps + a node-distance matrix, all
+> queries total) is built by a `TopologyBuilder` that collapses to `Topology::single_domain` on any
+> inconsistency (W13-1); `preferred_node` is the §15.3/§15.5 placement decision over the existing
+> `NumaPolicy` (W13-2); `Rebalancer::plan` is the §15.4 nearest-donor → most-pressured move so memory is
+> never permanently stranded (W13-3, the same-node transfer/central tiers are plan-05 W6 / M2);
+> `detect_mismatch` is the §15.2 periodic-refresh probe (W13-4). `topo-backend-posix::discover_topology`
+> is the real Linux sysfs read with the single-domain fallback. The W11 filler score's locality /
+> cross-NUMA terms — stubbed at 0 "until W13" — are now filled from `PlaceHints::home_node` vs the
+> region's `HugeConfig::home_node` (rewarded on match, penalized cross-node, neutral with no preference,
+> so the single-node case is unaffected). Placement / rebalancing are **policy, not modeled transitions**
+> (§2.4), so there is no Lean obligation. The node/LLC counts reconcile into `topo-stats` JSON and the
+> `topo.numa.*` control namespace. **What W13 leaves to M3/M5:** binding physical backing to the chosen
+> node in the POSIX provider (`mbind`/`set_mempolicy`) and standing up per-node hugepage backends so the
+> now-present locality term steers live placement — the policy + discovery are done; the provider-level
+> bind execution is the live-wiring step.
 
 ---
 

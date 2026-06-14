@@ -65,6 +65,10 @@ impl Control {
             "topo.release.demand_reserve_bytes" => {
                 Some(self.stats.release.demand_reserve_bytes.to_string())
             }
+            // Topology summary (§15, plan 04 W13): the discovered NUMA-node / LLC-domain
+            // counts from the latest stats snapshot (`1`/`0` for the single-domain case).
+            "topo.numa.nodes" => Some(self.stats.numa_nodes.to_string()),
+            "topo.numa.llc_domains" => Some(self.stats.llc_domains.to_string()),
             _ => None,
         }
     }
@@ -132,6 +136,19 @@ mod tests {
             c.get("topo.release.demand_reserve_bytes").as_deref(),
             Some("4096")
         );
+    }
+
+    #[test]
+    fn reads_the_topology_summary() {
+        // Plan 04 W13: the §15.2 node/LLC counts surface in the control namespace.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            numa_nodes: 2,
+            llc_domains: 4,
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.numa.nodes").as_deref(), Some("2"));
+        assert_eq!(c.get("topo.numa.llc_domains").as_deref(), Some("4"));
     }
 
     #[test]
