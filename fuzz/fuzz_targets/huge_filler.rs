@@ -53,6 +53,7 @@ fuzz_target!(|data: &[u8]| {
             2 => Lifetime::Long,
             _ => Lifetime::Unspecified,
         },
+        home_node: None,
     };
 
     // A power-of-two byte alignment in `[PAGE, 8*PAGE]`, so the §19.3 aligned-fit

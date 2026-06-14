@@ -650,6 +650,7 @@ proptest! {
                 2 => Lifetime::Long,
                 _ => Lifetime::Unspecified,
             },
+            home_node: None,
         };
         // Live sub-hugepage runs (freed via `free`) and whole-hugepage runs (freed via
         // `free_hugepages`), tracked separately so frees target real, live allocations.
