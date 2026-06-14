@@ -281,6 +281,11 @@ pub struct ReleaseStats {
     pub demand_reserve_bytes: u64,
     /// Cumulative number of ticks that planned any work (background activity rate).
     pub active_ticks: u64,
+    /// The most recent observed allocation rate (§21.2 `allocation_rate`), bytes/sec,
+    /// derived from the cumulative-counter delta over the last interval.
+    pub alloc_rate_bps: u64,
+    /// The most recent observed free rate (§21.2 `free_rate`), bytes/sec.
+    pub free_rate_bps: u64,
 }
 
 /// How far ahead the demand reserve looks: the reserve covers roughly the bytes the
@@ -347,6 +352,9 @@ pub struct ReleaseController {
     last_freed_total: u64,
     last_pressure_notifications: u64,
     recent_peak_free: u64,
+    /// The §21.2 alloc/free rates observed on the most recent interval (bytes/sec).
+    alloc_rate_bps: u64,
+    free_rate_bps: u64,
     backlog_bytes: u64,
     planned_bytes_total: u64,
     demand_reserve_bytes: u64,
@@ -392,6 +400,8 @@ impl ReleaseController {
             last_freed_total: 0,
             last_pressure_notifications: 0,
             recent_peak_free: 0,
+            alloc_rate_bps: 0,
+            free_rate_bps: 0,
             backlog_bytes: 0,
             planned_bytes_total: 0,
             demand_reserve_bytes: 0,
@@ -453,6 +463,8 @@ impl ReleaseController {
             ticks: self.ticks,
             demand_reserve_bytes: self.demand_reserve_bytes,
             active_ticks: self.active_ticks,
+            alloc_rate_bps: self.alloc_rate_bps,
+            free_rate_bps: self.free_rate_bps,
         }
     }
 
@@ -494,13 +506,24 @@ impl ReleaseController {
             self.recent_peak_free = free_now;
         }
 
-        // Alloc rate (bytes/sec) from the cumulative counter delta over the interval.
+        // Alloc/free rates (bytes/sec) from the cumulative counter deltas over the
+        // interval (§21.2). The reserve keys on the *allocation* rate (the conservative
+        // anti-oscillation choice: reserve for what will be allocated, regardless of
+        // frees); both are surfaced in stats so the host can observe the working set.
         let alloc_rate_bps = rate_per_sec(
             inputs
                 .allocated_bytes_total
                 .saturating_sub(self.last_allocated_total),
             elapsed_ms,
         );
+        let free_rate_bps = rate_per_sec(
+            inputs
+                .freed_bytes_total
+                .saturating_sub(self.last_freed_total),
+            elapsed_ms,
+        );
+        self.alloc_rate_bps = alloc_rate_bps;
+        self.free_rate_bps = free_rate_bps;
 
         // Track the dirty-decay clock: stamp when dirty (re)appears, clear when it
         // drains to zero, so the gate measures *continuous* dirtiness (§20.2). The
@@ -1173,6 +1196,33 @@ mod tests {
         );
         // Zero arenas ⇒ always the default, cursor unmoved.
         assert_eq!(c.next_fair_arena(0), ArenaId::DEFAULT);
+    }
+
+    #[test]
+    fn stats_surface_observed_alloc_and_free_rates() {
+        // The §21.2 alloc/free rates are derived from the cumulative-counter deltas and
+        // surfaced (so both `*_total` inputs are genuinely consumed, not sampled-unused).
+        let mut c = ReleaseController::new(DecayConfig::default());
+        c.tick(
+            0,
+            ReleaseInputs {
+                allocated_bytes_total: 0,
+                freed_bytes_total: 0,
+                ..base_inputs()
+            },
+        );
+        // 1 s later: +16 MiB allocated, +4 MiB freed ⇒ 16 MiB/s alloc, 4 MiB/s free.
+        c.tick(
+            1_000,
+            ReleaseInputs {
+                allocated_bytes_total: 16 * 1024 * 1024,
+                freed_bytes_total: 4 * 1024 * 1024,
+                ..base_inputs()
+            },
+        );
+        let s = c.stats();
+        assert_eq!(s.alloc_rate_bps, 16 * 1024 * 1024);
+        assert_eq!(s.free_rate_bps, 4 * 1024 * 1024);
     }
 
     #[test]

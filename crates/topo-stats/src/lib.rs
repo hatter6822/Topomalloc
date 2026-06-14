@@ -251,7 +251,9 @@ impl Stats {
                 "    \"demand_reserve_bytes\": {rel_reserve},\n",
                 "    \"planned_bytes_total\": {rel_planned},\n",
                 "    \"ticks\": {rel_ticks},\n",
-                "    \"active_ticks\": {rel_active}\n",
+                "    \"active_ticks\": {rel_active},\n",
+                "    \"alloc_rate_bps\": {rel_alloc_rate},\n",
+                "    \"free_rate_bps\": {rel_free_rate}\n",
                 "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
@@ -294,6 +296,8 @@ impl Stats {
             rel_planned = self.release.planned_bytes_total,
             rel_ticks = self.release.ticks,
             rel_active = self.release.active_ticks,
+            rel_alloc_rate = self.release.alloc_rate_bps,
+            rel_free_rate = self.release.free_rate_bps,
             metadata = self.metadata_bytes,
         )
     }
@@ -404,6 +408,8 @@ mod tests {
             ticks: 42,
             demand_reserve_bytes: 65536,
             active_ticks: 7,
+            alloc_rate_bps: 12_345,
+            free_rate_bps: 6_789,
         };
         let mut s = Stats::default();
         s.record_release(rs);
@@ -414,6 +420,8 @@ mod tests {
         assert_eq!(v["release"]["planned_bytes_total"], 1_048_576);
         assert_eq!(v["release"]["ticks"], 42);
         assert_eq!(v["release"]["active_ticks"], 7);
+        assert_eq!(v["release"]["alloc_rate_bps"], 12_345);
+        assert_eq!(v["release"]["free_rate_bps"], 6_789);
         // The default snapshot renders the no-pressure normal mode.
         let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
         assert_eq!(d["release"]["pressure_mode"], "normal");
