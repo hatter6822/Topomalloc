@@ -138,7 +138,7 @@ normal-frame runs (§36.9).
 | W12-2c | Demand reserve (§21.4) + anti-oscillation: reserve = f(recent rate, peak, refill latency, pressure); prevents release-then-refault. | M | ∥ | refault-loop oscillation test passes. |
 | W12-3a | Pressure modes (§21.5): Normal / Soft / Hard / Emergency triggers + behaviors. | M | | mode transitions tested against simulated pressure. |
 | W12-3b | **Emergency mode** (O-007) + bounded emergency reserve (§36.5): bypass optional caches, release aggressively, disable HugeCache reserve; reserve never depends on the normal heap. | M | ∥ | emergency path tested; reserve independent. |
-| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. | ✅ `LatencyClass` (FastOnly/BoundedSlow/MayBlock) subsumes the three flags as `ArenaPolicy::latency`; `ReleaseController::for_arena` adopts it as `max_latency`, so a fast-only arena skips every blocking ladder rung. |
+| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. ✅ `LatencyClass` (FastOnly/BoundedSlow/MayBlock) subsumes the three flags as `ArenaPolicy::latency`; `ReleaseController::for_arena` adopts it as `max_latency`, so a fast-only arena skips every blocking ladder rung. |
 
 > **▸ Implementation status (W12).** **Landed** (ahead of its M5 slot), in
 > `crates/topo-core/src/release.rs`: a **pure, `no_std`, host-driven** `ReleaseController` —
@@ -179,8 +179,8 @@ normal-frame runs (§36.9).
 
 **Depends on:** plan 05 W6 (transfer-cache domains). **Enables:** M3 (LLC), M4 (full).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
 | W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. | ✅ `topology::Topology`/`TopologyBuilder` (single-domain fallback on any inconsistency); `topo-backend-posix::discover_topology` parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same fallback. |
 | W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. | ✅ `Topology::preferred_node` over `NumaPolicy` (Local/Bind/Interleave/OsDefault/ArenaPolicy); the W11 filler score's locality/cross-NUMA terms are filled from `PlaceHints::home_node` vs the region's `home_node`. |
 | W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. | ✅ `Rebalancer::plan` — nearest-donor → most-pressured-node moves with the §15.4 tiers; the stranded-memory test passes (same-node cache tiers are the M2 cache layer's job). |
