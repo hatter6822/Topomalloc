@@ -185,7 +185,7 @@ feature, `topo-abi`'s `build_posix_allocator` serves the live C `malloc`/`free` 
 H-001/H-004/H-005 preservation proved in `lean/TopoMalloc/HugePageFiller.lean`.
 
 **Test counts:**
-- Rust: ~567 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~568 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)

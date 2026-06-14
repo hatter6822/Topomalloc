@@ -14,6 +14,7 @@ use topo_abi::{
     topomalloc_realloc,
 };
 use topo_backend_posix::PosixBackingProvider;
+use topo_core::bootstrap::BumpArena;
 use topo_core::classify::RequestKind;
 use topo_core::generated::tables::{HUGE_THRESHOLD, MAX_ALIGN, PAGE_SIZE};
 use topo_core::size_class::row;
@@ -21,6 +22,7 @@ use topo_core::{
     classify, trace, usable_size, ArenaPolicy, ArenaTable, CapRights, Delegation, RequestFlags,
     SkeletonAllocator,
 };
+use topo_core::{Hotness, HugePageFiller, Lifetime, PlaceHints, HUGEPAGE_SIZE};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -523,5 +525,122 @@ proptest! {
         prop_assert_ne!(rg1, rg0, "reset must bump the reset generation (§22.5)");
         prop_assert_eq!(t.stats(id).unwrap().generation, inc0, "reset keeps the incarnation");
         prop_assert!(t.is_active(id), "reset returns the arena to Active (§22.5)");
+    }
+}
+
+proptest! {
+    /// **HugePageFiller invariants under arbitrary op streams (§19.8 / B.4, plan 04
+    /// W11).** A *gating* companion to the nightly `huge_filler` fuzz target: under any
+    /// sequence of place (at varied power-of-two alignments) / free / subrelease /
+    /// unsubrelease / whole-hugepage reserve / free-run / mark-cold operations, the
+    /// filler stays well-formed (H-001/H-003/H-005 via `check_invariants`) and its
+    /// §19.7 coverage reconciles after *every* op — live == intact + partial, and the
+    /// nine §19.4 bins sum to the touched-hugepage count (H-003: each touched hugepage
+    /// is in exactly one bin). Draining every live allocation returns it to empty.
+    #[test]
+    fn hugepage_filler_stays_well_formed_and_reconciles(
+        ops in prop::collection::vec((0u8..6, any::<u8>()), 0..200),
+    ) {
+        const CAP: usize = 6;
+        let base = HUGEPAGE_SIZE * 16; // hugepage-aligned synthetic region base
+        // One metadata buffer per case (dropped at the end of the case — no leak).
+        // `buf` outlives `arena`, which outlives `f` (reverse-declaration drop order),
+        // and a 1 MiB arena dwarfs the CAP-slot descriptor pool + region cache.
+        let mut buf = vec![0u8; 1 << 20];
+        // SAFETY: `buf` outlives `arena`/`f`, and is never moved or aliased below.
+        let arena = unsafe { BumpArena::new(buf.as_mut_ptr(), buf.len()) };
+        let mut f = HugePageFiller::new(&arena, base, CAP).expect("filler construction");
+        prop_assert!(f.check_invariants());
+
+        let hints = |b: u8| PlaceHints {
+            hotness: match b % 3 {
+                0 => Hotness::Cold,
+                1 => Hotness::Hot,
+                _ => Hotness::Neutral,
+            },
+            lifetime: match (b / 3) % 4 {
+                0 => Lifetime::Short,
+                1 => Lifetime::Medium,
+                2 => Lifetime::Long,
+                _ => Lifetime::Unspecified,
+            },
+        };
+        // Live sub-hugepage runs (freed via `free`) and whole-hugepage runs (freed via
+        // `free_hugepages`), tracked separately so frees target real, live allocations.
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+
+        for (op, b) in ops {
+            match op {
+                // place a 1..=16 page run at a varied power-of-two alignment
+                0 | 1 => {
+                    let pages = (b as usize % 16) + 1;
+                    let align = PAGE_SIZE << ((b >> 5) & 0b11); // PAGE..=8*PAGE
+                    if let Some(p) = f.place(pages, align, hints(b)) {
+                        f.mark_committed(&p);
+                        live.push((p.base, p.pages));
+                    }
+                }
+                // free a live run; sometimes subrelease it, sometimes roll that back
+                2 => {
+                    if !live.is_empty() {
+                        let i = b as usize % live.len();
+                        let (bb, pp) = live.swap_remove(i);
+                        prop_assert!(f.free(bb, pp).valid);
+                        if b & 0x40 != 0 {
+                            if let Some(sr) = f.subrelease(bb, pp, b & 0x80 != 0) {
+                                if b & 0x20 != 0 {
+                                    f.unsubrelease(&sr);
+                                }
+                            }
+                        }
+                    }
+                }
+                // reserve a 1..=3 hugepage whole-run (the §19.2 large/awkward path)
+                3 => {
+                    let n = (b as usize % 3) + 1;
+                    if let Some(run) = f.reserve_hugepages(n) {
+                        f.mark_run_committed(&run);
+                        runs.push((run.base, run.hugepages));
+                    }
+                }
+                // free a whole-hugepage run
+                4 => {
+                    if !runs.is_empty() {
+                        let i = b as usize % runs.len();
+                        let (bb, hh) = runs.swap_remove(i);
+                        prop_assert!(f.free_hugepages(bb, hh).valid);
+                    }
+                }
+                // mark a hugepage cold (the W12 idle-decay hook)
+                _ => {
+                    let _ = f.mark_cold(base + (b as usize % CAP) * HUGEPAGE_SIZE);
+                }
+            }
+            // The §19.8 / B.4 invariant and the §19.7 reconciliation hold after each op.
+            prop_assert!(f.check_invariants(), "filler invariant violated");
+            let cov = f.coverage();
+            prop_assert_eq!(
+                cov.live_total_bytes,
+                cov.live_bytes_on_intact + cov.live_bytes_on_partial,
+                "live must split into intact + partial"
+            );
+            let binned: u32 = cov.bins.iter().sum();
+            prop_assert_eq!(
+                binned as u64,
+                cov.coverage_bytes / HUGEPAGE_SIZE as u64,
+                "the nine bins must sum to the touched-hugepage count (H-003)"
+            );
+        }
+
+        // Draining both allocation kinds returns the filler to empty, well-formed.
+        for (bb, pp) in live {
+            prop_assert!(f.free(bb, pp).valid);
+        }
+        for (bb, hh) in runs {
+            prop_assert!(f.free_hugepages(bb, hh).valid);
+        }
+        prop_assert!(f.check_invariants());
+        prop_assert_eq!(f.coverage().live_total_bytes, 0, "drained to empty");
     }
 }

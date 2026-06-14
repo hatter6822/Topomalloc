@@ -95,7 +95,10 @@ normal-frame runs (§36.9).
 > `huge_bin_classification_matches_lean` + the `lake exe check` `hugeBinGate`; H-002/H-003 and the per-page
 > place/free/subrelease state machine (H-001/H-004/H-005 preservation) are modeled in
 > `lean/TopoMalloc/HugePageFiller.lean`. The integration test `tests/tests/hugepage.rs` drives the live
-> engine + G-sim slices; `fuzz/fuzz_targets/huge_filler.rs` fuzzes the §19.8 invariants;
+> engine + G-sim slices; the `hugepage_filler_stays_well_formed_and_reconciles` **gating** proptest
+> (`tests/tests/property.rs`) and the nightly `fuzz/fuzz_targets/huge_filler.rs` both drive arbitrary
+> place/free/subrelease/unsubrelease/reserve-run/free-run/mark-cold streams against the §19.8 invariants +
+> the §19.7 coverage reconciliation (with shrinking in the proptest, deeper campaigns in the fuzzer);
 > `crates/topo-core/benches/huge.rs` is the non-gating criterion harness measuring place/free churn and
 > placement into a fragmented region **swept across filler sizes** (a flat curve is the evidence the
 > candidate scan is bounded, not O(hugepages)). The live C `malloc`/`free` entry points already run over
