@@ -262,8 +262,11 @@ retain policy). -/
 def freeRun (hp : HugePageState) (off len : Nat) : HugePageState :=
   fun p => if inRun off len p ∧ hp p = .live then .free else hp p
 
-/-- **subrelease**: the run's `free` pages become `released`. It touches **only**
-`free` pages — never `live` — so the H-005 guard is *structural*. -/
+/-- **subrelease**: the run's `free` pages become `released`. In this model it touches
+**only** `free` pages — never `live` — so H-005 holds *structurally* (by the shape of
+this function). The Rust `subrelease` enforces the equivalent runtime guard explicitly
+(`run_is_clear(live) ∧ run committed`, i.e. exactly the `free` pages), so the model is a
+faithful abstraction of the checked code. -/
 def subrelease (hp : HugePageState) (off len : Nat) : HugePageState :=
   fun p => if inRun off len p ∧ hp p = .free then .released else hp p
 

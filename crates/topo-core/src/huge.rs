@@ -101,9 +101,10 @@ const _: () = assert!(
 
 /// A hotness class for a page-run or a hugepage (§19.3 `hotness_match`, §19.5
 /// "pack hot objects densely"). Advisory placement input — never a safety input
-/// (DD-2: the score is policy). Derived from the request's [`Hints::hotness`]
-/// (`0` ⇒ [`Cold`](Hotness::Cold)/[`Neutral`](Hotness::Neutral); high ⇒
-/// [`Hot`](Hotness::Hot)) and, for a hugepage, the join of its residents' hotness.
+/// (DD-2: the score is policy). Derived from the request's [`Hints::hotness`] by
+/// [`from_hint`](Hotness::from_hint) (`0` ⇒ [`Cold`](Hotness::Cold); `1..=127` ⇒
+/// [`Neutral`](Hotness::Neutral); `≥ 128` ⇒ [`Hot`](Hotness::Hot)) and, for a
+/// hugepage, the join of its residents' hotness.
 ///
 /// [`Hints::hotness`]: crate::flags::Hints::hotness
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -633,16 +634,19 @@ pub struct Subrelease {
     pub len: usize,
 }
 
-/// Why a placement could not be made (a *safe* failure — the filler is unchanged).
+/// Why a [`HugePageBackend::new`] construction failed (a *safe* failure — any
+/// reservation already taken is rolled back, so nothing leaks). This is the
+/// **backend-construction** error channel; **placement** failures are signalled by
+/// [`place`](HugePageFiller::place) returning `None`, never by this type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HugeError {
-    /// No hugepage (existing or fresh) can hold the request: the region is full or
-    /// too fragmented (a clean fall-through, never a wrap).
+    /// The descriptor metadata could not be allocated (the filler's slot pool or the
+    /// region cache): the provider reservation has been released, leaving no region.
     NoSpace,
-    /// The request is malformed (zero pages, more than a hugepage, or an alignment
-    /// that no in-hugepage offset can satisfy).
+    /// The configured capacity is invalid: zero hugepages, or a hugepage count whose
+    /// `capacity × HUGEPAGE_SIZE` byte length overflows `usize`.
     InvalidRequest,
-    /// The backing provider failed (§36.6); the filler is rolled back, well-formed.
+    /// The backing provider's region reservation failed (§36.6); no region was taken.
     Backend(BackendError),
 }
 
@@ -896,10 +900,13 @@ impl HugePageFiller {
     /// better; ties break on lower base in [`place`](Self::place). A wrong score never
     /// misplaces a live object (the run is carved from the free bitmap regardless).
     ///
-    /// The §19.3 terms (locality/cross-NUMA are deferred to W13 topology and scored 0
-    /// until then — keeping the inputs backend-agnostic, DD-2):
-    /// `packing + hotness_match + lifetime_match + release_preservation + commit_bonus
-    ///  − fragmentation − lifetime_mismatch − partial_subrelease`.
+    /// The §19.3 score, exactly as returned below (locality/cross-NUMA are deferred to
+    /// W13 topology and scored 0 until then — keeping the inputs backend-agnostic, DD-2).
+    /// The sum is `packing + hotness_match + lifetime_match + locality_bonus +
+    /// release_preservation + commit_bonus − fragmentation − cross_numa_penalty −
+    /// partial_subrelease`, where `lifetime_match` is *itself* negative on a mismatch
+    /// (there is no separate lifetime-mismatch penalty term — the mismatch is the
+    /// negative match).
     fn score(s: &HugePageSlot, hints: PlaceHints, run_offset: usize, pages: usize) -> i64 {
         let used = s.used() as i64;
         let total = PAGES_PER_HUGEPAGE as i64;
@@ -1193,9 +1200,12 @@ impl HugePageFiller {
     ///   in whole pages) and currently **backed** (committed, not already released);
     /// * the hugepage is **cold/sparse** *or* `pressure_high` (§19.6 coldness/pressure
     ///   gate);
-    /// * the predicted RSS benefit (`pages`) exceeds the predicted fragmentation cost
-    ///   (modeled as `1`, since any returned run is ≥ 1 page) — trivially true here,
-    ///   but the comparison is the §19.6 cost/benefit gate, made explicit.
+    /// * the **cost/benefit gate** passes: the predicted RSS benefit (the `pages`
+    ///   reclaimed) is at least the predicted fragmentation cost, which scales with the
+    ///   hugepage's live coverage (`used / FRAGMENTATION_COST_DIVISOR`). So a small run
+    ///   from a *dense* hugepage is refused (its TLB coverage is repaid only by a larger
+    ///   run), while any run from a near-empty hugepage passes. `pressure_high` forces
+    ///   every backed-free byte back regardless of the gate (§20.5 emergency).
     ///
     /// On success it marks the run released, re-files the bin, bumps the subrelease
     /// metric, and returns the [`Subrelease`] for the caller to `decommit`. The
