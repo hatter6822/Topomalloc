@@ -264,6 +264,13 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.extents.reserved_region()
     }
 
+    /// Borrow the backing provider (the inner extent manager's), e.g. to read a
+    /// [`HookProvider`](crate::HookProvider)'s hook-failure counts (W10).
+    #[inline]
+    pub fn provider(&self) -> &P {
+        self.extents.provider()
+    }
+
     /// **Explicitly** return the backing region to the provider, surfacing the
     /// result (delegates to the inner [`ExtentManager::teardown`]). Idempotent with
     /// `Drop`. Used by the arena-destroy path to route a custom backing's refused

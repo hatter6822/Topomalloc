@@ -972,6 +972,56 @@ fn hooked_arena_serves_from_its_own_region_and_isolates() {
 }
 
 #[test]
+fn per_arena_hook_failures_surface_in_stats() {
+    // W10 observability: a hooked arena's custom-backing failures are reachable
+    // through `ArenaStats::hooks` (per-arena) and the global `AllocatorStats`.
+    let a = posix_allocator();
+    let (hooks, stats) = leak_hooks();
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+
+    // The shared/default backend has no hooks to fail ⇒ no hook stats.
+    assert!(
+        a.arena_stats(ArenaId::DEFAULT).unwrap().hooks.is_none(),
+        "a non-hooked arena carries no hook-failure stats"
+    );
+    // A fresh hooked arena has hook stats, all zero.
+    let hs0 = a
+        .arena_stats(arena)
+        .unwrap()
+        .hooks
+        .expect("a hooked arena carries hook-failure stats");
+    assert_eq!(hs0, topo_core::HookFailureStats::default());
+
+    // Arm the commit hook to fail every call, then allocate: the span's commit fails,
+    // the allocation fails cleanly (no fallback for a hooked arena), and the failure
+    // is COUNTED and observable per-arena — the gap W10's audit closed.
+    stats.fail_commit.store(1, Ordering::Relaxed);
+    let p = a.allocate_in(arena, 100, 16, RequestFlags::NONE);
+    assert!(
+        p.is_null(),
+        "a backing that cannot commit cannot satisfy the request"
+    );
+    stats.fail_commit.store(0, Ordering::Relaxed); // disarm
+
+    let hs = a.arena_stats(arena).unwrap().hooks.expect("hook stats");
+    assert!(
+        hs.commit >= 1,
+        "the commit-hook failure is observable per-arena (W10): {hs:?}"
+    );
+    // …and rolls up into the global cumulative total (live backend summed in).
+    assert!(
+        a.stats().hook_failures.commit >= 1,
+        "the commit-hook failure is observable in the global stats too"
+    );
+    assert!(
+        a.check_invariants(),
+        "the failed commit left every backend well-formed"
+    );
+}
+
+#[test]
 fn hooked_arena_destroy_returns_the_region_to_the_hooks() {
     let a = posix_allocator();
     let (hooks, stats) = leak_hooks();

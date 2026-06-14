@@ -1633,6 +1633,13 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         self.region
     }
 
+    /// Borrow the backing provider — e.g. to read a [`HookProvider`](crate::HookProvider)'s
+    /// per-kind hook-failure counts for [`ArenaStats`](crate::ArenaStats) (W10).
+    #[inline]
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
     /// **Explicitly** return the reserved region to the provider, surfacing the
     /// provider's result instead of discarding it the way `Drop` must (W10 strict
     /// teardown). Idempotent: the region is released **exactly once** across this

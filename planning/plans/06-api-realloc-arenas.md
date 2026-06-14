@@ -264,6 +264,21 @@ M4, W10, plan 09.
 > `HookProvider::release_hook_failures`). The §36.13 model gains the named obligation
 > `destroy_backing_release_failure_quarantines` (no new edge — the differential stays
 > green). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
+>
+> **▸ Optimal-completion pass (closed).** Routing, scale, and observability: **(1)**
+> per-arena routing is now **O(1)** (a lock-free `hook_slot` index on the `ArenaTable`
+> entry; large ops route by the descriptor's arena) instead of a registry scan;
+> **(2)** `MAX_HOOK_BACKENDS` 8 → **32** (`RESERVATION_CAP` 16 → 4 to shrink each
+> backend; a `const` stack-safe size-budget assertion bounds the inline registry);
+> **(3)** the C adapter reclaim is now **reference-based**
+> (`arena_has_hook_backend`), so a teardown-failure quarantine reclaims it too;
+> **(4)** **hook failures are now observable** — `ArenaStats::hooks` per-arena (the
+> two providers aggregated) and a cumulative `AllocatorStats::hook_failures` +
+> stats-JSON `arenas.hook_failures` globally (a persistent counter folds a backing's
+> counts in before it drops, so a teardown `release` failure survives the destroy).
+> `no_std`-bounded items (cross-provider reentrancy detection, deeper Lean refinement
+> of the teardown link, drain-quarantine slot retention) are documented as deliberate
+> constraints in [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
 
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|

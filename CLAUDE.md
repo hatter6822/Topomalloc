@@ -157,11 +157,12 @@ Extent hooks & custom backing (W10) are implemented ahead of their M4 slot too: 
 `merge` advisory notifications), §23.3 contract enforcement (alignment/size/subrange + no-overlap/
 dealloc-pairing + reentrancy), §34.8 hook failure injection, the §23.4 conditional-correctness Lean
 model, **the full §22.2/§22.4 per-arena `hooks` descriptor field** (`arena_create_hooked` — an arena
-served from its own `HookProvider`-backed region, §22.7-isolated), and the **C `topo_extent_hooks_t`
-ABI**.
+served from its own `HookProvider`-backed region, §22.7-isolated, with **O(1)** routing), the **C
+`topo_extent_hooks_t` ABI**, and **per-arena + global hook-failure observability** (`ArenaStats::hooks`
+/ `AllocatorStats::hook_failures` / stats JSON).
 
 **Test counts:**
-- Rust: ~525 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~535 tests across 12 crates (`cargo test --workspace`)
 - Lean: 83 build jobs including proof-checking every module (`lake build`) + 7 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 6 targets (`fuzz/fuzz_targets/`, incl. `arena_api` and `extent_hooks`)

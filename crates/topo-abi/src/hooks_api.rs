@@ -581,13 +581,14 @@ mod tests {
 
     #[test]
     fn destroy_surfaces_a_backing_release_failure() {
-        // W10 strict teardown (PR #14, thread #3) at the C ABI: when the custom
-        // backing's `dealloc` hook fails to take the arena's region back on destroy,
-        // `topo_arena_destroy` must NOT report success — it returns -1 and the arena
-        // is §36.13-quarantined (never cleanly destroyed). The adapter is retained
-        // (reclaim is gated on a clean `Ok` destroy — a conservative, safe rule that
-        // never frees a possibly-borrowed adapter): a bounded terminal-failure
-        // retention, never a use-after-free.
+        // W10 strict teardown at the C ABI: when the custom backing's `dealloc` hook
+        // fails to take the arena's region back on destroy, `topo_arena_destroy` must
+        // NOT report success — it returns -1 and the arena is §36.13-quarantined
+        // (never cleanly destroyed). The adapter is still reclaimed: a teardown-
+        // failure quarantine drops the arena's backend (and its borrow of the
+        // adapter), so freeing it is sound — reclamation tracks *references* (the
+        // backend's existence), not the success code. Only a drain-failure quarantine
+        // (which retains the backend) keeps the adapter.
         let mut vt = c_vtable();
         vt.dealloc = Some(c_dealloc_fail);
         // SAFETY: a valid vtable with the required alloc/dealloc.
@@ -608,8 +609,9 @@ mod tests {
             "a backing refusing its region return fails the destroy"
         );
         assert!(
-            chooks_tracked(id),
-            "the adapter is retained on a quarantined destroy (reclaim is Ok-only)"
+            !chooks_tracked(id),
+            "the backend is torn down even on a quarantined destroy, so the adapter \
+             is reclaimed (no leak), never a use-after-free"
         );
     }
 }

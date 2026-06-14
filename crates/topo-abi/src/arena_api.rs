@@ -191,22 +191,21 @@ pub unsafe extern "C" fn topo_arena_destroy(id: u32) -> i32 {
         return -1;
     };
     // SAFETY: the caller upholds this function's quiescence contract.
-    match unsafe { a.arena_destroy(ArenaId(id)) } {
-        Ok(_) => {
-            // The arena (and its hooked backend, if any) is fully destroyed — the
-            // allocator no longer references the C hook adapter, so reclaim it
-            // (no-op for a non-hooked arena). Bounds the per-create heap (W10).
-            crate::hooks_api::reclaim_chooks(id);
-            0
-        }
+    let r = unsafe { a.arena_destroy(ArenaId(id)) };
+    // Reclaim the C hook adapter exactly when the allocator no longer references it
+    // (W10). A clean destroy *and* a teardown-failure quarantine both drop the
+    // arena's backend — and with it the `HookProvider<&CHooks>` borrow — leaving no
+    // hooked backing for `id`, so freeing the adapter is sound and bounds the
+    // per-create heap. A drain-failure quarantine KEEPS the backend registered (its
+    // `HookProvider` still borrows the adapter), so the adapter is retained — freeing
+    // it would be a use-after-free. A no-op for a non-hooked arena or a destroy that
+    // was rejected outright (the arena, and any adapter, survive).
+    if !a.arena_has_hook_backend(ArenaId(id)) {
+        crate::hooks_api::reclaim_chooks(id);
+    }
+    match r {
+        Ok(_) => 0,
         Err(e) => {
-            // Do NOT reclaim the C hook adapter on a failed/quarantined destroy. A
-            // drain-failure quarantine KEEPS the arena's backend registered, so its
-            // `HookProvider` still borrows the adapter — freeing it would be a
-            // use-after-free. A teardown-failure quarantine is a terminal §36.13
-            // failure (the backing refused its own region return); retaining the
-            // small adapter there is acceptable, not the unbounded per-cycle leak
-            // W10 closed (a clean create/destroy cycle still reclaims via `Ok`).
             set_errno(arena_errno(e));
             -1
         }

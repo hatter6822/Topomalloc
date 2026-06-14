@@ -56,8 +56,8 @@ pub use allocator::{
 };
 pub use arena::{
     ArenaConfig, ArenaError, ArenaPolicy, ArenaState, ArenaStats, ArenaTable, CapRights,
-    DecayConfig, Delegation, NumaPolicy, RevocationPhase, ARENA_NAME_LEN, MAX_ARENAS,
-    QUOTA_UNLIMITED,
+    DecayConfig, Delegation, HookFailureStats, NumaPolicy, RevocationPhase, ARENA_NAME_LEN,
+    MAX_ARENAS, QUOTA_UNLIMITED,
 };
 pub use backend::{
     CachePolicy, FrameCap, MappedRange, ProviderState, ProviderStateMachine, Region, Rights,

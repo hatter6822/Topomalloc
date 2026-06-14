@@ -653,6 +653,28 @@ impl ArenaConfig {
 // Stats view
 // ---------------------------------------------------------------------------
 
+/// Per-arena custom-backing (extent-hook) failure counts (§23, plan 06 W10),
+/// aggregated over the arena's **two** hooked providers (its span-extent backing and
+/// its large-allocation backing). Present only for an arena created with
+/// [`arena_create_hooked`](crate::Allocator::arena_create_hooked); the shared
+/// (POSIX/seLe4n) backend has no hooks to fail. All zero means the custom backing has
+/// served the arena without faulting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookFailureStats {
+    /// `reserve` failures — the backing's `alloc` hook erred or returned a
+    /// §23.3-rejected (misaligned / undersized / overlapping) result.
+    pub reserve: u64,
+    /// `commit` / `decommit` / `purge_*` hook failures (recovered while well-formed).
+    pub commit: u64,
+    /// Whole-region `release` (`dealloc`) failures — a backing refusing to take a
+    /// region back (a leak in the backing; never an allocator fault).
+    pub release: u64,
+    /// Advisory `split`-hook failures (recorded, never acted on — §23.4).
+    pub split: u64,
+    /// Advisory `merge`-hook failures (recorded, never acted on — §23.4).
+    pub merge: u64,
+}
+
 /// An instantaneous, copyable view of one arena's authority + accounting (§22.2
 /// `ArenaStats`, §36.4). Produced by [`ArenaTable::stats`]; the values are
 /// per-field atomic reads (relaxed), so a snapshot taken during concurrent
@@ -699,6 +721,10 @@ pub struct ArenaStats {
     pub cache_budget_bytes: u64,
     /// Count of NUMA binding failures surfaced for this arena (§15.5).
     pub numa_bind_failures: u64,
+    /// Custom-backing (extent-hook) failure counts (§23, W10), or `None` for an
+    /// arena with no hooked backing. Aggregated over the arena's span + large hooked
+    /// providers by [`Allocator::arena_stats`](crate::Allocator::arena_stats).
+    pub hooks: Option<HookFailureStats>,
     /// The delegating parent arena, if this arena was delegated (§36.4).
     pub parent: Option<ArenaId>,
     /// The diagnostic name (§22.2).
@@ -759,6 +785,13 @@ struct ArenaAtomics {
     quota_limit: AtomicU64,
     /// NUMA binding-failure counter (§15.5 stats visibility).
     numa_bind_failures: AtomicU64,
+    /// The arena's hooked-backing **registry slot, plus one** (`0` ⇒ no hooked
+    /// backing — the shared backend serves it; `k` ⇒ registry slot `k − 1`, plan
+    /// 06 W10). Read lock-free on the routing fast path so a hooked arena resolves
+    /// its own [`HookProvider`]-backed span/large backing in O(1) instead of a
+    /// registry scan. Set when the backing is registered, cleared on teardown;
+    /// **survives a reset** (the region is kept). A `u8` bounds `MAX_HOOK_BACKENDS`.
+    hook_slot: AtomicU8,
 }
 
 impl ArenaAtomics {
@@ -775,6 +808,7 @@ impl ArenaAtomics {
             reserved: AtomicU64::new(0),
             quota_limit: AtomicU64::new(QUOTA_UNLIMITED),
             numa_bind_failures: AtomicU64::new(0),
+            hook_slot: AtomicU8::new(0),
         }
     }
 }
@@ -1013,6 +1047,8 @@ impl ArenaTable {
         a.reserved.store(0, Ordering::Relaxed);
         a.quota_limit.store(policy.quota_limit, Ordering::Relaxed);
         a.numa_bind_failures.store(0, Ordering::Relaxed);
+        // A fresh incarnation has no hooked backing until one is registered (W10).
+        a.hook_slot.store(0, Ordering::Relaxed);
         // Initializing: descriptive fields written before the id is published.
         a.state
             .store(ArenaState::Initializing as u8, Ordering::Relaxed);
@@ -1493,6 +1529,24 @@ impl ArenaTable {
         }
     }
 
+    /// `arena`'s hooked-backing registry slot **plus one** (`0` ⇒ none), read
+    /// lock-free for the W10 routing fast path. Returns `0` for an out-of-range id.
+    pub fn hook_slot_of(&self, arena: ArenaId) -> u8 {
+        self.slot(arena)
+            .map_or(0, |a| a.hook_slot.load(Ordering::Acquire))
+    }
+
+    /// Record that `arena`'s hooked backing lives in registry slot `slot_plus1 − 1`
+    /// (`0` clears it). A single lock-free store; the caller orders it before the
+    /// registry `count` release (create) or after taking the backing out (teardown),
+    /// so a reader that has observed `count` also observes this. A no-op for an
+    /// out-of-range id.
+    pub fn set_hook_slot(&self, arena: ArenaId, slot_plus1: u8) {
+        if let Some(a) = self.slot(arena) {
+            a.hook_slot.store(slot_plus1, Ordering::Release);
+        }
+    }
+
     // -- introspection --------------------------------------------------------
 
     /// A snapshot of `arena`'s authority + accounting, or `None` if the id is out
@@ -1530,6 +1584,9 @@ impl ArenaTable {
             huge: m.huge,
             cache_budget_bytes: m.cache_budget_bytes,
             numa_bind_failures: a.numa_bind_failures.load(Ordering::Relaxed),
+            // Filled in by `Allocator::arena_stats` for a hooked arena (the table has
+            // no access to the providers); `None` here means "no hooked backing".
+            hooks: None,
             parent: if m.parent_plus1 == 0 {
                 None
             } else {

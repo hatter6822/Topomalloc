@@ -214,6 +214,11 @@ impl AnyAllocator {
         dispatch!(self, a => a.arena_stats(arena))
     }
 
+    /// Whether `arena` currently has a registered hooked backing (W10).
+    pub fn arena_has_hook_backend(&self, arena: ArenaId) -> bool {
+        dispatch!(self, a => a.arena_has_hook_backend(arena))
+    }
+
     /// Whether `arena` is registered and currently allocatable (§22.3).
     pub fn arena_is_active(&self, arena: ArenaId) -> bool {
         dispatch!(self, a => a.arenas().is_active(arena))

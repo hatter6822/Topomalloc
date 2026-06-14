@@ -251,10 +251,13 @@ impl ExtentHooks for &(dyn ExtentHooks + Send + Sync + '_) {
 
 /// Capacity of a [`HookProvider`]'s live-reservation tracker. A provider backs one
 /// [`ExtentManager`](crate::ExtentManager), which reserves exactly one region, so a
-/// provider holds 0 or 1 live reservation in practice; this is generous headroom.
-/// If it is ever exceeded the §23.3 no-overlap/pairing check degrades to
-/// best-effort (it never reports a false overlap, only stops tracking new ranges).
-const RESERVATION_CAP: usize = 16;
+/// provider holds 0 or 1 live reservation in practice; `4` is ample headroom. (Kept
+/// small deliberately: the set is an **inline** array and each hooked arena carries
+/// two providers, so a large cap × [`MAX_HOOK_BACKENDS`](crate::MAX_HOOK_BACKENDS)
+/// would bloat the inline registry — see its size budget.) If it is ever exceeded the
+/// §23.3 no-overlap/pairing check degrades to best-effort (it never reports a false
+/// overlap, only stops tracking new ranges).
+const RESERVATION_CAP: usize = 4;
 
 /// The live-reservation set behind the §23.3 no-overlap + dealloc-pairing checks,
 /// guarded by a [`BackendLock`]. Fixed-capacity and allocation-free (`no_std`).
@@ -361,13 +364,23 @@ impl Drop for HookGuard<'_> {
 /// provider.
 ///
 /// It enforces the cheap §23.3 output contracts on every call (rejecting *and*
-/// debug-aborting on a violation — §2.4) and counts the advisory `split`/`merge`
-/// hook failures plus whole-region `release` (`dealloc`) failures for observability
-/// ([`split_hook_failures`](Self::split_hook_failures) /
-/// [`merge_hook_failures`](Self::merge_hook_failures) /
-/// [`release_hook_failures`](Self::release_hook_failures)).
+/// debug-aborting on a violation — §2.4) and counts every kind of hook failure for
+/// observability ([`reserve`](Self::reserve_hook_failures) /
+/// [`commit`](Self::commit_hook_failures) / [`release`](Self::release_hook_failures)
+/// / advisory [`split`](Self::split_hook_failures) /
+/// [`merge`](Self::merge_hook_failures)) — surfaced per-arena in
+/// [`ArenaStats::hooks`](crate::ArenaStats) and globally in the stats snapshot.
 pub struct HookProvider<H: ExtentHooks> {
     hooks: H,
+    /// Count of `reserve` failures: the backing's `alloc` hook returned `Err`, or
+    /// its result was rejected by the §23.3 geometry / no-overlap checks. A
+    /// "could not obtain backing" signal (the allocation then fails cleanly).
+    reserve_hook_failures: AtomicU64,
+    /// Count of physical-op failures: a `commit` / `decommit` / `purge_*` hook
+    /// returning `Err`. The extent manager already recovers from these while staying
+    /// well-formed (W4-5); counted so a backing that cannot back/return pages is
+    /// observable rather than silent.
+    commit_hook_failures: AtomicU64,
     /// Count of advisory §23.2 `split`-hook failures (W10-3 observability). These
     /// never alter the bookkeeping — the split already committed in the
     /// allocator's authoritative metadata — but are surfaced so a backing fault is
@@ -406,12 +419,24 @@ impl<H: ExtentHooks> HookProvider<H> {
     pub const fn new(hooks: H) -> Self {
         Self {
             hooks,
+            reserve_hook_failures: AtomicU64::new(0),
+            commit_hook_failures: AtomicU64::new(0),
             split_hook_failures: AtomicU64::new(0),
             merge_hook_failures: AtomicU64::new(0),
             release_hook_failures: AtomicU64::new(0),
             live: ReservationSet::new(),
             in_hook: AtomicBool::new(false),
         }
+    }
+
+    /// Tally a physical-op (`commit`/`decommit`/`purge_*`) hook result, counting a
+    /// failure for observability (W10) and forwarding it unchanged.
+    #[inline]
+    fn count_phys(&self, r: Result<(), BackendError>) -> Result<(), BackendError> {
+        if r.is_err() {
+            self.commit_hook_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        r
     }
 
     /// Enter a hook dispatch, refusing — and debug-aborting on — a re-entrant call
@@ -435,6 +460,19 @@ impl<H: ExtentHooks> HookProvider<H> {
     #[inline]
     pub fn hooks(&self) -> &H {
         &self.hooks
+    }
+
+    /// Number of `reserve` failures recorded — the backing's `alloc` hook erred or
+    /// returned a §23.3-rejected result (W10 observability).
+    #[inline]
+    pub fn reserve_hook_failures(&self) -> u64 {
+        self.reserve_hook_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of `commit`/`decommit`/`purge_*` hook failures recorded (W10).
+    #[inline]
+    pub fn commit_hook_failures(&self) -> u64 {
+        self.commit_hook_failures.load(Ordering::Relaxed)
     }
 
     /// Number of advisory §23.2 `split`-hook failures recorded (W10-3).
@@ -523,7 +561,15 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             let _guard = self.enter_hook()?;
             let mut zero = false;
             let mut commit = false;
-            self.hooks.alloc(size, align, &mut zero, &mut commit)?
+            match self.hooks.alloc(size, align, &mut zero, &mut commit) {
+                Ok(r) => r,
+                Err(e) => {
+                    // The backing could not obtain a region — count it (W10) and fail
+                    // the allocation cleanly (no memory is fabricated).
+                    self.reserve_hook_failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
         };
         // §23.3 / §2.4: never trust the hook's geometry. Reject — and **hand the
         // range back** (so a failed reserve never leaks the backing) — if it fails
@@ -545,8 +591,15 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
             false
         };
         if reject {
+            // A §23.3-violating result is a reserve failure too (W10 observability).
+            self.reserve_hook_failures.fetch_add(1, Ordering::Relaxed);
             let _guard = self.enter_hook();
-            let _ = self.hooks.dealloc(region, false);
+            // Hand the rejected range back so a failed reserve never leaks the
+            // backing; if the backing *also* refuses its own bad result, count that
+            // as a release failure (the range then leaks in the backing, not in us).
+            if self.hooks.dealloc(region, false).is_err() {
+                self.release_hook_failures.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(BackendError::InvalidRequest);
         }
         Ok(region)
@@ -555,25 +608,25 @@ impl<H: ExtentHooks> TopoBackingProvider for HookProvider<H> {
     fn commit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
         let _guard = self.enter_hook()?;
-        self.hooks.commit(region, offset, len)
+        self.count_phys(self.hooks.commit(region, offset, len))
     }
 
     fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
         let _guard = self.enter_hook()?;
-        self.hooks.decommit(region, offset, len)
+        self.count_phys(self.hooks.decommit(region, offset, len))
     }
 
     fn purge_lazy(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
         let _guard = self.enter_hook()?;
-        self.hooks.purge_lazy(region, offset, len)
+        self.count_phys(self.hooks.purge_lazy(region, offset, len))
     }
 
     fn purge_forced(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         Self::check_subrange(region, offset, len)?;
         let _guard = self.enter_hook()?;
-        self.hooks.purge_forced(region, offset, len)
+        self.count_phys(self.hooks.purge_forced(region, offset, len))
     }
 
     fn release(&self, _arena: ArenaId, region: Region) -> Result<(), BackendError> {
