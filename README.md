@@ -54,8 +54,18 @@ of rights / quota / label (§36.4) — with each child's quota **reserved** on i
 parent so a delegated subtree's live bytes stay within the root's quota (proved
 in Lean by `subtree_used_le_quota`) — NUMA policy modes (§15.5), and a C arena API
 (`topo_arena_create` / `delegate` / `reset` / `destroy`). The arena lifecycle
-state machine is modeled and proof-checked in Lean. Front-end caches (M2) and
-the remaining M1 pieces land per the plan.
+state machine is modeled and proof-checked in Lean.
+
+**Extent hooks & custom backing (W10)** ride on the same provider seam: the §23.2
+`ExtentHooks` interface and the `HookProvider` adapter run the whole central path
+over a user-supplied memory source / OS policy, with the §23.3 contracts enforced
+(alignment / size / sub-range, no-overlap, dealloc-pairing, reentrancy — rejected,
+never trusted) and the §23.4 "allocator correctness assumes hook correctness"
+assumption modeled and proof-checked in Lean (`ExtentHooks.lean`). The full §22.2
+per-arena `hooks` field is wired: `topo_arena_create_hooked` gives an arena its
+**own** custom-backed region, isolated from every other arena's by construction
+(§22.7), reachable from C through the `topo_extent_hooks_t` ABI. Front-end caches
+(M2) and the remaining M1 pieces land per the plan.
 
 ## Quick start
 

@@ -653,6 +653,29 @@ impl ArenaConfig {
 // Stats view
 // ---------------------------------------------------------------------------
 
+/// Per-arena custom-backing (extent-hook) failure counts (§23, plan 06 W10),
+/// aggregated over the arena's **two** hooked providers (its span-extent backing and
+/// its large-allocation backing). Present only for an arena created with
+/// [`arena_create_hooked`](crate::Allocator::arena_create_hooked); the shared
+/// (POSIX/seLe4n) backend has no hooks to fail. All zero means the custom backing has
+/// served the arena without faulting.
+/// Only **swallowed** failures are counted (the allocator handles them internally,
+/// so they are otherwise invisible). A `reserve` failure is deliberately absent: it
+/// is *returned* to the caller (the alloc / arena-create fails visibly) and drops the
+/// backing, so it can never be non-zero for a live or retired hooked arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookFailureStats {
+    /// `commit` / `decommit` / `purge_*` hook failures (recovered while well-formed).
+    pub commit: u64,
+    /// Whole-region `release` (`dealloc`) failures — a backing refusing to take a
+    /// region back (a leak in the backing; never an allocator fault).
+    pub release: u64,
+    /// Advisory `split`-hook failures (recorded, never acted on — §23.4).
+    pub split: u64,
+    /// Advisory `merge`-hook failures (recorded, never acted on — §23.4).
+    pub merge: u64,
+}
+
 /// An instantaneous, copyable view of one arena's authority + accounting (§22.2
 /// `ArenaStats`, §36.4). Produced by [`ArenaTable::stats`]; the values are
 /// per-field atomic reads (relaxed), so a snapshot taken during concurrent
@@ -699,6 +722,10 @@ pub struct ArenaStats {
     pub cache_budget_bytes: u64,
     /// Count of NUMA binding failures surfaced for this arena (§15.5).
     pub numa_bind_failures: u64,
+    /// Custom-backing (extent-hook) failure counts (§23, W10), or `None` for an
+    /// arena with no hooked backing. Aggregated over the arena's span + large hooked
+    /// providers by [`Allocator::arena_stats`](crate::Allocator::arena_stats).
+    pub hooks: Option<HookFailureStats>,
     /// The delegating parent arena, if this arena was delegated (§36.4).
     pub parent: Option<ArenaId>,
     /// The diagnostic name (§22.2).
@@ -759,6 +786,13 @@ struct ArenaAtomics {
     quota_limit: AtomicU64,
     /// NUMA binding-failure counter (§15.5 stats visibility).
     numa_bind_failures: AtomicU64,
+    /// The arena's hooked-backing **registry slot, plus one** (`0` ⇒ no hooked
+    /// backing — the shared backend serves it; `k` ⇒ registry slot `k − 1`, plan
+    /// 06 W10). Read lock-free on the routing fast path so a hooked arena resolves
+    /// its own [`HookProvider`]-backed span/large backing in O(1) instead of a
+    /// registry scan. Set when the backing is registered, cleared on teardown;
+    /// **survives a reset** (the region is kept). A `u8` bounds `MAX_HOOK_BACKENDS`.
+    hook_slot: AtomicU8,
 }
 
 impl ArenaAtomics {
@@ -775,6 +809,7 @@ impl ArenaAtomics {
             reserved: AtomicU64::new(0),
             quota_limit: AtomicU64::new(QUOTA_UNLIMITED),
             numa_bind_failures: AtomicU64::new(0),
+            hook_slot: AtomicU8::new(0),
         }
     }
 }
@@ -982,6 +1017,22 @@ impl ArenaTable {
         parent_plus1: u32,
         parent_generation: u32,
     ) -> Result<ArenaId, ArenaError> {
+        self.create_locked_inner(policy, parent_plus1, parent_generation, true)
+    }
+
+    /// `create_locked`, but with explicit publish control: `publish == false`
+    /// leaves the arena `Initializing` (not yet allocatable), so a caller that must
+    /// install per-arena state **before** the id is allocatable (§22.4 "install
+    /// hooks before first extent allocation", plan 06 W10) can do so and then call
+    /// [`publish`](Self::publish). The arena id is private to the caller until
+    /// published, so the unpublished window is race-free.
+    fn create_locked_inner(
+        &self,
+        policy: &ArenaPolicy,
+        parent_plus1: u32,
+        parent_generation: u32,
+        publish: bool,
+    ) -> Result<ArenaId, ArenaError> {
         let id = self.claim_slot_locked()?;
         let a = &self.atomics[id as usize];
         // Bump the *incarnation* generation off whatever the (possibly recycled)
@@ -997,6 +1048,8 @@ impl ArenaTable {
         a.reserved.store(0, Ordering::Relaxed);
         a.quota_limit.store(policy.quota_limit, Ordering::Relaxed);
         a.numa_bind_failures.store(0, Ordering::Relaxed);
+        // A fresh incarnation has no hooked backing until one is registered (W10).
+        a.hook_slot.store(0, Ordering::Relaxed);
         // Initializing: descriptive fields written before the id is published.
         a.state
             .store(ArenaState::Initializing as u8, Ordering::Relaxed);
@@ -1015,9 +1068,60 @@ impl ArenaTable {
             };
         }
         // Publish: the release store pairs with the acquire loads in `is_active`
-        // / `try_charge`, so a thread that sees `Active` also sees the fields.
-        a.state.store(ArenaState::Active as u8, Ordering::Release);
+        // / `try_charge`, so a thread that sees `Active` also sees the fields. When
+        // `publish` is false the arena stays `Initializing` until [`publish`].
+        if publish {
+            a.state.store(ArenaState::Active as u8, Ordering::Release);
+        }
         Ok(ArenaId(id))
+    }
+
+    /// Create an arena left in `Initializing` (not yet allocatable), returning its
+    /// id (private to the caller). The caller installs any per-arena state, then
+    /// calls [`publish`](Self::publish) to make it `Active`, or
+    /// [`abandon_pending`](Self::abandon_pending) to discard it (plan 06 W10).
+    ///
+    /// SPEC-transition: arena create (pending half, §22.4)
+    pub fn create_pending(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
+        policy.validate()?;
+        self.lock.acquire();
+        let r = self.create_locked_inner(policy, 0, 0, false);
+        self.lock.release();
+        r
+    }
+
+    /// Publish a [`create_pending`](Self::create_pending) arena: `Initializing →
+    /// Active`. Rejects an arena not in `Initializing`.
+    ///
+    /// SPEC-transition: arena create (publish half, §22.4)
+    pub fn publish(&self, arena: ArenaId) -> Result<(), ArenaError> {
+        let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+        if ArenaState::from_u8(a.state.load(Ordering::Acquire)) != ArenaState::Initializing {
+            return Err(ArenaError::IllegalTransition);
+        }
+        a.state.store(ArenaState::Active as u8, Ordering::Release);
+        Ok(())
+    }
+
+    /// Discard a [`create_pending`](Self::create_pending) arena whose initialization
+    /// failed: `Initializing → Destroyed` with a generation bump, releasing the slot
+    /// (§B.5). Rejects an arena not in `Initializing`.
+    pub fn abandon_pending(&self, arena: ArenaId) -> Result<(), ArenaError> {
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            if ArenaState::from_u8(a.state.load(Ordering::Acquire)) != ArenaState::Initializing {
+                return Err(ArenaError::IllegalTransition);
+            }
+            let gen = Generation(a.generation.load(Ordering::Relaxed)).next();
+            a.generation.store(gen.0, Ordering::Relaxed);
+            a.rights.store(0, Ordering::Relaxed);
+            a.state
+                .store(ArenaState::Destroyed as u8, Ordering::Release);
+            Ok(())
+        })();
+        self.lock.release();
+        r
     }
 
     /// `delegate`, with the table lock held.
@@ -1426,6 +1530,24 @@ impl ArenaTable {
         }
     }
 
+    /// `arena`'s hooked-backing registry slot **plus one** (`0` ⇒ none), read
+    /// lock-free for the W10 routing fast path. Returns `0` for an out-of-range id.
+    pub fn hook_slot_of(&self, arena: ArenaId) -> u8 {
+        self.slot(arena)
+            .map_or(0, |a| a.hook_slot.load(Ordering::Acquire))
+    }
+
+    /// Record that `arena`'s hooked backing lives in registry slot `slot_plus1 − 1`
+    /// (`0` clears it). A single lock-free store; the caller orders it before the
+    /// registry `count` release (create) or after taking the backing out (teardown),
+    /// so a reader that has observed `count` also observes this. A no-op for an
+    /// out-of-range id.
+    pub fn set_hook_slot(&self, arena: ArenaId, slot_plus1: u8) {
+        if let Some(a) = self.slot(arena) {
+            a.hook_slot.store(slot_plus1, Ordering::Release);
+        }
+    }
+
     // -- introspection --------------------------------------------------------
 
     /// A snapshot of `arena`'s authority + accounting, or `None` if the id is out
@@ -1463,6 +1585,9 @@ impl ArenaTable {
             huge: m.huge,
             cache_budget_bytes: m.cache_budget_bytes,
             numa_bind_failures: a.numa_bind_failures.load(Ordering::Relaxed),
+            // Filled in by `Allocator::arena_stats` for a hooked arena (the table has
+            // no access to the providers); `None` here means "no hooked backing".
+            hooks: None,
             parent: if m.parent_plus1 == 0 {
                 None
             } else {

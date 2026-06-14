@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* §35.3 ABI pinning: the one exposed struct's layout is frozen by
@@ -37,6 +38,32 @@ _Static_assert(offsetof(topomalloc_size_class_t, max_local_capacity) == 20,
 _Static_assert(sizeof(topo_flags_t) == 8, "topo_flags_t must be 64-bit");
 _Static_assert(sizeof(topo_arena_t) == 4, "topo_arena_t must be 32-bit");
 _Static_assert(sizeof(topo_tcache_t) == 4, "topo_tcache_t must be 32-bit");
+
+/* A minimal C extent-hook backing (§23.2, W10): malloc-backed, with op counters
+ * so the harness can confirm the arena's allocations were served from it. */
+static size_t g_hook_allocs = 0;
+static size_t g_hook_deallocs = 0;
+
+static void *hook_alloc(void *ctx, size_t size, size_t alignment, bool *zero, bool *commit) {
+    (void) ctx;
+    g_hook_allocs++;
+    /* The allocator requests PAGE_SIZE alignment; honour it (§23.3 — a misaligned
+     * result would be rejected). `size` is a multiple of `alignment` here. */
+    void *p = aligned_alloc(alignment, size);
+    if (p) {
+        *zero = false;
+        *commit = true;
+    }
+    return p;
+}
+static bool hook_dealloc(void *ctx, void *addr, size_t size, bool committed) {
+    (void) ctx;
+    (void) size;
+    (void) committed;
+    g_hook_deallocs++;
+    free(addr);
+    return false; /* success */
+}
 
 int main(void) {
     /* version + backend identification */
@@ -243,6 +270,27 @@ int main(void) {
     /* the default arena cannot be reset or destroyed (§22.5) */
     assert(topo_arena_reset(0) == -1);
     assert(topo_arena_destroy(0) == -1);
+
+    /* extent hooks & custom backing (§23.2/§22.2, W10): create an arena served
+     * from a C-supplied backing, allocate from it, and destroy it (returning the
+     * region to the backing). */
+    assert(topo_max_hook_backends() >= 1u);
+    topo_extent_hooks_t hooks = {0};
+    hooks.alloc = hook_alloc;
+    hooks.dealloc = hook_dealloc;
+    size_t allocs_before = g_hook_allocs;
+    topo_arena_t harena = topo_arena_create_hooked(&hooks, NULL, 4u << 20, 8u << 20);
+    assert(harena >= 1);
+    assert(g_hook_allocs >= allocs_before + 2); /* span + large regions reserved */
+    void *hxp = topo_mallocx(128, TOPO_ARENA(harena));
+    assert(hxp != NULL);
+    memset(hxp, 0xEE, 128);
+    topomalloc_free(hxp);
+    size_t deallocs_before = g_hook_deallocs;
+    assert(topo_arena_destroy(harena) == 0);
+    assert(g_hook_deallocs > deallocs_before); /* regions returned to the backing */
+    /* a NULL vtable is rejected cleanly */
+    assert(topo_arena_create_hooked(NULL, NULL, 0, 0) == 0);
 
     /* generated table header is consistent and usable from C */
     assert(TOPOMALLOC_QUANTUM == 16u);

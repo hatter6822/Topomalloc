@@ -1,9 +1,12 @@
 # Plan 06 — Public API, Reallocation & Arenas
 
 **Workstreams:** W8 (public API/ABI), W15 (realloc/aligned/calloc), W9 (capability-backed arenas), W10
-(extent hooks) · **Status:** rev 2.3 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
+(extent hooks) · **Status:** rev 2.4 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
 realloc core; **W9 landed (all units, ahead of M4): the live multi-arena data path, the §22.3/§36.13
-lifecycle, capability-monotonic delegation, quotas, NUMA policy, and the C arena API** ·
+lifecycle, capability-monotonic delegation, quotas, NUMA policy, and the C arena API**; **W10 landed
+(all units, ahead of M4): the §23.2 extent-hook interface + `HookProvider` over the backing seam, the
+§23.3 contract enforcement, the §23.4 Lean conditional-correctness model, and §34.8 hook failure
+injection** ·
 **Overview:** [README.md](README.md)
 **SPEC anchors:** §10, §25, §26, §9.6/§9.7, §22, §36.4, §36.13, §23, §35.2/§35.3; F-001..F-010, §15.5.
 **Upstream deps:** [03](03-core-allocator.md) (classify, pagemap, central), [04](04-backend-hugepages-release.md)
@@ -152,7 +155,9 @@ M4, W10, plan 09.
 > in `Check.lean` pinning `ArenaState`/`RevocationPhase` to the Lean machines (the provider/extent bar);
 > a **loom** model of the concurrent quota CAS; a **concurrent multi-arena** isolation test; the
 > **`arena_api` fuzz target**; and a **Miri**-clean pass over the new arena unsafe. Deliberate boundaries
-> (documented, not avoided): the `hooks` descriptor field is W10; cross-label **scrub recording** is
+> (documented, not avoided): the `hooks` descriptor field is W10 (now landed in full — the hook *mechanism*
+> via `HookProvider` **and** the per-arena `hooks` descriptor field via `arena_create_hooked`, see W10);
+> cross-label **scrub recording** is
 > plan 08 W18-6 (POSIX is single-label, so decommit suffices); per-arena **stats rendering** is W17
 > (M6); label *restriction* (vs. the sound equality) is a §36.12 model refinement that would re-open the
 > proven Lean `DelegatesFrom`, deferred to M7; the full combined phase×`State` refinement is M7 formal
@@ -193,11 +198,93 @@ M4, W10, plan 09.
 
 **Depends on:** plan 04 W4, W9. **Enables:** M4.
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W10-1 | Hook interface (§23.2) wired through the provider seam (plan 04). | M | | alloc/dealloc/commit/decommit/purge/split/merge dispatch to user hooks. |
-| W10-2 | Hook contracts (§23.3) enforced/validated (alignment, size, no-overlap, subrange-only, no undocumented reentrancy). | M | | violations detected in debug; assumptions documented in Lean (§23.4). |
-| W10-3 | Failure-injection tests (§34.8): every hook can fail; the allocator stays well-formed. | M | ∥ | fuzzed hook failures never corrupt state. |
+> **▸ Implementation status.** W10 is **landed** (ahead of its M4 slot). Extent
+> hooks are wired **through the provider seam** — the architecturally exact reading
+> of "wired through the provider seam (plan 04)", since that seam *is* the
+> custom-backing abstraction. [`topo_core::hooks`](../../crates/topo-core/src/hooks.rs)
+> defines [`ExtentHooks`] (the §23.2 interface in Rust idiom — `alloc`/`dealloc`/
+> `commit`/`decommit`/`purge_lazy`/`purge_forced`/`split`/`merge`) and the
+> [`HookProvider`] adapter that implements [`TopoBackingProvider`] over it, so an
+> [`ExtentManager`]/[`Allocator`] built over a `HookProvider` runs the whole proven
+> central path on a user backing **with no change above the seam**. The six physical
+> ops map to the existing seam methods (and **gate** — a hook failure is a
+> `BackendError` the manager already recovers from, W4-5); `split`/`merge` are added
+> to the seam as **advisory** notifications (§23.4: the `ExtentMap` owns sub-extent
+> geometry, so a hook failure is *recorded* — [`HookProvider::split_hook_failures`]
+> — never corrupting the bookkeeping), dispatched from the manager's carve/coalesce
+> via the new [`ExtentNotify`] sink (default `NoNotify` ⇒ POSIX/seLe4n unchanged).
+> The §23.3 output contracts that are load-bearing for safety (alignment, size,
+> sub-range) are **enforced** in `HookProvider` — rejected *and* debug-aborted
+> (§2.4), never trusted. The §23.4 conditional-correctness assumption ("allocator
+> correctness assumes hook correctness") is modeled and proof-checked in Lean
+> ([`ExtentHooks.lean`](../../lean/TopoMalloc/ExtentHooks.lean)). Verified by per-crate
+> unit tests, the cross-crate [`extent_hooks.rs`](../../tests/tests/extent_hooks.rs)
+> suite (end-to-end dispatch of every op over the extent manager **and** the full
+> allocator, contract rejection, and the §34.8 failure-injection property), and the
+> `extent_hooks` fuzz target.
+>
+> **▸ Optimal pass (closed).** A deliberate completeness pass closed every gap.
+> **(1) §23.3 stateful enforcement in `HookProvider`** — a fixed-capacity,
+> lock-guarded reservation set detects an `alloc` overlapping a live reservation and
+> a `dealloc` of a region never handed out (rejected + debug-aborted, not just in
+> test backings); a **reentrancy guard** catches a hook re-entering an op on the same
+> provider (debug-abort / refuse, not a deadlock). **(2) Per-arena hooked regions —
+> the full §22.2/§22.4 `hooks` descriptor field**, not just the shared-allocator
+> mechanism: [`Allocator::arena_create_hooked`] gives an arena its **own**
+> `HookProvider`-backed span + large region (`ExtentBacking`/`LargeBacking` seams +
+> a fixed-cap `HookRegistry`; a lock-free `count==0` fast path keeps the no-hooked-
+> arena case zero-overhead), isolated from every other arena's region by construction
+> (§22.7, proven in Lean by `perArena_disjoint_regions_isolate`). The §22.4 order is
+> honoured (reserve + register the backing **before** publishing the id `Active`);
+> destroy returns the region to the hooks (a backing that **refuses** the return
+> quarantines the arena — §36.13 — rather than reporting a clean destroy), reset
+> keeps it. **(3) The C
+> `topo_extent_hooks_t` ABI** (§23.2's C-struct surface): `topo_arena_create_hooked`
+> + the vtable in [`topo-abi`](../../crates/topo-abi/src/hooks_api.rs) and
+> `include/topomalloc.h`, exercised end-to-end by the C and C++ ABI harnesses.
+> **(4) Deeper Lean + a 7th `lake exe check` gate** (`hookContractGate`): the §23.4
+> model now connects to the real `WfRangesDisjoint` clause, and the decidable
+> contract checks are pinned to the Rust `HookProvider` validation. **(5) The full
+> central-path allocator** (not just the extent manager) is fuzzed under hook
+> failures, and a hook-vs-POSIX behavioural-equivalence test. See
+> [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
+>
+> **▸ PR-review hardening (PR #14, closed).** A code review surfaced four fixes,
+> each with a regression test: **(1)** the C `CHooks` adapter is **reclaimed** on
+> destroy (tracked in `CHOOKS_REGISTRY`, freed on a failed create) instead of leaked,
+> so a create/destroy loop stays bounded; **(2)** `arena_create_hooked` checks its
+> **two** per-arena reservations (span + large, separate `HookProvider` trackers) are
+> disjoint, so a hook returning overlapping regions is rejected, not aliased;
+> **(3)** a hook `alloc` result that fails the §23.3 geometry check is **handed back**
+> (`dealloc`) before the reserve fails, leaking no backing; **(4)** **strict fallible
+> teardown** — `ExtentManager`/`LargeAllocator` gain an explicit `teardown()` (release
+> once across it and `Drop`), and `arena_destroy` returns the region to the hooks
+> before the terminal step, so a backing that refuses it routes through the existing
+> `Draining → ErrorQuarantined` edge (returns `Err`; the failure is also counted by
+> `HookProvider::release_hook_failures`). The §36.13 model gains the named obligation
+> `destroy_backing_release_failure_quarantines` (no new edge — the differential stays
+> green). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
+>
+> **▸ Optimal-completion pass (closed).** Routing, scale, and observability: **(1)**
+> per-arena routing is now **O(1)** (a lock-free `hook_slot` index on the `ArenaTable`
+> entry; large ops route by the descriptor's arena) instead of a registry scan;
+> **(2)** `MAX_HOOK_BACKENDS` 8 → **32** (`RESERVATION_CAP` 16 → 4 to shrink each
+> backend; a `const` stack-safe size-budget assertion bounds the inline registry);
+> **(3)** the C adapter reclaim is now **reference-based**
+> (`arena_has_hook_backend`), so a teardown-failure quarantine reclaims it too;
+> **(4)** **hook failures are now observable** — `ArenaStats::hooks` per-arena (the
+> two providers aggregated) and a cumulative `AllocatorStats::hook_failures` +
+> stats-JSON `arenas.hook_failures` globally (a persistent counter folds a backing's
+> counts in before it drops, so a teardown `release` failure survives the destroy).
+> `no_std`-bounded items (cross-provider reentrancy detection, deeper Lean refinement
+> of the teardown link, drain-quarantine slot retention) are documented as deliberate
+> constraints in [docs/DECISIONS.md](../../docs/DECISIONS.md) (W10).
+
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W10-1 | Hook interface (§23.2) wired through the provider seam (plan 04). | M | | alloc/dealloc/commit/decommit/purge/split/merge dispatch to user hooks. | **DONE** — `ExtentHooks` + `HookProvider` (six physical ops via the seam); `split`/`merge` seam notifications dispatched from carve/coalesce through `ExtentNotify`; exercised end to end over both the extent manager and the full allocator |
+| W10-2 | Hook contracts (§23.3) enforced/validated (alignment, size, no-overlap, subrange-only, no undocumented reentrancy). | M | | violations detected in debug; assumptions documented in Lean (§23.4). | **DONE** — `HookProvider` rejects + debug-aborts every §23.3 violation: misaligned/undersized/out-of-range (stateless) **and** no-overlap + dealloc-pairing (a lock-guarded reservation set) **and** reentrancy (a per-provider guard refuses a re-entrant call instead of deadlocking); §23.4 modeled in `ExtentHooks.lean` (alloc/split/merge/subrange preserve disjointness *given* the contract, tied to the real `WfRangesDisjoint`), with a `lake exe check` `hookContractGate` pinning the decidable checks to the Rust ones |
+| W10-3 | Failure-injection tests (§34.8): every hook can fail; the allocator stays well-formed. | M | ∥ | fuzzed hook failures never corrupt state. | **DONE** — every hook can fail; `commit` rolls the carve back, `decommit` retains, `split`/`merge` are advisory; a proptest + the `extent_hooks` fuzz target assert `check_invariants` after every step under injected failures |
 
 ---
 

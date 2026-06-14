@@ -22,7 +22,31 @@
 #include <cstring>
 #include <new>
 #include <thread>
+#include <cstdlib>
 #include <vector>
+
+// A minimal C extent-hook backing (§23.2, W10) with C linkage, so it can be
+// assigned to the C function-pointer fields of topo_extent_hooks_t.
+extern "C" {
+static std::size_t g_cpp_hook_allocs = 0;
+static std::size_t g_cpp_hook_deallocs = 0;
+static void *cpp_hook_alloc(void *, std::size_t size, std::size_t alignment, bool *zero,
+                            bool *commit) {
+    ++g_cpp_hook_allocs;
+    // Honour the requested (PAGE_SIZE) alignment (§23.3); `size` is a multiple of it.
+    void *p = std::aligned_alloc(alignment, size);
+    if (p) {
+        *zero = false;
+        *commit = true;
+    }
+    return p;
+}
+static bool cpp_hook_dealloc(void *, void *addr, std::size_t, bool) {
+    ++g_cpp_hook_deallocs;
+    std::free(addr);
+    return false;
+}
+}
 
 namespace {
 
@@ -181,6 +205,25 @@ int main() {
         assert(topo_arena_destroy(arena) == 0);
         // The default arena is protected.
         assert(topo_arena_destroy(0) == -1);
+
+        // Extent hooks & custom backing (§23.2/§22.2, W10): an arena served from a
+        // C++-supplied backing.
+        assert(topo_max_hook_backends() >= 1u);
+        topo_extent_hooks_t hooks{};
+        hooks.alloc = cpp_hook_alloc;
+        hooks.dealloc = cpp_hook_dealloc;
+        const std::size_t a_before = g_cpp_hook_allocs;
+        const topo_arena_t harena = topo_arena_create_hooked(&hooks, nullptr, 4u << 20, 8u << 20);
+        assert(harena >= 1u);
+        assert(g_cpp_hook_allocs >= a_before + 2);
+        void *xp = topo_mallocx(200, TOPO_ARENA(harena));
+        assert(xp != nullptr);
+        std::memset(xp, 0x44, 200);
+        topomalloc_free(xp);
+        const std::size_t d_before = g_cpp_hook_deallocs;
+        assert(topo_arena_destroy(harena) == 0);
+        assert(g_cpp_hook_deallocs > d_before);
+        assert(topo_arena_create_hooked(nullptr, nullptr, 0, 0) == 0);
     }
 
     std::printf("C++ ABI smoke: OK (version=%s, %u size classes)\n",

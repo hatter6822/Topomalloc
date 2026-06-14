@@ -32,13 +32,15 @@ use std::sync::OnceLock;
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::{
     Allocator, AllocatorConfig, AllocatorStats, ArenaConfig, ArenaError, ArenaId, ArenaPolicy,
-    ArenaStats, Delegation, FreeOutcome, Generation, InvalidFree, MetaArena, PageMap, RequestFlags,
+    ArenaStats, Delegation, ExtentHooks, FreeOutcome, Generation, InvalidFree, MetaArena, PageMap,
+    RequestFlags,
 };
 
 mod arena_api;
 mod c_api;
 mod errno_shim;
 mod extended;
+mod hooks_api;
 mod policy;
 
 pub use arena_api::{
@@ -58,6 +60,7 @@ pub use extended::{
     TOPO_LIFETIME_MEDIUM, TOPO_LIFETIME_SHORT, TOPO_NO_HUGEPAGE, TOPO_PREFER_HUGEPAGE,
     TOPO_TCACHE_NONE, TOPO_ZERO,
 };
+pub use hooks_api::{topo_arena_create_hooked, topo_extent_hooks_t, topo_max_hook_backends};
 pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
@@ -195,9 +198,25 @@ impl AnyAllocator {
         dispatch!(self, a => a.arena_configure(arena, cfg))
     }
 
+    /// Create an arena served from its own [`ExtentHooks`] backing region (§22.2,
+    /// plan 06 W10). `hooks` must be `'static` (the global allocator is `'static`).
+    pub fn arena_create_hooked(
+        &self,
+        policy: &ArenaPolicy,
+        hooks: &'static (dyn ExtentHooks + Send + Sync),
+        cfg: AllocatorConfig,
+    ) -> Result<ArenaId, ArenaError> {
+        dispatch!(self, a => a.arena_create_hooked(policy, hooks, cfg))
+    }
+
     /// A snapshot of an arena's authority + accounting (§22.2/§36.4).
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
         dispatch!(self, a => a.arena_stats(arena))
+    }
+
+    /// Whether `arena` currently has a registered hooked backing (W10).
+    pub fn arena_has_hook_backend(&self, arena: ArenaId) -> bool {
+        dispatch!(self, a => a.arena_has_hook_backend(arena))
     }
 
     /// Whether `arena` is registered and currently allocatable (§22.3).

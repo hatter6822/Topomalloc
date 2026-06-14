@@ -969,3 +969,311 @@ corrected behavior:
   cannot give. New unit + property tests (`delegation_reserves_parent_quota_…`,
   `delegated_subtree_never_exceeds_parent_quota`) and the loom quota model (the
   reservation commits through the same gate CAS) pin it.
+
+## W10 — extent hooks & custom backing over the provider seam (plan 06)
+
+Extent hooks (§23) let an application supply a **custom memory source** or
+**custom OS policies**. The design decision is where they attach, and the answer
+follows from the existing architecture rather than adding a parallel mechanism:
+
+* **Hooks *are* a backing provider.** Every OS/kernel interaction already flows
+  through the `TopoBackingProvider` seam (§3/§36.6) — that seam *is* the
+  custom-backing abstraction (overview §3, D2). So the §23.2 interface is realized
+  as `topo_core::hooks::ExtentHooks` (the eight ops in Rust idiom), adapted to the
+  seam by `HookProvider<H>`. An `ExtentManager`/`Allocator` built over a
+  `HookProvider` runs the whole proven central path on the user backing **with no
+  change above the seam** — the exact reading of "wired through the provider seam
+  (plan 04)". This reuses the seam's fallibility-and-well-formedness contract
+  (§36.6 / W4-5) instead of re-deriving it. The six physical ops map 1:1
+  (`alloc→reserve`, `dealloc→release`, `commit`/`decommit`/`purge_lazy`/
+  `purge_forced`), and a hook failure is the `BackendError` the manager already
+  recovers from.
+
+* **`split`/`merge` are advisory seam notifications, not gates.** They are the two
+  §23.2 ops with no §20.4 physical analogue. In TopoMalloc's architecture the
+  `ExtentMap` is the **source of truth** for sub-extent geometry: the manager
+  reserves one region and subdivides it internally, so the provider/backing sees
+  only offset ranges, never extent objects. `split`/`merge` were therefore added to
+  `TopoBackingProvider` as **default-Ok notification** methods (joining the
+  `decommit`/`purge`/`revoke_descendants` family of default seam ops, so POSIX and
+  seLe4n are unchanged), dispatched from the manager's carve/coalesce through a new
+  `ExtentNotify` sink (`ProviderNotify` adapter; default `NoNotify` is a ZST, so the
+  pre-W10 path is byte-for-byte identical). A hook failure here is **recorded**
+  (`HookProvider::split_hook_failures`/`merge_hook_failures`) but never alters the
+  bookkeeping — §23.3 "hook failures are reported without corrupting allocator
+  state", and §23.4 "allocator correctness assumes hook correctness". This is the
+  only sound choice given an authoritative `ExtentMap`: a notification cannot be a
+  veto without making the allocator's own metadata subordinate to an unverified
+  hook. Threading was done **additively** (`carve`/`split`/`merge`/`coalesce`/`free`
+  keep their signatures; new `*_in` variants take the notifier), so every existing
+  caller, test, and fuzz target is untouched and the proven `ExtentMap` logic is
+  unchanged save for the post-success notify call.
+
+* **§23.3 contracts: enforce the load-bearing half, assume the rest (§2.4).**
+  `HookProvider` validates the cheap, allocation-free output contracts on every
+  call — an `alloc` result must be non-null, aligned to the request, and at least
+  the requested size; a commit/decommit/purge target must be a sub-range of the
+  reservation — and **rejects** a violation with `InvalidRequest` (so even a buggy
+  hook cannot make the allocator hand out memory that fails the request) *and*
+  debug-aborts to surface the hook bug. The stateful contracts (no-overlap with
+  live ranges, dealloc pairs a live reservation) are self-checked by the test/fuzz
+  backings. Reentrancy (§23.3 "no recursive TopoMalloc calls") is the inherited
+  seam contract: hooks run under the held back-end extent lock (as the existing
+  `commit`/`decommit` provider calls do), so a re-entrant allocator call deadlocks
+  on that non-re-entrant lock — the documented, enforced boundary; explicit
+  recursion detection is a hardened-profile concern (plan 08).
+
+* **§23.4 modeled in Lean.** `lean/TopoMalloc/ExtentHooks.lean` states the §23.3
+  contracts as hypotheses and proves the operations preserve the well-formedness
+  core *under* them: a contract-honouring `alloc` keeps the allocator's ranges
+  pairwise disjoint; `split`/`merge` keep the region tiled and preserve
+  disjointness from every other extent; a sub-range op touches no other extent. Each
+  theorem consumes the contract and concludes well-formedness — literally "allocator
+  correctness assumes hook correctness" — and rests only on the standard axioms
+  (`propext`/`Quot.sound`/`Classical.choice`), with a non-vacuity witness so nothing
+  is proved vacuously. The Rust `HookProvider` discharges the cheap half of the
+  premise at runtime, so only the genuinely unverifiable backing behaviour is
+  assumed.
+
+* **W10-3 failure injection.** Every fallible runtime hook can fail and the back-end
+  stays well-formed: a `commit` failure rolls the carve back (W4-5), a `decommit`
+  failure (unmap policy) retains the extent, `split`/`merge` failures are advisory.
+  A proptest (`tests/tests/extent_hooks.rs`) and the `extent_hooks` fuzz target
+  assert `check_invariants` after every step under randomized per-hook failures.
+
+### W10 optimal pass (per-arena hooked regions + C ABI + hardening)
+
+A deliberate completeness pass closed every gap the first pass deferred:
+
+* **§23.3 stateful enforcement moved into `HookProvider` (not just test
+  backings).** A fixed-capacity, lock-guarded reservation set (`ReservationSet`,
+  allocation-free, cap 16 — a provider backs one manager ⇒ ≤ 1 live reservation)
+  detects an `alloc` result that overlaps a live reservation, and a `dealloc` of a
+  region never handed out — rejected *and* debug-aborted. A per-provider
+  reentrancy guard (`in_hook` flag) catches a hook that re-enters an op on the same
+  provider (refuse with `Unsupported` + debug-abort) instead of deadlocking on the
+  held back-end lock — clean detection, the documented enforcement of §23.3's "no
+  recursive TopoMalloc calls" for the common same-provider case (cross-provider
+  re-entry still hits the lock).
+* **Per-arena hooked regions — the full §22.2/§22.4 `hooks` descriptor field.**
+  This is the re-architecture the first pass deferred (and the user later
+  requested). An arena created with `Allocator::arena_create_hooked` serves its
+  span **and** large allocations from its own `HookProvider`-backed region,
+  **isolated** from every other arena's region by construction (§22.7 — proven in
+  Lean by `perArena_disjoint_regions_isolate`: disjoint regions ⇒ disjoint
+  allocations). The design keeps the proven shared path byte-identical:
+  - The span/large paths route the *extent source* through new type-erased seams
+    `ExtentBacking` / `LargeBacking` (impl'd by `ExtentManager<P>` /
+    `LargeAllocator<P>`), so the call sites are not generic over the provider; a
+    fixed-capacity `HookRegistry` (`MAX_HOOK_BACKENDS`) holds the per-arena
+    backends, and a **lock-free `count == 0` fast path** means a program with no
+    hooked arenas pays nothing. Hooks are **borrowed** (`&'a dyn ExtentHooks`), not
+    boxed, so the core stays allocation-free (no re-entrant `Box::new` through the
+    global allocator); a hooked arena's hooks outlive the allocator like the
+    metadata/pagemap do.
+  - Routing: span create/retire route by `span.arena()`; large alloc by arena;
+    large **free / `usable_size` / `realloc` find the owner** (the one backend whose
+    descriptor pool resolves the pointer — the shared pagemap is global, so the
+    descriptor is found by trying the shared backend then each hooked one; a hooked
+    arena's descriptor is *not* in the shared pool, so every pool-querying op must
+    route, not just `free`); drain routes by arena. `stats()` and `check_invariants`
+    **aggregate** every backend, so the live-large count and the §20.1 physical-state
+    breakdown cover the hooked regions too.
+  - Lifecycle (§22.4 order): the hooked backing is reserved + **registered before**
+    the arena id is published `Active` (the id is private to the create call until
+    then, so the window is race-free). `arena.rs` gains
+    `create_pending`/`publish`/`abandon_pending` for that split. Destroy tears the
+    region down (returns it to the hooks via `dealloc`, *outside* the registry lock
+    so the hook never runs under it) **before** the terminal step, so a backing that
+    refuses the return quarantines rather than reporting a clean destroy (the
+    strict-teardown hardening below); reset keeps it.
+  - Concurrency (soundness): the registry is accessed **per element via raw
+    pointers** — never a whole-array `&[Option; N]` / `&mut [Option; N]` — the same
+    slot-pool discipline `ExtentMap`/`SpanPool`/`ArenaTable` use. A reference into
+    one slot is then disjoint from a concurrent destroy clearing *another* slot
+    (which only forms a narrow `&mut` to its own element), so a worker holding a
+    backend reference for arena X is never invalidated by a destroy of arena Y — no
+    whole-array `&mut` to over-assert. Slots are cleared in place (never moved), so
+    under the §22.5/§36.13 quiescence contract (an arena's create/destroy does not
+    race its own alloc/free) a backend reference is stable for the op. A concurrent
+    stress test (workers hammer one hooked arena while another thread create/destroys
+    others) exercises exactly this.
+* **The C `topo_extent_hooks_t` ABI (§23.2's C-struct surface).** `topo-abi`
+  exposes the vtable + `topo_arena_create_hooked(hooks, ctx, span_bytes,
+  large_bytes)` + `topo_max_hook_backends()`; a `CHooks` adapter maps the C
+  function pointers (jemalloc bool convention: `true` ⇒ failure; NULL op ⇒ the
+  no-op default) to the Rust trait. The vtable is copied (the caller's struct need
+  not persist); the adapter is heap-owned with a `'static` borrow handed to the
+  allocator, tracked in `CHOOKS_REGISTRY` and **reclaimed on destroy** (freed on a
+  failed create) so a create/destroy loop stays bounded — see the PR-review
+  hardening below (it is *not* leaked, despite an earlier pass that left it so).
+  `include/topomalloc.h` declares it; the C and C++ ABI harnesses drive a real
+  custom backing end to end; the `nm` header↔symbol cross-check balances at 30.
+  (A hook backing must honour the requested `PAGE_SIZE` alignment — the §23.3 guard
+  correctly rejects a plain-`malloc` backing, so the harnesses use `aligned_alloc`.)
+* **Deeper Lean + a 7th gate.** `ExtentHooks.lean` now connects the §23.4 contract
+  to the **real** `WfRangesDisjoint` clause of the abstract `State`
+  (`allocContract_preserves_rangesDisjoint`), not just `Range` geometry; decidable
+  mirrors of the Rust `HookProvider` checks (`alignedOk`/`atLeastOk`/`subrangeOk`)
+  are tied to the contract props and gated by a new `lake exe check`
+  `hookContractGate`, so the model and the runtime enforcement cannot drift.
+* **Stronger tests.** The **full** central-path allocator (malloc/free/realloc, not
+  just the extent manager) is fuzzed under injected hook failures asserting the
+  §8.6 identity + non-aliasing; a hook-vs-POSIX behavioural-equivalence test; and
+  per-arena routing/isolation/lifecycle/registry-full integration tests.
+
+* **Audit pass (two real fixes).** A deliberate deep audit of the per-arena work
+  found and fixed: **(a)** a soundness hazard — the registry originally formed
+  whole-array `&`/`&mut` references and returned an element reference held without
+  the lock, which a concurrent destroy of a *different* arena could invalidate
+  under Stacked/Tree Borrows (latent UB despite disjoint writes); rewritten to
+  per-element raw access. **(b)** a correctness bug — `realloc`/`usable_size` of a
+  hooked-arena *large* object queried the shared large pool (which cannot resolve a
+  hooked descriptor) and so spuriously returned NULL/None; routed through the owner
+  like `free`. Both now have regression tests (a concurrent registry stress test
+  and a hooked-arena large realloc test). The audit also closed the stats gap above
+  (aggregate `live_large` + backend breakdown over the hooked regions).
+
+* **PR-review hardening (PR #14, four fixes).** A code review of the per-arena +
+  C-ABI work surfaced four issues, each fixed with a regression test:
+  - **Adapter lifetime (P2).** The C `CHooks` adapter was leaked on every create.
+    Now each adapter's box address is tracked in `CHOOKS_REGISTRY` keyed by arena
+    id and **reclaimed** on `topo_arena_destroy` (and freed on a failed create), so
+    a create/destroy loop no longer grows the heap. The reclaim runs only on a clean
+    `Ok` destroy — by then the arena's backend (and its `HookProvider<&CHooks>`
+    borrow) is gone, so the free is sound; a quarantined destroy keeps the adapter
+    (a bounded, terminal-failure retention, never a use-after-free).
+  - **Cross-region no-overlap (P2).** A hooked arena reserves its span and large
+    regions through **two** `HookProvider` instances, so neither tracker sees the
+    other's range. A buggy hook returning overlapping span/large regions would let
+    small spans and large allocations alias. `arena_create_hooked` now checks the
+    two reserved regions are disjoint at construction — debug-abort, release-reject
+    (`ArenaError::Exhausted`), with both built managers handing their regions back.
+  - **Reject-path hand-back (P2).** When a hook's `alloc` result fails the §23.3
+    geometry check, `HookProvider::reserve` now returns the range to the hook
+    (`dealloc`) before failing, so a rejected reservation never leaks the backing.
+    (The rejected range was never recorded as live, so the hand-back dispatches the
+    hook's `dealloc` directly, not `release` — which would trip the pairing check.)
+  - **Strict fallible teardown (P2, §36.13).** Previously a backing `dealloc`
+    failure during destroy was swallowed by the infallible `ExtentManager::drop`.
+    Now `ExtentManager`/`LargeAllocator` expose an explicit fallible `teardown()`
+    (release exactly once across it and `Drop`, via a `released` flag), and
+    `arena_destroy` returns the hooked region to the hooks **before** `finish_destroy`
+    — a refusal routes through the existing `Draining → ErrorQuarantined` edge
+    (returns `Err`, arena quarantined, never a clean `Destroyed`), exactly the
+    capability-revoke partial-failure shape. The failure is also counted for
+    observability (`HookProvider::release_hook_failures`, mirroring the
+    `split`/`merge` counters). No new abstract transition: the trigger rides the
+    already-proven quarantine edge, pinned by the named Lean obligation
+    `ArenaLifecycle.destroy_backing_release_failure_quarantines` (the Rust↔Lean
+    `state_machine_is_exactly_the_spec_graph` differential stays green).
+
+### W10 optimal-completion pass (routing, scale, observability)
+
+A final pass closed the remaining big-O / observability gaps a self-audit surfaced.
+
+* **O(1) per-arena routing (was an O(MAX_HOOK_BACKENDS) scan).** Each arena now
+  records its hooked-backing **registry slot** in a lock-free `AtomicU8` on its
+  `ArenaTable` entry (`hook_slot`, `0` = none, `k` = registry slot `k − 1`). Routing
+  reads it directly instead of scanning the registry:
+  - `hook_backend(arena)` keeps the zero-overhead `count == 0` fast path (no hooked
+    arena ⇒ one atomic, no table/registry touch), then on a hit reads `hook_slot` and
+    indexes the one slot under the registry lock (a defensive `b.arena == arena`
+    identity check fails closed).
+  - large `free`/`realloc`/`usable_size` route by the **descriptor's** arena —
+    `FreeTarget::Large { desc }` / `PointerClass::Large { desc }` carry
+    `*const LargeDescriptor`, whose `arena()` names the owner in O(1); the per-arena
+    pool *is* where its descriptors live, so no descriptor-pool search remains.
+  Memory ordering: `set_hook_slot` is program-ordered **before** the registry `count`
+  release at registration, so a reader that observes `count ≥ 1` (Acquire) also
+  observes the slot. Slot stability is the same §22.5/§36.13 quiescence argument as
+  before (an arena's own create/destroy never races its own op; a *different* arena's
+  destroy clears only its own slot in place). The change deleted the
+  `LargeBacking::arena_of` scan callers.
+* **Scale: `MAX_HOOK_BACKENDS` 8 → 32, footprint shrunk.** The registry is a fixed
+  inline array built **on the stack** at construction (the allocator is created by
+  value before being boxed/leaked), so the cap is **stack-bounded** — raising it to 64
+  overflowed the dual-backend (`AnyAllocator`/G-sim) init. To raise it safely,
+  `RESERVATION_CAP` dropped 16 → 4 (a provider holds ≤ 1 live reservation, so 16 was
+  4× over-provisioned), shrinking each backend ~1 KiB → ~0.6 KiB; a `const _`
+  `assert!` then caps the inline array at a **48 KiB stack-safe budget** so neither a
+  raised cap nor a future field on `ArenaHookBackend` can overflow init or silently
+  bloat every allocator. The `u8` slot index bounds it at 255; the budget bites first.
+  (A genuinely large population would need the registry moved out of line into the
+  metadata arena — a future refactor, not the inline array.)
+* **Adapter reclaim made precise (reference-based, not success-code-based).** The C
+  `topo_arena_destroy` now reclaims the `CHooks` adapter iff
+  `!arena_has_hook_backend(id)` — i.e. exactly when the allocator no longer holds the
+  backend (and thus the adapter borrow). That covers a clean destroy **and** a
+  *teardown-failure* quarantine (the backend was dropped during the failed teardown),
+  closing the small adapter leak the earlier "Ok-only" rule left there; a
+  *drain-failure* quarantine keeps the backend (borrow alive) so the adapter is
+  correctly retained. `Allocator::arena_has_hook_backend` is the `hook_slot != 0`
+  read. (No use-after-free: teardown drops the backend synchronously before
+  `arena_destroy` returns, so "no backend" ⇒ "no borrow".)
+* **Observability: hook failures are now reachable.** The self-audit's headline gap
+  was that the `HookProvider` failure counters were unreadable for a *hooked arena*
+  (the provider is internal). Fixed at both granularities, mirroring
+  `numa_bind_failures`:
+  - `HookProvider` gained a `commit` (commit/decommit/purge) counter alongside the
+    existing release/split/merge. Only **swallowed** failures are counted — those the
+    allocator handles internally (and so are otherwise invisible). A `reserve` failure
+    is deliberately *not* counted: it is **returned** to the caller (the alloc /
+    arena-create fails visibly) and drops the backing, so a counter would be redundant
+    *and* structurally always 0 in the aggregated view (a live/retired hooked arena
+    reserved successfully). The reject-path hand-back `dealloc` failure (a backing
+    refusing its *own* bad result back) counts as a **`release`** failure.
+  - **Per-arena:** `ArenaStats::hooks: Option<HookFailureStats>` — aggregated over the
+    arena's **two** providers (span + large) by `Allocator::arena_stats`; `None` for a
+    non-hooked arena. Read **under the registry lock** (not via `hook_backend`, which
+    releases it): `arena_stats` is introspection and *can* race `arena_destroy`, so it
+    must block the teardown from dropping the backing mid-read — the alloc/free routing
+    is instead protected by the §22.5 quiescence contract.
+  - **Global:** `AllocatorStats::hook_failures` and the stats-JSON
+    `arenas.hook_failures` object (additive, §35.3) — the operator-facing surface that
+    reaches C. It is a **cumulative** total: a persistent `AtomicHookFailures` on the
+    allocator folds a backend's counts in **before it drops** at teardown (so a
+    `release` failure, which fires *during* teardown, survives the destroy), plus
+    every live backend's current counts.
+
+#### Deliberate constraints (documented, not "fixed")
+
+These were weighed and left as the right design for a safety-first `no_std` core.
+
+* **Cross-provider reentrancy is bounded by the lock, not detected.** The `in_hook`
+  flag cleanly catches a hook re-entering an op on the **same** provider. A hook that
+  re-enters via a *different* provider is bounded by the non-re-entrant back-end lock
+  (it deadlocks rather than corrupting state — still safe). Full recursion detection
+  needs a per-thread guard; `topo-core` is `no_std` and has **no thread-local**, and a
+  global flag would false-positive across threads. Clean full detection is therefore a
+  hardened/`std`-profile concern, already scheduled for plan 08 W18 — adding a `std`
+  feature to the core here would duplicate it and breach the `no_std` discipline.
+* **The teardown→quarantine link is modeled at the phase level, by design.** The Lean
+  obligation `destroy_backing_release_failure_quarantines` states the
+  `Draining → ErrorQuarantined` edge; the runtime fact that
+  `teardown_hook_backend` returning `Err` *drives* it sits **below** the
+  backing-provider abstraction (trust boundary #2, §36.6). Refining it into the
+  abstract `arenaDestroy` transition would mean modeling the provider in Lean, which
+  the trust boundary deliberately abstracts. The Rust behavior is pinned by a test.
+* **A drain-failure quarantine retains its registry slot — necessarily.** A failed
+  capability *revoke* (seLe4n; POSIX revoke is the ambient no-op) means the region's
+  descendants are still live, so the region **must not** be returned to the backing
+  (§36.6/§36.13 revoke-before-recycle). The backend therefore stays registered
+  (slot held). This is correct, not a leak to "reclaim"; quarantine is terminal by
+  spec, and a recovery/reaping mechanism for quarantined arenas is a separate feature.
+* **The `alloc` `zero`/`commit` out-flags are not consumed.** `HookProvider::reserve`
+  commits before use (M-005) and zeroes via the §26.3 span zeroed-flag, so a backing
+  that pre-commits/pre-zeroes optimises through its own cheap `commit` hook, not the
+  reservation flags — a deliberate layering choice that keeps the reservation path
+  uniform across POSIX/seLe4n/hooks.
+* **`RESERVATION_CAP = 4` degrades to best-effort past 4 live ranges** — which cannot
+  happen (a provider backs one manager ⇒ ≤ 1 live reservation); past it the
+  no-overlap/pairing checks never *false*-alarm, they only stop tracking.
+
+Verified by per-arena/global stats tests (`per_arena_hook_failures_surface_in_stats`,
+the topo-stats JSON test), the existing concurrent registry stress test (now over the
+O(1) path), the strict-teardown + reclaim tests, and the §34.8 extent-stream fuzz
+(which covers the state-corruption-risk hooks — commit/decommit/split/merge). A
+dedicated arena-lifecycle fuzz target is the one deferred item (the per-arena path is
+covered deterministically and concurrently; a nightly fuzz target could not be
+compiled-verified in the work environment).

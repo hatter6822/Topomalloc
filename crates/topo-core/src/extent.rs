@@ -300,6 +300,21 @@ impl StateBytes {
     pub const fn free(self) -> usize {
         self.reserved + self.dirty + self.muzzy + self.released
     }
+
+    /// Field-wise sum, for aggregating several regions' breakdowns into one total
+    /// (e.g. the shared backend plus each per-arena hooked region, W10). Saturating
+    /// so an aggregate never wraps (`StateBytes` are byte counts bounded by the
+    /// reserved address space; saturation is belt-and-suspenders).
+    #[inline]
+    pub const fn add(self, other: StateBytes) -> StateBytes {
+        StateBytes {
+            reserved: self.reserved.saturating_add(other.reserved),
+            active: self.active.saturating_add(other.active),
+            dirty: self.dirty.saturating_add(other.dirty),
+            muzzy: self.muzzy.saturating_add(other.muzzy),
+            released: self.released.saturating_add(other.released),
+        }
+    }
 }
 
 /// A back-end operation that could not complete. Every variant leaves the
@@ -338,6 +353,54 @@ pub enum Fit {
     /// size-segregated, so the smallest fit is in the lowest non-empty bin.
     #[default]
     Best,
+}
+
+/// Sink notified when the bookkeeping **splits or merges** an extent within a
+/// provider-supplied region — the §23.2 `split`/`merge` hook point (plan 06 W10).
+/// A *custom backing* (one supplied through the [`TopoBackingProvider`] seam, e.g.
+/// a `HookProvider`) uses it to keep its own notion of extent boundaries (§23.1)
+/// in step with the allocator's `ExtentMap`.
+///
+/// **Advisory (§23.4).** The `ExtentMap` is the source of truth for sub-extent
+/// geometry: it subdivides the region it `reserve`d without otherwise involving
+/// the provider, so a notification carries information the backing *may* track,
+/// never permission the bookkeeping *needs*. The methods therefore return nothing
+/// — a notifier records or forwards as it sees fit but can never veto or corrupt a
+/// split/merge, so the back-end stays well-formed regardless (W10-3). The
+/// addresses are absolute byte addresses within the managed region (the same
+/// addresses the backing handed out via `reserve`/`alloc`).
+pub trait ExtentNotify {
+    /// The extent `[base, base + total_len)` was split into a prefix of
+    /// `prefix_len` bytes (kept at `base`) and a suffix of `total_len - prefix_len`
+    /// bytes (at `base + prefix_len`). `backed` is whether the extent was fully
+    /// physically committed (so both halves are).
+    fn on_split(&self, base: usize, total_len: usize, prefix_len: usize, backed: bool);
+
+    /// The address-adjacent extents `[left_base, left_base + left_len)` and
+    /// `[right_base, right_base + right_len)` (with `left_base + left_len ==
+    /// right_base`) were merged into the left one. `backed` is whether both were
+    /// fully committed (the merge only coalesces backing-compatible neighbours).
+    fn on_merge(
+        &self,
+        left_base: usize,
+        left_len: usize,
+        right_base: usize,
+        right_len: usize,
+        backed: bool,
+    );
+}
+
+/// The no-op notifier — the POSIX/seLe4n default. The allocator subdivides its
+/// reserved region without telling the provider, exactly as before W10. A ZST, so
+/// `carve`/`free` over `&NoNotify` compile to the identical pre-W10 code.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoNotify;
+
+impl ExtentNotify for NoNotify {
+    #[inline]
+    fn on_split(&self, _base: usize, _total_len: usize, _prefix_len: usize, _backed: bool) {}
+    #[inline]
+    fn on_merge(&self, _lb: usize, _ll: usize, _rb: usize, _rl: usize, _backed: bool) {}
 }
 
 /// One pool slot. All fields are integers, so a zeroed block of slots is a valid
@@ -787,6 +850,19 @@ impl ExtentMap {
     ///
     /// SPEC-transition: `extent_split` (§18.3 / §33.4 `span_split_preserves_disjointness`)
     pub fn split(&mut self, id: ExtentId, prefix_len: usize) -> Option<ExtentId> {
+        self.split_in(id, prefix_len, &NoNotify)
+    }
+
+    /// [`split`](Self::split), additionally notifying `notify` of the §23.2 split
+    /// once it has succeeded (plan 06 W10). The notification is the *only*
+    /// difference from [`split`](Self::split); the bookkeeping is identical, so the
+    /// `&NoNotify` form is byte-for-byte the pre-W10 path.
+    pub fn split_in(
+        &mut self,
+        id: ExtentId,
+        prefix_len: usize,
+        notify: &dyn ExtentNotify,
+    ) -> Option<ExtentId> {
         let parent = self.view(id)?;
         // §18.4: both results page-aligned ⇒ prefix is a nonzero page multiple,
         // and strictly less than the extent (a zero-length tail is not a split).
@@ -836,6 +912,10 @@ impl ExtentMap {
             self.bin_insert(right.0);
         }
         debug_assert!(self.check_invariants());
+        // §23.2 split notification (W10): the bookkeeping has committed, so this is
+        // purely informational (a custom backing may track the new boundary). Uses
+        // the pre-split geometry (`parent`), the source of `prefix_len`.
+        notify.on_split(parent.base, parent.len, prefix_len, backed);
         Some(right)
     }
 
@@ -864,6 +944,13 @@ impl ExtentMap {
     ///
     /// SPEC-transition: `extent_merge` (§18.3 / §33.4 `span_merge_preserves_disjointness`)
     pub fn merge(&mut self, left: ExtentId, right: ExtentId) -> bool {
+        self.merge_in(left, right, &NoNotify)
+    }
+
+    /// [`merge`](Self::merge), additionally notifying `notify` of the §23.2 merge
+    /// once it has succeeded (plan 06 W10). Informational only — see
+    /// [`split_in`](Self::split_in).
+    pub fn merge_in(&mut self, left: ExtentId, right: ExtentId, notify: &dyn ExtentNotify) -> bool {
         let (lv, rv) = match (self.view(left), self.view(right)) {
             (Some(l), Some(r)) => (l, r),
             _ => return false,
@@ -893,6 +980,10 @@ impl ExtentMap {
         self.bin_insert(left.0);
         self.push_slot(right.0);
         debug_assert!(self.check_invariants());
+        // §23.2 merge notification (W10): informational, after the bookkeeping
+        // commits. Uses the pre-merge geometries (`lv`/`rv`); `backed` is shared
+        // because `mergeable` already required backing-compatibility.
+        notify.on_merge(lv.base, lv.len, rv.base, rv.len, lv.committed_len == lv.len);
         true
     }
 
@@ -901,15 +992,21 @@ impl ExtentMap {
     /// At most two merges (left and right neighbour), each O(1) via the address
     /// list — the boundary-tag coalescing of DD-1.
     pub fn coalesce(&mut self, id: ExtentId) -> ExtentId {
+        self.coalesce_in(id, &NoNotify)
+    }
+
+    /// [`coalesce`](Self::coalesce), notifying `notify` of each §23.2 merge it
+    /// performs (plan 06 W10).
+    pub fn coalesce_in(&mut self, id: ExtentId, notify: &dyn ExtentNotify) -> ExtentId {
         let mut survivor = id;
         // Merge with the right neighbour into `survivor`.
         let next = self.get(survivor.0).addr_next;
-        if next != NIL && self.merge(survivor, ExtentId(next)) {
+        if next != NIL && self.merge_in(survivor, ExtentId(next), notify) {
             // `survivor` absorbed `next`.
         }
         // Merge with the left neighbour into it (the left becomes the survivor).
         let prev = self.get(survivor.0).addr_prev;
-        if prev != NIL && self.merge(ExtentId(prev), survivor) {
+        if prev != NIL && self.merge_in(ExtentId(prev), survivor, notify) {
             survivor = ExtentId(prev);
         }
         survivor
@@ -974,6 +1071,20 @@ impl ExtentMap {
     ///
     /// SPEC-transition: `extent_alloc` (§18.3)
     pub fn carve(&mut self, needed_len: usize, align: usize, fit: Fit) -> Option<ExtentId> {
+        self.carve_in(needed_len, align, fit, &NoNotify)
+    }
+
+    /// [`carve`](Self::carve), notifying `notify` of each §23.2 split the carve
+    /// performs (an alignment-prefix trim and/or a size-tail trim, plan 06 W10).
+    /// The notification is the *only* difference; the carve's pre-check-then-commit
+    /// failure-safety (W4-5: a refused carve never half-mutates) is unchanged.
+    pub fn carve_in(
+        &mut self,
+        needed_len: usize,
+        align: usize,
+        fit: Fit,
+        notify: &dyn ExtentNotify,
+    ) -> Option<ExtentId> {
         if needed_len == 0 || !needed_len.is_multiple_of(PAGE_SIZE) || !align.is_power_of_two() {
             return None;
         }
@@ -992,13 +1103,13 @@ impl ExtentMap {
         // Trim the alignment prefix: split off `[base, aligned)` as a free head,
         // and continue with the aligned remainder.
         if prefix > 0 {
-            let right = self.split(active, prefix)?; // left stays free, right is aligned
+            let right = self.split_in(active, prefix, notify)?; // left free, right aligned
             active = right;
         }
         // Trim the size remainder: split off the tail past `needed_len` as free.
         let active_len = self.get(active.0).len;
         if active_len > needed_len {
-            let _tail = self.split(active, needed_len)?; // tail stays free
+            let _tail = self.split_in(active, needed_len, notify)?; // tail stays free
         }
         debug_assert_eq!(self.get(active.0).base, aligned);
         debug_assert_eq!(self.get(active.0).len, needed_len);
@@ -1029,6 +1140,17 @@ impl ExtentMap {
     ///
     /// SPEC-transition: `extent free` (object/span `Live -> CentralFree`/`Dirty`, §7.2/§20.1)
     pub fn free(&mut self, id: ExtentId, new_state: ExtentState) -> Option<ExtentId> {
+        self.free_in(id, new_state, &NoNotify)
+    }
+
+    /// [`free`](Self::free), notifying `notify` of each §23.2 merge the coalesce
+    /// performs (plan 06 W10).
+    pub fn free_in(
+        &mut self,
+        id: ExtentId,
+        new_state: ExtentState,
+        notify: &dyn ExtentNotify,
+    ) -> Option<ExtentId> {
         let e = self.view(id)?;
         debug_assert_eq!(e.state, ExtentState::Active, "freeing a non-Active extent");
         debug_assert!(
@@ -1040,7 +1162,7 @@ impl ExtentMap {
         self.put(id.0, s);
         self.free_bytes += e.len;
         self.bin_insert(id.0);
-        let survivor = self.coalesce(id);
+        let survivor = self.coalesce_in(id, notify);
         debug_assert!(self.check_invariants());
         Some(survivor)
     }
@@ -1329,6 +1451,59 @@ pub struct NoRegionCache;
 
 impl RegionCacheHook for NoRegionCache {}
 
+/// Adapts a [`TopoBackingProvider`] to the [`ExtentNotify`] sink (plan 06 W10): a
+/// bookkeeping split/merge inside the manager's region is dispatched to the
+/// provider's §23.2 [`split`](TopoBackingProvider::split) /
+/// [`merge`](TopoBackingProvider::merge) hook (a no-op default on POSIX/seLe4n; the
+/// custom-backing notification on a `HookProvider`). The absolute extent base the
+/// `ExtentMap` reports is rebased onto the manager's reserved region, so the
+/// dispatched [`Region`] pointer carries the backing's own provenance rather than a
+/// bare integer cast. The provider's `Result` is intentionally discarded — the
+/// notification is advisory (§23.4): the bookkeeping has already committed and is
+/// well-formed; a backing that wishes to surface a hook failure records it itself
+/// (e.g. `HookProvider`'s counters).
+struct ProviderNotify<'p, P: TopoBackingProvider> {
+    provider: &'p P,
+    /// The manager's whole reserved region — its `base` is the provenance root.
+    region: Region,
+    /// The arena the manager serves (passed through to the §23.2 hook).
+    arena: ArenaId,
+}
+
+impl<P: TopoBackingProvider> ProviderNotify<'_, P> {
+    /// A same-provenance [`Region`] for the sub-extent `[base, base + len)` within
+    /// the reserved region (`base` is an absolute address the `ExtentMap` reports).
+    #[inline]
+    fn subregion(&self, base: usize, len: usize) -> Region {
+        let offset = base.wrapping_sub(self.region.base as usize);
+        Region {
+            base: self.region.base.wrapping_add(offset),
+            len,
+        }
+    }
+}
+
+impl<P: TopoBackingProvider> ExtentNotify for ProviderNotify<'_, P> {
+    #[inline]
+    fn on_split(&self, base: usize, total_len: usize, prefix_len: usize, backed: bool) {
+        let region = self.subregion(base, total_len);
+        let _ = self.provider.split(
+            self.arena,
+            region,
+            prefix_len,
+            total_len - prefix_len,
+            backed,
+        );
+    }
+
+    #[inline]
+    fn on_merge(&self, lb: usize, ll: usize, rb: usize, rl: usize, backed: bool) {
+        let left = self.subregion(lb, ll);
+        let right = self.subregion(rb, rl);
+        let _ = self.provider.merge(self.arena, left, right, backed);
+    }
+}
+
 /// The back-end extent manager (§18): an [`ExtentMap`] over a provider-reserved
 /// region, guarded by the §27.2 backend lock and driving the
 /// [`TopoBackingProvider`] for every physical-state transition. POSIX is the
@@ -1348,6 +1523,12 @@ pub struct ExtentManager<P: TopoBackingProvider> {
     retain: RetainPolicy,
     lock: BackendLock,
     map: UnsafeCell<ExtentMap>,
+    /// Whether the region has already been returned to the provider — set by an
+    /// explicit [`teardown`](Self::teardown) or by `Drop`, so the `release` happens
+    /// exactly once. Only ever touched under exclusive access (`&mut self` / drop),
+    /// never through a shared `&self`, so it needs no synchronization (W10 fallible
+    /// teardown).
+    released: bool,
 }
 
 // SAFETY: every access to `map` goes through `lock` (the §27.2 backend lock),
@@ -1415,6 +1596,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
                     retain: RetainPolicy::from_profile(),
                     lock: BackendLock::new(),
                     map: UnsafeCell::new(map),
+                    released: false,
                 })
             }
             None => {
@@ -1443,6 +1625,39 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         self.provider.name()
     }
 
+    /// The whole reserved [`Region`] this manager owns (its single provider
+    /// reservation). Used to confirm two managers over a custom backing hold
+    /// **disjoint** regions (§23.3 no-overlap across separate reservations, W10).
+    #[inline]
+    pub fn reserved_region(&self) -> Region {
+        self.region
+    }
+
+    /// Borrow the backing provider — e.g. to read a [`HookProvider`](crate::HookProvider)'s
+    /// per-kind hook-failure counts for [`ArenaStats`](crate::ArenaStats) (W10).
+    #[inline]
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    /// **Explicitly** return the reserved region to the provider, surfacing the
+    /// provider's result instead of discarding it the way `Drop` must (W10 strict
+    /// teardown). Idempotent: the region is released **exactly once** across this
+    /// call and the eventual `Drop`. A custom backing ([`HookProvider`](crate::HookProvider))
+    /// can refuse the return (a failing `dealloc` hook); the arena-destroy path routes
+    /// that `Err` into the §36.13 quarantine instead of reporting a clean destroy.
+    ///
+    /// The release is attempted only once even on failure: a refused return will
+    /// refuse again, and the provider's reservation set has already dropped the
+    /// region, so a retry from `Drop` would mis-account it.
+    pub fn teardown(&mut self) -> Result<(), BackendError> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        self.provider.release(self.arena, self.region)
+    }
+
     /// Acquire the backend lock and expose the guarded map (RAII release).
     #[inline]
     fn lock(&self) -> MapGuard<'_> {
@@ -1458,6 +1673,18 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     #[inline]
     fn sub_offset(&self, extent_base: usize) -> usize {
         extent_base - (self.region.base as usize)
+    }
+
+    /// The [`ExtentNotify`] sink that dispatches the bookkeeping's split/merge
+    /// events to the provider's §23.2 hooks (plan 06 W10). Borrows the provider for
+    /// the duration of one `carve_in`/`free_in`; a no-op on POSIX/seLe4n.
+    #[inline]
+    fn notifier(&self) -> ProviderNotify<'_, P> {
+        ProviderNotify {
+            provider: &self.provider,
+            region: self.region,
+            arena: self.arena,
+        }
     }
 
     /// The [`Region`] (address + length) backing extent `r`, or `None` if stale.
@@ -1530,10 +1757,12 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
             return Err(ExtentError::InvalidRequest);
         }
         let needed = align_up(size, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        let notify = self.notifier();
         let g = self.lock();
+        // Carve, dispatching each alignment/size-trim split to the §23.2 hook (W10).
         let id = g
             .map
-            .carve(needed, align, fit)
+            .carve_in(needed, align, fit, &notify)
             .ok_or(ExtentError::Exhausted)?;
         // Commit the part of the carved extent that is not yet backed (M-005). For
         // a freshly carved extent `committed_len` is `0` (was Reserved/Released) or
@@ -1545,12 +1774,14 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
             if let Err(err) = self.provider.commit(self.region, offset, uncommitted) {
                 // Roll back: return the carved extent to the free index in a state
                 // consistent with its (unchanged) backing, leaving us well-formed.
+                // The coalesce notifies the §23.2 merge hook, so a backing that saw
+                // the carve's splits sees the matching re-merge (net zero).
                 let recovered = if e.committed_len == e.len {
                     ExtentState::Dirty
                 } else {
                     ExtentState::Released
                 };
-                g.map.free(id, recovered);
+                g.map.free_in(id, recovered, &notify);
                 return Err(ExtentError::Backend(err));
             }
             g.map.mark_committed(id);
@@ -1604,25 +1835,27 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     ///
     /// SPEC-transition: `extent free` (object `Live -> CentralFree`/`Dirty`, §7.2/§20.1)
     pub fn free(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        let notify = self.notifier();
         let g = self.lock();
         let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
         if e.state != ExtentState::Active {
             return Err(ExtentError::NotFree); // double free / not an allocation
         }
+        // Each free's coalesce dispatches its §23.2 merge(s) to the hook (W10).
         match self.retain {
             RetainPolicy::Retain => {
-                g.map.free(r.id, ExtentState::Dirty);
+                g.map.free_in(r.id, ExtentState::Dirty, &notify);
             }
             RetainPolicy::Unmap => {
                 let offset = self.sub_offset(e.base);
                 match self.provider.decommit(self.region, offset, e.committed_len) {
                     Ok(()) => {
                         g.map.mark_decommitted(r.id, ExtentState::Active);
-                        g.map.free(r.id, ExtentState::Released);
+                        g.map.free_in(r.id, ExtentState::Released, &notify);
                     }
                     // Decommit failed: retain instead (still a valid free).
                     Err(_) => {
-                        g.map.free(r.id, ExtentState::Dirty);
+                        g.map.free_in(r.id, ExtentState::Dirty, &notify);
                     }
                 }
             }
@@ -1794,13 +2027,74 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     }
 }
 
+/// A **type-erased view** of an [`ExtentManager`] as a span-extent source (plan 06
+/// W10 per-arena hooked regions). The allocator's span path reserves and frees
+/// backing extents through this seam so it can route an arena to its **own** backing
+/// region (a [`HookProvider`](crate::HookProvider)-backed manager) without being
+/// generic over the provider type at the call site: the shared default backend and a
+/// per-arena hooked backend are different `ExtentManager<P>` instantiations, but both
+/// are `&dyn ExtentBacking`. The seam is exactly the methods the span create/retire
+/// and stats paths need; the default backend's behaviour is unchanged (one `dyn`
+/// call on the slow span-create path).
+pub trait ExtentBacking {
+    /// Allocate a committed backing extent of at least `size` bytes at `align`.
+    fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError>;
+    /// Free a backing extent (retain/unmap per policy), coalescing.
+    fn free(&self, r: ExtentRef) -> Result<(), ExtentError>;
+    /// Revoke the extent's descendants for `arena`, **then** free it (§36.6/§36.13).
+    fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError>;
+    /// The backing [`Region`] of `r`, or `None` if stale.
+    fn region_of(&self, r: ExtentRef) -> Option<Region>;
+    /// The §20.1 physical-state byte breakdown (stats reconciliation, §8.6).
+    fn state_bytes(&self) -> StateBytes;
+    /// Bytes physically committed across the region.
+    fn committed_bytes(&self) -> usize;
+    /// Whether the back-end is well-formed (the W4-5 oracle).
+    fn check_invariants(&self) -> bool;
+}
+
+impl<P: TopoBackingProvider> ExtentBacking for ExtentManager<P> {
+    #[inline]
+    fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError> {
+        ExtentManager::alloc(self, size, align, fit)
+    }
+    #[inline]
+    fn free(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        ExtentManager::free(self, r)
+    }
+    #[inline]
+    fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError> {
+        ExtentManager::free_revoking(self, r, arena)
+    }
+    #[inline]
+    fn region_of(&self, r: ExtentRef) -> Option<Region> {
+        ExtentManager::region_of(self, r)
+    }
+    #[inline]
+    fn state_bytes(&self) -> StateBytes {
+        ExtentManager::state_bytes(self)
+    }
+    #[inline]
+    fn committed_bytes(&self) -> usize {
+        ExtentManager::committed_bytes(self)
+    }
+    #[inline]
+    fn check_invariants(&self) -> bool {
+        ExtentManager::check_invariants(self)
+    }
+}
+
 impl<P: TopoBackingProvider> Drop for ExtentManager<P> {
     fn drop(&mut self) {
-        // Return the whole reserved region to the provider. A failure here cannot be
-        // reported from `drop`, but providers must leave their state well-formed
-        // (§36.6); the metadata-backed slot pool is monotonic and simply goes away
-        // with its arena.
-        let _ = self.provider.release(self.arena, self.region);
+        // Return the whole reserved region to the provider — unless an explicit
+        // `teardown` already did (then this is a no-op, so the region is released
+        // exactly once). A failure here cannot be reported from `drop`, but providers
+        // must leave their state well-formed (§36.6); the metadata-backed slot pool
+        // is monotonic and simply goes away with its arena. Callers that must observe
+        // a release failure use `teardown` (W10).
+        if !self.released {
+            let _ = self.provider.release(self.arena, self.region);
+        }
     }
 }
 
@@ -1992,6 +2286,82 @@ mod tests {
         assert_eq!(e.base, 0x4000_0000);
         // The remainder (5 pages) is still free.
         assert_eq!(m.free_bytes(), 5 * PAGE);
+        assert!(m.check_invariants());
+    }
+
+    /// `(base, total_len, prefix_len, backed)` of the last reported split.
+    type SplitGeom = (usize, usize, usize, bool);
+    /// `(left_base, left_len, right_base, right_len, backed)` of the last merge.
+    type MergeGeom = (usize, usize, usize, usize, bool);
+
+    /// A counting [`ExtentNotify`] for the W10 notification-threading tests:
+    /// records every split/merge the bookkeeping reports, plus the last geometry.
+    #[derive(Default)]
+    struct CountingNotify {
+        splits: AtomicU32,
+        merges: AtomicU32,
+        last_split: Mutex<Option<SplitGeom>>,
+        last_merge: Mutex<Option<MergeGeom>>,
+    }
+    impl ExtentNotify for CountingNotify {
+        fn on_split(&self, base: usize, total_len: usize, prefix_len: usize, backed: bool) {
+            self.splits.fetch_add(1, O::Relaxed);
+            *self.last_split.lock().unwrap() = Some((base, total_len, prefix_len, backed));
+        }
+        fn on_merge(&self, lb: usize, ll: usize, rb: usize, rl: usize, backed: bool) {
+            self.merges.fetch_add(1, O::Relaxed);
+            *self.last_merge.lock().unwrap() = Some((lb, ll, rb, rl, backed));
+        }
+    }
+
+    #[test]
+    fn carve_in_and_free_in_notify_each_split_and_merge() {
+        // W10: `carve_in` notifies the §23.2 split hook for the tail trim, and
+        // `free_in`'s coalesce notifies the merge hook when the freed extent rejoins
+        // its neighbour — with the correct pre-split / pre-merge geometry.
+        let n = CountingNotify::default();
+        let base = 0x4000_0000;
+        let mut m = map(base, 8);
+        // Carve 3 pages: trims a 5-page tail ⇒ exactly one split notification.
+        let id = m.carve_in(3 * PAGE, PAGE, Fit::Best, &n).expect("carve");
+        assert_eq!(n.splits.load(O::Relaxed), 1, "tail trim is one split");
+        assert_eq!(
+            *n.last_split.lock().unwrap(),
+            Some((base, 8 * PAGE, 3 * PAGE, false)),
+            "pre-split geometry: the 8-page extent cut at 3 pages, unbacked"
+        );
+        assert_eq!(n.merges.load(O::Relaxed), 0);
+        // Free the 3-page extent: it coalesces back with the 5-page free tail ⇒ one
+        // merge notification, with the pre-merge geometry (3-page left, 5-page right).
+        m.free_in(id, ExtentState::Released, &n).expect("free");
+        assert_eq!(
+            n.merges.load(O::Relaxed),
+            1,
+            "rejoining the tail is one merge"
+        );
+        assert_eq!(
+            *n.last_merge.lock().unwrap(),
+            Some((base, 3 * PAGE, base + 3 * PAGE, 5 * PAGE, false))
+        );
+        assert!(m.check_invariants());
+        assert_eq!(m.free_bytes(), 8 * PAGE, "whole region free again");
+    }
+
+    #[test]
+    fn carve_in_over_alignment_notifies_prefix_and_tail_splits() {
+        // W10: an over-aligned carve trims a page-aligned prefix *and* a size tail —
+        // two distinct §23.2 split notifications.
+        let n = CountingNotify::default();
+        let base = PAGE; // region base not 4*PAGE-aligned ⇒ a prefix trim is needed
+        let mut m = map(base, 16);
+        let _id = m
+            .carve_in(2 * PAGE, 4 * PAGE, Fit::Best, &n)
+            .expect("aligned carve");
+        assert_eq!(
+            n.splits.load(O::Relaxed),
+            2,
+            "prefix trim + tail trim = two splits"
+        );
         assert!(m.check_invariants());
     }
 

@@ -18,6 +18,7 @@ whole model:
 import TopoMalloc.Types
 import TopoMalloc.ArenaLifecycle
 import TopoMalloc.ExtentState
+import TopoMalloc.ExtentHooks
 import TopoMalloc.SizeClass
 import TopoMalloc.Generated.SizeClasses
 import TopoMalloc.State

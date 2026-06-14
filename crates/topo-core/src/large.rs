@@ -257,6 +257,28 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         self.extents.backend_name()
     }
 
+    /// The whole reserved [`Region`] backing this large allocator (W10: used to
+    /// confirm an arena's span and large regions are disjoint).
+    #[inline]
+    pub fn reserved_region(&self) -> Region {
+        self.extents.reserved_region()
+    }
+
+    /// Borrow the backing provider (the inner extent manager's), e.g. to read a
+    /// [`HookProvider`](crate::HookProvider)'s hook-failure counts (W10).
+    #[inline]
+    pub fn provider(&self) -> &P {
+        self.extents.provider()
+    }
+
+    /// **Explicitly** return the backing region to the provider, surfacing the
+    /// result (delegates to the inner [`ExtentManager::teardown`]). Idempotent with
+    /// `Drop`. Used by the arena-destroy path to route a custom backing's refused
+    /// region return into §36.13 quarantine (W10 strict teardown).
+    pub fn teardown(&mut self) -> Result<(), crate::error::BackendError> {
+        self.extents.teardown()
+    }
+
     /// Allocate a large region of at least `bytes` aligned to `align`, install its
     /// [`LargeDescriptor`] in the pagemap, and return the base pointer (null on
     /// failure). Consults `hook` (the §18.6 region cache) first. **Bypasses the
@@ -650,6 +672,80 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 true
             }
         }
+    }
+}
+
+/// A **type-erased view** of a [`LargeAllocator`] for per-arena hooked regions
+/// (plan 06 W10). Like [`ExtentBacking`](crate::ExtentBacking) for the span path,
+/// this lets the allocator route a large allocation to an arena's **own**
+/// [`HookProvider`](crate::HookProvider)-backed large allocator without being
+/// generic over the provider at the call site — the shared default large allocator
+/// and a per-arena hooked one are different `LargeAllocator<P>` instantiations, but
+/// both are `&dyn LargeBacking`. Each method resolves `ptr` against the backend's
+/// **own** descriptor pool, so a query on a backend that does not own `ptr` returns
+/// `None`/`false`/`0` — which is exactly how the free path finds the owner (the one
+/// backend whose [`arena_of`](Self::arena_of) is `Some`).
+pub trait LargeBacking {
+    /// Allocate a large region for `arena`; null on failure (W9 arena tagging).
+    fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8;
+    /// The usable size of the live large allocation at `ptr` *in this backend*.
+    fn usable_size(&self, ptr: *mut u8) -> Option<usize>;
+    /// The owning arena of the live large allocation at `ptr` *in this backend*.
+    fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId>;
+    /// Free the large allocation at `ptr` *if it belongs to this backend*.
+    ///
+    /// # Safety
+    /// `ptr` is a base pointer this allocator handed out (or null/foreign — those
+    /// are rejected); the caller upholds the [`LargeAllocator::free`] contract.
+    unsafe fn free(&self, ptr: *mut u8) -> bool;
+    /// Free every live large of `arena` (reset/destroy); see
+    /// [`LargeAllocator::free_arena`].
+    ///
+    /// # Safety
+    /// `arena` is quiesced (the §22.5/§36.13 precondition).
+    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool);
+    /// Number of large allocations currently live in this backend.
+    fn live_count(&self) -> usize;
+    /// The §20.1 physical-state byte breakdown of this backend's large region.
+    fn state_bytes(&self) -> crate::extent::StateBytes;
+    /// Whether this backend's back-end is well-formed.
+    fn check_invariants(&self) -> bool;
+}
+
+impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
+    #[inline]
+    fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
+        LargeAllocator::allocate_in(self, arena, bytes, align)
+    }
+    #[inline]
+    fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        LargeAllocator::usable_size(self, ptr)
+    }
+    #[inline]
+    fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId> {
+        LargeAllocator::arena_of(self, ptr)
+    }
+    #[inline]
+    unsafe fn free(&self, ptr: *mut u8) -> bool {
+        // SAFETY: forwarded unchanged from the trait's `free` contract.
+        unsafe { LargeAllocator::free(self, ptr) }
+    }
+    #[inline]
+    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+        // SAFETY: forwarded unchanged from the trait's `free_arena` contract.
+        unsafe { LargeAllocator::free_arena(self, arena) }
+    }
+    #[inline]
+    fn live_count(&self) -> usize {
+        LargeAllocator::live_count(self)
+    }
+    #[inline]
+    fn state_bytes(&self) -> crate::extent::StateBytes {
+        LargeAllocator::state_bytes(self)
+    }
+    #[inline]
+    fn check_invariants(&self) -> bool {
+        LargeAllocator::check_invariants(self)
     }
 }
 

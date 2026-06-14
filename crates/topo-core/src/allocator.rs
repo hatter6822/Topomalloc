@@ -46,22 +46,25 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::arena::{ArenaConfig, ArenaError, ArenaPolicy, ArenaStats, ArenaTable, Delegation};
+use crate::arena::{
+    ArenaConfig, ArenaError, ArenaPolicy, ArenaStats, ArenaTable, Delegation, HookFailureStats,
+};
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
 use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, RequestKind};
 use crate::error::BackendError;
 use crate::extent::{
-    BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, StateBytes,
+    BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, StateBytes,
 };
 use crate::flags::RequestFlags;
 use crate::generated::tables::PAGE_SIZE;
 use crate::generated::tables::SIZE_CLASSES;
+use crate::hooks::{ExtentHooks, HookProvider};
 use crate::ids::{ArenaId, Generation, Label, NodeId, SizeClassId, SpanId};
-use crate::large::{LargeAllocator, LargeConfig};
+use crate::large::{LargeAllocator, LargeBacking, LargeConfig};
 use crate::overflow::align_up;
 use crate::pagemap::PageMap;
 use crate::ptr_class::{
@@ -250,6 +253,10 @@ pub struct AllocatorStats {
     pub live_arenas: u64,
     /// Cumulative NUMA binding failures across all arenas (§15.5, W9-7).
     pub numa_bind_failures: u64,
+    /// Cumulative custom-backing (extent-hook) failures across **all** hooked
+    /// arenas, per kind (§23, plan 06 W10). All zero unless a hooked arena's backing
+    /// has faulted (and zero entirely for a program with no hooked arenas).
+    pub hook_failures: HookFailureStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +461,143 @@ pub fn predicted_usable_size(size: usize, align: usize, flags: RequestFlags) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-arena hooked backing regions (plan 06 W10, §22.2/§22.4)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of arenas that can carry their **own** extent hooks at once
+/// (§22.2 `ExtentHooks hooks`). Each consumes a backing region + descriptor pools
+/// from the metadata arena, so the count is bounded (§27.5); the registry itself is
+/// a fixed inline array in the (singleton) allocator, kept within a size budget by
+/// the assertion below. This covers the custom-backing use cases at scale (per-
+/// device/DMA, shared-memory, debug, and per-subsystem arenas). A `u8` slot index
+/// (`+1`, `0` = none) bounds it at 255; the size budget below bounds it well first —
+/// the registry is constructed **inline on the stack** (the allocator is built by
+/// value before being boxed/leaked), so the budget is also a stack-safety ceiling.
+pub const MAX_HOOK_BACKENDS: usize = 32;
+
+/// The borrowed, type-erased hooks an arena's backing region is served from. The
+/// caller owns the hooks (they outlive the allocator, exactly as the metadata and
+/// pagemap do), so the core stays allocation-free (no `Box`).
+type ArenaHooks<'a> = &'a (dyn ExtentHooks + Send + Sync);
+
+/// A per-arena hooked backing (§22.2): a dedicated span-extent region **and** a
+/// dedicated large allocator, both served by the arena's own [`ExtentHooks`]
+/// through a [`HookProvider`]. Disjoint from every other arena's region by
+/// construction, so §22.7 isolation holds geometrically. Built before the arena's
+/// id is published (§22.4 "install hooks before first extent allocation"); torn
+/// down (its regions returned to the hooks via `dealloc`) on destroy.
+struct ArenaHookBackend<'a> {
+    /// The owning arena's id (the registry key).
+    arena: ArenaId,
+    /// The arena's span-extent backing region.
+    span_extents: ExtentManager<HookProvider<ArenaHooks<'a>>>,
+    /// The arena's large-allocation backing (own descriptor pool; shared pagemap).
+    large: LargeAllocator<'a, HookProvider<ArenaHooks<'a>>>,
+}
+
+// The hook registry is a fixed inline array in the (singleton) allocator, built on
+// the stack at construction; keep it within a **stack-safe** size budget so neither a
+// raised `MAX_HOOK_BACKENDS` nor a field added to `ArenaHookBackend` (nor a larger
+// `RESERVATION_CAP`) can overflow the stack at init or silently bloat every allocator
+// (~0.6 KiB/backend today; the dual-backend `AnyAllocator` holds one inline).
+const _: () = assert!(
+    core::mem::size_of::<[Option<ArenaHookBackend<'static>>; MAX_HOOK_BACKENDS]>() <= 48 * 1024,
+    "hook registry exceeds its size budget; reduce MAX_HOOK_BACKENDS or RESERVATION_CAP",
+);
+
+impl ArenaHookBackend<'_> {
+    /// **Explicitly** return both backing regions to the hooks (W10 strict
+    /// teardown), surfacing a refusal instead of letting `Drop` swallow it. Both
+    /// regions are torn down **even if the first refuses**, so neither is leaked
+    /// gratuitously; the first error is reported. `Drop` is a no-op afterward (each
+    /// manager has recorded its region as already released), so the hooks see each
+    /// region returned exactly once.
+    fn teardown(&mut self) -> Result<(), BackendError> {
+        let span = self.span_extents.teardown();
+        let large = self.large.teardown();
+        span.and(large)
+    }
+
+    /// Aggregate this backing's per-kind hook-failure counts over its **two**
+    /// providers (span-extent + large) for [`ArenaStats::hooks`] (W10 observability).
+    fn hook_failure_stats(&self) -> HookFailureStats {
+        let sp = self.span_extents.provider();
+        let lp = self.large.provider();
+        HookFailureStats {
+            commit: sp.commit_hook_failures() + lp.commit_hook_failures(),
+            release: sp.release_hook_failures() + lp.release_hook_failures(),
+            split: sp.split_hook_failures() + lp.split_hook_failures(),
+            merge: sp.merge_hook_failures() + lp.merge_hook_failures(),
+        }
+    }
+}
+
+/// The fixed-capacity registry of [`ArenaHookBackend`]s. Slots are assigned on
+/// arena-create-with-hooks and cleared **in place** on destroy (never moved), so a
+/// reference obtained for one arena's op stays valid under the §22.5/§36.13
+/// quiescence contract (an arena's create/destroy does not race its own
+/// alloc/free, and a *different* arena's destroy clears only its own slot). The
+/// lock-free `count` is the fast path: `0` ⇒ no hooked arena exists, so every
+/// allocation/free uses the shared backend with **zero** registry access.
+struct HookRegistry<'a> {
+    lock: BackendLock,
+    slots: UnsafeCell<[Option<ArenaHookBackend<'a>>; MAX_HOOK_BACKENDS]>,
+    count: AtomicUsize,
+}
+
+impl HookRegistry<'_> {
+    const fn new() -> Self {
+        Self {
+            lock: BackendLock::new(),
+            slots: UnsafeCell::new([const { None }; MAX_HOOK_BACKENDS]),
+            count: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Persistent, lock-free cumulative hook-failure counters (W10). A torn-down hooked
+/// backend's counts are folded in here **before it drops**, so the global stats
+/// total survives an arena's destroy — the per-arena [`HookProvider`] counters drop
+/// with the backend, but `release` failures in particular fire *during* teardown, so
+/// they would otherwise be unobservable. Live backends' counts are added on top in
+/// [`Allocator::stats`].
+struct AtomicHookFailures {
+    commit: AtomicU64,
+    release: AtomicU64,
+    split: AtomicU64,
+    merge: AtomicU64,
+}
+
+impl AtomicHookFailures {
+    const fn new() -> Self {
+        Self {
+            commit: AtomicU64::new(0),
+            release: AtomicU64::new(0),
+            split: AtomicU64::new(0),
+            merge: AtomicU64::new(0),
+        }
+    }
+
+    /// Fold a retiring backend's counts in (relaxed — pure monotone counters).
+    fn accumulate(&self, s: &HookFailureStats) {
+        self.commit.fetch_add(s.commit, Ordering::Relaxed);
+        self.release.fetch_add(s.release, Ordering::Relaxed);
+        self.split.fetch_add(s.split, Ordering::Relaxed);
+        self.merge.fetch_add(s.merge, Ordering::Relaxed);
+    }
+
+    /// Read the cumulative counts so far.
+    fn snapshot(&self) -> HookFailureStats {
+        HookFailureStats {
+            commit: self.commit.load(Ordering::Relaxed),
+            release: self.release.load(Ordering::Relaxed),
+            split: self.split.load(Ordering::Relaxed),
+            merge: self.merge.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The M1 allocator over the central path (W8-1a): classify → central list /
 /// large path, under the structures' own locks. See the module docs for the
 /// composition and the concurrency argument.
@@ -495,13 +639,25 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Cumulative usable bytes ever returned. `live = allocated - freed` by
     /// construction, so the §8.6 application-side identity cannot drift.
     freed_bytes: AtomicU64,
+    /// Per-arena hooked backing regions (plan 06 W10, §22.2): an arena created with
+    /// [`arena_create_hooked`](Self::arena_create_hooked) serves its span/large
+    /// allocations from its own [`ExtentHooks`] instead of the shared backend.
+    /// Empty (zero-overhead) for programs that never use custom backings.
+    hooks: HookRegistry<'a>,
+    /// Cumulative hook failures from **torn-down** hooked backings (W10), so the
+    /// global stats total survives an arena's destroy. Live backings are summed on
+    /// top in [`stats`](Self::stats).
+    retired_hooks: AtomicHookFailures,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
 // their own synchronization; `meta`/`meta_region` are `Sync` by bound; the span
 // pool's mutable state (`spans.inner`) is only touched under `span_lock`, and its
-// immutable `slots`/`cap` support lock-free address↔slot conversion. So
-// concurrent `&self` use is data-race-free.
+// immutable `slots`/`cap` support lock-free address↔slot conversion. The `hooks`
+// registry's `UnsafeCell` slot array is touched only under its own `lock` (the
+// §22.5/§36.13 quiescence contract keeps a slot stable for an arena's own ops, and
+// destroy clears a slot in place — never moves it). So concurrent `&self` use is
+// data-race-free.
 unsafe impl<P: TopoBackingProvider + Send + Sync> Sync for Allocator<'_, P> {}
 // SAFETY: the allocator owns its pool and `Send` extent/large managers; the
 // borrowed pagemap/meta references are `Sync`, so they may be used from
@@ -560,12 +716,111 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_lock: BackendLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
+            hooks: HookRegistry::new(),
+            retired_hooks: AtomicHookFailures::new(),
         })
     }
 
     /// The backend name of the providers (W0-14b).
     pub fn backend_name(&self) -> &'static str {
         self.span_extents.backend_name()
+    }
+
+    // -- per-arena hooked backing routing (W10) -------------------------------
+
+    /// Raw pointer to hooked-backend registry slot `i` (`i < MAX_HOOK_BACKENDS`).
+    /// **Per-element** raw access is load-bearing for soundness: it keeps a borrow
+    /// of one slot disjoint from a concurrent mutation of another, so a thread
+    /// holding `&backend_X` (slot i) while a *different* arena's destroy clears slot
+    /// j never has its borrow invalidated by a whole-array `&mut`. This is the same
+    /// slot-pool discipline `ExtentMap`/`SpanPool`/`ArenaTable` use — never form a
+    /// `&[Option; N]` / `&mut [Option; N]` over the registry.
+    #[inline]
+    fn hook_slot(&self, i: usize) -> *mut Option<ArenaHookBackend<'a>> {
+        debug_assert!(i < MAX_HOOK_BACKENDS);
+        // SAFETY: `i < MAX_HOOK_BACKENDS` (the array length); casting `*mut [T; N]`
+        // to `*mut T` views the first element, and `.add(i)` indexes element `i`,
+        // all within the same allocation.
+        unsafe {
+            self.hooks
+                .slots
+                .get()
+                .cast::<Option<ArenaHookBackend<'a>>>()
+                .add(i)
+        }
+    }
+
+    /// The hooked backend serving `arena`, or `None` (the shared backend serves
+    /// it). Fast path: with no hooked arenas the atomic `count` short-circuits
+    /// before any lock. The returned reference is valid for the current op under
+    /// the §22.5/§36.13 quiescence contract (see [`HookRegistry`]).
+    #[inline]
+    fn hook_backend(&self, arena: ArenaId) -> Option<&ArenaHookBackend<'a>> {
+        // Common-case fast path: no hooked arena exists ⇒ zero registry/table access.
+        if self.hooks.count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        // O(1): the arena records its own registry slot (W10), so route directly
+        // instead of scanning. `0` ⇒ no hooked backing (the shared backend serves it).
+        // The `count` acquire above synchronises with the registering `count` release,
+        // which is program-ordered *after* `set_hook_slot`, so this read sees it.
+        let slot_plus1 = self.arenas.hook_slot_of(arena);
+        if slot_plus1 == 0 {
+            return None;
+        }
+        let i = (slot_plus1 - 1) as usize;
+        if i >= MAX_HOOK_BACKENDS {
+            debug_assert!(false, "hook_slot out of range (W10)");
+            return None;
+        }
+        self.hooks.lock.acquire();
+        // SAFETY: the registry lock is held (no concurrent mutator of slot `i`);
+        // `(*slot).as_ref()` borrows only element `i`. The recorded slot is confirmed
+        // to still hold *this* arena's backing — a defensive identity check that
+        // fails closed; under §22.5/§36.13 quiescence the arena's own create/destroy
+        // cannot race this op, so the mapping is stable.
+        let found = unsafe { (*self.hook_slot(i)).as_ref() }
+            .filter(|b| b.arena == arena)
+            .map(|b| b as *const ArenaHookBackend<'a>);
+        self.hooks.lock.release();
+        // SAFETY: the matched slot is stable for this op (see above); a *different*
+        // arena's destroy mutates only its own slot (per-element), so it cannot move
+        // or invalidate this one.
+        found.map(|p| unsafe { &*p })
+    }
+
+    /// The span-extent backing for `arena`: its own hooked region, or the shared.
+    #[inline]
+    fn span_backing(&self, arena: ArenaId) -> &dyn ExtentBacking {
+        match self.hook_backend(arena) {
+            Some(b) => &b.span_extents,
+            None => &self.span_extents,
+        }
+    }
+
+    /// The large backing for `arena`: its own hooked region, or the shared.
+    #[inline]
+    fn large_backing(&self, arena: ArenaId) -> &dyn LargeBacking {
+        match self.hook_backend(arena) {
+            Some(b) => &b.large,
+            None => &self.large,
+        }
+    }
+
+    /// The large backend that **owns** allocations made in `arena` — its own hooked
+    /// backing if it has one, else the shared backend. O(1): a large `free` /
+    /// `realloc` / `usable_size` resolves the owning arena straight from the
+    /// allocation's descriptor (`FreeTarget::Large { desc }` carries
+    /// [`LargeDescriptor::arena`]), so there is no descriptor-pool search — the
+    /// owning arena's hooked pool *is* where its descriptors live (W10). A non-hooked
+    /// arena (including a foreign / already-freed pointer routed to the default
+    /// arena) resolves to the shared backend.
+    #[inline]
+    fn large_owner_for(&self, arena: ArenaId) -> &dyn LargeBacking {
+        match self.hook_backend(arena) {
+            Some(b) => &b.large,
+            None => &self.large,
+        }
     }
 
     /// The arena this allocator serves.
@@ -641,7 +896,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let p = match req.kind {
             RequestKind::Small { sc, .. } => self.alloc_small(arena, sc),
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                self.large.allocate_in(arena, usable, req.align)
+                // Route to the arena's own hooked large backing if it has one (W10).
+                self.large_backing(arena)
+                    .allocate_in(arena, usable, req.align)
             }
         };
         if p.is_null() {
@@ -736,19 +993,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let bytes = (row.slab_pages as usize)
             .checked_mul(PAGE_SIZE)
             .ok_or(ExtentError::Exhausted)?;
-        let ext = self.span_extents.alloc(bytes, PAGE_SIZE, Fit::Best)?;
-        let region = match self.span_extents.region_of(ext) {
+        // The span's backing extent comes from the arena's own hooked region when it
+        // has one (W10), else the shared span region. Captured once: the reference is
+        // stable for this create under the §22.5/§36.13 quiescence contract.
+        let backing = self.span_backing(arena);
+        let ext = backing.alloc(bytes, PAGE_SIZE, Fit::Best)?;
+        let region = match backing.region_of(ext) {
             Some(r) => r,
             None => return Err(ExtentError::Stale), // unreachable: ext is fresh
         };
         let base_ptr = region.base;
         let base = base_ptr as usize;
         let Some(layout) = SlabLayout::compute(sc, base, 0) else {
-            let _ = self.span_extents.free(ext);
+            let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
         };
         let Ok(object_count) = u32::try_from(layout.object_count) else {
-            let _ = self.span_extents.free(ext);
+            let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
         };
 
@@ -767,7 +1028,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             (i, true)
         } else {
             self.span_lock.release();
-            let _ = self.span_extents.free(ext);
+            let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
         };
 
@@ -830,7 +1091,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
         self.span_lock.release();
         if !initialized {
-            let _ = self.span_extents.free(ext);
+            let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
         }
 
@@ -852,7 +1113,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     inner.live -= 1;
                 }
                 self.span_lock.release();
-                let _ = self.span_extents.free(ext);
+                let _ = backing.free(ext);
                 Err(ExtentError::Exhausted)
             }
         }
@@ -909,25 +1170,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
                 FreeOutcome::Freed
             }
-            Ok(FreeTarget::Large { .. }) => {
-                // The large allocator re-resolves under its own lock, so a
-                // concurrent double free of the same pointer settles on
-                // exactly one winner (large.rs DD-1) — only the winner (the
-                // call that returns `true`) records the freed bytes, so the
-                // counter cannot double-count. The usable size is captured
-                // first: after the free the descriptor may recycle.
-                let usable = self.large.usable_size(ptr).unwrap_or(0);
-                // Recover the owning arena before the free recycles the
-                // descriptor, so the quota credit lands on the right arena.
-                let arena = self.large.arena_of(ptr);
+            Ok(FreeTarget::Large { desc }) => {
+                // SAFETY: `desc` is a live large descriptor — the pagemap classified
+                // `ptr` as a live large allocation pointing to it, and descriptors
+                // live in never-freed metadata. Its `arena` routes the free to the
+                // owning backend in O(1): a hooked arena's large descriptors live in
+                // its own pool, the rest in the shared pool (W10).
+                let arena = unsafe { (*desc).arena() };
+                let owner = self.large_owner_for(arena);
+                // The owner re-resolves `ptr` under its own lock, so a concurrent
+                // double free of the same pointer settles on exactly one winner
+                // (large.rs DD-1) — only the winner (the call that returns `true`)
+                // records the freed bytes, so the counter cannot double-count. The
+                // usable size is captured first: after the free the descriptor may
+                // recycle.
+                let usable = owner.usable_size(ptr).unwrap_or(0);
                 // SAFETY: this method's own contract is the large path's
                 // contract, forwarded unchanged.
-                if unsafe { self.large.free(ptr) } {
+                if unsafe { owner.free(ptr) } {
                     self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
                     // Credit the owning arena's quota (§36.17 exact accounting).
-                    if let Some(a) = arena {
-                        self.arenas.credit(a, usable as u64);
-                    }
+                    self.arenas.credit(arena, usable as u64);
                     FreeOutcome::Freed
                 } else {
                     FreeOutcome::DoubleFree
@@ -1052,8 +1315,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         };
         self.span_lock.release();
         // Revoke-before-recycle; a revoke failure leaves the extent allocated
-        // (well-formed) and is reported so a drain quarantines (§36.13).
-        self.span_extents.free_revoking(ext, arena).is_ok()
+        // (well-formed) and is reported so a drain quarantines (§36.13). Route to
+        // the arena's own hooked backing if it has one (W10) — the same backing the
+        // extent was carved from in `create_span`.
+        self.span_backing(arena).free_revoking(ext, arena).is_ok()
     }
 
     // -- introspection --------------------------------------------------------
@@ -1078,7 +1343,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
                 Some(size_class::usable_size(span.size_class()))
             }
-            Ok(FreeTarget::Large { .. }) => self.large.usable_size(ptr),
+            // Route to the backend that owns `ptr` (shared or a hooked arena's),
+            // since each resolves only its own descriptor pool (W10). O(1): the
+            // descriptor names its arena directly.
+            // SAFETY: `desc` is a live large descriptor (never-freed metadata).
+            Ok(FreeTarget::Large { desc }) => self
+                .large_owner_for(unsafe { (*desc).arena() })
+                .usable_size(ptr),
             _ => None,
         }
     }
@@ -1200,11 +1471,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     }
                     (row.size as usize, span_ref.arena())
                 }
-                PointerClass::Large { .. } => {
+                PointerClass::Large { desc } => {
+                    // Route to the backend that owns `ptr` — the shared large region
+                    // or the original arena's own hooked region (W10); each resolves
+                    // only its own descriptor pool, so the shared one would miss a
+                    // hooked-arena large object. O(1): the descriptor names its arena.
+                    // SAFETY: `desc` is a live large descriptor (never-freed metadata).
+                    let arena = unsafe { (*desc).arena() };
+                    let owner = self.large_owner_for(arena);
                     // The pointer is live (the caller's contract for realloc; a
                     // racing free of the same pointer is C UB and is caught by
                     // the lock-validated read here).
-                    let Some(usable) = self.large.usable_size(ptr) else {
+                    let Some(usable) = owner.usable_size(ptr) else {
                         return ptr::null_mut();
                     };
                     // In-place fast path: the new request is still medium/large
@@ -1222,9 +1500,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                             }
                         }
                     }
-                    // A live large always has an owning arena; fall back to the
-                    // engine's region arena if a concurrent retire raced the read.
-                    (usable, self.large.arena_of(ptr).unwrap_or(self.arena))
+                    // The owning arena was resolved from the descriptor above.
+                    (usable, arena)
                 }
                 _ => return ptr::null_mut(),
             };
@@ -1270,6 +1547,184 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.arenas.create(policy)
     }
 
+    /// Create an explicit arena whose span/large allocations are served from its
+    /// **own** [`ExtentHooks`] backing region (§22.2/§22.4 per-arena hooks, plan 06
+    /// W10) — a custom memory source / OS policy private to this arena, isolated
+    /// from every other arena's region by construction (§22.7). `region_cfg` sizes
+    /// the arena's backing (its `span_region_bytes` / `large_region_bytes` and the
+    /// descriptor-pool capacities). The hooks must outlive the allocator (they are
+    /// borrowed, like the metadata/pagemap), so the core stays allocation-free.
+    ///
+    /// The §22.4 order is honoured: the hooked backing is reserved and **registered
+    /// before** the arena id is published `Active` (the id is private to this call
+    /// until then, so the unpublished window is race-free). On any failure the
+    /// pending arena is abandoned and nothing leaks.
+    ///
+    /// Returns [`ArenaError::Exhausted`] if the hooked-backend registry is full
+    /// ([`MAX_HOOK_BACKENDS`]) or the hooks cannot reserve the backing.
+    ///
+    /// SPEC-transition: arena create with hooks `Initializing → Active` (§22.4)
+    pub fn arena_create_hooked(
+        &self,
+        policy: &ArenaPolicy,
+        hooks: ArenaHooks<'a>,
+        region_cfg: AllocatorConfig,
+    ) -> Result<ArenaId, ArenaError> {
+        let id = self.arenas.create_pending(policy)?;
+        match self.build_and_register_hook_backend(id, hooks, region_cfg) {
+            Ok(()) => match self.arenas.publish(id) {
+                Ok(()) => Ok(id),
+                Err(e) => {
+                    // Unreachable (id is Initializing), but stay leak-free. The
+                    // rollback ignores a teardown error: there is no clean arena to
+                    // quarantine here, and the regions are returned best-effort.
+                    let _ = self.teardown_hook_backend(id);
+                    let _ = self.arenas.abandon_pending(id);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = self.arenas.abandon_pending(id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Build the per-arena hooked backing (reserving its regions via `hooks`) and
+    /// register it in the [`HookRegistry`]. Builds **first** (so two concurrent
+    /// creations never claim the same slot), then finds a free slot and inserts
+    /// atomically under the registry lock; on no free slot the just-built backing is
+    /// dropped, returning its regions to the hooks.
+    fn build_and_register_hook_backend(
+        &self,
+        id: ArenaId,
+        hooks: ArenaHooks<'a>,
+        cfg: AllocatorConfig,
+    ) -> Result<(), ArenaError> {
+        let span_extents = ExtentManager::new(
+            HookProvider::new(hooks),
+            self.meta,
+            id,
+            cfg.span_region_bytes,
+            PAGE_SIZE,
+            cfg.span_extent_slots,
+        )
+        .map_err(|_| ArenaError::Exhausted)?;
+        let large = LargeAllocator::new(
+            HookProvider::new(hooks),
+            self.meta,
+            self.pagemap,
+            id,
+            LargeConfig {
+                region_bytes: cfg.large_region_bytes,
+                region_align: PAGE_SIZE,
+                extent_slots: cfg.large_extent_slots,
+                large_slots: cfg.large_slots,
+            },
+        )
+        .map_err(|_| ArenaError::Exhausted)?;
+        // §23.3 no-overlap **across the two reservations**: the span and large
+        // regions are served by separate `HookProvider`s, so neither provider's
+        // own tracker sees the other's range. Check disjointness explicitly here —
+        // a hook that returns an overlapping span/large region would otherwise let
+        // the arena's small-object spans and large allocations alias. On overlap,
+        // both `span_extents` and `large` drop, returning their regions to the hooks.
+        {
+            let (sb, se) = span_extents.reserved_region().addr_range();
+            let (lb, le) = large.reserved_region().addr_range();
+            let disjoint = se <= lb || le <= sb;
+            debug_assert!(
+                disjoint,
+                "§23.3: a hooked arena's span and large regions overlap (W10)"
+            );
+            if !disjoint {
+                return Err(ArenaError::Exhausted);
+            }
+        }
+        // Held in an `Option` so a failed insert (registry full) drops the built
+        // backing here, returning its regions to the hooks — and so the move into a
+        // slot is a single, unconditional `take`.
+        let mut backend = Some(ArenaHookBackend {
+            arena: id,
+            span_extents,
+            large,
+        });
+        self.hooks.lock.acquire();
+        for i in 0..MAX_HOOK_BACKENDS {
+            let slot = self.hook_slot(i);
+            // SAFETY: registry lock held ⇒ no concurrent access to slot `i`; the
+            // per-element borrow never forms a whole-array reference.
+            if unsafe { (*slot).is_none() } {
+                // SAFETY: as above; overwrites the `None` slot with the backing.
+                unsafe { *slot = backend.take() };
+                // Record the arena's slot for O(1) routing (W10), program-ordered
+                // **before** the `count` release below — so a reader that observes
+                // `count ≥ 1` (Acquire) also observes this slot index.
+                self.arenas.set_hook_slot(id, (i + 1) as u8);
+                // Release: pairs with the `Acquire` in `hook_backend`; the later
+                // arena `publish` (a Release on the arena state) program-orders after
+                // this, so a thread that sees the arena `Active` also sees the slot.
+                self.hooks.count.fetch_add(1, Ordering::Release);
+                break;
+            }
+        }
+        self.hooks.lock.release();
+        if backend.is_none() {
+            Ok(()) // inserted
+        } else {
+            Err(ArenaError::Exhausted) // registry full; `backend` drops → regions freed
+        }
+    }
+
+    /// Remove `arena`'s hooked backing from the registry (if any) and **tear it
+    /// down**, returning its span/large regions to the hooks via `dealloc` and
+    /// surfacing a refusal (W10 strict teardown). Called on a *completed* drain,
+    /// after every span/large of the arena was retired. The backing is moved out
+    /// under the registry lock and torn down *outside* it, so the user `dealloc`
+    /// hook never runs while the lock is held.
+    ///
+    /// Returns `Ok(())` for a non-hooked arena (a no-op) or a clean teardown, and
+    /// `Err` (the first backing error) if a hook refused a region return — the
+    /// destroy path routes that into the §36.13 quarantine; the (unreachable)
+    /// create-rollback path ignores it.
+    fn teardown_hook_backend(&self, arena: ArenaId) -> Result<(), BackendError> {
+        if self.hooks.count.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        self.hooks.lock.acquire();
+        let mut taken: Option<ArenaHookBackend<'a>> = None;
+        for i in 0..MAX_HOOK_BACKENDS {
+            let slot = self.hook_slot(i);
+            // SAFETY: registry lock held; per-element borrow of slot `i` only.
+            let matches = unsafe { (*slot).as_ref().is_some_and(|b| b.arena == arena) };
+            if matches {
+                // Clear the arena's O(1) routing index (W10), then move the backing
+                // out of its slot (leaving `None`). The arena is quiesced (§22.5/
+                // §36.13), so no concurrent op of its own can race this.
+                self.arenas.set_hook_slot(arena, 0);
+                // SAFETY: as above; moves the backing out of its slot (leaving `None`).
+                taken = unsafe { (*slot).take() };
+                self.hooks.count.fetch_sub(1, Ordering::Release);
+                break;
+            }
+        }
+        self.hooks.lock.release();
+        // Tear the regions down (via `hooks.dealloc`) outside the lock; `Drop` then
+        // no-ops. `None` (non-hooked arena) is a clean no-op.
+        match taken {
+            Some(mut backend) => {
+                let r = backend.teardown();
+                // Fold the retiring backing's cumulative hook failures into the
+                // persistent total before it drops, so they survive the destroy —
+                // a `release` failure in particular fires *during* the teardown above
+                // (W10 observability).
+                self.retired_hooks.accumulate(&backend.hook_failure_stats());
+                r
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005):
     /// decay, hugepage policy, NUMA preference, soft cache budget, and name. The
     /// authority (rights/label) and quota ceiling are immutable here (a configure
@@ -1290,10 +1745,47 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.arenas.delegate(parent, del)
     }
 
+    /// Whether `arena` currently has a registered hooked backing (W10): `true` from
+    /// a successful [`arena_create_hooked`](Self::arena_create_hooked) until the
+    /// backing is torn down. Lets a caller (the C ABI) reclaim a hook adapter exactly
+    /// when the allocator no longer references it — after a clean destroy **or** a
+    /// teardown-failure quarantine (the backing was dropped ⇒ `false`), but *not* a
+    /// drain-failure quarantine (the backing, and its borrow of the adapter, are
+    /// retained ⇒ `true`).
+    pub fn arena_has_hook_backend(&self, arena: ArenaId) -> bool {
+        self.arenas.hook_slot_of(arena) != 0
+    }
+
     /// A snapshot of `arena`'s authority + accounting (§22.2/§36.4), or `None`
-    /// for an out-of-range id.
+    /// for an out-of-range id. For a hooked arena (W10), the
+    /// [`hooks`](ArenaStats::hooks) field carries its custom backing's per-kind
+    /// hook-failure counts, aggregated over the arena's span + large providers.
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
-        self.arenas.stats(arena)
+        let mut s = self.arenas.stats(arena)?;
+        // Read the hooked backing's failure counts **under the registry lock** (unlike
+        // `hook_backend`, which releases it and returns a reference for the alloc/free
+        // path, safe only because an arena's own op cannot race its destroy, §22.5).
+        // `arena_stats` is introspection — it *can* race `arena_destroy(arena)` — so it
+        // must hold the lock across the read, which blocks the teardown from removing
+        // and dropping the backing mid-read (teardown takes the same lock to remove a
+        // slot before dropping its backing outside the lock).
+        if self.hooks.count.load(Ordering::Acquire) != 0 {
+            let slot_plus1 = self.arenas.hook_slot_of(arena);
+            if slot_plus1 != 0 && (slot_plus1 as usize) <= MAX_HOOK_BACKENDS {
+                let i = (slot_plus1 - 1) as usize;
+                self.hooks.lock.acquire();
+                // SAFETY: the registry lock is held (so no concurrent mutator of slot
+                // `i`, and no teardown can drop the backing during the read); borrows
+                // only element `i`, confirmed to be this arena's (fails closed).
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    if b.arena == arena {
+                        s.hooks = Some(b.hook_failure_stats());
+                    }
+                }
+                self.hooks.lock.release();
+            }
+        }
+        Some(s)
     }
 
     /// **Reset** an explicit arena (§22.5, W9-4): discard all its extant
@@ -1334,9 +1826,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// allocations/delegations, §36.13 step 1), drain caches + return/unmap +
     /// revoke + recycle (the internal `drain_arena` — the POSIX collapse of the
     /// §36.13 unmap→revoke→recycle order; real capability revocation drops in at
-    /// plan 09), then `Draining → Destroyed` on success or `→ ErrorQuarantined`
-    /// on partial failure — **never** `Destroyed` on failure (§36.13). Returns
-    /// the new generation.
+    /// plan 09), return any per-arena hooked backing region to its hooks (W10), then
+    /// `Draining → Destroyed` on success or `→ ErrorQuarantined` on partial failure
+    /// — **never** `Destroyed` on failure (§36.13). A partial failure is either a
+    /// drain that could not revoke a backing **or** a custom backing that refused
+    /// its region return on teardown. Returns the new generation.
     ///
     /// # Safety
     ///
@@ -1349,8 +1843,25 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // SAFETY: the arena is now `Draining` (no new allocations/delegations)
         // and the caller guarantees quiescence.
         if unsafe { self.drain_arena(arena) } {
-            self.arenas.finish_destroy(arena)
+            // The drain retired every span/large of the arena (their backing extents
+            // are now free in its hooked region, if any); return that region to the
+            // hooks **before** the terminal `Destroyed` step (W10 strict teardown),
+            // so a custom backing that refuses the return routes into the §36.13
+            // quarantine instead of being lost after a clean destroy. A no-op (Ok)
+            // for a non-hooked arena.
+            if self.teardown_hook_backend(arena).is_err() {
+                // Objects all drained, but the backing refused a region return:
+                // quarantine (Draining → ErrorQuarantined) rather than report a clean
+                // destroy (§36.13). The id is NOT retired/reused; the refused region
+                // is a leak confined to the user's backing (its `dealloc` chose so).
+                self.arenas.quarantine(arena)?;
+                return Err(ArenaError::IllegalTransition);
+            }
+            let gen = self.arenas.finish_destroy(arena)?;
+            Ok(gen)
         } else {
+            // Partial drain failure: quarantine and KEEP the hooked backing for
+            // recovery (never tear it down on a non-clean drain, §36.13).
             self.arenas.quarantine(arena)?;
             Err(ArenaError::IllegalTransition)
         }
@@ -1400,8 +1911,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // global `live_bytes = allocated - freed` accurate (§8.6/§36.17) — the
         // arena's own `used` is zeroed by the reset/destroy completion.
         // SAFETY: the arena is quiesced (its objects are not concurrently freed),
-        // the reset/destroy precondition.
-        let (_, large_bytes, large_revoked) = unsafe { self.large.free_arena(arena) };
+        // the reset/destroy precondition. Route to the arena's own hooked large
+        // backing if it has one (W10).
+        let (_, large_bytes, large_revoked) =
+            unsafe { self.large_backing(arena).free_arena(arena) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
@@ -1438,12 +1951,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.span_extents.committed_bytes()
     }
 
-    /// Whether both back-ends **and** the arena registry are well-formed (W4-5 +
-    /// B.5 oracle; debug/tests).
+    /// Whether both shared back-ends, **every per-arena hooked backing**, and the
+    /// arena registry are well-formed (W4-5 + B.5 oracle; debug/tests).
     pub fn check_invariants(&self) -> bool {
-        self.span_extents.check_invariants()
+        let mut ok = self.span_extents.check_invariants()
             && self.large.check_invariants()
-            && self.arenas.check_invariants()
+            && self.arenas.check_invariants();
+        if self.hooks.count.load(Ordering::Acquire) > 0 {
+            self.hooks.lock.acquire();
+            for i in 0..MAX_HOOK_BACKENDS {
+                // SAFETY: registry lock held; per-element borrow of slot `i` only.
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    ok = ok && b.span_extents.check_invariants() && b.large.check_invariants();
+                }
+            }
+            self.hooks.lock.release();
+        }
+        ok
     }
 
     /// Take a statistics snapshot (§31.1; the W8 DoD "state exposes stats and
@@ -1460,6 +1984,33 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 central_free_bytes += bin.total_central_free() * row.size as u64;
             }
         }
+        // Aggregate the shared backend with every per-arena hooked region (W10), so
+        // the §20.1 physical-state breakdown and the live-large count reflect *all*
+        // backends — not just the shared one (an arena's own region is still this
+        // allocator's memory). A no-op when no hooked arena exists.
+        let mut span_backend = self.span_extents.state_bytes();
+        let mut large_backend = self.large.state_bytes();
+        let mut live_large = self.large.live_count() as u64;
+        // Cumulative hook failures: the persistent total from torn-down backings
+        // plus every live backing's current counts (W10 observability).
+        let mut hf = self.retired_hooks.snapshot();
+        if self.hooks.count.load(Ordering::Acquire) > 0 {
+            self.hooks.lock.acquire();
+            for i in 0..MAX_HOOK_BACKENDS {
+                // SAFETY: registry lock held; per-element borrow of slot `i` only.
+                if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
+                    span_backend = span_backend.add(b.span_extents.state_bytes());
+                    large_backend = large_backend.add(b.large.state_bytes());
+                    live_large += b.large.live_count() as u64;
+                    let s = b.hook_failure_stats();
+                    hf.commit += s.commit;
+                    hf.release += s.release;
+                    hf.split += s.split;
+                    hf.merge += s.merge;
+                }
+            }
+            self.hooks.lock.release();
+        }
         AllocatorStats {
             // Saturating: `freed` can transiently exceed `allocated` only in
             // a torn relaxed read during concurrent ops; never report a wrap.
@@ -1467,13 +2018,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             allocated_bytes_total: allocated,
             freed_bytes_total: freed,
             central_free_bytes,
-            span_backend: self.span_extents.state_bytes(),
-            large_backend: self.large.state_bytes(),
+            span_backend,
+            large_backend,
             pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
             live_spans: self.live_span_count() as u64,
-            live_large: self.large.live_count() as u64,
+            live_large,
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
+            hook_failures: hf,
         }
     }
 }

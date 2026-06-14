@@ -33,7 +33,7 @@ use crate::policy::{zero_size_policy, ZeroSizePolicy};
 /// §36.14 `TOPO_ERR_*` classes a C caller can read after a failed arena call:
 /// authority denials are `EACCES`, a draining/inactive arena is `EBUSY`, a quota
 /// overrun is `ENOMEM`, and every malformed/illegal request is `EINVAL`.
-fn arena_errno(e: ArenaError) -> i32 {
+pub(crate) fn arena_errno(e: ArenaError) -> i32 {
     match e {
         ArenaError::AuthorityDenied => EACCES,
         ArenaError::NotActive => EBUSY,
@@ -191,7 +191,19 @@ pub unsafe extern "C" fn topo_arena_destroy(id: u32) -> i32 {
         return -1;
     };
     // SAFETY: the caller upholds this function's quiescence contract.
-    match unsafe { a.arena_destroy(ArenaId(id)) } {
+    let r = unsafe { a.arena_destroy(ArenaId(id)) };
+    // Reclaim the C hook adapter exactly when the allocator no longer references it
+    // (W10). A clean destroy *and* a teardown-failure quarantine both drop the
+    // arena's backend — and with it the `HookProvider<&CHooks>` borrow — leaving no
+    // hooked backing for `id`, so freeing the adapter is sound and bounds the
+    // per-create heap. A drain-failure quarantine KEEPS the backend registered (its
+    // `HookProvider` still borrows the adapter), so the adapter is retained — freeing
+    // it would be a use-after-free. A no-op for a non-hooked arena or a destroy that
+    // was rejected outright (the arena, and any adapter, survive).
+    if !a.arena_has_hook_backend(ArenaId(id)) {
+        crate::hooks_api::reclaim_chooks(id);
+    }
+    match r {
         Ok(_) => 0,
         Err(e) => {
             set_errno(arena_errno(e));

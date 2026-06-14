@@ -69,7 +69,9 @@ def canStep : ArenaPhase → ArenaPhase → Bool
   | active, draining => true            -- destroy begins (§36.13)
   | draining, destroyed => true         -- destroy completes (§36.13)
   | resetting, errorQuarantined => true -- reset partial failure (§36.13)
-  | draining, errorQuarantined => true  -- destroy partial failure (§36.13)
+  | draining, errorQuarantined => true  -- destroy partial failure: a refused revoke
+                                        -- OR a custom backing refusing its region
+                                        -- return on teardown (§36.13, W10)
   | _, _ => false
 
 /-- **Allocations only in `Active` (§22.3).** A phase admits allocation iff it is
@@ -116,6 +118,19 @@ theorem quarantined_is_terminal (p : ArenaPhase) : canStep errorQuarantined p = 
 clean `Destroyed` (§36.13). -/
 theorem quarantine_cannot_reach_destroyed : canStep errorQuarantined destroyed = false :=
   quarantined_is_terminal destroyed
+
+/-- **A destroy that cannot return its backing quarantines, never destroys (§36.13,
+extended for the W10 custom-backing teardown).** The destroy protocol's *only*
+failure landing is `errorQuarantined`, whatever the partial-failure reason — a
+refused capability revoke **or** a custom backing (`ExtentHooks`) refusing its
+region return on teardown (`HookProvider::release` failing). Both route through the
+same `draining → errorQuarantined` edge, and that landing is terminal, so a destroy
+whose backing-release fails is never reported as a clean `Destroyed`. This is the
+formal counterpart of the runtime `arena_destroy` returning `Err` and quarantining
+when `teardown_hook_backend` surfaces a hook `dealloc` failure. -/
+theorem destroy_backing_release_failure_quarantines :
+    canStep draining errorQuarantined = true ∧ canStep errorQuarantined destroyed = false :=
+  ⟨rfl, quarantine_cannot_reach_destroyed⟩
 
 /-- A terminal phase has no successors (the general statement). -/
 theorem terminal_has_no_successor {p : ArenaPhase} (h : p.isTerminal = true) (q : ArenaPhase) :

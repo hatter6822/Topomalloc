@@ -58,6 +58,9 @@ pub struct Stats {
     pub live_arenas: u64,
     /// Cumulative NUMA binding failures across all arenas (§15.5).
     pub numa_bind_failures: u64,
+    /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
+    /// per kind (§23, plan 06 W10).
+    pub hook_failures: topo_core::HookFailureStats,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -135,6 +138,7 @@ impl Stats {
         self.metadata_bytes = a.pagemap_metadata_bytes;
         self.live_arenas = a.live_arenas;
         self.numa_bind_failures = a.numa_bind_failures;
+        self.hook_failures = a.hook_failures;
         let combined = topo_core::StateBytes {
             reserved: a.span_backend.reserved + a.large_backend.reserved,
             active: a.span_backend.active + a.large_backend.active,
@@ -171,7 +175,13 @@ impl Stats {
                 "  }},\n",
                 "  \"arenas\": {{\n",
                 "    \"count\": {live_arenas},\n",
-                "    \"numa_bind_failures\": {numa_bind_failures}\n",
+                "    \"numa_bind_failures\": {numa_bind_failures},\n",
+                "    \"hook_failures\": {{\n",
+                "      \"commit\": {hf_commit},\n",
+                "      \"release\": {hf_release},\n",
+                "      \"split\": {hf_split},\n",
+                "      \"merge\": {hf_merge}\n",
+                "    }}\n",
                 "  }},\n",
                 "  \"backend\": {{\n",
                 "    \"dirty_bytes\": {dirty},\n",
@@ -197,6 +207,10 @@ impl Stats {
             central = self.central_free_bytes,
             live_arenas = self.live_arenas,
             numa_bind_failures = self.numa_bind_failures,
+            hf_commit = self.hook_failures.commit,
+            hf_release = self.hook_failures.release,
+            hf_split = self.hook_failures.split,
+            hf_merge = self.hook_failures.merge,
             dirty = self.dirty_bytes,
             muzzy = self.muzzy_bytes,
             released = self.released_bytes,
@@ -289,12 +303,21 @@ mod tests {
             live_large: 1,
             live_arenas: 3,
             numa_bind_failures: 7,
+            hook_failures: topo_core::HookFailureStats {
+                commit: 12,
+                release: 13,
+                split: 14,
+                merge: 15,
+            },
         };
         let mut s = Stats::default();
         s.record_allocator(&snap);
         // Arena summary (plan 06 W9) maps through and renders.
         assert_eq!(s.live_arenas, 3);
         assert_eq!(s.numa_bind_failures, 7);
+        // Hook-failure counts (plan 06 W10) map through and render in the JSON.
+        assert_eq!(s.hook_failures.commit, 12);
+        assert_eq!(s.hook_failures.merge, 15);
         assert_eq!(s.live_bytes, 1000);
         assert_eq!(s.allocated_bytes_total, 1500);
         assert_eq!(s.freed_bytes_total, 500);
@@ -317,5 +340,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["arenas"]["count"], 3);
         assert_eq!(v["arenas"]["numa_bind_failures"], 7);
+        assert_eq!(v["arenas"]["hook_failures"]["commit"], 12);
+        assert_eq!(v["arenas"]["hook_failures"]["release"], 13);
+        assert_eq!(v["arenas"]["hook_failures"]["split"], 14);
+        assert_eq!(v["arenas"]["hook_failures"]["merge"], 15);
     }
 }

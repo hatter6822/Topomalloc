@@ -122,6 +122,21 @@ guesses into ABI.
 | `topomalloc_version()` | NUL-terminated version string |
 | `topomalloc_backend()` | active backend name (`"posix"` / `"sele4n-sim"`) |
 
+### Extent hooks & custom backing (§23.2, W10)
+
+| Symbol | Semantics |
+|--------|-----------|
+| `topo_extent_hooks_t` | the §23.2 hook vtable: `alloc`/`dealloc` (required) + `commit`/`decommit`/`purge_lazy`/`purge_forced`/`split`/`merge` (NULL ⇒ the no-op default). Bool-returning hooks use the jemalloc convention (`true` ⇒ failure). |
+| `topo_arena_create_hooked(hooks, ctx, span_bytes, large_bytes)` | create an arena served from the custom backing `*hooks`; returns its id (routable via `TOPO_ARENA(id)`), or `0` + `errno` (`EINVAL` NULL/incomplete vtable, `ENOMEM` registry-full / reserve failure). The vtable is copied; `ctx` must persist. |
+| `topo_max_hook_backends()` | the maximum number of arenas that can carry their own hooks at once. |
+
+A hooked arena's span/large allocations come from its **own** region, isolated
+from every other arena's by construction (§22.7). The §23.3 contracts are enforced
+by the allocator (a misaligned/undersized/out-of-range result, an overlap, a
+mismatched dealloc, or reentrancy is rejected) — so a backing must, e.g., honour
+the requested alignment (`aligned_alloc`, not bare `malloc`). Destroying the arena
+returns its region to the backing via `dealloc`.
+
 ### Behavior contracts
 
 * **errno (W8-1b):** allocation failure ⇒ `ENOMEM`; validation failure ⇒
