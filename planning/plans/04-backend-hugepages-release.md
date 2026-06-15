@@ -201,8 +201,9 @@ normal-frame runs (§36.9).
 > **▸ Implementation status (W13).** **Landed and live.** The §15.2 `Topology` snapshot
 > (`crates/topo-core/src/topology.rs`, pure/`no_std`/bounded; CPU→LLC→NUMA maps + a node-distance matrix,
 > all queries total) is built by a `TopologyBuilder` that collapses to `Topology::single_domain` on any
-> inconsistency and **densely renumbers the OS node ids in use** (no phantom node on a sparse platform;
-> the raw OS id is kept in `os_node_of` for `mbind`) — W13-1. `preferred_node`/`preferred_node_at` is the
+> inconsistency and **densely renumbers the OS node ids — and the LLC-domain ids — in use** (no phantom
+> node or LLC domain on a sparse platform, for any builder caller; the raw OS node id is kept in
+> `os_node_of` for `mbind`) — W13-1. `preferred_node`/`preferred_node_at` is the
 > §15.3/§15.5 placement decision over `NumaPolicy` (W13-2); `Rebalancer::plan` is the §15.4 nearest-donor →
 > most-pressured **surplus-only** move (never strands the donor, no churn) — W13-3; `detect_mismatch` is the
 > §15.2 refresh probe (W13-4). `topo-backend-posix::discover_topology` is the real Linux sysfs read with the

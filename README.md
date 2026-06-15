@@ -118,8 +118,8 @@ and the `topo.release.*` control namespace.
 Topology", and is **live**: a pure, `no_std` `Topology` snapshot models the §15
 `CPU → LLC → NUMA node` hierarchy, built from Linux sysfs
 (`topo-backend-posix::discover_topology`), **always falling back to a conservative single
-domain** on inconsistent data and densely renumbering sparse OS node ids (no phantom node;
-the raw id is kept for `mbind`) (§15.2). `preferred_node` is the §15.3/§15.5 placement
+domain** on inconsistent data and densely renumbering sparse OS node ids *and* LLC-domain ids
+(no phantom node or LLC domain; the raw node id is kept for `mbind`) (§15.2). `preferred_node` is the §15.3/§15.5 placement
 decision over the NUMA policy (local / bind / interleave / OS-default / arena), and a
 `Rebalancer` plans nearest-donor → most-pressured-node moves that strand no one — moving
 only a donor's **surplus** (free beyond its own demand) (§15.4). A **`NodeRouter`** makes

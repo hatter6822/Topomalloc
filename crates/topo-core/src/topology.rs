@@ -44,12 +44,14 @@ pub const DISTANCE_REMOTE: u8 = 20;
 /// Every query is total — an out-of-range CPU reads as the default domain, so the
 /// placement path never panics on a stale CPU id.
 ///
-/// **Node ids are dense and internal.** Discovery densely renumbers the OS NUMA node
-/// ids actually in use to `0..node_count()` (as it already does for LLC domains), so
-/// every id in that range is a real node — there are no phantom gaps even when the
-/// platform numbers nodes sparsely (OS nodes 0 and 2 present, 1 absent). The raw OS id
-/// is preserved in `node_os_id` and recovered by [`os_node_of`](Self::os_node_of) for
-/// syscalls (`mbind`/`set_mempolicy`), which need the kernel's node number.
+/// **Node *and* LLC ids are dense and internal.** [`build`](TopologyBuilder::build)
+/// densely renumbers the OS NUMA node ids — and, by the identical construction, the
+/// LLC-domain ids — actually in use to `0..node_count()` / `0..llc_count()`, so every id in
+/// those ranges is a real domain: no phantom gaps even when the platform numbers nodes (or
+/// LLC domains) sparsely (OS nodes 0 and 2 present, 1 absent). The raw OS *node* id is
+/// preserved in `node_os_id` and recovered by [`os_node_of`](Self::os_node_of) for syscalls
+/// (`mbind`/`set_mempolicy`), which need the kernel's node number; LLC ids are purely
+/// internal (no syscall consumes them), so no raw-id map is kept for them.
 #[derive(Clone)]
 pub struct Topology {
     n_cpus: u16,
@@ -234,8 +236,6 @@ pub struct TopologyBuilder {
     cpu_llc: [u16; MAX_CPUS],
     cpu_set: [bool; MAX_CPUS],
     node_dist: [[u8; MAX_NODES]; MAX_NODES],
-    max_node: u16,
-    max_llc: u16,
     consistent: bool,
 }
 
@@ -256,8 +256,6 @@ impl TopologyBuilder {
             cpu_llc: [0; MAX_CPUS],
             cpu_set: [false; MAX_CPUS],
             node_dist,
-            max_node: 0,
-            max_llc: 0,
             consistent: ok,
         }
     }
@@ -272,8 +270,6 @@ impl TopologyBuilder {
             self.cpu_node[cpu as usize] = node as u16;
             self.cpu_llc[cpu as usize] = llc as u16;
             self.cpu_set[cpu as usize] = true;
-            self.max_node = self.max_node.max(node as u16);
-            self.max_llc = self.max_llc.max(llc as u16);
         } else {
             self.consistent = false;
         }
@@ -293,12 +289,13 @@ impl TopologyBuilder {
     /// online CPU was set consistently; otherwise the conservative single-domain
     /// fallback over the same CPU count.
     ///
-    /// The OS node ids actually in use are **densely renumbered** to `0..node_count()`
-    /// (as the LLC ids already are), so a sparsely-numbered platform (e.g. OS nodes 0 and
-    /// 2 present, 1 absent) yields exactly two nodes rather than a three-node model with a
-    /// phantom node 1. The raw OS id is kept in `node_os_id` for the `mbind` path
-    /// ([`Topology::os_node_of`]). On a dense-numbered platform the renumbering is the
-    /// identity, so the common case is unchanged.
+    /// Both the OS NUMA node ids and the LLC-domain ids actually in use are **densely
+    /// renumbered** to `0..node_count()` / `0..llc_count()`, so a sparsely-numbered platform
+    /// (e.g. OS nodes 0 and 2 present, 1 absent) yields exactly two nodes rather than a
+    /// three-node model with a phantom node 1 — and likewise for LLC domains. The raw OS
+    /// *node* id is kept in `node_os_id` for the `mbind` path ([`Topology::os_node_of`]); LLC
+    /// ids are internal only. On a dense-numbered platform the renumbering is the identity,
+    /// so the common case is unchanged.
     pub fn build(self) -> Topology {
         if !self.consistent || self.n_cpus == 0 {
             return Topology::single_domain(self.n_cpus.max(1) as u32);
@@ -371,12 +368,44 @@ impl TopologyBuilder {
             d += 1;
         }
 
+        // Densely renumber the LLC domains actually in use to `0..n_llc`, mirroring the
+        // node renumbering above, so a sparsely-numbered LLC space yields no phantom domain
+        // in `llc_count()`. On the discovery path the ids arrive already dense (the sysfs
+        // reader renumbers package ids), so this is the identity there; doing it *here* in
+        // the builder hardens every direct caller too (defense in depth — §15.2 "no phantom
+        // domain"). LLC ids are internal only, so — unlike nodes — no raw-id map is kept.
+        // `self.cpu_llc[k] < MAX_LLC` is guaranteed by `set_cpu`, and the no-gap check above
+        // means every online CPU is set, so the index and the `≥ 1` count both hold.
+        let mut llc_used = [false; MAX_LLC];
+        let mut k = 0usize;
+        while k < self.n_cpus as usize {
+            llc_used[self.cpu_llc[k] as usize] = true;
+            k += 1;
+        }
+        let mut dense_llc_of = [0u16; MAX_LLC];
+        let mut n_llc = 0u16;
+        let mut l = 0usize;
+        while l < MAX_LLC {
+            if llc_used[l] {
+                dense_llc_of[l] = n_llc;
+                n_llc += 1;
+            }
+            l += 1;
+        }
+        debug_assert!(n_llc >= 1, "a consistent build has at least one LLC domain");
+        let mut cpu_llc = [0u16; MAX_CPUS];
+        let mut k = 0usize;
+        while k < self.n_cpus as usize {
+            cpu_llc[k] = dense_llc_of[self.cpu_llc[k] as usize];
+            k += 1;
+        }
+
         Topology {
             n_cpus: self.n_cpus,
             n_nodes,
-            n_llc: self.max_llc + 1,
+            n_llc,
             cpu_node,
-            cpu_llc: self.cpu_llc,
+            cpu_llc,
             node_dist,
             node_os_id,
         }
@@ -644,6 +673,35 @@ mod tests {
         assert_eq!(t.distance(NodeId(0), NodeId(0)), DISTANCE_LOCAL);
         // An out-of-range dense id reads as the default OS node (total).
         assert_eq!(t.os_node_of(NodeId(9)), 0);
+    }
+
+    #[test]
+    fn build_densely_renumbers_sparse_llc_domains_no_phantom() {
+        // The LLC axis gets the same no-phantom guarantee as the node axis: a platform
+        // whose LLC ids are sparse — LLC domains 0 and 3 present, 1 and 2 absent — must
+        // yield exactly TWO dense LLC domains, not `max + 1 == 4` with two phantom ones.
+        // This hardens a *direct* builder caller; the sysfs reader already passes dense
+        // ids, so the discovery path is unchanged (the renumber is the identity there).
+        let mut b = TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0) // LLC 0
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 1, 3) // LLC 3 (1 and 2 never appear)
+            .set_cpu(3, 1, 3);
+        let t = b.build();
+
+        assert_eq!(t.node_count(), 2);
+        assert_eq!(
+            t.llc_count(),
+            2,
+            "two real LLC domains, no phantom 1/2 from max+1"
+        );
+        // CPUs are remapped to dense LLC ids: OS LLC 0 ⇒ dense 0, OS LLC 3 ⇒ dense 1.
+        assert_eq!(t.llc_of_cpu(0), 0);
+        assert_eq!(t.llc_of_cpu(1), 0);
+        assert_eq!(t.llc_of_cpu(2), 1);
+        assert_eq!(t.llc_of_cpu(3), 1);
+        // An out-of-range CPU still reads as LLC domain 0 (total).
+        assert_eq!(t.llc_of_cpu(999), 0);
     }
 
     #[test]

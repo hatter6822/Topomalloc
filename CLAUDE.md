@@ -213,8 +213,9 @@ certified by the §21.6 release-safety theorem (`release_to_os_preserves_live_ob
 Topology awareness (W13) completes plan 04 and is **live**. The §15.2 `Topology` snapshot
 (`crates/topo-core/src/topology.rs`, pure/`no_std`; CPU→LLC→NUMA maps + a node-distance matrix, all
 queries total) is built by a `TopologyBuilder` that **falls back to a conservative single domain** on
-any inconsistency and **densely renumbers the OS node ids in use** (so a sparse platform has no phantom
-node; the raw OS id is kept in `os_node_of` for `mbind`) — W13-1. `preferred_node`/`preferred_node_at`
+any inconsistency and **densely renumbers the OS node ids — and the LLC-domain ids — in use** (so a
+sparse platform has no phantom node *or* LLC domain; the raw OS node id is kept in `os_node_of` for
+`mbind`) — W13-1. `preferred_node`/`preferred_node_at`
 is the §15.3/§15.5 placement decision over `NumaPolicy` (Local / Bind / Interleave / OsDefault /
 ArenaPolicy, W13-2); the §15.4 `Rebalancer` plans a nearest-donor → most-pressured move that strands
 no one — moving only a donor's **movable surplus** (`free − own demand`, via

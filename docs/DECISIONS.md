@@ -1282,18 +1282,21 @@ compiled-verified in the work environment).
 
 These decisions close the live-integration gaps of the §15 topology workstream.
 
-* **NUMA node ids are dense + internal, with a preserved OS-id map.** Discovery
-  densely renumbers the OS node ids actually in use to `0..node_count()` (as it already
-  does for LLC), so a sparsely-numbered platform (OS nodes 0 and 2 present, 1 absent)
-  yields **two** nodes, not a three-node model with a phantom node 1 — keeping
-  `node_count()`/stats exact and every dense id `< node_count()` a real node (the
-  rebalancer, interleave, and the per-node router can iterate `0..node_count()` with no
-  holes). Because `mbind`/`set_mempolicy` need the *kernel's* node number, the raw OS id
-  is kept in `node_os_id` and recovered by `Topology::os_node_of`. On a dense platform
-  the renumbering is the identity, so the common case is unchanged. The alternative
-  (raw OS ids + a "present" mask) was rejected: it pushes present-awareness into every
-  consumer, whereas dense ids give the clean invariant "all ids `< node_count()` are
-  real".
+* **NUMA node *and* LLC ids are dense + internal, with a preserved OS-id map for nodes.**
+  `TopologyBuilder::build` densely renumbers the OS node ids — and, by the identical
+  construction, the LLC-domain ids — actually in use to `0..node_count()` / `0..llc_count()`,
+  so a sparsely-numbered platform (OS nodes 0 and 2 present, 1 absent) yields **two** nodes,
+  not a three-node model with a phantom node 1 — keeping `node_count()`/`llc_count()`/stats
+  exact and every dense id a real domain (the rebalancer, interleave, and the per-node router
+  can iterate `0..node_count()` with no holes). Because `mbind`/`set_mempolicy` need the
+  *kernel's* node number, the raw OS *node* id is kept in `node_os_id` and recovered by
+  `Topology::os_node_of`; LLC ids are internal only, so no raw-id map is kept for them.
+  Doing **both** renumberings inside `build` (not only in the sysfs reader) hardens every
+  direct builder caller, not just the discovery path — the documented "no phantom domain"
+  invariant then holds uniformly (defense in depth). On a dense platform the renumbering is
+  the identity, so the common case is unchanged. The alternative (raw OS ids + a "present"
+  mask) was rejected: it pushes present-awareness into every consumer, whereas dense ids give
+  the clean invariant "all ids `< node_count()` / `< llc_count()` are real".
 * **The rebalancer donates only a node's *surplus*, never its raw free.** A move is
   sized and gated by `movable_surplus = free − own demand` (not raw free), so it can
   never strand the donor it draws from, and a round with no surplus anywhere plans
@@ -1339,8 +1342,9 @@ These decisions close the live-integration gaps of the §15 topology workstream.
   (placement config is sticky) and is the single source of truth (`stats` decodes the same
   atomic, so the two can never disagree).
 
-Verified by the topology unit tests (dense renumbering, the local-for-every-slot distance
-diagonal, `os_node_of` round-trip, `preferred_node_at` equivalence, the move helper), the
+Verified by the topology unit tests (dense **node and LLC** renumbering with the no-phantom
+guarantee, the local-for-every-slot distance diagonal, `os_node_of` round-trip,
+`preferred_node_at` equivalence, the move helper), the
 router unit tests (routing-by-policy, the avoid-decline-does-not-fabricate-demand
 regression, deterministic bind-failure counting, refresh, interleave, live rebalance), the
 arena unit tests (the lock-free `numa` encode/decode round-trip + survives-reset), the

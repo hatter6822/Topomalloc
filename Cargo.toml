@@ -46,9 +46,13 @@ exclude = ["fuzz", "vendor/sele4n"]
 # completion — genuine first-touch (an unbound default backend for OsDefault), real
 # `sched_getcpu` `Local`, nearest-node spillover, W12 `release_idle`, and the
 # host-driven `topomalloc_numa_*` C control surface; removed the now-dead filler NUMA
-# score term. In a 0.x series new backwards-compatible functionality is a patch bump
+# score term. 0.1.13: W13 audit — `TopologyBuilder::build` now densely renumbers the
+# LLC-domain ids too (not just NUMA nodes), so the documented no-phantom-domain invariant
+# holds for *any* builder caller (not only the sysfs reader) and `llc_count()`/stats stay
+# exact on a sparsely-numbered LLC space; dropped the now-dead `max_node`/`max_llc` builder
+# fields. In a 0.x series new backwards-compatible functionality is a patch bump
 # (the 0.x minor is the breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
