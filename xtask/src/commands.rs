@@ -166,7 +166,14 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         r.run(
             "workspace tests",
             "cargo",
-            &["test", "--workspace", "--target", t, "--", "--test-threads=1"],
+            &[
+                "test",
+                "--workspace",
+                "--target",
+                t,
+                "--",
+                "--test-threads=1",
+            ],
         );
         return r.finish();
     }
