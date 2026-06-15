@@ -1396,3 +1396,84 @@ nearest-node spillover, `MAX_NODES` scale), the `numa_api` control-surface test 
 configs), the multi-node integration tests over the real provider (first-touch + W12 release,
 and a concurrent alloc/free/rebalance/refresh stress test), and the W8-8 header↔symbol
 cross-check over the seven new C symbols.
+
+## W14 — lifetime/hotness placement policy & heap sampling (plan 07)
+
+These decisions close the §24 placement workstream, with the minimal §31.4 sampling slice that
+feeds it from real traffic.
+
+* **The learning policy is a pure, `no_std`, host-driven object — the `ReleaseController` (W12)
+  pattern — not engine-owned state.** `SiteProfileTable` (`crates/topo-core/src/placement.rs`)
+  holds the §24.4 `AllocationSiteProfile`s and answers `place_hints(stack_id)`; it reads no clock
+  and makes no provider calls (timestamps are inputs). This keeps the core formally tractable and
+  testable in isolation, and lets the *learned-profile machinery evolve behind a fixed safety
+  wall* exactly as the plan's deep-dive prescribes. The sampler (W17-3) is the input feed; the
+  policy itself is independently complete and correct.
+* **The §24.5 safety boundary holds by construction, not by audit.** The policy's *only* output
+  type is the advisory `PlaceHints { hotness, lifetime }` — the same score-only input the W11
+  filler already documents as "a wrong hint can hurt fragmentation but never misplace a live
+  object" (a run is carved from the free bitmap regardless of score). There is therefore **no
+  code path** from a profile to a size/alignment/validity/free decision. The
+  `engine_size_align_validity_free_are_invariant_under_hints` fixed-wall test (plus the
+  pure-filler, proptest, and `placement` fuzz companions) sweeps every hint combination —
+  including deliberately *wrong* learned ones — and asserts identical usable size, alignment,
+  writability, and free path. Placement is policy, not a modeled transition (§2.4, as for W13),
+  so there is **no Lean obligation and no trace-grammar change**.
+* **§24.2 lifetime classes are a distinct, richer taxonomy from the §10.4 user hint.** The user
+  flag (`Lifetime`: Unspecified/Short/Medium/Long) is a coarse *request* hint; the *inferred*
+  `LifetimeClass` (Unknown/Ephemeral/Short/Medium/Long/Persistent) is learned from measured ages
+  and projected back onto the coarse hint for the filler. Keeping them separate avoids
+  conflating "what the caller said" with "what we observed", and the projection
+  (`to_hint`) is the single, total bridge.
+* **Bounded, allocation-free state everywhere.** The size-class distribution is a small
+  Space-Saving summary (top-`K` with overcount bounds — the principled bounded frequent-items
+  sketch, since a site allocates few distinct sizes); the profile table is fixed-capacity open
+  addressing with bounded-probe least-confidence eviction; the live sampled-object set is
+  fixed-capacity open addressing with backward-shift deletion (no tombstones) and drops past a
+  7/8 load rather than evicting a live record. Nothing grows or allocates, so the whole
+  subsystem is `no_std`-clean and the sampled path cannot recurse into the allocator via a
+  growth.
+* **Confidence is two-tier but reported as one number.** Hotness confidence scales with alloc
+  samples (a mixed-hotness site self-corrects: its mean drifts to neutral ⇒ no grouping
+  pressure); lifetime confidence is free-sample maturity × histogram concentration (so we never
+  act on a lifetime we have not *seen die*). `place_hints` gates each dimension on its own
+  confidence; the §24.4 `confidence` field is the conservative `min` of the two. A site with
+  only allocations (no observed frees) is never "confident" about lifetime — the right
+  conservative default (§24.6 "when the allocator has confidence").
+* **Sampling is off by default and lock-free on the hot path (§31.4).** The decision is a
+  per-thread Poisson `Sampler` (a fixed-point exponential inter-sample interval, so the core
+  stays floating-point-free, §6) touching only thread-local state. The **free** path's
+  "is this sampled?" test is a lock-free atomic `SampleBloom` with **no false negatives**, so the
+  common non-sampled free never takes the sampled-set lock; only a (rare) maybe-positive does
+  (DD-1 F2). When disabled, every hook is a single relaxed atomic load — the default artifact's
+  path is unchanged.
+* **Stack capture is `libc::backtrace` into a fixed buffer, warmed up at enable.** The §31.4
+  / Appendix-F trap is an unwinder that allocates and re-enters the allocator from inside an
+  allocation. We capture return addresses straight into a fixed `StackBuf` (no growth), and run
+  the one-time glibc unwinder `dlopen` at *enable* time (outside any sampled allocation) so the
+  capture itself never allocates. A thread-local re-entrancy guard makes the whole sampled slow
+  path non-re-entrant; the `sampling_lifecycle_*` test drives 20k sampled allocations and proves
+  no deadlock/recursion. On non-glibc targets capture degrades to "un-attributed" rather than
+  failing to build.
+* **The global sampled state is a lazily-`Box`ed `Mutex`, initialized at enable under the
+  bootstrap guard.** An all-zero `static` would force the `min_confidence_bp != 0` table into
+  `.data` (binary bloat); a stack-built `static` const is large. Lazy `Box` init at enable
+  (off the hot path, and under the existing `BOOTSTRAPPING` guard when set from
+  `$TOPOMALLOC_SAMPLE_RATE` at startup) costs the default build nothing and keeps the slow path
+  allocation-free thereafter (`STATE.get()` is a plain load once armed).
+* **`realloc` is sampled as retire-old + create-new.** The hook frees the old object's record
+  before the resize and samples the result as a fresh allocation; an in-place resize is simply
+  re-sampled. A failed resize leaves the old object un-tracked — an accepted, bounded profiling
+  inaccuracy, never a correctness issue.
+* **Observability rides the host-composes-stats seam.** `placement_stats()` is the accessor the
+  host folds into `topo_stats::Stats::record_placement` (exactly like `record_release` /
+  `record_node_router`); the `placement` JSON block and the `topo.placement.*` control keys read
+  from it. These are *profiling* estimates (sampled live bytes ≠ managed VM), so they sit
+  **outside** the §8.6 byte reconciliation by design.
+
+Verified by 21 new `topo-core` unit tests (placement + sampling), the `placement` integration
+suite (the fixed-wall safety boundary over a real hugepage-backed engine, grouping observability,
+the learned-profile→hint loop, and the live off→on→concurrent sampling lifecycle), a
+`learned_profile_never_breaks_placement_geometry` proptest, the `placement` fuzz target, the
+stats/control reconciliation tests, and the W8-8 header↔symbol cross-check over the six new
+`topomalloc_profile_*` C symbols.

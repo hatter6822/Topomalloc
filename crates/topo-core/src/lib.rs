@@ -36,9 +36,11 @@ pub mod node_router;
 pub mod overflow;
 pub mod pagemap;
 pub mod pinned;
+pub mod placement;
 pub mod profile;
 pub mod ptr_class;
 pub mod release;
+pub mod sampling;
 pub mod size_class;
 pub mod skeleton;
 pub mod slab;
@@ -88,6 +90,10 @@ pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
 pub use large::{LargeAllocator, LargeBacking, LargeConfig};
 pub use node_router::{NodeRouter, NodeRouterStats, RouterControl};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
+pub use placement::{
+    AllocationSiteProfile, LifetimeClass, LifetimeHistogram, PlacementStats, SiteProfileTable,
+    SizeClassDist, StackId, CONFIDENT_SAMPLES, DEFAULT_MIN_CONFIDENCE_BP, SIZE_DIST_K,
+};
 pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{
     classify_ptr, validate_free, AnyMetadataRegion, FreeTarget, InvalidFree, MetadataRegion,
@@ -96,6 +102,10 @@ pub use ptr_class::{
 pub use release::{
     demand_reserve, LatencyClass, PressureMode, PressureThresholds, ReleaseController,
     ReleaseInputs, ReleasePlan, ReleaseStats,
+};
+pub use sampling::{
+    Rng, SampleBloom, SampleConfig, SampledObjects, SampledRecord, Sampler, StackBuf, BLOOM_WORDS,
+    MAX_STACK_FRAMES,
 };
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};

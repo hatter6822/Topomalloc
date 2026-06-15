@@ -32,6 +32,9 @@ topo-test-support = { path = "../crates/topo-test-support" }
 
 [dev-dependencies]
 proptest = "1"
+# Validates the §31.3 profile-dump JSON in the W14 placement integration tests
+# (test-only; the same dep topo-stats uses for its JSON assertions).
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -133,7 +133,27 @@ through the existing region-cache seam, so the **default path and a single-node 
 byte-for-byte unchanged**. Placement is policy, not a modeled transition, so it adds no
 proof obligation. The router's bind-failure / rebalance / spillover counters and the
 node/LLC counts reconcile into the stats JSON and the `topo.numa.*` control namespace.
-Front-end caches (M2) and the remaining M1 pieces land per the plan.
+
+**Lifetime, hotness & placement policy (W14)** completes plan 07's placement track. The
+six §24.2 `LifetimeClass`es, the §24.4 `AllocationSiteProfile` record (stack id, a bounded
+Space-Saving size-class summary, a right-censored lifetime histogram, mean hotness,
+alloc/free rates, sampled live bytes, confidence), and the `SiteProfileTable` learning
+policy live in `crates/topo-core/src/placement.rs` — a **pure, `no_std`, host-driven**
+object (the W12 `ReleaseController` pattern) that distils a confident profile into the
+advisory `PlaceHints` (hotness + lifetime) the W11 filler already groups by (cold spans,
+short-lived together, long-lived-hot densely packed; §24.6–§24.8). To feed it from *real*
+traffic, the **minimal W17-3 sampling slice** landed alongside (`sampling.rs` + the
+`topo-abi` glue): a lock-free per-thread Poisson decision, an allocation-free
+`libc::backtrace` capture into a fixed buffer, a `SampleBloom`-gated sampled-object
+lifecycle with right-censored lifetimes, and a re-entrancy guard so the sampler **never
+re-enters the allocator** (§31.4). It is **off by default** (one relaxed atomic load on the
+hot path), enabled by `$TOPOMALLOC_SAMPLE_RATE` or `topomalloc_profile_set_rate`. The
+**single non-negotiable** — the §24.5 safety boundary — is a fixed, tested wall: a
+placement decision (even from a wrong or adversarial learned profile) may change *where* an
+object lands but **never** its size, alignment, validity, or free path. Placement is policy,
+not a modeled transition (§2.4), so it adds **no Lean obligation**; the profiler's counters
+reconcile into the stats JSON (`placement` block) and the `topo.placement.*` control
+namespace. Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Quick start
 

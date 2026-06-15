@@ -334,6 +334,38 @@ uint64_t topomalloc_numa_rebalance_moves(void);
 uint64_t topomalloc_numa_spillovers(void);
 
 /* ------------------------------------------------------------------------
+ * Heap/lifetime sampling & placement profiling (plan 07 W14 + W17-3)
+ *
+ * Sampling is OFF by default (zero hot-path cost). Setting a non-zero mean
+ * sample interval starts attributing the live heap by call site (a lock-free
+ * per-thread Poisson decision + an allocation-free stack capture), feeding the
+ * lifetime/hotness placement policy. The sampler never re-enters the allocator
+ * and never affects an allocation's size, alignment, or validity (the SPEC
+ * §24.5 safety boundary). $TOPOMALLOC_SAMPLE_RATE sets the same rate at startup.
+ * --------------------------------------------------------------------- */
+
+/* Start/stop sampled profiling: mean_bytes is the mean allocated bytes between
+ * samples (a Poisson rate); 0 disables. */
+void topomalloc_profile_set_rate(uint64_t mean_bytes);
+
+/* 1 if sampled profiling is currently enabled, else 0. */
+int topomalloc_profile_enabled(void);
+
+/* The current mean sample interval in bytes (0 when disabled). */
+uint64_t topomalloc_profile_rate(void);
+
+/* Distinct allocation sites currently profiled. */
+uint64_t topomalloc_profile_sites(void);
+
+/* Sites confident enough to steer placement. */
+uint64_t topomalloc_profile_confident_sites(void);
+
+/* Render the live profile as JSON into buf (NUL-terminated, truncated to cap),
+ * returning the full length in bytes (excl. NUL); pass buf=NULL/cap=0 to query
+ * the length only. */
+size_t topomalloc_profile_dump_json(char *buf, size_t cap);
+
+/* ------------------------------------------------------------------------
  * Identification
  * --------------------------------------------------------------------- */
 

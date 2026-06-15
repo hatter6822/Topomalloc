@@ -91,6 +91,14 @@ pub struct Stats {
     /// Live NUMA router: cumulative spillover allocations (served off the preferred node
     /// because it was full — §15.4 remote reuse at allocation time).
     pub numa_spillovers: u64,
+
+    // --- placement / lifetime profiling (§24/§31.3, plan 07 W14 + W17-3) -----
+    /// The allocation-site learning policy's running counters (sites tracked, confident
+    /// sites, sampled alloc/free/censored counts, evictions, sampled live bytes). All zero
+    /// unless heap/lifetime sampling has been enabled; populated via
+    /// [`record_placement`](Self::record_placement). These are *profiling* estimates, not a
+    /// managed-memory byte class, so they do not enter the §8.6 VM reconciliation.
+    pub placement: topo_core::PlacementStats,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -222,6 +230,14 @@ impl Stats {
         self.numa_spillovers = r.spillovers;
     }
 
+    /// Record the placement learning policy's running counters (§24/§31.3, plan 07 W14)
+    /// from a [`SiteProfileTable::stats`](topo_core::SiteProfileTable::stats) snapshot. The
+    /// profiler is a host-owned sibling (like the release controller / hugepage backend),
+    /// so its summary is composed alongside [`record_allocator`](Self::record_allocator).
+    pub fn record_placement(&mut self, ps: topo_core::PlacementStats) {
+        self.placement = ps;
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -304,6 +320,15 @@ impl Stats {
                 "    \"rebalance_released_bytes\": {numa_rebalance_released_bytes},\n",
                 "    \"spillovers\": {numa_spillovers}\n",
                 "  }},\n",
+                "  \"placement\": {{\n",
+                "    \"sites_tracked\": {pl_sites},\n",
+                "    \"confident_sites\": {pl_confident},\n",
+                "    \"alloc_samples\": {pl_alloc},\n",
+                "    \"free_samples\": {pl_free},\n",
+                "    \"censored_samples\": {pl_censored},\n",
+                "    \"evictions\": {pl_evict},\n",
+                "    \"sampled_live_bytes\": {pl_live}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -353,6 +378,13 @@ impl Stats {
             numa_rebalance_moves = self.numa_rebalance_moves,
             numa_rebalance_released_bytes = self.numa_rebalance_released_bytes,
             numa_spillovers = self.numa_spillovers,
+            pl_sites = self.placement.sites_tracked,
+            pl_confident = self.placement.confident_sites,
+            pl_alloc = self.placement.alloc_samples,
+            pl_free = self.placement.free_samples,
+            pl_censored = self.placement.censored_samples,
+            pl_evict = self.placement.evictions,
+            pl_live = self.placement.sampled_live_bytes,
             metadata = self.metadata_bytes,
         )
     }
@@ -530,6 +562,35 @@ mod tests {
         let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
         assert_eq!(d["topology"]["router_bind_failures"], 0);
         assert_eq!(d["topology"]["spillovers"], 0);
+    }
+
+    #[test]
+    fn placement_stats_reconcile_into_stats_and_json() {
+        // W14 / W17-3: the learning policy's running counters flow into the snapshot and
+        // the JSON `placement` block.
+        let ps = topo_core::PlacementStats {
+            sites_tracked: 12,
+            confident_sites: 5,
+            alloc_samples: 1000,
+            free_samples: 900,
+            censored_samples: 40,
+            evictions: 3,
+            sampled_live_bytes: 4_194_304,
+        };
+        let mut s = Stats::default();
+        s.record_placement(ps);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["placement"]["sites_tracked"], 12);
+        assert_eq!(v["placement"]["confident_sites"], 5);
+        assert_eq!(v["placement"]["alloc_samples"], 1000);
+        assert_eq!(v["placement"]["free_samples"], 900);
+        assert_eq!(v["placement"]["censored_samples"], 40);
+        assert_eq!(v["placement"]["evictions"], 3);
+        assert_eq!(v["placement"]["sampled_live_bytes"], 4_194_304u64);
+        // The default snapshot (profiling never enabled) is all-zero.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["placement"]["sites_tracked"], 0);
+        assert_eq!(d["placement"]["alloc_samples"], 0);
     }
 
     #[test]

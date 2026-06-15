@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. The hugepage-aware backend (W11) rides on the §18.6 region-cache seam: the four §19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a real, backend-agnostic placement subsystem over the provider seam — nine §19.4 occupancy bins (each hugepage in exactly one, H-003), packing-scored placement (§19.3), partial subrelease guarded by H-005, §19.7 coverage metrics in stats, and the §19.8 H-001..H-005 invariants checked in debug — wired into the live large path through the existing `RegionCacheHook`, identical over POSIX and the seLe4n simulator. Front-end caches (M2) and the remaining M1 pieces land per the plan.
+**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. The hugepage-aware backend (W11) rides on the §18.6 region-cache seam: the four §19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a real, backend-agnostic placement subsystem over the provider seam — nine §19.4 occupancy bins (each hugepage in exactly one, H-003), packing-scored placement (§19.3), partial subrelease guarded by H-005, §19.7 coverage metrics in stats, and the §19.8 H-001..H-005 invariants checked in debug — wired into the live large path through the existing `RegionCacheHook`, identical over POSIX and the seLe4n simulator. The release controller (W12), live NUMA topology router (W13), and the lifetime/hotness/site-profile **placement policy** (W14) — fed live by a **minimal, off-by-default heap-sampling slice** (W17-3: lock-free per-thread Poisson decision, alloc-free `libc::backtrace` capture, right-censored sampled-object lifecycle, all behind a re-entrancy guard) — ride on top, the placement policy upholding the §24.5 safety boundary (it changes locality, never size/alignment/validity) by construction. Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Essential Build Commands
 
@@ -239,11 +239,36 @@ moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON 
 control namespace. A first-class per-node *demand* signal (the rebalancer uses an alloc-failure
 approximation) and LLC-domain placement (transfer caches, M2) remain the deferred pieces.
 
+Lifetime, hotness & placement policy (W14) completes plan 07's placement track ahead of its M6 slot, in
+`crates/topo-core/src/placement.rs`: the six §24.2 `LifetimeClass`es, the §24.4 `AllocationSiteProfile`
+record (stack id, a bounded Space-Saving `SizeClassDist`, a right-censored `LifetimeHistogram`, mean
+hotness, alloc/free rates, `sampled_live_bytes`, per-dimension + combined confidence), and the
+`SiteProfileTable` learning policy — a **pure, `no_std`, host-driven** object (the W12 `ReleaseController`
+pattern) whose `place_hints` distils a *confident* profile into the advisory `PlaceHints` (hotness +
+lifetime) the W11 filler already groups by (§24.6–§24.8: cold → cold/sparse, same-lifetime via
+open-fresh-on-mismatch, long+hot → hot-dense). W14-1 reuses the existing W11 hint plumbing. The single
+non-negotiable, the §24.5 safety boundary, holds **by construction** — the policy's only output is
+score-only `PlaceHints`, so a missing/wrong/adversarial profile can change *where* an object lands but
+never its size/alignment/validity/free path — and is pinned by the fixed-wall test
+(`engine_size_align_validity_free_are_invariant_under_hints` + pure-filler + proptest + fuzz companions).
+The **minimal W17-3 sampling slice** landed alongside to feed the policy live (`crates/topo-core/src/sampling.rs`
++ the `topo-abi` glue): a lock-free per-thread Poisson `Sampler` (W17-3a, fixed-point exponential, FP-free
+core), an allocation-free `libc::backtrace` capture into a fixed `StackBuf` (W17-3b, warmed up at enable),
+a `SampleBloom`-gated `SampledObjects` lifecycle with right-censored lifetimes (W17-3c, the free hot path
+stays lock-free), and `SiteProfileTable` as the aggregator (W17-3d) with a `topomalloc_profile_dump_json`
+dump. Sampling is wired into `AnyAllocator::{allocate,free,realloc}`, **off by default** (one relaxed
+atomic load on the hot path), enabled by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`, and a
+thread-local re-entrancy guard keeps the sampler from re-entering the allocator (§31.4). Placement is
+policy, not a modeled transition (§2.4, as for W13), so there is **no Lean obligation and no trace-grammar
+change**; the profiler's counters reconcile into `topo-stats` JSON (`placement` block) and the
+`topo.placement.*` control namespace (profiling estimates, outside the §8.6 byte reconciliation). The full
+W17 stats core / epoch snapshot / flags / redaction / `explain` remain for M6.
+
 **Test counts:**
-- Rust: ~668 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~702 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 8 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, and `topology`)
+- Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
@@ -263,8 +288,8 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13) | MIT | Yes |
-| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13), the lifetime/hotness/site-profile placement policy + the heap-sampling machinery (W14 + W17-3) | MIT | Yes |
+| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, the `topomalloc_profile_*` sampling control surface (W17-3), live sampler glue, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery; `OsCore` — `sched_getcpu` current-CPU oracle (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
@@ -340,9 +365,9 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | Conformance class | Primary workstreams | First | Full |
 |--------------------|---------------------|-------|------|
 | **Core** (API, ownership, metadata, safety) | W2, W3, W5, W8, W15, W16 | M1 | M4 |
-| **Performance** (per-CPU, batching, hugepage, budgets) | W6, W7, W11, W12, W13 | M3 | M5 |
+| **Performance** (per-CPU, batching, hugepage, budgets, placement) | W6, W7, W11, W12, W13, W14 | M3 | M5 |
 | **Formal** (Lean model, machine-checkable tables, contracts) | W1 | M0 | M7 (single-core), M9 (SMP) |
-| **Operational** (stats, profiles, controls, diagnostics) | W17, W20, W12 | M4 | M6 |
+| **Operational** (stats, profiles, controls, diagnostics) | W17, W20, W12, W14 | M4 | M6 |
 | **Microkernel** (seLe4n profile, **required**) | W22 + W1 bridge + W4 seam | M1 (sim) | M8 (real ABI), M9 (SMP) |
 
 ## Source Organization
@@ -350,8 +375,8 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 ```text
 topomalloc/
 ├── crates/
-│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, hugepage filler)
-│   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc)
+│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, hugepage filler, placement policy + sampling)
+│   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc, profile/sampling control)
 │   ├── topo-backend-posix/    (mmap/madvise/mprotect — the POSIX backend)
 │   ├── topo-backend-sele4n/   (Sele4nSim + real seLe4n ABI — GPL-3.0-or-later)
 │   ├── topo-arch/             (per-arch RSEQ assembly: x86-64, AArch64)
