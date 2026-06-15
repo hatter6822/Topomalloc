@@ -206,7 +206,7 @@ fn real_two_node_router(cap: usize) -> NodeRouter<PosixBackingProvider, FixedCor
     let m = meta(1 << 21);
     let mut b = TopologyBuilder::new(2);
     b.set_cpu(0, 0, 0).set_cpu(1, 1, 1);
-    NodeRouter::build(b.build(), FixedCore(CoreId::DEFAULT), |_node, _os| {
+    NodeRouter::build(b.build(), FixedCore(CoreId::DEFAULT), |_target| {
         HugePageBackend::new(
             PosixBackingProvider::new(),
             m,
@@ -330,4 +330,31 @@ fn live_router_refresh_cycle_over_real_posix() {
         "Local now follows the refreshed map"
     );
     assert!(r.try_cache(a2));
+}
+
+#[test]
+fn live_router_first_touch_and_release_over_real_posix() {
+    // OsDefault serves from the UNBOUND first-touch backend (real mmap, no mbind), Bind from
+    // the bound node, and release_idle returns freed empty hugepages to the OS — end to end
+    // over the real provider.
+    let r = real_two_node_router(4);
+    let d = r
+        .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::OsDefault))
+        .expect("first-touch default");
+    assert!(
+        r.addr_in_default(d.base as usize),
+        "OsDefault → unbound first-touch backend"
+    );
+    assert_eq!(r.node_of_addr(d.base as usize), None, "not a bound node");
+    // A whole hugepage bound to node 1, then freed ⇒ an empty-backed hugepage on node 1.
+    let b = r
+        .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
+        .expect("bound hugepage");
+    assert_eq!(r.node_of_addr(b.base as usize), Some(1));
+    assert!(r.try_cache(b), "free routes home to node 1's backend");
+    // release_idle(0) returns node 1's idle empty hugepage to the OS (W12 handoff).
+    let released = r.release_idle(0);
+    assert!(released > 0, "idle empty hugepages returned to the OS");
+    assert!(r.try_cache(d));
+    assert!(r.check_invariants());
 }

@@ -41,6 +41,7 @@ mod c_api;
 mod errno_shim;
 mod extended;
 mod hooks_api;
+mod numa_api;
 mod policy;
 
 pub use arena_api::{
@@ -61,6 +62,11 @@ pub use extended::{
     TOPO_TCACHE_NONE, TOPO_ZERO,
 };
 pub use hooks_api::{topo_arena_create_hooked, topo_extent_hooks_t, topo_max_hook_backends};
+pub use numa_api::{
+    topomalloc_numa_bind_failures, topomalloc_numa_nodes, topomalloc_numa_rebalance_moves,
+    topomalloc_numa_rebalance_tick, topomalloc_numa_refresh, topomalloc_numa_release,
+    topomalloc_numa_spillovers,
+};
 pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
@@ -271,42 +277,43 @@ fn build_posix_allocator(
     let cfg = AllocatorConfig::default();
     #[cfg(feature = "hugepage-optimized")]
     {
-        use topo_backend_posix::discover_topology;
-        use topo_core::{CoreId, FixedCore, HugeConfig, HugePageBackend, NodeRouter};
+        use topo_backend_posix::{discover_topology, OsCore};
+        use topo_core::{HugeConfig, HugePageBackend, NodeRouter};
 
         let capacity = (cfg.large_region_bytes / topo_core::HUGEPAGE_SIZE).max(1);
-        // Build a live NUMA router: one hugepage backend per discovered NUMA node, each
-        // bound to its node (§15.5), with the large region split across them. On a
-        // single-node machine this is exactly one backend — byte-for-byte the plain
-        // hugepage path — so the integration degrades cleanly where there is nothing to
-        // place. Placement follows the arena's `NumaPolicy` (resolved into the engine's
-        // hints, §15.3/§15.5); the current-CPU source is a `FixedCore` until the RSEQ
-        // per-CPU identity lands (plan 05 W7), so `Local`/`Interleave` use core 0 today.
+        // Build a live NUMA router: one `mbind`-bound hugepage backend per discovered NUMA
+        // node (serving explicit Local/Bind/Interleave), plus — on a multi-node host — an
+        // **unbound default backend** serving `OsDefault`/`ArenaPolicy` so the kernel places
+        // those pages first-touch (the node of the using thread, the right default). On a
+        // single-node machine this is exactly one backend — byte-for-byte the plain hugepage
+        // path. The current-CPU source is the real `OsCore` (`sched_getcpu`), so `Local`
+        // tracks the running thread; placement follows the arena's `NumaPolicy` (§15.3/§15.5).
         let topo = discover_topology();
         let n = (topo.node_count() as usize).max(1);
-        // Round up so the per-node backends total *at least* the single-backend capacity
-        // (no capacity regression from the split); on a single node this is exactly
-        // `capacity`. The extra is virtual address space (lazily faulted), so it is free.
+        // Per **bound** backend, round up so the per-node set totals at least `capacity`; the
+        // unbound default gets the full `capacity` (it serves the common first-touch traffic).
+        // The extra is virtual address space (lazily faulted), so it is free.
         let per_node = capacity.div_ceil(n).max(1);
-        let router = NodeRouter::build(topo, FixedCore(CoreId::DEFAULT), |_node, _os| {
+        let router = NodeRouter::build(topo, OsCore, |target| {
+            let cap = if target.is_some() { per_node } else { capacity };
             HugePageBackend::new(
                 PosixBackingProvider::new(),
                 meta,
                 ArenaId::DEFAULT,
-                HugeConfig::with_capacity(per_node),
+                HugeConfig::with_capacity(cap),
             )
             .ok()
         })?;
         // Leak-and-reclaim, as for the single backend: only a successfully-built router is
         // leaked into `'static`; the raw pointer is kept so a failing allocator build
-        // reclaims it (its `Drop` releases *every* per-node reservation). On success it is
-        // process-lived (like `meta`/`pagemap`).
-        let router_ptr: *mut NodeRouter<PosixBackingProvider, FixedCore> =
+        // reclaims it (its `Drop` releases *every* reservation). On success it is
+        // process-lived (like `meta`/`pagemap`) and published for the C control surface.
+        let router_ptr: *mut NodeRouter<PosixBackingProvider, OsCore> =
             Box::into_raw(Box::new(router));
         // SAFETY: `router_ptr` came from `Box::into_raw` just above and is uniquely owned;
         // reborrowing it as `&'static` is sound because it is only reclaimed on the failure
         // arm below (after the borrow ends), and otherwise leaked for the process lifetime.
-        let huge: &'static NodeRouter<PosixBackingProvider, FixedCore> = unsafe { &*router_ptr };
+        let huge: &'static NodeRouter<PosixBackingProvider, OsCore> = unsafe { &*router_ptr };
         match Allocator::new_with_huge(
             PosixBackingProvider::new(),
             PosixBackingProvider::new(),
@@ -317,13 +324,19 @@ fn build_posix_allocator(
             ArenaId::DEFAULT,
             cfg,
         ) {
-            Ok(a) => Some(a),
+            Ok(a) => {
+                // Publish the live router for the host-driven C NUMA control surface
+                // (rebalance / refresh / release / stats). The `&'static` outlives the
+                // process; `OnceLock::set` ignores a second build (the first allocator wins).
+                crate::numa_api::publish_router(huge);
+                Some(a)
+            }
             Err(_) => {
                 // The allocator only *borrowed* `huge` and that borrow ended with the
                 // `Err`, so reclaim the leaked router before returning `None`.
                 // SAFETY: `router_ptr` was produced by `Box::into_raw` of the same type
                 // above; reclaimed exactly once, only on this failure path, never used
-                // again (no double-free). Its `Drop` releases every per-node reservation.
+                // again (no double-free). Its `Drop` releases every reservation.
                 drop(unsafe { Box::from_raw(router_ptr) });
                 None
             }

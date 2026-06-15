@@ -86,7 +86,7 @@ pub use huge::{
 };
 pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
 pub use large::{LargeAllocator, LargeBacking, LargeConfig};
-pub use node_router::{NodeRouter, NodeRouterStats};
+pub use node_router::{NodeRouter, NodeRouterStats, RouterControl};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{
