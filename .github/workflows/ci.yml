@@ -109,7 +109,11 @@ jobs:
       - name: Install AArch64 runtime (cross linker + dev libc + qemu-user)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user qemu-user-static
-      - name: Test (retry once on AArch64 infra flake, DD-2)
+      # The AArch64 suite runs under qemu-user, which `xtask test --target` forces
+      # single-threaded to dodge a qemu 8.2.x /proc/self/maps thread-safety crash
+      # (fixed upstream in qemu >= 9.0.4, commit bbd5630a75e7; see xtask `test`).
+      # The retry stays as a secondary net for genuine infra flakes (DD-2).
+      - name: Test (AArch64 under qemu-user; retry once on infra flake, DD-2)
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
             cargo xtask test   # host: includes the G-sim vertical slice

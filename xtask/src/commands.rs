@@ -143,10 +143,30 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
     // A cross target runs the standard workspace suite under the configured
     // runner; per-kind selection below is for host development.
     if let Some(t) = flag_value(args, "--target") {
+        // Run single-threaded under the qemu-user runner. qemu-user 8.2.x (Ubuntu
+        // 24.04's qemu, used by CI) has a thread-safety bug in its /proc/self/maps
+        // emulation: `open_self_maps` / `walk_memory_regions` (linux-user/syscall.c)
+        // walk the guest memory map *without* taking the mmap lock, so when one guest
+        // thread reads /proc/self/maps (Rust's panic/backtrace machinery does) while
+        // another is mmap/munmap-ing (the allocator's backing churn), qemu dereferences
+        // a torn page-table entry and dies with "QEMU internal SIGSEGV {addr=0x20}" —
+        // the *emulator* crashing, not a guest fault. Fixed upstream by qemu commit
+        // bbd5630a75e7 ("linux-user: Emulate /proc/self/maps under mmap_lock", in qemu
+        // >= 9.0.4); until the CI runner ships that, serialize so the maps read never
+        // races a map mutation. A ~30-line pure-C repro (concurrent /proc/self/maps
+        // reads + mmap, no TopoMalloc) crashes this qemu 20/20; single-threaded, 0/40.
+        //
+        // This costs no concurrency coverage: qemu-user on an x86 host executes guest
+        // atomics with the host's strong (TSO) ordering, so it cannot faithfully
+        // exercise AArch64's weak memory model regardless of thread count. Real
+        // concurrency correctness is covered by ThreadSanitizer + the parallel x86 run
+        // (data races / the C++ memory model) and the native-arm64 RSEQ job (real
+        // hardware). The asm/instruction-set coverage this qemu job exists for is
+        // thread-count-independent.
         r.run(
             "workspace tests",
             "cargo",
-            &["test", "--workspace", "--target", t],
+            &["test", "--workspace", "--target", t, "--", "--test-threads=1"],
         );
         return r.finish();
     }
