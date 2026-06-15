@@ -96,13 +96,16 @@ the OS (§20–§21). A `tick(now_ms, inputs)` pump samples the §21.2 observati
 classifies the §21.5 pressure mode (Normal/Soft/Hard/Emergency, with hysteresis;
 allocation failure or cgroup-critical forces Emergency), computes the §21.4 demand
 reserve — the anti-oscillation brake that withholds release proportional to recent
-demand so freed memory is not faulted straight back (§21.1 R2) — and plans the §21.3
+demand so freed memory is not faulted straight back (§21.1 R2), capped at the
+`recent_peak` of releasable-free memory (a leaky peak-hold that relaxes toward current
+free, so a transient free spike does not pin the reserve high) — and plans the §21.3
 priority ladder (drain caches → release empty hugepages beyond the reserve → purge aged
 dirty-not-on-hot → convert aged dirty→muzzy → subrelease cold-sparse → release aged
 muzzy → emergency shrink) — where dirty and muzzy are each retained for reuse until
 their `dirty_decay_ms`/`muzzy_decay_ms` interval elapses — each rung gated by mode and
-the §36.11 latency class, rate-capped (§20.2) with a
-backlog. It is wired **live** through `HugePageBackend::release_tick`, which drives the
+the §36.11 latency class, rate-capped (§20.2) with a backlog (the max of carried-vs-
+current desire, so a rate-capped persistent supply cannot make it diverge). It is wired
+**live** through `HugePageBackend::release_tick`, which drives the
 W11 `release_empty_excess` demand-reserve hook — so an idle backend returns its empty
 hugepages to the OS while a churning one holds them back — identical over POSIX and the
 seLe4n simulator (§36.9). The controller adds **no abstract transition**: it sequences
