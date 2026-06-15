@@ -498,6 +498,16 @@ fn run_is_clear(bm: &[u64; BITMAP_WORDS], start: usize, len: usize) -> bool {
     true
 }
 
+/// Whether `addr` lies in the half-open address range `[base, base + len)`, computed
+/// **without** the `base + len` addition (which could wrap near the top of the address
+/// space and answer wrongly). The `&&` short-circuits, so `addr - base` is only evaluated
+/// once `addr >= base` holds — it can never underflow — and `addr - base < len` is the
+/// overflow-free equivalent of `addr < base + len`.
+#[inline]
+const fn region_contains(base: usize, len: usize, addr: usize) -> bool {
+    addr >= base && addr - base < len
+}
+
 /// Count set bits in `bm` over the page range `[start, start + len)`.
 #[inline]
 fn run_popcount(bm: &[u64; BITMAP_WORDS], start: usize, len: usize) -> usize {
@@ -2258,10 +2268,11 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 
     /// Whether `addr` lies within this backend's reserved region (used by the live
     /// [`NodeRouter`](crate::NodeRouter) to route a freed region back to its owner).
+    /// Overflow-free: it uses the `addr - base < len` form, never the wrap-prone
+    /// `base + len` (the private `region_contains` helper).
     #[inline]
     pub fn owns_addr(&self, addr: usize) -> bool {
-        let base = self.region.base as usize;
-        addr >= base && addr < base + self.region.len
+        region_contains(self.region.base as usize, self.region.len, addr)
     }
 
     /// **Best-effort NUMA-bind this backend's whole region to OS node `os_node`** (§15.5,
@@ -2678,6 +2689,45 @@ mod filler_tests {
         f.mark_committed(&p);
         assert!(f.check_invariants());
         p
+    }
+
+    #[test]
+    fn region_contains_is_overflow_safe() {
+        // Ordinary half-open `[base, base + len)` membership.
+        assert!(region_contains(1000, 100, 1000), "inclusive start");
+        assert!(region_contains(1000, 100, 1099), "last byte");
+        assert!(!region_contains(1000, 100, 1100), "exclusive end");
+        assert!(!region_contains(1000, 100, 999), "before the start");
+        assert!(
+            !region_contains(1000, 0, 1000),
+            "an empty region contains nothing"
+        );
+
+        // Near the top of the address space, where `base + len` **wraps**: membership must
+        // still be correct. The old `addr < base + len` form computed `base + len`, which
+        // overflowed to a small value and answered wrongly; the `addr - base < len` form
+        // never forms that sum.
+        let base = usize::MAX - 50;
+        let len = 100; // base + len = usize::MAX + 50 ⇒ would wrap to 49
+        assert_eq!(base.wrapping_add(len), 49, "the sum genuinely wraps here");
+        assert!(region_contains(base, len, base), "start, even near the top");
+        assert!(
+            region_contains(base, len, usize::MAX),
+            "50 bytes in — the wrapping `base + len` form answered this wrong"
+        );
+        assert!(
+            !region_contains(base, len, base - 1),
+            "just before the start"
+        );
+        // A low (wrapped-around) address is NOT in a real, non-wrapping reservation.
+        assert!(
+            !region_contains(base, len, 10),
+            "wrapped low address is not a member"
+        );
+        assert!(
+            !region_contains(base, len, 48),
+            "nor is the wrapped end region"
+        );
     }
 
     #[test]
