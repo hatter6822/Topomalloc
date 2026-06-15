@@ -271,29 +271,39 @@ fn build_posix_allocator(
     let cfg = AllocatorConfig::default();
     #[cfg(feature = "hugepage-optimized")]
     {
+        use topo_backend_posix::discover_topology;
+        use topo_core::{CoreId, FixedCore, HugeConfig, HugePageBackend, NodeRouter};
+
         let capacity = (cfg.large_region_bytes / topo_core::HUGEPAGE_SIZE).max(1);
-        // If `HugePageBackend::new` itself fails it rolls its own reservation back
-        // (§19.2) and `.ok()?` returns before any leak. Only a *successful* backend
-        // is leaked into `'static` for the allocator to borrow — so the raw pointer
-        // is kept to reclaim it if the allocator build below fails (see the failure
-        // arm), guaranteeing the backend's `Drop` (which releases the large virtual
-        // reservation) runs on every path. On success the backend stays leaked
-        // (process-lived, like `meta`/`pagemap`), and the success path is unchanged.
-        let huge_ptr: *mut topo_core::HugePageBackend<PosixBackingProvider> =
-            Box::into_raw(Box::new(
-                topo_core::HugePageBackend::new(
-                    PosixBackingProvider::new(),
-                    meta,
-                    ArenaId::DEFAULT,
-                    topo_core::HugeConfig::with_capacity(capacity),
-                )
-                .ok()?,
-            ));
-        // SAFETY: `huge_ptr` came from `Box::into_raw` just above and is uniquely
-        // owned here; reborrowing it as `&'static` is sound because it is only ever
-        // reclaimed on the failure arm below (after the borrow ends), and otherwise
-        // leaked for the process lifetime.
-        let huge: &'static topo_core::HugePageBackend<PosixBackingProvider> = unsafe { &*huge_ptr };
+        // Build a live NUMA router: one hugepage backend per discovered NUMA node, each
+        // bound to its node (§15.5), with the large region split across them. On a
+        // single-node machine this is exactly one backend — byte-for-byte the plain
+        // hugepage path — so the integration degrades cleanly where there is nothing to
+        // place. Placement follows the arena's `NumaPolicy` (resolved into the engine's
+        // hints, §15.3/§15.5); the current-CPU source is a `FixedCore` until the RSEQ
+        // per-CPU identity lands (plan 05 W7), so `Local`/`Interleave` use core 0 today.
+        let topo = discover_topology();
+        let n = (topo.node_count() as usize).max(1);
+        let per_node = (capacity / n).max(1);
+        let router = NodeRouter::build(topo, FixedCore(CoreId::DEFAULT), |node, _os| {
+            HugePageBackend::new(
+                PosixBackingProvider::new(),
+                meta,
+                ArenaId::DEFAULT,
+                HugeConfig::with_capacity(per_node).with_home_node(node),
+            )
+            .ok()
+        })?;
+        // Leak-and-reclaim, as for the single backend: only a successfully-built router is
+        // leaked into `'static`; the raw pointer is kept so a failing allocator build
+        // reclaims it (its `Drop` releases *every* per-node reservation). On success it is
+        // process-lived (like `meta`/`pagemap`).
+        let router_ptr: *mut NodeRouter<PosixBackingProvider, FixedCore> =
+            Box::into_raw(Box::new(router));
+        // SAFETY: `router_ptr` came from `Box::into_raw` just above and is uniquely owned;
+        // reborrowing it as `&'static` is sound because it is only reclaimed on the failure
+        // arm below (after the borrow ends), and otherwise leaked for the process lifetime.
+        let huge: &'static NodeRouter<PosixBackingProvider, FixedCore> = unsafe { &*router_ptr };
         match Allocator::new_with_huge(
             PosixBackingProvider::new(),
             PosixBackingProvider::new(),
@@ -306,13 +316,12 @@ fn build_posix_allocator(
         ) {
             Ok(a) => Some(a),
             Err(_) => {
-                // The allocator only *borrowed* `huge` and that borrow has ended
-                // with the `Err`, so reclaim the leaked backend before returning
-                // `None`; its `Drop` returns the reservation to the provider.
-                // SAFETY: `huge_ptr` was produced by `Box::into_raw` of the same
-                // type above; it is reclaimed exactly once, only on this failure
-                // path, and is not used again afterward (no double-free).
-                drop(unsafe { Box::from_raw(huge_ptr) });
+                // The allocator only *borrowed* `huge` and that borrow ended with the
+                // `Err`, so reclaim the leaked router before returning `None`.
+                // SAFETY: `router_ptr` was produced by `Box::into_raw` of the same type
+                // above; reclaimed exactly once, only on this failure path, never used
+                // again (no double-free). Its `Drop` releases every per-node reservation.
+                drop(unsafe { Box::from_raw(router_ptr) });
                 None
             }
         }

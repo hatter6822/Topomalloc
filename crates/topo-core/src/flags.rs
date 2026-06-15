@@ -329,7 +329,14 @@ mod tests {
         assert_eq!(h.numa, NumaPolicy::Bind(crate::ids::NodeId(2)));
         assert_eq!(h.hotness, base.hotness);
         assert_eq!(h.lifetime, base.lifetime);
-        assert_eq!(Hints { numa: base.numa, ..h }, base, "only numa differs");
+        assert_eq!(
+            Hints {
+                numa: base.numa,
+                ..h
+            },
+            base,
+            "only numa differs"
+        );
     }
 
     #[test]
