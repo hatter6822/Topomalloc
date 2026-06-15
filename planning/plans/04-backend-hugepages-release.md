@@ -1,7 +1,15 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.1 · **Overview:** [README.md](README.md)
+(topology) · **Status:** rev 2.3 — **plan 04 complete: W4 + W11 + W12 + W13 all landed.** W4 (the seam + POSIX backend + extents + large path);
+**W11 landed (all units, ahead of M5): the hugepage filler / huge cache / region cache as a real,
+backend-agnostic placement subsystem over the provider seam, wired into the live large path through the
+§18.6 `RegionCacheHook`**; **W12 landed (all units, ahead of M5): the memory release controller &
+background-purge pump — the §21.3 ladder / §21.4 demand reserve / §21.5 pressure modes as a pure,
+host-driven policy, wired live into the W11 demand-reserve hook via `HugePageBackend::release_tick`**;
+**W13 landed (all units): the §15 CPU/LLC/NUMA topology model, placement policy, cross-domain
+rebalancer, and sysfs discovery — filling the W11 filler score's locality/cross-NUMA terms** ·
+**Overview:** [README.md](README.md)
 **SPEC anchors:** §18, §20, §21, §19, §15, §36.6, §36.9, §36.11; M-004/M-005, H-001..H-005, O-007.
 **Upstream deps:** [03](03-core-allocator.md) (pagemap/spans). **Downstream:** [03](03-core-allocator.md)
 (spans come from extents), [09](09-sele4n-integration.md) (the capability provider implements the same seam).
@@ -67,18 +75,44 @@ for **W4-2 onward** (extent ops touch the pagemap). **Enables:** W5, plan 06 (ar
 **Depends on:** W4, plan 03 W5. **Enables:** M5. Reuses the same placement model on seLe4n over contiguous
 normal-frame runs (§36.9).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W11-1a | HugeAllocator: reserve hugepage-aligned virtual ranges (§19.2). | M | | reservations hugepage-aligned. |
-| W11-1b | HugeCache: cache empty *backed* hugepages for quick reuse; demand-reserve hook (W12). | M | ∥ | empty-backed reuse avoids immediate faults. |
-| W11-2a | HugePageFiller bin set (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/cold_sparse/hot_dense) as the structure; each hugepage in **exactly one** bin; bin transitions on occupancy change. | M | | H-003: bin membership consistent with occupancy. |
-| W11-2b | Candidate selection/scoring (§19.3): approximate-bin scan; packing/locality/lifetime/hotness/release-preservation bonuses minus fragmentation/cross-numa/partial-subrelease penalties. | M | | no full scan of all hugepages; deterministic in test mode. |
-| W11-2c | Bin↔occupancy consistency invariant + tests (H-002/H-003): occupancy bytes == sum of contained spans/large allocs. | M | ∥ | invariants checked in debug (B.4). |
-| W11-3 | RegionCache for awkward sizes (§18.6): allocations slightly larger than a hugepage avoid rounding to multiple full hugepages. | M | ∥ | waste on awkward sizes bounded; tested. |
-| W11-4a | Packing policy (§19.5): pack same-lifetime/hot-dense; prefer partially-used hugepages; keep some empty-backed in HugeCache. | M | | policy observable in stats; never misplaces a live object. |
-| W11-4b | Partial-subrelease guards (§19.6/H-005): subrange has no live object, aligned to release granularity, gated on coldness/pressure, recorded as a metric. | M | ∥ | partial subrelease only when all guards pass; metric emitted. |
-| W11-5 | Coverage metrics (§19.7) exported to stats (plan 07): coverage_bytes, intact/partial live bytes, empty_backed/released, partial_subreleased, fragmentation, coverage_ratio. | S | ∥ | all §19.7 fields present; ratio computed. |
-| W11-6 | seLe4n large-mapping policy (§36.9): same placement over contiguous normal-frame runs; prefer whole-mapping release. | M | | correct when every backing range is normal pages; Sim test (plan 09). |
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W11-1a | HugeAllocator: reserve hugepage-aligned virtual ranges (§19.2). | M | | reservations hugepage-aligned. | ✅ `HugePageBackend::new` reserves a `HUGEPAGE_SIZE`-aligned region; `reserve_hugepages` carves contiguous whole-hugepage runs. |
+| W11-1b | HugeCache: cache empty *backed* hugepages for quick reuse; demand-reserve hook (W12). | M | ∥ | empty-backed reuse avoids immediate faults. | ✅ a freed hugepage stays `EmptyBacked` (committed); reuse hits the same backed pages with no `commit_run` (no fault). `release_empty_excess(reserve)` is the W12 demand-reserve hook: it returns the backing of empty hugepages beyond `reserve` to the OS. |
+| W11-2a | HugePageFiller bin set (§19.4: empty_backed/nearly_empty/sparse/medium/nearly_full/full/partial_subreleased/cold_sparse/hot_dense) as the structure; each hugepage in **exactly one** bin; bin transitions on occupancy change. | M | | H-003: bin membership consistent with occupancy. | ✅ nine `HugeBin`s; `classify_bin` is total; `refile` re-files on every occupancy/state change (H-003 by construction). |
+| W11-2b | Candidate selection/scoring (§19.3): approximate-bin scan; packing/locality/lifetime/hotness/release-preservation bonuses minus fragmentation/cross-numa/partial-subrelease penalties. | M | | no full scan of all hugepages; deterministic in test mode. | ✅ `PACKING_ORDER` scan capped at `SCAN_CAP`; `score` is a deterministic `i64` over packing/hotness-match/**lifetime-match**/release-preservation/fragmentation/partial-subrelease (locality/cross-NUMA score 0 until W13 topology), ties break on lowest base. The `PlaceHints` (hotness+lifetime) flow from the request flags through the seam to the filler. |
+| W11-2c | Bin↔occupancy consistency invariant + tests (H-002/H-003): occupancy bytes == sum of contained spans/large allocs. | M | ∥ | invariants checked in debug (B.4). | ✅ `check_invariants` verifies `live ⊆ committed`, `committed ∩ released = ∅`, the filed bin == `target_bin`, and the bin-list counts; `debug_assert`ed after every mutation + fuzzed. |
+| W11-3 | RegionCache for awkward sizes (§18.6): allocations slightly larger than a hugepage avoid rounding to multiple full hugepages. | M | ∥ | waste on awkward sizes bounded; tested. | ✅ a validating `RegionCache` re-reserves freed empty-backed runs in O(1) (stale entries pruned, never double-vended); awkward runs reused, not re-rounded. |
+| W11-4a | Packing policy (§19.5): pack same-lifetime/hot-dense; prefer partially-used hugepages; keep some empty-backed in HugeCache. | M | | policy observable in stats; never misplaces a live object. | ✅ packing-ordered scan fills denser hugepages first; a run is carved from the free bitmap, so the score can never misplace a live object. The policy's **effect is observable in stats**: `HugeStats::bins` (rendered as `hugepage.bin_counts` in the JSON) reports the live set's distribution across the nine §19.4 bins, and it reconciles with the touched-hugepage count (H-003). Same-lifetime packing is enforced: when the best partial hugepage's score loses to a fresh hugepage's (a strong lifetime/hotness mismatch), placement opens a fresh hugepage instead of mixing lifetimes (bounded by region capacity). |
+| W11-4b | Partial-subrelease guards (§19.6/H-005): subrange has no live object, aligned to release granularity, gated on coldness/pressure, recorded as a metric. | M | ∥ | partial subrelease only when all guards pass; metric emitted. | ✅ `subrelease` refuses any run intersecting a live page (H-005), is page-aligned, gated on cold/sparse-or-pressure, **and a real §19.6 cost/benefit test** (predicted RSS benefit ≥ a fragmentation cost that scales with the hugepage's live coverage); on success the backend does §36.6 revoke-before-decommit; the §19.6 metric is emitted; the W12 `mark_cold` hook is provided. |
+| W11-5 | Coverage metrics (§19.7) exported to stats (plan 07): coverage_bytes, intact/partial live bytes, empty_backed/released, partial_subreleased, fragmentation, coverage_ratio. | S | ∥ | all §19.7 fields present; ratio computed. | ✅ `HugeStats` carries all §19.7 fields; `Stats::record_huge` renders them (+ `coverage_ratio_bp` and the §19.4 `bin_counts` distribution) in the stats JSON. |
+| W11-6 | seLe4n large-mapping policy (§36.9): same placement over contiguous normal-frame runs; prefer whole-mapping release. | M | | correct when every backing range is normal pages; Sim test (plan 09). | ✅ a §36.9 **G-sim slice** (`filler_outcome_is_identical_over_posix_and_the_sele4n_simulator`) runs the identical workload over POSIX and `Sele4nSim` and asserts an **identical** abstract outcome; `subrelease` does §36.6 revoke-before-decommit so the seLe4n release path is capability-correct. |
+
+> **▸ Implementation status.** W11 is **landed** (ahead of its M5 slot), in `crates/topo-core/src/huge.rs`,
+> and **wired live** through the engine. The pure `HugePageFiller` (per-hugepage live/committed/released
+> page bitmaps + the nine §19.4 bin lists) is the correctness object — H-002/H-003 by construction, H-005
+> enforced by the `subrelease` guard — and the provider-driven `HugePageBackend` wraps it behind the §27.2
+> backend lock, drives `revoke`/`commit`/`decommit`, and implements the §18.6 `RegionCacheHook` (now
+> hint-carrying, §19.3/§19.5). `Allocator::new_with_huge` (the `hugepage_optimized` configuration) routes
+> every medium/large allocation through the filler — carrying the request's hotness/lifetime hints — with
+> the small/free paths byte-for-byte unchanged; `Allocator::new` keeps the M1 extent path. The §19.4
+> `classify_bin` is pinned to the Lean `TopoMalloc.Huge.HugeBin.classifyBin` by
+> `huge_bin_classification_matches_lean` + the `lake exe check` `hugeBinGate`; H-002/H-003 and the per-page
+> place/free/subrelease state machine (H-001/H-004/H-005 preservation) are modeled in
+> `lean/TopoMalloc/HugePageFiller.lean`. The integration test `tests/tests/hugepage.rs` drives the live
+> engine + G-sim slices; the `hugepage_filler_stays_well_formed_and_reconciles` **gating** proptest
+> (`tests/tests/property.rs`) and the nightly `fuzz/fuzz_targets/huge_filler.rs` both drive arbitrary
+> place/free/subrelease/unsubrelease/reserve-run/free-run/mark-cold streams against the §19.8 invariants +
+> the §19.7 coverage reconciliation (with shrinking in the proptest, deeper campaigns in the fuzzer);
+> `crates/topo-core/benches/huge.rs` is the non-gating criterion harness measuring place/free churn and
+> placement into a fragmented region **swept across filler sizes** (a flat curve is the evidence the
+> candidate scan is bounded, not O(hugepages)). The live C `malloc`/`free` entry points already run over
+> the filler **under the `hugepage-optimized` feature**: `topo-abi`'s `build_posix_allocator` constructs a
+> `HugePageBackend` over the POSIX provider and serves the named `"posix"` allocator through
+> `Allocator::new_with_huge`, gated so the default MIT artifact stays byte-for-byte the M1 extent path.
+> What W11 leaves to **M5** (not a W11 concern): making the hugepage path the **unconditional** process
+> `malloc` backing (a plan-10 deployment wiring — the feature seam exists; flipping the default is M5) and the W12 release controller (pressure modes /
+> demand-reserve *policy*) that drives `mark_cold` and `release_empty_excess` (the *mechanisms* W11 provides).
 
 > **▸ Decomposition — W11-2 (hugepage filler).** Splitting *bins* (W11-2a) from *scoring* (W11-2b) matters
 > because bins are the **correctness** object (H-003: exactly one bin, consistent with occupancy) while the
@@ -104,7 +138,33 @@ normal-frame runs (§36.9).
 | W12-2c | Demand reserve (§21.4) + anti-oscillation: reserve = f(recent rate, peak, refill latency, pressure); prevents release-then-refault. | M | ∥ | refault-loop oscillation test passes. |
 | W12-3a | Pressure modes (§21.5): Normal / Soft / Hard / Emergency triggers + behaviors. | M | | mode transitions tested against simulated pressure. |
 | W12-3b | **Emergency mode** (O-007) + bounded emergency reserve (§36.5): bypass optional caches, release aggressively, disable HugeCache reserve; reserve never depends on the normal heap. | M | ∥ | emergency path tested; reserve independent. |
-| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. |
+| W12-4 | Latency classes (§36.11) annotated on slow paths; arena flags `no_ipc_fast_only`/`bounded_slow_path`/`may_block`. | S | ∥ | each slow path tagged; real-time arenas can forbid blocking. ✅ `LatencyClass` (FastOnly/BoundedSlow/MayBlock) subsumes the three flags as `ArenaPolicy::latency`; `ReleaseController::for_arena` adopts it as `max_latency`, so a fast-only arena skips every blocking ladder rung. |
+
+> **▸ Implementation status (W12).** **Landed** (ahead of its M5 slot), in
+> `crates/topo-core/src/release.rs`: a **pure, `no_std`, host-driven** `ReleaseController` —
+> `tick(now_ms, inputs) -> ReleasePlan` with an injected clock, so it runs identically over POSIX and
+> seLe4n and is fully deterministic/unit-testable. **W12-1a** the §20.2 decay config is consolidated
+> onto `arena::DecayConfig` (extended with `release_rate_bytes_per_sec`/`background_purge_enabled` +
+> `low_rss`/`debug`/`server` presets) and wired into `ArenaPolicy`. **W12-2a** `ReleaseInputs` is the
+> §21.2 vector (rates derived from cumulative-counter deltas). **W12-3a** `PressureMode` is the §21.5
+> Normal/Soft/Hard/Emergency ladder with escalate-now / de-escalate-past-the-margin hysteresis
+> (alloc-failure / cgroup-critical force Emergency, O-007). **W12-2c** `demand_reserve` is the §21.4
+> anti-oscillation brake (grows with the alloc rate + refill cost, caps at recent peak free, attenuates
+> with pressure; Emergency reserves nothing, §36.5). **W12-2b** the §21.3 six-rung ladder is gated by
+> mode + the §36.11 latency ceiling and rate-capped (§20.2) with the unmet remainder accrued as backlog
+> (§20.3, W12-1b). **W12-3b** a heap-independent emergency reserve is fixed at construction. It is wired
+> **live** via `HugePageBackend::release_tick`, which drives the W11-1b `release_empty_excess`
+> demand-reserve hook from the plan — the W11→W12 handoff — and the §36.9 G-sim slice
+> (`release_outcome_is_identical_over_posix_and_the_sele4n_simulator`) proves it is backend-agnostic. The
+> running counters reconcile into `topo-stats` JSON + the `topo.release.*` control namespace. **No new
+> abstract transition:** the controller sequences mechanisms already certified by the §21.6
+> `release_to_os_preserves_live_objects` (`lean/TopoMalloc/Theorems/Release.lean`), so there is no new
+> Lean obligation. Tested by 18 `release` unit tests (incl. the §21.1 R2 oscillation property), the
+> `release_controller_plan_never_exceeds_supply` gating proptest, and the `tests/tests/release.rs` live
+> integration + G-sim slices. **What W12 leaves to M5/M6:** driving the extent-path rungs (purge dirty →
+> muzzy → release) and cold-sparse subrelease from a host pump over the live engine (the controller
+> *plans* them today; the §20.4 mechanisms execute them), and the mutating decay control surface
+> (`topo.dirty_decay_ms`, …) which is plan 07 W20.
 
 > **▸ Decomposition — W12-2 (release controller).** Split *inputs* (W12-2a, a pure read of the observation
 > vector), *the ladder* (W12-2b, the ordered policy), and *the demand reserve* (W12-2c, the anti-oscillation
@@ -119,12 +179,29 @@ normal-frame runs (§36.9).
 
 **Depends on:** plan 05 W6 (transfer-cache domains). **Enables:** M3 (LLC), M4 (full).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. |
-| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. |
-| W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. |
-| W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. |
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. | ✅ `topology::Topology`/`TopologyBuilder` (single-domain fallback on any inconsistency); `topo-backend-posix::discover_topology` parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same fallback. |
+| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. | ✅ `Topology::preferred_node` over `NumaPolicy` (Local/Bind/Interleave/OsDefault/ArenaPolicy); the W11 filler score's locality/cross-NUMA terms are filled from `PlaceHints::home_node` vs the region's `home_node`. |
+| W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. | ✅ `Rebalancer::plan` — nearest-donor → most-pressured-node moves with the §15.4 tiers; the stranded-memory test passes (same-node cache tiers are the M2 cache layer's job). |
+| W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. | ✅ `Topology::detect_mismatch` — the periodic-probe primitive the host runs to decide when to rebuild + swap the snapshot. |
+
+> **▸ Implementation status (W13).** **Landed**, in `crates/topo-core/src/topology.rs` (pure,
+> `no_std`, bounded). The §15.2 `Topology` snapshot (CPU→LLC→NUMA maps + a node-distance matrix, all
+> queries total) is built by a `TopologyBuilder` that collapses to `Topology::single_domain` on any
+> inconsistency (W13-1); `preferred_node` is the §15.3/§15.5 placement decision over the existing
+> `NumaPolicy` (W13-2); `Rebalancer::plan` is the §15.4 nearest-donor → most-pressured move so memory is
+> never permanently stranded (W13-3, the same-node transfer/central tiers are plan-05 W6 / M2);
+> `detect_mismatch` is the §15.2 periodic-refresh probe (W13-4). `topo-backend-posix::discover_topology`
+> is the real Linux sysfs read with the single-domain fallback. The W11 filler score's locality /
+> cross-NUMA terms — stubbed at 0 "until W13" — are now filled from `PlaceHints::home_node` vs the
+> region's `HugeConfig::home_node` (rewarded on match, penalized cross-node, neutral with no preference,
+> so the single-node case is unaffected). Placement / rebalancing are **policy, not modeled transitions**
+> (§2.4), so there is no Lean obligation. The node/LLC counts reconcile into `topo-stats` JSON and the
+> `topo.numa.*` control namespace. **What W13 leaves to M3/M5:** binding physical backing to the chosen
+> node in the POSIX provider (`mbind`/`set_mempolicy`) and standing up per-node hugepage backends so the
+> now-present locality term steers live placement — the policy + discovery are done; the provider-level
+> bind execution is the live-wiring step.
 
 ---
 

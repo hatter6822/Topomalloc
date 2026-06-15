@@ -1680,6 +1680,12 @@ Recommended coverage ratio:
 coverage_ratio = live_bytes_on_intact_hugepages / max(live_bytes_total, 1)
 ```
 
+Implementations MAY additionally expose `hugepage.bin_counts`, the count of
+managed hugepages in each of the nine §19.4 occupancy bins (the packing policy's
+observable *effect*, W11-4a). It is a diagnostic, not a coverage metric: by H-003
+every touched hugepage is in exactly one bin, so `sum(bin_counts)` equals
+`coverage_bytes / hugepage_size`.
+
 ## 19.8 Hugepage correctness invariants
 
 H-001. A live object range MUST be contained in a committed, nonreleased subrange.

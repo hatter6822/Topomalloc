@@ -51,7 +51,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use topo_core::{ArenaId, BackendError, Region, TopoBackingProvider};
+use topo_core::{ArenaId, BackendError, Region, TopoBackingProvider, Topology};
 
 /// A live reservation owned by the provider: its base, the bytes mapped (for
 /// `munmap`/free — `>=` the requested size, rounded to the OS page), and the
@@ -546,11 +546,231 @@ mod sys {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Topology discovery (§15.2, plan 04 W13-1/W13-4)
+// ---------------------------------------------------------------------------
+
+/// **Discover the §15.2 CPU/LLC/NUMA topology** from the platform, falling back to the
+/// conservative single-domain model on any missing or unreadable data (§15.2 — the
+/// allocator MUST tolerate inconsistent topology). On Linux this reads sysfs
+/// (`/sys/devices/system/node/*` for NUMA membership, `physical_package_id` as the LLC
+/// proxy, `node*/distance` for the §15.4 distance matrix); elsewhere it reports one
+/// domain over the online CPU count. The host calls this at startup and on a hotplug /
+/// periodic-mismatch refresh ([`Topology::detect_mismatch`](topo_core::Topology::detect_mismatch)).
+pub fn discover_topology() -> Topology {
+    let n = online_cpus();
+    #[cfg(target_os = "linux")]
+    {
+        linux_topology::discover(n).unwrap_or_else(|| Topology::single_domain(n))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Topology::single_domain(n)
+    }
+}
+
+/// The number of online CPUs (`sysconf(_SC_NPROCESSORS_ONLN)`), at least 1.
+fn online_cpus() -> u32 {
+    // SAFETY: `sysconf` with a valid name is always safe; `-1`/`0` ⇒ the 1-CPU floor.
+    let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if v >= 1 {
+        (v as u64).min(topo_core::topology::MAX_CPUS as u64) as u32
+    } else {
+        1
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_topology {
+    use super::Topology;
+    use topo_core::topology::MAX_NODES;
+    use topo_core::TopologyBuilder;
+
+    /// Parse a Linux "cpulist" string (`"0-3,8,10-11"`), invoking `f` for each CPU it
+    /// names. Tolerant: malformed fragments are skipped.
+    fn for_each_in_list(list: &str, mut f: impl FnMut(u32)) {
+        for part in list.trim().split(',') {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((a, b)) = part.split_once('-') {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                    for c in a..=b {
+                        f(c);
+                    }
+                }
+            } else if let Ok(c) = part.trim().parse::<u32>() {
+                f(c);
+            }
+        }
+    }
+
+    /// `cpu → node` from `/sys/devices/system/node/node{K}/cpulist`, plus a parallel
+    /// `seen[c]` mask recording which CPUs were actually named by *some* node's cpulist.
+    /// `None` if the node hierarchy is absent (→ caller falls back to a single domain).
+    ///
+    /// A CPU absent from every cpulist (a partial/sparse sysfs, or a node id beyond the
+    /// bounded `0..MAX_NODES` scan) keeps its placeholder node `0` **but** `seen[c]` stays
+    /// `false`: the caller must treat that as missing data, not as genuine node-0
+    /// membership (§15.2 — a never-observed CPU must not be fabricated onto node 0).
+    fn read_cpu_nodes(n_cpus: u32) -> Option<(std::vec::Vec<u32>, std::vec::Vec<bool>)> {
+        let mut cpu_node = std::vec![0u32; n_cpus as usize];
+        let mut seen = std::vec![false; n_cpus as usize];
+        let mut any = false;
+        for node in 0..MAX_NODES as u32 {
+            let path = std::format!("/sys/devices/system/node/node{node}/cpulist");
+            let Ok(list) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            any = true;
+            for_each_in_list(&list, |c| {
+                if c < n_cpus {
+                    cpu_node[c as usize] = node;
+                    seen[c as usize] = true;
+                }
+            });
+        }
+        any.then_some((cpu_node, seen))
+    }
+
+    /// `cpu → LLC` from each CPU's `physical_package_id` (the socket — a robust LLC
+    /// proxy: LLC is per-socket on mainstream x86/ARM). Distinct package ids are
+    /// renumbered to a dense `0..n_llc`. `None` if any CPU's id is unreadable.
+    fn read_cpu_llc(n_cpus: u32) -> Option<std::vec::Vec<u32>> {
+        let mut llc = std::vec![0u32; n_cpus as usize];
+        let mut seen: std::vec::Vec<u16> = std::vec::Vec::new();
+        for c in 0..n_cpus {
+            let path = std::format!("/sys/devices/system/cpu/cpu{c}/topology/physical_package_id");
+            let id: u16 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+            let dense = match seen.iter().position(|&p| p == id) {
+                Some(i) => i as u32,
+                None => {
+                    seen.push(id);
+                    (seen.len() - 1) as u32
+                }
+            };
+            llc[c as usize] = dense;
+        }
+        Some(llc)
+    }
+
+    /// Record the parsed `cpu → (node, LLC)` mapping into `b`, calling
+    /// [`set_cpu`](TopologyBuilder::set_cpu) **only for CPUs actually observed** in some
+    /// `node*/cpulist` (`seen[c]`). A CPU never seen is deliberately left *unset* so the
+    /// builder's own gap check (a CPU never recorded ⇒ inconsistent) fires the
+    /// conservative single-domain fallback, rather than the placeholder node `0` being
+    /// passed off as real membership (§15.2). Pure (no sysfs) so it is unit-testable.
+    pub(super) fn fill_builder(
+        b: &mut TopologyBuilder,
+        n_cpus: u32,
+        cpu_node: &[u32],
+        seen: &[bool],
+        cpu_llc: &[u32],
+    ) {
+        for c in 0..n_cpus as usize {
+            if seen[c] {
+                b.set_cpu(c as u32, cpu_node[c], cpu_llc[c]);
+            }
+            // Else: leave CPU `c` unset → the builder reports a gap and falls back.
+        }
+    }
+
+    /// Build the §15.2 snapshot from sysfs, or `None` to fall back. The
+    /// [`TopologyBuilder`] itself re-checks consistency, so even a partial read that
+    /// gets this far yields a *safe* snapshot.
+    pub(super) fn discover(n_cpus: u32) -> Option<Topology> {
+        let (cpu_node, seen) = read_cpu_nodes(n_cpus)?;
+        let cpu_llc = read_cpu_llc(n_cpus)?;
+        let mut b = TopologyBuilder::new(n_cpus);
+        fill_builder(&mut b, n_cpus, &cpu_node, &seen, &cpu_llc);
+        // §15.4 node distances (best-effort; the default remote distance stands if a
+        // row is unreadable).
+        for a in 0..MAX_NODES as u32 {
+            let path = std::format!("/sys/devices/system/node/node{a}/distance");
+            let Ok(row) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (b_idx, d) in row.split_whitespace().enumerate() {
+                if let Ok(dist) = d.parse::<u8>() {
+                    b.set_distance(a, b_idx as u32, dist);
+                }
+            }
+        }
+        Some(b.build())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PAGE: usize = 16384; // the allocator page; a multiple of any OS page.
+
+    #[test]
+    fn discover_topology_yields_a_valid_snapshot() {
+        // §15.2: discovery returns a usable snapshot whether it reads real sysfs or
+        // falls back to a single domain — never empty, never panicking.
+        let t = discover_topology();
+        assert!(t.cpu_count() >= 1, "at least one CPU");
+        assert!(t.node_count() >= 1, "at least one node");
+        assert!(t.llc_count() >= 1, "at least one LLC domain");
+        // Every query is total: an out-of-range CPU reads as the default domain.
+        assert_eq!(t.node_of_cpu(u32::MAX), topo_core::NodeId::DEFAULT);
+        // The discovered node count never exceeds the bounded model.
+        assert!(t.node_count() as usize <= topo_core::topology::MAX_NODES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_cpu_node_coverage_falls_back_to_single_domain() {
+        // §15.2 regression: if some online CPU is never named by any `node*/cpulist`
+        // (a partial/sparse sysfs, or a node id beyond the bounded scan), the parsed
+        // node array still carries a *placeholder* 0 for that CPU — but `seen[c]` is
+        // false. Discovery must NOT pass that off as genuine node-0 membership: the
+        // unseen CPU is left unset, so the builder's gap check fires the conservative
+        // single-domain fallback (NOT "everything steered to node 0").
+        use topo_core::TopologyBuilder;
+
+        let n_cpus = 4u32;
+        // CPUs 0,1 observed on node 0; 2,3 observed on node 1 — but CPU 3 was never
+        // seen in any cpulist (its node entry is the placeholder 0, seen[3] == false).
+        let cpu_node = [0u32, 0, 1, 0];
+        let seen = [true, true, true, false];
+        let cpu_llc = [0u32, 0, 1, 1];
+
+        let mut b = TopologyBuilder::new(n_cpus);
+        linux_topology::fill_builder(&mut b, n_cpus, &cpu_node, &seen, &cpu_llc);
+        let t = b.build();
+
+        assert!(
+            t.is_single_domain(),
+            "an unseen CPU must trigger the single-domain fallback, not node-0 fabrication"
+        );
+        assert_eq!(
+            t.cpu_count(),
+            n_cpus,
+            "the fallback keeps the online CPU count"
+        );
+        // Every CPU reads as the one conservative node — none is steered onto node 0 of
+        // a (wrongly) multi-node snapshot.
+        for c in 0..n_cpus {
+            assert_eq!(t.node_of_cpu(c), topo_core::NodeId(0));
+        }
+
+        // Sanity: with full coverage the same inputs DO build the real two-node map,
+        // so the fallback is driven by the missing CPU, not by the data shape.
+        let seen_full = [true, true, true, true];
+        let cpu_node_full = [0u32, 0, 1, 1];
+        let mut b2 = TopologyBuilder::new(n_cpus);
+        linux_topology::fill_builder(&mut b2, n_cpus, &cpu_node_full, &seen_full, &cpu_llc);
+        let t2 = b2.build();
+        assert!(
+            !t2.is_single_domain(),
+            "full coverage builds the real topology"
+        );
+        assert_eq!(t2.node_count(), 2);
+        assert_eq!(t2.node_of_cpu(3), topo_core::NodeId(1));
+    }
 
     #[test]
     fn reserve_commit_write_release_roundtrip() {

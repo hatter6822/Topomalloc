@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::extent::BackendLock;
 use crate::flags::HugepagePolicy;
 use crate::ids::{ArenaId, Generation, Label, NodeId};
+use crate::release::LatencyClass;
 
 /// Maximum number of arenas a single [`ArenaTable`] tracks (ids `0..MAX_ARENAS`).
 ///
@@ -152,27 +153,60 @@ impl CapRights {
 // Decay policy (§20.5/§22.2) — a carried descriptor field
 // ---------------------------------------------------------------------------
 
-/// Per-arena decay timing (§22.2 `DecayConfig`, Appendix C): how long freed
-/// backing lingers *dirty* (physically backed, reusable cheaply) before it is
-/// lazily purged to *muzzy*, and how long *muzzy* lingers before being returned
-/// to the OS. Carried on the arena descriptor from M1 (D2); the **release
-/// controller that consumes it is plan 04 W12 (M5)** — at M4 the field is
-/// recorded and reconfigurable, not yet acted on, so an arena that wants
-/// low-RSS behavior can already express it.
+/// Per-arena decay & background-purge configuration (§20.2/§22.2 `DecayConfig`,
+/// Appendix C, plan 04 W12-1a): how long freed backing lingers *dirty* (physically
+/// backed, reusable cheaply) before it is lazily purged to *muzzy*, how long *muzzy*
+/// lingers before being returned to the OS, the rate cap on release, and whether the
+/// background-purge pump does routine work for this arena. Carried on the arena
+/// descriptor from M1 (D2) and **consumed by the release controller**
+/// ([`ReleaseController`](crate::release::ReleaseController), W12): the controller
+/// reads these to gate the §21.3 ladder and bound its per-tick release rate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DecayConfig {
-    /// Milliseconds a freed extent stays *dirty* before lazy purge (§20.1).
+    /// Milliseconds a freed extent stays *dirty* before lazy purge (§20.1/§20.2).
     pub dirty_decay_ms: u64,
-    /// Milliseconds a *muzzy* extent stays before being returned to the OS.
+    /// Milliseconds a *muzzy* extent stays before being returned to the OS (§20.2).
     pub muzzy_decay_ms: u64,
+    /// Upper bound on bytes returned to the OS per second (§20.2); `0` ⇒ unlimited.
+    /// The cap is what keeps a large idle drop from stalling on a burst of
+    /// `madvise`/`decommit`; the unmet remainder becomes release-controller backlog.
+    pub release_rate_bytes_per_sec: u64,
+    /// Whether the background-purge pump does any non-emergency work for this arena
+    /// (§20.2/§20.3). `false` suppresses routine decay (Emergency release still acts).
+    pub background_purge_enabled: bool,
 }
 
 impl DecayConfig {
-    /// The Appendix-C server defaults (10 s dirty, 10 s muzzy).
+    /// The Appendix-C / §32.3 server defaults (10 s dirty, 10 s muzzy, unlimited rate,
+    /// background purging on).
     pub const DEFAULT: DecayConfig = DecayConfig {
         dirty_decay_ms: 10_000,
         muzzy_decay_ms: 10_000,
+        release_rate_bytes_per_sec: 0,
+        background_purge_enabled: true,
     };
+
+    /// The latency-first server preset (the [`DEFAULT`](Self::DEFAULT)).
+    pub const fn server() -> Self {
+        Self::DEFAULT
+    }
+
+    /// The RSS-minimizing preset (the `low_rss` profile, §30.1): zero decay so dirty
+    /// and muzzy memory are purged/released promptly, trading reuse cost for footprint.
+    pub const fn low_rss() -> Self {
+        DecayConfig {
+            dirty_decay_ms: 0,
+            muzzy_decay_ms: 0,
+            release_rate_bytes_per_sec: 0,
+            background_purge_enabled: true,
+        }
+    }
+
+    /// The debug preset: prompt release (returns memory quickly so use-after-free is
+    /// caught sooner, §20.5) — the same aggressive decay as [`low_rss`](Self::low_rss).
+    pub const fn debug() -> Self {
+        Self::low_rss()
+    }
 }
 
 impl Default for DecayConfig {
@@ -445,6 +479,14 @@ pub struct ArenaPolicy {
     /// `0` ⇒ the global default. Carried from M1; consumed by the cache layer at
     /// plan 05 W6 (M2).
     pub cache_budget_bytes: u64,
+    /// The slowest release/purge latency class this arena tolerates (§36.11, plan 04
+    /// W12-4). Subsumes the three SPEC flags: [`FastOnly`](LatencyClass::FastOnly) is
+    /// `no_ipc_fast_only` (a real-time arena — the release controller skips every
+    /// blocking ladder rung for it), [`BoundedSlow`](LatencyClass::BoundedSlow) is
+    /// `bounded_slow_path`, and [`MayBlock`](LatencyClass::MayBlock) (the default) is
+    /// `may_block`. Feeds [`ReleaseController`](crate::release::ReleaseController)'s
+    /// `max_latency`.
+    pub latency: LatencyClass,
     /// A short diagnostic name (truncated to [`ARENA_NAME_LEN`]).
     pub name: [u8; ARENA_NAME_LEN],
 }
@@ -467,6 +509,7 @@ impl ArenaPolicy {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: *b"default\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
         }
     }
@@ -483,6 +526,7 @@ impl ArenaPolicy {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: [0u8; ARENA_NAME_LEN],
         }
     }
@@ -503,6 +547,14 @@ impl ArenaPolicy {
     /// Set the quota ceiling.
     pub const fn with_quota(mut self, limit: u64) -> Self {
         self.quota_limit = limit;
+        self
+    }
+
+    /// Set the slowest release/purge latency class this arena tolerates (§36.11,
+    /// W12-4). A `FastOnly` (real-time, `no_ipc_fast_only`) arena makes the release
+    /// controller skip every blocking ladder rung.
+    pub const fn with_latency(mut self, latency: LatencyClass) -> Self {
+        self.latency = latency;
         self
     }
 
@@ -1155,6 +1207,7 @@ impl ArenaTable {
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
+            latency: LatencyClass::MayBlock,
             name: del.name,
         };
         policy.validate()?;
@@ -2217,6 +2270,7 @@ mod tests {
             .with_decay(DecayConfig {
                 dirty_decay_ms: 1,
                 muzzy_decay_ms: 2,
+                ..DecayConfig::DEFAULT
             })
             .with_numa(NumaPolicy::Interleave)
             .with_huge(HugepagePolicy::Prefer);

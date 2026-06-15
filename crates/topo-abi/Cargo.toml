@@ -29,6 +29,9 @@ libc = "0.2"
 [features]
 default = []
 sele4n-sim = ["dep:topo-backend-sele4n"]
+# The `hugepage_optimized` profile (plan 04 W11): the global POSIX allocator serves
+# its medium/large path from a hugepage backend. Off by default (the M1 extent path).
+hugepage-optimized = ["topo-core/hugepage-optimized"]
 
 [dev-dependencies]
 # Micro-benchmark harness (W0-8, §34.6). Default features (rayon, plotters, and

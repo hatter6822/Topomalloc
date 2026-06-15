@@ -19,6 +19,7 @@ import TopoMalloc.Types
 import TopoMalloc.ArenaLifecycle
 import TopoMalloc.ExtentState
 import TopoMalloc.ExtentHooks
+import TopoMalloc.HugePageFiller
 import TopoMalloc.SizeClass
 import TopoMalloc.Generated.SizeClasses
 import TopoMalloc.State

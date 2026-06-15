@@ -29,6 +29,7 @@ pub mod fe;
 pub mod flags;
 pub mod generated;
 pub mod hooks;
+pub mod huge;
 pub mod ids;
 pub mod large;
 pub mod overflow;
@@ -36,11 +37,13 @@ pub mod pagemap;
 pub mod pinned;
 pub mod profile;
 pub mod ptr_class;
+pub mod release;
 pub mod size_class;
 pub mod skeleton;
 pub mod slab;
 pub mod span;
 pub mod thread_cache;
+pub mod topology;
 pub mod trace;
 pub mod transfer_cache;
 
@@ -75,6 +78,11 @@ pub use extent::{
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use hooks::{ExtentHooks, HookProvider};
+pub use huge::{
+    classify_bin, FreeReport, Hotness, HugeBin, HugeConfig, HugeError, HugePageBackend,
+    HugePageFiller, HugeRun, HugeStats, PlaceHints, Placement, Subrelease, HUGEPAGE_SIZE,
+    PAGES_PER_HUGEPAGE,
+};
 pub use ids::{ArenaId, Generation, Label, LargeId, NodeId, SizeClassId, SpanId};
 pub use large::{LargeAllocator, LargeBacking, LargeConfig};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
@@ -83,12 +91,20 @@ pub use ptr_class::{
     classify_ptr, validate_free, AnyMetadataRegion, FreeTarget, InvalidFree, MetadataRegion,
     NoMetadata, PointerClass,
 };
+pub use release::{
+    demand_reserve, LatencyClass, PressureMode, PressureThresholds, ReleaseController,
+    ReleaseInputs, ReleasePlan, ReleaseStats,
+};
 pub use size_class::{size_class, usable_size, SizeClassRow};
 pub use skeleton::{SkeletonAllocator, MIN_ALIGN};
 pub use slab::SlabLayout;
 pub use span::{
     ClassifyGeometry, FreeBitmap, GenGuard, LargeDescriptor, LargeState, NonCentralResidency,
     SpanDescriptor, SpanFlags, SpanGuard, SpanState, INLINE_BITS, MAX_BITMAP_WORDS,
+};
+pub use topology::{
+    NodePressure, RebalanceMove, RebalanceTier, Rebalancer, Topology, TopologyBuilder,
+    DISTANCE_LOCAL, DISTANCE_REMOTE, MAX_NODES,
 };
 
 // W6 cache layer re-exports (plan 05).

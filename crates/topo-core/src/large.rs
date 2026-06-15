@@ -40,6 +40,7 @@ use crate::bootstrap::MetadataAlloc;
 use crate::extent::{
     BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, NoRegionCache, RegionCacheHook,
 };
+use crate::flags::Hints;
 use crate::ids::{ArenaId, LargeId};
 use crate::pagemap::PageMap;
 use crate::span::LargeDescriptor;
@@ -193,14 +194,29 @@ pub struct LargeAllocator<'a, P: TopoBackingProvider> {
     arena: ArenaId,
     lock: BackendLock,
     pool: UnsafeCell<LargePool>,
+    /// The §18.6 region cache consulted by the implicit-hook paths
+    /// ([`allocate`](Self::allocate) / [`allocate_in`](Self::allocate_in) /
+    /// [`free`](Self::free)). Defaults to [`NoRegionCache`] (the M1 behaviour — no
+    /// hugepage backend); a caller wires the hugepage backend in with
+    /// [`with_region_cache`](Self::with_region_cache) under the `hugepage_optimized`
+    /// profile, and then the large path is served by the filler with **no other
+    /// change** (W11 live wiring). The explicit-hook paths
+    /// ([`allocate_with`](Self::allocate_with) / [`free_with`](Self::free_with)) still
+    /// override per call.
+    region_cache: &'a (dyn RegionCacheHook + Sync),
 }
 
+/// The process-static no-op region cache — the default for a [`LargeAllocator`] not
+/// wired to a hugepage backend (a ZST, so the default is zero-overhead).
+static NO_REGION_CACHE: NoRegionCache = NoRegionCache;
+
 // SAFETY: all access to `pool` goes through `lock`; `extents`/`pagemap` carry their
-// own synchronization; `meta` is `Sync`; `arena` is immutable. So concurrent
+// own synchronization; `meta` is `Sync`; `arena` is immutable; `region_cache` is a
+// shared reference to a `Sync` hook (immutable after construction). So concurrent
 // `&self` use is data-race-free.
 unsafe impl<P: TopoBackingProvider + Send + Sync> Sync for LargeAllocator<'_, P> {}
 // SAFETY: the allocator owns its pool (metadata-backed, never aliased) and a `Send`
-// extent manager; the borrowed `pagemap`/`meta` are `Sync`.
+// extent manager; the borrowed `pagemap`/`meta`/`region_cache` references are `Sync`.
 unsafe impl<P: TopoBackingProvider + Send> Send for LargeAllocator<'_, P> {}
 
 impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
@@ -229,7 +245,19 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             arena,
             lock: BackendLock::new(),
             pool: UnsafeCell::new(pool),
+            region_cache: &NO_REGION_CACHE,
         })
+    }
+
+    /// Install a §18.6 [`RegionCacheHook`] (e.g. a `HugePageBackend`) as this large
+    /// allocator's default region cache, so the implicit-hook paths
+    /// ([`allocate`](Self::allocate)/[`allocate_in`](Self::allocate_in)/
+    /// [`free`](Self::free)) route through it (W11 live wiring, selected by the
+    /// `hugepage_optimized` profile). Consumes and returns `self` (a builder step at
+    /// construction). The default (unwired) large allocator uses [`NoRegionCache`].
+    pub fn with_region_cache(mut self, hook: &'a (dyn RegionCacheHook + Sync)) -> Self {
+        self.region_cache = hook;
+        self
     }
 
     /// The number of large allocations currently live.
@@ -290,7 +318,20 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large_allocate` (§18.5) + pagemap publish (§17.2 P-Map-006)
     pub fn allocate_with(&self, bytes: usize, align: usize, hook: &dyn RegionCacheHook) -> *mut u8 {
-        self.allocate_with_in(self.arena, bytes, align, hook)
+        self.allocate_with_in(self.arena, bytes, align, Hints::default(), hook)
+    }
+
+    /// Allocate from `arena` with the installed region cache and explicit placement
+    /// `hints` (the engine's large path, so a wired hugepage backend packs by
+    /// hotness/lifetime, §19.3/§19.5, W11). Tags the descriptor with `arena` (W9).
+    pub fn allocate_in_hinted(
+        &self,
+        arena: ArenaId,
+        bytes: usize,
+        align: usize,
+        hints: Hints,
+    ) -> *mut u8 {
+        self.allocate_with_in(arena, bytes, align, hints, self.region_cache)
     }
 
     /// As [`allocate_with`](Self::allocate_with), but tags the resulting
@@ -298,15 +339,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// large allocation retains its arena identity for isolation (§22.7) and for
     /// per-arena reset/destroy ([`free_arena`](Self::free_arena)). The shared
     /// region is still reserved under the manager's region arena; only the
-    /// per-allocation descriptor carries `arena`.
+    /// per-allocation descriptor carries `arena`. `hints` are forwarded to the
+    /// region cache (W11 hugepage placement).
     pub fn allocate_with_in(
         &self,
         arena: ArenaId,
         bytes: usize,
         align: usize,
+        hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> *mut u8 {
-        let (region, backing) = match self.extents.alloc_large(bytes, align, hook) {
+        let (region, backing) = match self.extents.alloc_large(bytes, align, hints, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
         };
@@ -363,14 +406,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         region.base
     }
 
-    /// Allocate with the default (no-op) region cache.
+    /// Allocate with this allocator's installed region cache (the default
+    /// [`NoRegionCache`], or a wired hugepage backend, W11).
     pub fn allocate(&self, bytes: usize, align: usize) -> *mut u8 {
-        self.allocate_with(bytes, align, &NoRegionCache)
+        self.allocate_with(bytes, align, self.region_cache)
     }
 
-    /// Allocate from arena `arena` with the default region cache (plan 06 W9).
+    /// Allocate from arena `arena` with the installed region cache and default hints
+    /// (plan 06 W9; the hugepage backend when wired, W11). The engine's main path
+    /// uses [`allocate_in_hinted`](Self::allocate_in_hinted) to carry real hints.
     pub fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
-        self.allocate_with_in(arena, bytes, align, &NoRegionCache)
+        self.allocate_with_in(arena, bytes, align, Hints::default(), self.region_cache)
     }
 
     /// The owning arena of the live large allocation based at `ptr`, or `None`
@@ -513,8 +559,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// As [`free_with`](Self::free_with).
     pub unsafe fn free_revoking(&self, ptr: *mut u8, arena: ArenaId) -> (bool, bool) {
-        // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first.
-        unsafe { self.free_inner(ptr, &NoRegionCache, Some(arena)) }
+        // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first. The
+        // installed region cache (the hugepage backend when wired, W11) routes a
+        // cache-served arena-drain free back to it rather than dropping it.
+        unsafe { self.free_inner(ptr, self.region_cache, Some(arena)) }
     }
 
     /// The shared body of the large-free paths. `revoke` selects whether the
@@ -606,8 +654,9 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// As [`free_with`](Self::free_with).
     pub unsafe fn free(&self, ptr: *mut u8) -> bool {
-        // SAFETY: identical contract, forwarded.
-        unsafe { self.free_with(ptr, &NoRegionCache) }
+        // SAFETY: identical contract, forwarded; the installed region cache (the
+        // hugepage backend when wired, W11) routes a cache-served free back to it.
+        unsafe { self.free_with(ptr, self.region_cache) }
     }
 
     /// The usable size of the large allocation at base `ptr`, or `None` if `ptr` is
@@ -666,9 +715,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 }
             },
             None => {
-                // Cache-served (§18.6): offer it back; if the cache declines, the
-                // region is simply dropped (the cache owns its lifecycle).
-                let _ = hook.try_cache(region);
+                // Cache-served (§18.6): offer it back. For an arena drain
+                // (`revoke == Some`), the region's descendant capabilities must be
+                // revoked **before** it re-enters the cache for reuse by another
+                // authority domain (§36.6/§36.13 revoke-before-recycle) — otherwise a
+                // capability-backed arena destroy/reset could recycle cache-served pages
+                // without revocation. On POSIX (single ambient authority) the revoking
+                // variant is a no-op wrapper over `try_cache`. If the cache declines,
+                // the region is simply dropped (the cache owns its lifecycle).
+                match revoke {
+                    Some(arena) => {
+                        let _ = hook.try_cache_revoking(region, arena);
+                    }
+                    None => {
+                        let _ = hook.try_cache(region);
+                    }
+                }
                 true
             }
         }
@@ -901,7 +963,7 @@ mod tests {
         }
     }
     impl RegionCacheHook for OneShotCache {
-        fn try_alloc(&self, bytes: usize, align: usize) -> Option<Region> {
+        fn try_alloc(&self, bytes: usize, align: usize, _hints: Hints) -> Option<Region> {
             if !self.served.get() && bytes <= self.len && align <= PAGE {
                 self.served.set(true);
                 Some(Region {
@@ -925,6 +987,68 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: exactly the pointer/layout from `new`.
             unsafe { dealloc(self.base, self.layout) };
+        }
+    }
+
+    /// A `Sync` one-shot cache that distinguishes the plain ([`try_cache`]) vs the
+    /// **revoking** ([`try_cache_revoking`]) return path, so a test can prove an arena
+    /// drain routes a cache-served large through revoke-before-recycle (§36.6).
+    /// Installed via [`with_region_cache`] (which requires `Sync`), so it is leaked for
+    /// `'static` — its host allocation is intentionally never freed (a test).
+    ///
+    /// [`try_cache`]: RegionCacheHook::try_cache
+    /// [`try_cache_revoking`]: RegionCacheHook::try_cache_revoking
+    /// [`with_region_cache`]: LargeAllocator::with_region_cache
+    struct SyncOneShotCache {
+        base: *mut u8,
+        len: usize,
+        served: std::sync::atomic::AtomicBool,
+        plain_returns: std::sync::atomic::AtomicUsize,
+        revoking_returns: std::sync::atomic::AtomicUsize,
+    }
+    impl SyncOneShotCache {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, PAGE).unwrap();
+            // SAFETY: nonzero, page-aligned layout.
+            let base = unsafe { alloc(layout) };
+            assert!(!base.is_null());
+            Self {
+                base,
+                len,
+                served: std::sync::atomic::AtomicBool::new(false),
+                plain_returns: std::sync::atomic::AtomicUsize::new(0),
+                revoking_returns: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    // SAFETY: the cache exposes only atomics and an immutable `base`/`len` into a leaked
+    // host allocation (never freed during the test), so concurrent `&self` use is
+    // data-race-free.
+    unsafe impl Sync for SyncOneShotCache {}
+    // SAFETY: as for `Sync` — the cache owns only atomics and a leaked, never-aliased
+    // host pointer, so moving it across threads moves no shared mutable state.
+    unsafe impl Send for SyncOneShotCache {}
+    impl RegionCacheHook for SyncOneShotCache {
+        fn try_alloc(&self, bytes: usize, align: usize, _hints: Hints) -> Option<Region> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if bytes <= self.len && align <= PAGE && !self.served.swap(true, Relaxed) {
+                Some(Region {
+                    base: self.base,
+                    len: self.len,
+                })
+            } else {
+                None
+            }
+        }
+        fn try_cache(&self, _region: Region) -> bool {
+            self.plain_returns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        fn try_cache_revoking(&self, _region: Region, _arena: ArenaId) -> bool {
+            self.revoking_returns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
         }
     }
 
@@ -1178,6 +1302,39 @@ mod tests {
         );
         assert_eq!(la.live_count(), 0);
         assert_eq!(la.usable_size(p), None);
+        assert!(la.check_invariants());
+    }
+
+    #[test]
+    fn cache_served_arena_drain_revokes_before_recycling() {
+        // §36.6/§36.13 (review #6): an arena drain (`free_revoking`) of a *cache-served*
+        // large must return the region through the REVOKING cache path
+        // (`try_cache_revoking`) — revoking the region's descendant capabilities before
+        // it re-enters the cache for reuse by another authority domain — NOT the plain
+        // `try_cache`, which would recycle the pages without revocation.
+        let cache: &'static SyncOneShotCache = Box::leak(Box::new(SyncOneShotCache::new(3 * PAGE)));
+        let la = large(64, 16).with_region_cache(cache);
+        // The installed cache serves the allocation (`backing == None`).
+        let p = la.allocate(3 * PAGE, PAGE);
+        assert!(!p.is_null());
+        assert_eq!(p, cache.base, "served from the cache region");
+        assert_eq!(la.live_count(), 1);
+        // Drain the arena: the cache-served region returns via `try_cache_revoking`.
+        // SAFETY: `p` is a live large of `ArenaId::DEFAULT` from this allocator.
+        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT) };
+        assert!(retired, "the cache-served large is retired on drain");
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            cache.revoking_returns.load(Relaxed),
+            1,
+            "returned via the revoking cache path (revoke-before-recycle)"
+        );
+        assert_eq!(
+            cache.plain_returns.load(Relaxed),
+            0,
+            "NOT the plain try_cache path (which skips revocation)"
+        );
+        assert_eq!(la.live_count(), 0);
         assert!(la.check_invariants());
     }
 

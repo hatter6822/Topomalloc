@@ -399,6 +399,25 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "low-rss"],
     );
+    // W11: the hugepage_optimized profile routes the engine's large path through the
+    // hugepage filler. Run the core suite under it (the filler/backend) and the ABI
+    // suite (the hugepage-backed global allocator) so the live wiring is exercised.
+    r.run(
+        "test hugepage_optimized core (W11)",
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "topo-core",
+            "--features",
+            "hugepage-optimized",
+        ],
+    );
+    r.run(
+        "test hugepage_optimized ABI (W11 live global allocator)",
+        "cargo",
+        &["test", "-p", "topo-abi", "--features", "hugepage-optimized"],
+    );
     // seLe4n `real-abi`: the GPL backend must keep compiling against the pinned,
     // vendored ABI (D8, W4-1) — guards the `vendor/sele4n` wiring against drift.
     r.run(
@@ -474,6 +493,27 @@ fn clippy_steps(r: &mut Runner<'_>) {
             "--all-targets",
             "--features",
             "sele4n-sim",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    );
+    // The `hugepage-optimized` feature (W11) gates conditional code on the live
+    // path — the `HugePageBackend`-backed engine wiring in `topo-abi` and the
+    // filler tests in `topo-core` — that the default workspace clippy never
+    // compiles, so it gets its own gate, mirroring the sele4n-sim slice above.
+    r.run(
+        "clippy -D warnings (hugepage-optimized)",
+        "cargo",
+        &[
+            "clippy",
+            "-p",
+            "topo-core",
+            "-p",
+            "topo-abi",
+            "--all-targets",
+            "--features",
+            "hugepage-optimized",
             "--",
             "-D",
             "warnings",

@@ -301,6 +301,7 @@ pub extern "C" fn topo_arena_configure(id: u32, dirty_decay_ms: u64, muzzy_decay
     let cfg = ArenaConfig::from_stats(&s).with_decay(DecayConfig {
         dirty_decay_ms,
         muzzy_decay_ms,
+        ..DecayConfig::DEFAULT
     });
     match a.arena_configure(ArenaId(id), &cfg) {
         Ok(()) => 0,

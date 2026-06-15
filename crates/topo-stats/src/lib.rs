@@ -11,7 +11,7 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 use topo_core::VERSION;
 
@@ -61,6 +61,25 @@ pub struct Stats {
     /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
     /// per kind (§23, plan 06 W10).
     pub hook_failures: topo_core::HookFailureStats,
+
+    // --- hugepage coverage (§19.7, plan 04 W11-5) ---------------------------
+    /// The §19.7 hugepage coverage metrics, summed over the hugepage backend(s).
+    /// All zero unless a hugepage backend is in use; populated via
+    /// [`record_huge`](Self::record_huge).
+    pub hugepage: topo_core::HugeStats,
+
+    // --- release controller (§20.3/§21, plan 04 W12) ------------------------
+    /// The release-controller / background-purge running counters (pressure mode,
+    /// backlog, planned bytes, demand reserve). All zero unless a release controller
+    /// is in use; populated via [`record_release`](Self::record_release).
+    pub release: topo_core::ReleaseStats,
+
+    // --- topology (§15, plan 04 W13) ----------------------------------------
+    /// Discovered NUMA node count (§15.2); `1` for the single-domain fallback.
+    /// Populated via [`record_topology`](Self::record_topology).
+    pub numa_nodes: u32,
+    /// Discovered LLC-domain count (§15.2); `1` for the single-domain fallback.
+    pub llc_domains: u32,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -149,11 +168,52 @@ impl Stats {
         self.record_backend(combined);
     }
 
+    /// Record the §19.7 hugepage coverage metrics (plan 04 W11-5) from a hugepage
+    /// backend's [`HugeStats`](topo_core::HugeStats) (its
+    /// [`coverage`](topo_core::HugePageBackend::coverage) snapshot). The backend is a
+    /// separate component from the central path, so its coverage is recorded
+    /// alongside [`record_allocator`](Self::record_allocator); several backends'
+    /// coverage sums with [`HugeStats::add`](topo_core::HugeStats::add) before being
+    /// recorded. The §19.7 `coverage_ratio` is rendered (computed, not stored) from
+    /// the recorded fields.
+    pub fn record_huge(&mut self, hs: topo_core::HugeStats) {
+        self.hugepage = hs;
+    }
+
+    /// Record the release-controller running counters (§20.3/§21, plan 04 W12) from a
+    /// [`ReleaseController::stats`](topo_core::ReleaseController::stats) snapshot. The
+    /// controller is a host-owned sibling of the allocator (like the hugepage backend),
+    /// so its stats are recorded alongside [`record_allocator`](Self::record_allocator).
+    pub fn record_release(&mut self, rs: topo_core::ReleaseStats) {
+        self.release = rs;
+    }
+
+    /// Record the §15.2 topology summary (plan 04 W13) from a discovered
+    /// [`Topology`](topo_core::Topology): its NUMA-node and LLC-domain counts (both `1`
+    /// for the conservative single-domain fallback). The host records it once at
+    /// startup and on a refresh.
+    pub fn record_topology(&mut self, t: &topo_core::Topology) {
+        self.numa_nodes = t.node_count();
+        self.llc_domains = t.llc_count();
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
     /// identifiers, so no escaping is required.
     pub fn to_json(&self) -> String {
+        // §19.4 bin distribution (W11-4a), rendered as a compact JSON array. Built
+        // here rather than inline in the template so it tracks `HugeBin::COUNT`
+        // automatically; this is the slow stats surface, so the small per-element
+        // allocations are immaterial.
+        let mut hp_bins = String::from("[");
+        for (i, count) in self.hugepage.bins.iter().enumerate() {
+            if i > 0 {
+                hp_bins.push(',');
+            }
+            hp_bins.push_str(&count.to_string());
+        }
+        hp_bins.push(']');
         format!(
             concat!(
                 "{{\n",
@@ -190,6 +250,31 @@ impl Stats {
                 "    \"pageheap_free_bytes\": {pageheap},\n",
                 "    \"virtual_bytes\": {virtual_b}\n",
                 "  }},\n",
+                "  \"hugepage\": {{\n",
+                "    \"coverage_bytes\": {hp_coverage},\n",
+                "    \"live_bytes_on_intact_hugepages\": {hp_intact},\n",
+                "    \"live_bytes_on_partial_hugepages\": {hp_partial},\n",
+                "    \"empty_backed_bytes\": {hp_empty_backed},\n",
+                "    \"empty_released_bytes\": {hp_empty_released},\n",
+                "    \"partial_subreleased_bytes\": {hp_subreleased},\n",
+                "    \"fragmentation_bytes\": {hp_fragmentation},\n",
+                "    \"coverage_ratio_bp\": {hp_ratio_bp},\n",
+                "    \"bin_counts\": {hp_bins}\n",
+                "  }},\n",
+                "  \"release\": {{\n",
+                "    \"pressure_mode\": \"{rel_mode}\",\n",
+                "    \"backlog_bytes\": {rel_backlog},\n",
+                "    \"demand_reserve_bytes\": {rel_reserve},\n",
+                "    \"planned_bytes_total\": {rel_planned},\n",
+                "    \"ticks\": {rel_ticks},\n",
+                "    \"active_ticks\": {rel_active},\n",
+                "    \"alloc_rate_bps\": {rel_alloc_rate},\n",
+                "    \"free_rate_bps\": {rel_free_rate}\n",
+                "  }},\n",
+                "  \"topology\": {{\n",
+                "    \"numa_nodes\": {numa_nodes},\n",
+                "    \"llc_domains\": {llc_domains}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
                 "  }}\n",
@@ -216,6 +301,25 @@ impl Stats {
             released = self.released_bytes,
             pageheap = self.pageheap_free_bytes,
             virtual_b = self.virtual_bytes,
+            hp_coverage = self.hugepage.coverage_bytes,
+            hp_intact = self.hugepage.live_bytes_on_intact,
+            hp_partial = self.hugepage.live_bytes_on_partial,
+            hp_empty_backed = self.hugepage.empty_backed_bytes,
+            hp_empty_released = self.hugepage.empty_released_bytes,
+            hp_subreleased = self.hugepage.partial_subreleased_bytes,
+            hp_fragmentation = self.hugepage.fragmentation_bytes,
+            hp_ratio_bp = self.hugepage.coverage_ratio_bp(),
+            hp_bins = hp_bins,
+            rel_mode = self.release.mode.as_str(),
+            rel_backlog = self.release.backlog_bytes,
+            rel_reserve = self.release.demand_reserve_bytes,
+            rel_planned = self.release.planned_bytes_total,
+            rel_ticks = self.release.ticks,
+            rel_active = self.release.active_ticks,
+            rel_alloc_rate = self.release.alloc_rate_bps,
+            rel_free_rate = self.release.free_rate_bps,
+            numa_nodes = self.numa_nodes,
+            llc_domains = self.llc_domains,
             metadata = self.metadata_bytes,
         )
     }
@@ -267,6 +371,103 @@ mod tests {
         assert_eq!(v["backend"]["dirty_bytes"], 2048);
         assert_eq!(v["backend"]["released_bytes"], 512);
         assert_eq!(v["backend"]["virtual_bytes"], 15872);
+    }
+
+    #[test]
+    fn hugepage_coverage_reconciles_into_stats_and_json() {
+        // W11-5: the §19.7 coverage metrics flow into the stats snapshot and the JSON,
+        // and the coverage ratio is computed from the recorded fields.
+        let hs = topo_core::HugeStats {
+            coverage_bytes: 4 * 2 * 1024 * 1024, // 4 hugepages
+            live_bytes_on_intact: 3 * 1024 * 1024,
+            live_bytes_on_partial: 1024 * 1024,
+            empty_backed_bytes: 2 * 1024 * 1024,
+            empty_released_bytes: 512 * 1024,
+            partial_subreleased_bytes: 256 * 1024,
+            fragmentation_bytes: 128 * 1024,
+            live_total_bytes: 4 * 1024 * 1024,
+            // Two empty-backed + one full + one partial-subreleased hugepage: a
+            // distribution that must reconcile to the 4-hugepage coverage above.
+            bins: [2, 0, 0, 0, 0, 1, 1, 0, 0],
+        };
+        let mut s = Stats::default();
+        s.record_huge(hs);
+        assert_eq!(s.hugepage.coverage_bytes, 4 * 2 * 1024 * 1024);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["hugepage"]["coverage_bytes"], 4u64 * 2 * 1024 * 1024);
+        assert_eq!(
+            v["hugepage"]["live_bytes_on_intact_hugepages"],
+            3u64 * 1024 * 1024
+        );
+        assert_eq!(
+            v["hugepage"]["live_bytes_on_partial_hugepages"],
+            1024u64 * 1024
+        );
+        assert_eq!(v["hugepage"]["empty_backed_bytes"], 2u64 * 1024 * 1024);
+        assert_eq!(v["hugepage"]["empty_released_bytes"], 512u64 * 1024);
+        assert_eq!(v["hugepage"]["partial_subreleased_bytes"], 256u64 * 1024);
+        assert_eq!(v["hugepage"]["fragmentation_bytes"], 128u64 * 1024);
+        // ratio = intact / total = 3 MiB / 4 MiB = 7500 bp.
+        assert_eq!(v["hugepage"]["coverage_ratio_bp"], 7500);
+        // The §19.4 bin distribution renders as a compact array in HugeBin order and
+        // sums to the touched-hugepage count (4).
+        assert_eq!(
+            v["hugepage"]["bin_counts"],
+            serde_json::json!([2, 0, 0, 0, 0, 1, 1, 0, 0])
+        );
+        let bin_sum: u64 = hs.bins.iter().map(|&c| c as u64).sum();
+        assert_eq!(bin_sum, hs.coverage_bytes / (2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn release_controller_stats_reconcile_into_stats_and_json() {
+        // W12: the release-controller running counters flow into the snapshot and the
+        // JSON `release` block, with the pressure mode rendered as its stable string.
+        let rs = topo_core::ReleaseStats {
+            mode: topo_core::PressureMode::Hard,
+            backlog_bytes: 4096,
+            planned_bytes_total: 1_048_576,
+            ticks: 42,
+            demand_reserve_bytes: 65536,
+            active_ticks: 7,
+            alloc_rate_bps: 12_345,
+            free_rate_bps: 6_789,
+        };
+        let mut s = Stats::default();
+        s.record_release(rs);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["release"]["pressure_mode"], "hard");
+        assert_eq!(v["release"]["backlog_bytes"], 4096);
+        assert_eq!(v["release"]["demand_reserve_bytes"], 65536);
+        assert_eq!(v["release"]["planned_bytes_total"], 1_048_576);
+        assert_eq!(v["release"]["ticks"], 42);
+        assert_eq!(v["release"]["active_ticks"], 7);
+        assert_eq!(v["release"]["alloc_rate_bps"], 12_345);
+        assert_eq!(v["release"]["free_rate_bps"], 6_789);
+        // The default snapshot renders the no-pressure normal mode.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["release"]["pressure_mode"], "normal");
+    }
+
+    #[test]
+    fn topology_summary_reconciles_into_stats_and_json() {
+        // W13: the discovered §15.2 node/LLC counts flow into the snapshot + JSON.
+        let mut b = topo_core::TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0)
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 1, 1)
+            .set_cpu(3, 1, 1);
+        let t = b.build();
+        let mut s = Stats::default();
+        s.record_topology(&t);
+        assert_eq!(s.numa_nodes, 2);
+        assert_eq!(s.llc_domains, 2);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["topology"]["numa_nodes"], 2);
+        assert_eq!(v["topology"]["llc_domains"], 2);
+        // The default snapshot reports the conservative single domain.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["topology"]["numa_nodes"], 0); // unrecorded ⇒ 0 (no topology yet)
     }
 
     #[test]

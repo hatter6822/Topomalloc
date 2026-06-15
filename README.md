@@ -64,8 +64,66 @@ never trusted) and the §23.4 "allocator correctness assumes hook correctness"
 assumption modeled and proof-checked in Lean (`ExtentHooks.lean`). The full §22.2
 per-arena `hooks` field is wired: `topo_arena_create_hooked` gives an arena its
 **own** custom-backed region, isolated from every other arena's by construction
-(§22.7), reachable from C through the `topo_extent_hooks_t` ABI. Front-end caches
-(M2) and the remaining M1 pieces land per the plan.
+(§22.7), reachable from C through the `topo_extent_hooks_t` ABI.
+
+**Hugepage-aware backend (W11)** rides on the §18.6 region-cache seam: the four
+§19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a
+real, backend-agnostic placement subsystem over the provider seam. A
+`HugePageFiller` packs sub-hugepage page-runs into hugepages over the nine §19.4
+occupancy bins (each hugepage in **exactly one**, H-003) with packing-ordered,
+scored placement carrying the request's hotness **and** lifetime hints (§19.3/
+§19.5, no full scan); a provider-driven `HugePageBackend` implements the
+`RegionCacheHook` the large path consults, so a medium/large request is packed or
+served as a whole-hugepage run. It is wired **live** through the engine —
+`Allocator::new_with_huge` (the `hugepage_optimized` configuration) routes every
+medium/large allocation through the filler with the small/free paths unchanged —
+and a §36.9 G-sim slice proves the *identical* outcome over POSIX and the seLe4n
+simulator. Partial subrelease is guarded so it can **never** intersect a live
+object (H-005, proved in Lean both over the `Range` geometry and as a per-page
+state machine), gated by a real §19.6 cost/benefit test and §36.6
+revoke-before-decommit; an empty-hugepage demand-reserve (`release_empty_excess`)
+returns excess RSS. The §19.7 coverage metrics — plus the §19.4 per-bin
+distribution (`hugepage.bin_counts`) — reconcile into the stats JSON, and
+the §19.4 bin classification is pinned to the Lean model by a `lake exe check`
+differential gate. Under the `hugepage-optimized` feature the live C
+`malloc`/`free` already run over a `HugePageBackend`-backed engine
+(`topo-abi`'s `build_posix_allocator`), gated so the default MIT artifact is
+byte-for-byte the M1 extent path.
+
+**Release controller (W12)** rides on the W11 mechanisms: a **pure, `no_std`,
+host-driven** `ReleaseController` decides when and how much unused memory returns to
+the OS (§20–§21). A `tick(now_ms, inputs)` pump samples the §21.2 observation vector,
+classifies the §21.5 pressure mode (Normal/Soft/Hard/Emergency, with hysteresis;
+allocation failure or cgroup-critical forces Emergency), computes the §21.4 demand
+reserve — the anti-oscillation brake that withholds release proportional to recent
+demand so freed memory is not faulted straight back (§21.1 R2) — and plans the §21.3
+priority ladder (drain caches → release empty hugepages beyond the reserve → purge aged
+dirty-not-on-hot → convert aged dirty→muzzy → subrelease cold-sparse → release aged
+muzzy → emergency shrink) — where dirty and muzzy are each retained for reuse until
+their `dirty_decay_ms`/`muzzy_decay_ms` interval elapses — each rung gated by mode and
+the §36.11 latency class, rate-capped (§20.2) with a
+backlog. It is wired **live** through `HugePageBackend::release_tick`, which drives the
+W11 `release_empty_excess` demand-reserve hook — so an idle backend returns its empty
+hugepages to the OS while a churning one holds them back — identical over POSIX and the
+seLe4n simulator (§36.9). The controller adds **no abstract transition**: it sequences
+mechanisms already certified by the §21.6 release-safety theorem, so the proof stays
+discharged. Pressure mode, backlog, and demand reserve reconcile into the stats JSON
+and the `topo.release.*` control namespace.
+
+**Topology awareness (W13)** completes plan 04's "Backend, Hugepages, Release &
+Topology": a pure, `no_std` `Topology` snapshot models the §15 `CPU → LLC → NUMA node`
+hierarchy, built from Linux sysfs (`topo-backend-posix::discover_topology`) and
+**always falling back to a conservative single domain** on missing or inconsistent data
+(§15.2). `preferred_node` is the §15.3/§15.5 placement decision over the NUMA policy
+(local / bind / interleave / OS-default / arena), a `Rebalancer` plans nearest-donor →
+most-pressured-node moves so memory is never permanently stranded (§15.4), and
+`detect_mismatch` is the periodic-refresh probe. This fills the hugepage filler score's
+locality / cross-NUMA terms (W11 left them at 0 "until W13"): a request's explicit node
+preference is rewarded on a matching region and penalized cross-node, neutral with no
+preference — so the single-node case is unaffected and safety is never involved.
+Placement is policy, not a modeled transition, so it adds no proof obligation. The
+node/LLC counts reconcile into the stats JSON and the `topo.numa.*` control namespace.
+Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Quick start
 
@@ -147,6 +205,8 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 - Provider state machine differential (§36.6)
 - Extent state machine differential (§20.1)
 - Arena lifecycle differential (§22.3/§36.13 transitions + revocation chain)
+- Extent-hook contract differential (§23.3 alignment/size/sub-range checks)
+- Hugepage-bin differential (§19.4 `classifyBin` ↔ Rust `classify_bin`)
 
 **Selected headline theorems:**
 
@@ -154,6 +214,7 @@ standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 |----------|--------|
 | Size-class table covers all small requests | `Theorems/SizeClass.lean` |
 | 14-clause WellFormed preservation (per transition) | `Theorems/*.lean` |
+| Partial subrelease never strands a live object (H-005) | `HugePageFiller.lean` |
 | Arena lifecycle: alloc only in Active; partial failure never Destroyed | `ArenaLifecycle.lean` |
 | Capability delegation is attenuation-only (`DelegatesFrom`) | `SeLe4n/CapBackedArena.lean` |
 | Delegated subtree's live bytes stay within the root quota (`subtree_used_le_quota`) | `SeLe4n/CapBackedArena.lean` |
