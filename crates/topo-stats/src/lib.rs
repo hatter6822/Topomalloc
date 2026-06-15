@@ -80,6 +80,17 @@ pub struct Stats {
     pub numa_nodes: u32,
     /// Discovered LLC-domain count (§15.2); `1` for the single-domain fallback.
     pub llc_domains: u32,
+    /// Live NUMA router: the cumulative count of per-node `mbind` failures (§15.5
+    /// "NUMA binding failures MUST be visible in stats"). Populated via
+    /// [`record_node_router`](Self::record_node_router); `0` when no router is wired.
+    pub numa_router_bind_failures: u64,
+    /// Live NUMA router: cumulative §15.4 rebalancer moves executed.
+    pub numa_rebalance_moves: u64,
+    /// Live NUMA router: cumulative bytes returned to the OS by rebalancer moves.
+    pub numa_rebalance_released_bytes: u64,
+    /// Live NUMA router: cumulative spillover allocations (served off the preferred node
+    /// because it was full — §15.4 remote reuse at allocation time).
+    pub numa_spillovers: u64,
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -197,6 +208,20 @@ impl Stats {
         self.llc_domains = t.llc_count();
     }
 
+    /// Record the live NUMA router's running counters (§15.4/§15.5, plan 04 W13) from a
+    /// [`NodeRouterStats`](topo_core::NodeRouterStats) snapshot — the bind-failure count
+    /// (the §15.5 visibility requirement), executed rebalancer moves and bytes released,
+    /// and spillover allocations. The router is a host-owned sibling like the hugepage
+    /// backend, so its stats are composed alongside [`record_topology`](Self::record_topology).
+    /// Also pins `numa_nodes` to the router's node count (= the placed-across node count).
+    pub fn record_node_router(&mut self, r: topo_core::NodeRouterStats) {
+        self.numa_nodes = r.nodes;
+        self.numa_router_bind_failures = r.bind_failures;
+        self.numa_rebalance_moves = r.rebalance_moves;
+        self.numa_rebalance_released_bytes = r.rebalance_released_bytes;
+        self.numa_spillovers = r.spillovers;
+    }
+
     /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
     /// additive: new fields may be added in later milestones, never removed or
     /// renamed within a release series (§35.3). Strings here are fixed ASCII
@@ -273,7 +298,11 @@ impl Stats {
                 "  }},\n",
                 "  \"topology\": {{\n",
                 "    \"numa_nodes\": {numa_nodes},\n",
-                "    \"llc_domains\": {llc_domains}\n",
+                "    \"llc_domains\": {llc_domains},\n",
+                "    \"router_bind_failures\": {numa_router_bind_failures},\n",
+                "    \"rebalance_moves\": {numa_rebalance_moves},\n",
+                "    \"rebalance_released_bytes\": {numa_rebalance_released_bytes},\n",
+                "    \"spillovers\": {numa_spillovers}\n",
                 "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
@@ -320,6 +349,10 @@ impl Stats {
             rel_free_rate = self.release.free_rate_bps,
             numa_nodes = self.numa_nodes,
             llc_domains = self.llc_domains,
+            numa_router_bind_failures = self.numa_router_bind_failures,
+            numa_rebalance_moves = self.numa_rebalance_moves,
+            numa_rebalance_released_bytes = self.numa_rebalance_released_bytes,
+            numa_spillovers = self.numa_spillovers,
             metadata = self.metadata_bytes,
         )
     }
@@ -468,6 +501,35 @@ mod tests {
         // The default snapshot reports the conservative single domain.
         let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
         assert_eq!(d["topology"]["numa_nodes"], 0); // unrecorded ⇒ 0 (no topology yet)
+    }
+
+    #[test]
+    fn node_router_counters_reconcile_into_stats_and_json() {
+        // W13: the live router's §15.4/§15.5 counters flow into the snapshot + JSON, and
+        // its node count overrides the discovered count (it is what we place across).
+        let mut s = Stats::default();
+        s.record_node_router(topo_core::NodeRouterStats {
+            nodes: 2,
+            bind_failures: 3,
+            rebalance_moves: 5,
+            rebalance_released_bytes: 4096,
+            spillovers: 9,
+        });
+        assert_eq!(s.numa_nodes, 2);
+        assert_eq!(s.numa_router_bind_failures, 3);
+        assert_eq!(s.numa_rebalance_moves, 5);
+        assert_eq!(s.numa_rebalance_released_bytes, 4096);
+        assert_eq!(s.numa_spillovers, 9);
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        assert_eq!(v["topology"]["numa_nodes"], 2);
+        assert_eq!(v["topology"]["router_bind_failures"], 3);
+        assert_eq!(v["topology"]["rebalance_moves"], 5);
+        assert_eq!(v["topology"]["rebalance_released_bytes"], 4096);
+        assert_eq!(v["topology"]["spillovers"], 9);
+        // Default (no router wired) ⇒ all zero.
+        let d: serde_json::Value = serde_json::from_str(&Stats::default().to_json()).unwrap();
+        assert_eq!(d["topology"]["router_bind_failures"], 0);
+        assert_eq!(d["topology"]["spillovers"], 0);
     }
 
     #[test]

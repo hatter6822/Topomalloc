@@ -964,14 +964,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
                 // Route to the arena's own hooked large backing if it has one (W10);
                 // otherwise the shared backend, carrying the request's placement hints
-                // so a wired hugepage backend packs by hotness/lifetime (W11). A hooked
-                // arena's custom backing does not place by hints (it is the user's
-                // memory source), so it takes the hint-less trait path.
+                // so a wired hugepage backend packs by hotness/lifetime (W11) and a live
+                // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
+                // the router need not know the arena). A hooked arena's custom backing
+                // does not place by hints (it is the user's memory source), so it takes
+                // the hint-less trait path.
                 match self.hook_backend(arena) {
                     Some(b) => b.large.allocate_in(arena, usable, req.align),
                     None => {
+                        let hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
                         self.large
-                            .allocate_in_hinted(arena, usable, req.align, req.flags.hints())
+                            .allocate_in_hinted(arena, usable, req.align, hints)
                     }
                 }
             }

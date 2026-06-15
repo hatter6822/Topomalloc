@@ -598,10 +598,25 @@ mod tests {
         set_errno(5);
         assert!(trallocx(p, 0, 0).is_null());
         assert_eq!(get_errno(), 5, "freeing via rallocx(p, 0) is not an error");
-        // The object was genuinely freed: the same class slot is vended again.
-        let q = topo_mallocx(64, 0);
-        assert_eq!(q, p, "rallocx(p, 0) must actually free");
-        tdallocx(q, 0);
+        // The object was genuinely freed (not leaked): its slot is vended again. The live
+        // allocator has no front-end thread cache yet (M2), so a freed small object returns
+        // to the *shared* central free list, which a parallel test thread can transiently
+        // touch — so confirm recycling by membership in a bounded batch (held to drain the
+        // list toward the freed slot, then freed), not by asserting the exact next call.
+        let mut batch = Vec::with_capacity(64);
+        let mut recycled = false;
+        for _ in 0..64 {
+            let x = topo_mallocx(64, 0);
+            recycled |= x == p;
+            batch.push(x);
+        }
+        for x in batch {
+            tdallocx(x, 0);
+        }
+        assert!(
+            recycled,
+            "rallocx(p, 0) must actually free (p recycled within a batch)"
+        );
 
         // An *invalid flag word* with size 0 must NOT free: validation comes
         // first, deterministically (§10.4).

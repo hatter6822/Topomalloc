@@ -464,10 +464,25 @@ mod tests {
             assert_eq!(p.cast::<u8>().read(), 0x5a);
         }
         tfree(p);
-        // The engine recycles: same class ⇒ the hole is vended again.
-        let q = topomalloc_malloc(40);
-        assert_eq!(q, p, "free must actually recycle (no more M0 leak)");
-        tfree(q);
+        // The engine recycles (no more M0 leak): the freed slot is vended again. No
+        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
+        // central free list, which a parallel test thread can transiently touch — confirm
+        // recycling by membership in a bounded batch (held to drain toward the freed slot,
+        // then freed), not by asserting the exact next call.
+        let mut batch = Vec::with_capacity(64);
+        let mut recycled = false;
+        for _ in 0..64 {
+            let x = topomalloc_malloc(40);
+            recycled |= x == p;
+            batch.push(x);
+        }
+        for x in batch {
+            tfree(x);
+        }
+        assert!(
+            recycled,
+            "free must actually recycle (p reused within a batch)"
+        );
     }
 
     #[test]

@@ -384,6 +384,19 @@ pub trait TopoBackingProvider {
         Ok(())
     }
 
+    /// **Bind `region`'s physical backing to NUMA node `os_node`** (§15.5, W13) — the
+    /// kernel's node number (from [`Topology::os_node_of`](crate::Topology::os_node_of)),
+    /// not a dense id. Best-effort: applied to the *whole reservation* before it is
+    /// faulted (e.g. Linux `mbind`/`set_mempolicy`), so future faults land on `os_node`.
+    /// **A no-op by default** — POSIX without NUMA, seLe4n, and non-Linux targets return
+    /// `Ok(())`, and the live [`NodeRouter`](crate::NodeRouter) treats any `Err` as a
+    /// recorded [bind failure](crate::Topology) (counted in stats), never fatal: a missed
+    /// bind only loses locality (§2.4 "safety before policy").
+    fn bind_node(&self, region: Region, os_node: u32) -> Result<(), BackendError> {
+        let _ = (region, os_node);
+        Ok(())
+    }
+
     /// A short, stable name for diagnostics and trace output (e.g. `"posix"`).
     fn name(&self) -> &'static str;
 

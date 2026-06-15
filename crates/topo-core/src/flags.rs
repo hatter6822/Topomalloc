@@ -40,6 +40,7 @@
 //! subsystems (plans 15/05) and would burn bits before those exist. They are
 //! added — with their own fields or an out-of-band handle — when those land.
 
+use crate::arena::NumaPolicy;
 use crate::ids::ArenaId;
 
 /// Expected lifetime hint (§10.4 `TOPO_LIFETIME_*`). Advisory; carried for the
@@ -87,6 +88,12 @@ pub struct Hints {
     pub lifetime: Lifetime,
     /// Hotness hint (`0..=255`; 0 = cold/neutral).
     pub hotness: u8,
+    /// Resolved NUMA placement policy (§15.5, W13). The flag word does **not** encode a
+    /// node yet (per-call `TOPO_NUMA` is deferred, see the module docs), so decoding from
+    /// flags always yields [`OsDefault`](NumaPolicy::OsDefault); the engine *overrides*
+    /// this with the request's arena's policy before the large path, and the live
+    /// [`NodeRouter`](crate::NodeRouter) reads it to steer placement.
+    pub numa: NumaPolicy,
 }
 
 /// The internal, validated representation of an allocation request's flag word.
@@ -203,6 +210,19 @@ impl RequestFlags {
             hugepage,
             lifetime,
             hotness: ((self.0 & Self::HOTNESS_MASK) >> Self::HOTNESS_SHIFT) as u8,
+            // The flag word carries no node; the engine fills this from the arena's policy.
+            numa: NumaPolicy::OsDefault,
+        }
+    }
+
+    /// As [`hints`](Self::hints) but with the NUMA placement policy resolved from the
+    /// request's arena (§15.5, W13) — the engine calls this on the large path so the live
+    /// [`NodeRouter`](crate::NodeRouter) can steer placement to the preferred node.
+    #[inline]
+    pub fn hints_with_numa(self, numa: NumaPolicy) -> Hints {
+        Hints {
+            numa,
+            ..self.hints()
         }
     }
 
@@ -293,6 +313,30 @@ mod tests {
         assert_eq!(h, Hints::default());
         assert_eq!(RequestFlags::NONE.arena(), ArenaId::DEFAULT);
         assert_eq!(RequestFlags::NONE.raw(), 0);
+        // The flag word carries no node, so decoding always yields OsDefault (W13).
+        assert_eq!(h.numa, NumaPolicy::OsDefault);
+    }
+
+    #[test]
+    fn hints_with_numa_overrides_only_the_policy() {
+        // The engine resolves the arena's NUMA policy into the hints for the large path
+        // (§15.5, W13); every other decoded field is preserved.
+        let f = RequestFlags::NONE
+            .with_hotness(200)
+            .with_lifetime(Lifetime::Long);
+        let base = f.hints();
+        let h = f.hints_with_numa(NumaPolicy::Bind(crate::ids::NodeId(2)));
+        assert_eq!(h.numa, NumaPolicy::Bind(crate::ids::NodeId(2)));
+        assert_eq!(h.hotness, base.hotness);
+        assert_eq!(h.lifetime, base.lifetime);
+        assert_eq!(
+            Hints {
+                numa: base.numa,
+                ..h
+            },
+            base,
+            "only numa differs"
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ use topo_core::{
     DecayConfig, Hotness, HugePageFiller, Lifetime, PlaceHints, PressureMode, ReleaseController,
     ReleaseInputs, HUGEPAGE_SIZE,
 };
+use topo_core::{NodePressure, Rebalancer, TopologyBuilder};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -650,7 +651,6 @@ proptest! {
                 2 => Lifetime::Long,
                 _ => Lifetime::Unspecified,
             },
-            home_node: None,
         };
         // Live sub-hugepage runs (freed via `free`) and whole-hugepage runs (freed via
         // `free_hugepages`), tracked separately so frees target real, live allocations.
@@ -729,5 +729,84 @@ proptest! {
         }
         prop_assert!(f.check_invariants());
         prop_assert_eq!(f.coverage().live_total_bytes, 0, "drained to empty");
+    }
+}
+
+proptest! {
+    /// **Rebalancer surplus-safety + convergence under arbitrary topologies (§15.4,
+    /// plan 04 W13).** For any node count, distance matrix, and per-node (free, demand),
+    /// driving [`Rebalancer::plan`] to a fixpoint: every move is bounded by the donor's
+    /// *surplus* (free beyond its own demand) so applying it can neither underflow nor
+    /// strand the donor, the total unmet need strictly decreases by exactly the move each
+    /// step (monotone progress), and the loop converges in `≤ nodes` moves — the §15.4
+    /// "never permanently stranded" guarantee with no churn, the randomized companion to
+    /// the unit fixpoint test.
+    #[test]
+    fn rebalancer_never_strands_a_donor_and_converges(
+        n_nodes in 2u32..=8,
+        // (free, demand) per node (indices 0..n_nodes used), and a flat distance matrix.
+        pressures in prop::collection::vec((0u64..(1u64 << 16), 0u64..(1u64 << 16)), 8),
+        dists in prop::collection::vec(10u8..=40, 8 * 8),
+    ) {
+        // Build an n-node topology (one CPU per node) over the random distance matrix.
+        let mut b = TopologyBuilder::new(n_nodes);
+        for c in 0..n_nodes {
+            b.set_cpu(c, c, c);
+        }
+        for a in 0..n_nodes {
+            for d in 0..n_nodes {
+                b.set_distance(a, d, dists[(a * n_nodes + d) as usize]);
+            }
+        }
+        let topo = b.build();
+        // Only a genuine multi-node snapshot can rebalance; the build keeps the shape we
+        // constructed (every CPU set, nodes 0..n_nodes), so this holds — assert to be sure.
+        prop_assert_eq!(topo.node_count(), n_nodes);
+
+        let mut nodes: Vec<NodePressure> = (0..n_nodes as usize)
+            .map(|i| NodePressure {
+                free_bytes: pressures[i].0,
+                demand_bytes: pressures[i].1,
+            })
+            .collect();
+        let total_need = |ns: &[NodePressure]| -> u64 { ns.iter().map(|p| p.unmet_need()).sum() };
+
+        let mut prev_total = total_need(&nodes);
+        let mut moves = 0u32;
+        while let Some(m) = Rebalancer::plan(&nodes, &topo) {
+            let (s, d) = (m.src.0 as usize, m.dst.0 as usize);
+            prop_assert_ne!(s, d, "donor and recipient are distinct nodes");
+            prop_assert!((s as u32) < n_nodes && (d as u32) < n_nodes, "indices in range");
+            prop_assert!(m.bytes > 0, "a planned move transfers ≥ 1 byte");
+            prop_assert!(
+                m.bytes <= nodes[s].movable_surplus(),
+                "the move is bounded by the donor's surplus"
+            );
+            prop_assert!(
+                m.bytes <= nodes[d].unmet_need(),
+                "the move is bounded by the recipient's need"
+            );
+
+            // Apply it via the canonical move semantics (donor → surplus, recipient ← relief).
+            prop_assert!(m.apply(&mut nodes), "endpoints in range");
+
+            prop_assert_eq!(nodes[s].unmet_need(), 0, "a move never strands the donor");
+            let now_total = total_need(&nodes);
+            prop_assert_eq!(
+                now_total,
+                prev_total - m.bytes,
+                "total unmet need drops by exactly the moved bytes"
+            );
+            prop_assert!(now_total < prev_total, "strict progress each move (no churn)");
+            prev_total = now_total;
+
+            moves += 1;
+            prop_assert!(moves <= n_nodes, "converges in ≤ nodes moves");
+        }
+
+        // Fixpoint: nothing relievable is left — no node has need, or none has surplus.
+        let any_need = nodes.iter().any(|p| p.unmet_need() > 0);
+        let any_surplus = nodes.iter().any(|p| p.movable_surplus() > 0);
+        prop_assert!(!any_need || !any_surplus, "fixpoint has no relievable stranding");
     }
 }

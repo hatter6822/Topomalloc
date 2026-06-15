@@ -66,9 +66,17 @@ impl Control {
                 Some(self.stats.release.demand_reserve_bytes.to_string())
             }
             // Topology summary (§15, plan 04 W13): the discovered NUMA-node / LLC-domain
-            // counts from the latest stats snapshot (`1`/`0` for the single-domain case).
+            // counts from the latest stats snapshot (`1`/`0` for the single-domain case),
+            // plus the live router's §15.4/§15.5 counters (bind failures, rebalancer moves
+            // and bytes released, spillovers) — all `0` when no router is wired.
             "topo.numa.nodes" => Some(self.stats.numa_nodes.to_string()),
             "topo.numa.llc_domains" => Some(self.stats.llc_domains.to_string()),
+            "topo.numa.bind_failures" => Some(self.stats.numa_router_bind_failures.to_string()),
+            "topo.numa.rebalance_moves" => Some(self.stats.numa_rebalance_moves.to_string()),
+            "topo.numa.rebalance_released_bytes" => {
+                Some(self.stats.numa_rebalance_released_bytes.to_string())
+            }
+            "topo.numa.spillovers" => Some(self.stats.numa_spillovers.to_string()),
             _ => None,
         }
     }
@@ -149,6 +157,30 @@ mod tests {
         });
         assert_eq!(c.get("topo.numa.nodes").as_deref(), Some("2"));
         assert_eq!(c.get("topo.numa.llc_domains").as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn reads_the_live_router_counters() {
+        // Plan 04 W13: the live NUMA router's §15.4/§15.5 counters surface in the control
+        // namespace, and default to "0" when no router is wired.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            numa_router_bind_failures: 3,
+            numa_rebalance_moves: 5,
+            numa_rebalance_released_bytes: 4096,
+            numa_spillovers: 9,
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.numa.bind_failures").as_deref(), Some("3"));
+        assert_eq!(c.get("topo.numa.rebalance_moves").as_deref(), Some("5"));
+        assert_eq!(
+            c.get("topo.numa.rebalance_released_bytes").as_deref(),
+            Some("4096")
+        );
+        assert_eq!(c.get("topo.numa.spillovers").as_deref(), Some("9"));
+        // No router wired ⇒ "0".
+        let d = Control::new(Profile::Performance);
+        assert_eq!(d.get("topo.numa.bind_failures").as_deref(), Some("0"));
     }
 
     #[test]

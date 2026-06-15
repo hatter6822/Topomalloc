@@ -1277,3 +1277,122 @@ O(1) path), the strict-teardown + reclaim tests, and the §34.8 extent-stream fu
 dedicated arena-lifecycle fuzz target is the one deferred item (the per-arena path is
 covered deterministically and concurrently; a nightly fuzz target could not be
 compiled-verified in the work environment).
+
+## W13 — topology awareness & live NUMA placement (plan 04)
+
+These decisions close the live-integration gaps of the §15 topology workstream.
+
+* **NUMA node *and* LLC ids are dense + internal, with a preserved OS-id map for nodes.**
+  `TopologyBuilder::build` densely renumbers the OS node ids — and, by the identical
+  construction, the LLC-domain ids — actually in use to `0..node_count()` / `0..llc_count()`,
+  so a sparsely-numbered platform (OS nodes 0 and 2 present, 1 absent) yields **two** nodes,
+  not a three-node model with a phantom node 1 — keeping `node_count()`/`llc_count()`/stats
+  exact and every dense id a real domain (the rebalancer, interleave, and the per-node router
+  can iterate `0..node_count()` with no holes). Because `mbind`/`set_mempolicy` need the
+  *kernel's* node number, the raw OS *node* id is kept in `node_os_id` and recovered by
+  `Topology::os_node_of`; LLC ids are internal only, so no raw-id map is kept for them.
+  Doing **both** renumberings inside `build` (not only in the sysfs reader) hardens every
+  direct builder caller, not just the discovery path — the documented "no phantom domain"
+  invariant then holds uniformly (defense in depth). On a dense platform the renumbering is
+  the identity, so the common case is unchanged. The alternative (raw OS ids + a "present"
+  mask) was rejected: it pushes present-awareness into every consumer, whereas dense ids give
+  the clean invariant "all ids `< node_count()` / `< llc_count()` are real".
+* **The rebalancer donates only a node's *surplus*, never its raw free.** A move is
+  sized and gated by `movable_surplus = free − own demand` (not raw free), so it can
+  never strand the donor it draws from, and a round with no surplus anywhere plans
+  nothing rather than churning memory between equally-starved nodes. Proven to converge
+  in `≤ nodes` moves (the need/surplus node-potential strictly decreases each move).
+* **Live placement is a per-node-backend *router*, not a NUMA-aware filler.** The
+  formally-modeled, fuzzed `HugePageFiller` is left **untouched**; instead a `NodeRouter`
+  (`RegionCacheHook`) holds one `HugePageBackend` per node in a fixed `[…; MAX_NODES]`
+  array (no `Vec` — the core is `no_std` without `alloc`) and routes the large path to
+  the preferred node's backend. Installed via the existing
+  `new_with_huge(&dyn RegionCacheHook)` seam, so the engine change is one resolved
+  `Hints.numa` field and the **default path stays byte-for-byte unchanged**. A
+  single-node machine builds exactly one backend — identical to today — so the
+  integration degrades cleanly where there is nothing to place.
+* **The router computes the node from `Hints.numa`; the topology lives in the router.**
+  The engine resolves the arena's `NumaPolicy` into a `Hints.numa` field and the router
+  (holding the swappable `Topology`, a `CoreProvider`, and an atomic interleave counter)
+  computes `preferred_node_at` and routes. This keeps the placement state in one
+  cohesive, host-refreshable component (`refresh` swaps the snapshot under the router's
+  lock — host-driven, matching the release pump's model, no background thread) rather
+  than threading current-CPU + interleave + topology through the engine.
+* **`mbind` is best-effort; a bind failure is recorded, never fatal (§15.5).** Each
+  backend's region is bound to its node's OS id at construction via a new defaulted
+  `TopoBackingProvider::bind_node` (no-op on seLe4n / non-Linux, real `set_mempolicy`/
+  `mbind` on Linux). A failure increments `numa_bind_failures` (now a *driven*, non-vacuous
+  counter) and placement proceeds — "safety before policy": a missed bind hurts locality,
+  never correctness.
+* **Per-node demand is approximated from per-node allocation failures.** The allocator
+  has no first-class per-node *demand* signal, so the rebalancer's live driver derives it
+  from each node-backend's recent alloc-failure count (free comes from each backend's
+  empty-backed coverage). This is an explicit approximation — documented as such — that
+  is honest enough to drive the §15.4 ladder without inventing per-node demand
+  accounting (a real demand model is M5). An `Avoid` (`NO_HUGEPAGE`) decline is **not**
+  counted as demand — it is short-circuited at the router before any node is chosen, so a
+  policy decline never fabricates a rebalancer signal.
+* **The arena's NUMA policy is read lock-free on the alloc path.** Resolving the arena's
+  policy into the request's hints sits on the large/medium allocation path, and
+  `try_charge` is deliberately lock-free (an atomic CAS, no table lock). So the policy
+  lives in a per-arena `AtomicU64` (encoded, like `hook_slot`), read with a single
+  `Relaxed` load — *not* under the table lock — keeping the alloc path lock-free. It is
+  purely a policy value (a torn/garbage read decodes to the safe `OsDefault`, never a
+  capability or quota), so a relaxed atomic with no lock is sound; it survives a reset
+  (placement config is sticky) and is the single source of truth (`stats` decodes the same
+  atomic, so the two can never disagree).
+
+Verified by the topology unit tests (dense **node and LLC** renumbering with the no-phantom
+guarantee, the local-for-every-slot distance diagonal, `os_node_of` round-trip,
+`preferred_node_at` equivalence, the move helper), the
+router unit tests (routing-by-policy, the avoid-decline-does-not-fabricate-demand
+regression, deterministic bind-failure counting, refresh, interleave, live rebalance), the
+arena unit tests (the lock-free `numa` encode/decode round-trip + survives-reset), the
+cross-crate integration tests (discovery → stats → control, the multi-node router placement
++ mbind-failure path, the host-driven refresh cycle, the live rebalancer drive-to-fixpoint),
+the `rebalancer_never_strands_a_donor_and_converges` gating proptest, and the new
+`fuzz/fuzz_targets/topology.rs` target (builder totality + rebalancer convergence over
+arbitrary inputs).
+
+### W13 optimal-completion pass (first-touch, real CPU, control surface)
+
+A follow-up pass closed the live-behavior gaps a self-audit surfaced.
+
+* **`OsDefault` is genuine first-touch (an unbound default backend), not node 0.** The
+  earlier router resolved `OsDefault` to node 0 and served it from a bound backend,
+  pinning the *common* case to node 0 + `mbind` on a multi-node box and defeating the
+  kernel's first-touch policy (place the page on the node of the touching thread — usually
+  optimal). The router now holds an **unbound** default backend (no `mbind`) serving
+  `OsDefault`/`ArenaPolicy`, so the OS places those pages first-touch; the per-node *bound*
+  backends serve only explicit `Local`/`Bind`/`Interleave`. On a single node there is no
+  separate default (binding the only node is a no-op, so the lone backend *is* first-touch),
+  so the single-node path is byte-for-byte unchanged. The `make` factory takes
+  `Option<NodeId>` (`Some` = bound per-node, `None` = unbound default); the ABI sizes the
+  default at full capacity (it serves the common case) and the per-node set at `capacity/n`.
+  Rejected alternatives: routing `OsDefault` to the current node (`≈ Local` — simpler but
+  binds to the *allocator's* node, wrong for producer/consumer); per-allocation `mbind`
+  (would drop the per-node backends the rebalancer samples).
+* **`Local` uses the real running CPU (`sched_getcpu`), not a fixed core.** A new `OsCore`
+  `CoreProvider` (`topo-backend-posix`, Linux `sched_getcpu`, core 0 elsewhere) replaces
+  `FixedCore(0)` in the live ABI, so `Local` tracks the actual thread. The seam stays
+  injectable, so the RSEQ per-CPU identity (plan 05 W7) is still a drop-in.
+* **The filler's NUMA score term was removed as dead code.** With placement done by
+  *routing* to per-node backends (each one node), the per-candidate `locality_bonus`/
+  `cross_numa_penalty` never discriminated anything on the live path — so `PlaceHints`/
+  `HugeConfig`/`HugePageFiller` lost their `home_node` and the score lost its NUMA terms.
+* **Spillover prefers the nearest node; `Interleave` rotates over the backend count.** A
+  full preferred node spills to the nearest other node by `Topology::distance` (then the
+  default backend), not index order (§15.4); and `Interleave` round-robins over the actual
+  backend count, so a node-count-changing refresh can never bias it.
+* **The rebalancer/refresh/idle-release are reachable on the deployed C ABI.** A type-erased
+  `RouterControl` trait + a global handle let the C `topomalloc_numa_rebalance_tick` /
+  `_refresh` / `_release` / `_nodes` / `_bind_failures` / `_rebalance_moves` / `_spillovers`
+  entry points drive the live router (host-driven, no background thread — matching the
+  chosen model). Each is a graceful no-op when no router is wired. `release_idle` is the
+  W12 idle-memory handoff driven router-wide.
+
+Verified by the expanded router unit tests (first-touch default, single-node default,
+nearest-node spillover, `MAX_NODES` scale), the `numa_api` control-surface test (both feature
+configs), the multi-node integration tests over the real provider (first-touch + W12 release,
+and a concurrent alloc/free/rebalance/refresh stress test), and the W8-8 header↔symbol
+cross-check over the seven new C symbols.

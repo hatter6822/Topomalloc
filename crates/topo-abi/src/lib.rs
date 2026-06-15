@@ -41,6 +41,7 @@ mod c_api;
 mod errno_shim;
 mod extended;
 mod hooks_api;
+mod numa_api;
 mod policy;
 
 pub use arena_api::{
@@ -61,6 +62,11 @@ pub use extended::{
     TOPO_TCACHE_NONE, TOPO_ZERO,
 };
 pub use hooks_api::{topo_arena_create_hooked, topo_extent_hooks_t, topo_max_hook_backends};
+pub use numa_api::{
+    topomalloc_numa_bind_failures, topomalloc_numa_nodes, topomalloc_numa_rebalance_moves,
+    topomalloc_numa_rebalance_tick, topomalloc_numa_refresh, topomalloc_numa_release,
+    topomalloc_numa_spillovers,
+};
 pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
@@ -271,29 +277,43 @@ fn build_posix_allocator(
     let cfg = AllocatorConfig::default();
     #[cfg(feature = "hugepage-optimized")]
     {
+        use topo_backend_posix::{discover_topology, OsCore};
+        use topo_core::{HugeConfig, HugePageBackend, NodeRouter};
+
         let capacity = (cfg.large_region_bytes / topo_core::HUGEPAGE_SIZE).max(1);
-        // If `HugePageBackend::new` itself fails it rolls its own reservation back
-        // (§19.2) and `.ok()?` returns before any leak. Only a *successful* backend
-        // is leaked into `'static` for the allocator to borrow — so the raw pointer
-        // is kept to reclaim it if the allocator build below fails (see the failure
-        // arm), guaranteeing the backend's `Drop` (which releases the large virtual
-        // reservation) runs on every path. On success the backend stays leaked
-        // (process-lived, like `meta`/`pagemap`), and the success path is unchanged.
-        let huge_ptr: *mut topo_core::HugePageBackend<PosixBackingProvider> =
-            Box::into_raw(Box::new(
-                topo_core::HugePageBackend::new(
-                    PosixBackingProvider::new(),
-                    meta,
-                    ArenaId::DEFAULT,
-                    topo_core::HugeConfig::with_capacity(capacity),
-                )
-                .ok()?,
-            ));
-        // SAFETY: `huge_ptr` came from `Box::into_raw` just above and is uniquely
-        // owned here; reborrowing it as `&'static` is sound because it is only ever
-        // reclaimed on the failure arm below (after the borrow ends), and otherwise
-        // leaked for the process lifetime.
-        let huge: &'static topo_core::HugePageBackend<PosixBackingProvider> = unsafe { &*huge_ptr };
+        // Build a live NUMA router: one `mbind`-bound hugepage backend per discovered NUMA
+        // node (serving explicit Local/Bind/Interleave), plus — on a multi-node host — an
+        // **unbound default backend** serving `OsDefault`/`ArenaPolicy` so the kernel places
+        // those pages first-touch (the node of the using thread, the right default). On a
+        // single-node machine this is exactly one backend — byte-for-byte the plain hugepage
+        // path. The current-CPU source is the real `OsCore` (`sched_getcpu`), so `Local`
+        // tracks the running thread; placement follows the arena's `NumaPolicy` (§15.3/§15.5).
+        let topo = discover_topology();
+        let n = (topo.node_count() as usize).max(1);
+        // Per **bound** backend, round up so the per-node set totals at least `capacity`; the
+        // unbound default gets the full `capacity` (it serves the common first-touch traffic).
+        // The extra is virtual address space (lazily faulted), so it is free.
+        let per_node = capacity.div_ceil(n).max(1);
+        let router = NodeRouter::build(topo, OsCore, |target| {
+            let cap = if target.is_some() { per_node } else { capacity };
+            HugePageBackend::new(
+                PosixBackingProvider::new(),
+                meta,
+                ArenaId::DEFAULT,
+                HugeConfig::with_capacity(cap),
+            )
+            .ok()
+        })?;
+        // Leak-and-reclaim, as for the single backend: only a successfully-built router is
+        // leaked into `'static`; the raw pointer is kept so a failing allocator build
+        // reclaims it (its `Drop` releases *every* reservation). On success it is
+        // process-lived (like `meta`/`pagemap`) and published for the C control surface.
+        let router_ptr: *mut NodeRouter<PosixBackingProvider, OsCore> =
+            Box::into_raw(Box::new(router));
+        // SAFETY: `router_ptr` came from `Box::into_raw` just above and is uniquely owned;
+        // reborrowing it as `&'static` is sound because it is only reclaimed on the failure
+        // arm below (after the borrow ends), and otherwise leaked for the process lifetime.
+        let huge: &'static NodeRouter<PosixBackingProvider, OsCore> = unsafe { &*router_ptr };
         match Allocator::new_with_huge(
             PosixBackingProvider::new(),
             PosixBackingProvider::new(),
@@ -304,15 +324,20 @@ fn build_posix_allocator(
             ArenaId::DEFAULT,
             cfg,
         ) {
-            Ok(a) => Some(a),
+            Ok(a) => {
+                // Publish the live router for the host-driven C NUMA control surface
+                // (rebalance / refresh / release / stats). The `&'static` outlives the
+                // process; `OnceLock::set` ignores a second build (the first allocator wins).
+                crate::numa_api::publish_router(huge);
+                Some(a)
+            }
             Err(_) => {
-                // The allocator only *borrowed* `huge` and that borrow has ended
-                // with the `Err`, so reclaim the leaked backend before returning
-                // `None`; its `Drop` returns the reservation to the provider.
-                // SAFETY: `huge_ptr` was produced by `Box::into_raw` of the same
-                // type above; it is reclaimed exactly once, only on this failure
-                // path, and is not used again afterward (no double-free).
-                drop(unsafe { Box::from_raw(huge_ptr) });
+                // The allocator only *borrowed* `huge` and that borrow ended with the
+                // `Err`, so reclaim the leaked router before returning `None`.
+                // SAFETY: `router_ptr` was produced by `Box::into_raw` of the same type
+                // above; reclaimed exactly once, only on this failure path, never used
+                // again (no double-free). Its `Drop` releases every reservation.
+                drop(unsafe { Box::from_raw(router_ptr) });
                 None
             }
         }
@@ -660,12 +685,29 @@ mod tests {
             ptr::write_bytes(p, 1, 128);
             g.dealloc(p, layout);
         }
-        // The engine genuinely freed it: the same class slot comes back.
-        // SAFETY: valid layout; q freed below.
-        let q = unsafe { g.alloc(layout) };
-        assert_eq!(q, p, "freed object must be recycled by the engine");
-        // SAFETY: q is live.
-        unsafe { g.dealloc(q, layout) };
+        // The engine genuinely freed it (not leaked): the slot is vended again. No
+        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
+        // central free list, which a parallel test thread can transiently touch — confirm
+        // recycling by membership in a bounded batch (held to drain toward the freed slot,
+        // then freed), not by asserting the exact next call.
+        let mut batch = Vec::with_capacity(64);
+        let mut recycled = false;
+        for _ in 0..64 {
+            // SAFETY: valid layout; every allocation is freed in the loop below.
+            let x = unsafe { g.alloc(layout) };
+            recycled |= x == p;
+            batch.push(x);
+        }
+        for x in batch {
+            if !x.is_null() {
+                // SAFETY: a non-null `x` came from `g.alloc(layout)` above and is freed once.
+                unsafe { g.dealloc(x, layout) };
+            }
+        }
+        assert!(
+            recycled,
+            "freed object must be recycled by the engine (within a batch)"
+        );
     }
 
     #[test]

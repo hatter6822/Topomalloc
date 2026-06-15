@@ -299,6 +299,41 @@ topo_arena_t topo_arena_create_hooked(const topo_extent_hooks_t *hooks, void *ct
 size_t topo_max_hook_backends(void);
 
 /* ------------------------------------------------------------------------
+ * NUMA control surface (topology awareness, plan 04 W13)
+ *
+ * Placement is automatic: every large/medium allocation routes through the
+ * live NUMA router (under the hugepage-optimized build) to the right node's
+ * backend, with OsDefault left first-touch. These are the host-driven
+ * *maintenance* operations (off the alloc fast path, no background thread); a
+ * host drives them on its own cadence. Each is a no-op returning 0 when no
+ * router is wired (the default build, or a single-node host).
+ * --------------------------------------------------------------------- */
+
+/* Drive one cross-domain rebalancer tick (return a donor node's idle memory to
+ * the OS to relieve a starved node). Returns 1 if a move executed, else 0. */
+int topomalloc_numa_rebalance_tick(void);
+
+/* Re-discover the platform topology and swap it into the live router (the
+ * host-driven hotplug/affinity/cgroup refresh). Returns 1 if refreshed, else 0. */
+int topomalloc_numa_refresh(void);
+
+/* Return idle empty hugepages beyond reserve_per_node (per backend) to the OS;
+ * returns the bytes released. */
+size_t topomalloc_numa_release(size_t reserve_per_node);
+
+/* The number of NUMA nodes the live router places across (0 if no router). */
+size_t topomalloc_numa_nodes(void);
+
+/* Cumulative per-node mbind binding failures (locality lost, not correctness). */
+uint64_t topomalloc_numa_bind_failures(void);
+
+/* Cumulative rebalancer moves executed across all rebalance_tick calls. */
+uint64_t topomalloc_numa_rebalance_moves(void);
+
+/* Cumulative spillover allocations (served off the preferred node when full). */
+uint64_t topomalloc_numa_spillovers(void);
+
+/* ------------------------------------------------------------------------
  * Identification
  * --------------------------------------------------------------------- */
 

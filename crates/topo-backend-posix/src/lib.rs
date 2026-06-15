@@ -51,7 +51,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use topo_core::{ArenaId, BackendError, Region, TopoBackingProvider, Topology};
+use topo_core::{
+    ArenaId, BackendError, CoreId, CoreProvider, Region, TopoBackingProvider, Topology,
+};
 
 /// A live reservation owned by the provider: its base, the bytes mapped (for
 /// `munmap`/free — `>=` the requested size, rounded to the OS page), and the
@@ -75,6 +77,7 @@ pub struct PosixBackingProvider {
     decommit_calls: AtomicU64,
     purge_lazy_calls: AtomicU64,
     purge_forced_calls: AtomicU64,
+    bind_node_calls: AtomicU64,
 }
 
 impl Default for PosixBackingProvider {
@@ -106,6 +109,7 @@ impl PosixBackingProvider {
             decommit_calls: AtomicU64::new(0),
             purge_lazy_calls: AtomicU64::new(0),
             purge_forced_calls: AtomicU64::new(0),
+            bind_node_calls: AtomicU64::new(0),
         }
     }
 
@@ -129,6 +133,10 @@ impl PosixBackingProvider {
     /// Number of `purge_forced` calls.
     pub fn purge_forced_calls(&self) -> u64 {
         self.purge_forced_calls.load(Ordering::Relaxed)
+    }
+    /// Number of `bind_node` (NUMA `mbind`) calls — observability for the §15.5 path.
+    pub fn bind_node_calls(&self) -> u64 {
+        self.bind_node_calls.load(Ordering::Relaxed)
     }
 
     /// Validate that `[offset, offset+len)` lies within `region` and return the
@@ -234,6 +242,17 @@ impl TopoBackingProvider for PosixBackingProvider {
 
     // `revoke_descendants` uses the default no-op (single ambient authority — there
     // are no descendant capabilities to revoke on POSIX, §36.6).
+
+    fn bind_node(&self, region: Region, os_node: u32) -> Result<(), BackendError> {
+        // §15.5 best-effort NUMA bind: prefer `os_node` for `region`'s future faults
+        // (Linux `mbind(MPOL_PREFERRED)`). Applied to the not-yet-faulted reservation, so
+        // it only steers placement; a failure is surfaced to the caller (the router
+        // records it) and never corrupts state. No-op on non-Linux.
+        self.bind_node_calls.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `region` is a live reservation of this provider; binding the NUMA policy
+        // of its page-aligned VA range performs no read/write through the pointer.
+        unsafe { sys::bind_node(region.base as usize, region.len, os_node) }
+    }
 
     fn name(&self) -> &'static str {
         "posix"
@@ -465,6 +484,64 @@ mod sys {
             Err(BackendError::InvalidRequest)
         }
     }
+
+    /// Bind `[addr, addr+len)`'s NUMA policy to prefer node `os_node` (§15.5, W13). On
+    /// Linux this is `mbind(MPOL_PREFERRED)` via the raw syscall (`mbind` has no portable
+    /// libc wrapper); on other unix (Darwin) NUMA binding is unavailable, so it is a no-op.
+    ///
+    /// # Safety
+    /// `[addr, addr+len)` is a page-aligned, not-yet-faulted range of a live reservation.
+    #[cfg(target_os = "linux")]
+    pub(super) unsafe fn bind_node(
+        addr: usize,
+        len: usize,
+        os_node: u32,
+    ) -> Result<(), BackendError> {
+        if len == 0 {
+            return Ok(());
+        }
+        // The OS node id fits one mask word (discovery bounds OS ids to < MAX_NODES ≤ 64).
+        if os_node >= 64 {
+            return Err(BackendError::InvalidRequest);
+        }
+        // MPOL_PREFERRED: *prefer* `os_node`, falling back to other nodes if it is full,
+        // so a bind never fails the eventual allocation — best-effort placement (§2.4).
+        const MPOL_PREFERRED: libc::c_long = 1;
+        let nodemask: libc::c_ulong = 1u64 << os_node;
+        // SAFETY: `mbind` only sets the policy of our own page-aligned VA range (no access
+        // through `addr`); it reads exactly one valid mask word at `&nodemask`.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                addr as *mut libc::c_void,
+                len as libc::c_ulong,
+                MPOL_PREFERRED,
+                &nodemask as *const libc::c_ulong,
+                64 as libc::c_ulong, // bits available in the mask
+                0 as libc::c_uint,   // flags
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            // Kernel without NUMA, a node that does not exist, etc. — best-effort, so the
+            // caller records the failure and proceeds (locality lost, never correctness).
+            Err(BackendError::OutOfMemory)
+        }
+    }
+
+    /// NUMA binding is unavailable on non-Linux unix (e.g. Darwin) — a no-op.
+    ///
+    /// # Safety
+    /// As the Linux variant.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) unsafe fn bind_node(
+        _addr: usize,
+        _len: usize,
+        _os_node: u32,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
@@ -544,6 +621,18 @@ mod sys {
         unsafe { dealloc(base as *mut u8, l) };
         Ok(())
     }
+
+    /// No NUMA on the host-allocator fallback — a no-op.
+    ///
+    /// # Safety
+    /// As the unix variant.
+    pub(super) unsafe fn bind_node(
+        _addr: usize,
+        _len: usize,
+        _os_node: u32,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +666,33 @@ fn online_cpus() -> u32 {
         (v as u64).min(topo_core::topology::MAX_CPUS as u64) as u32
     } else {
         1
+    }
+}
+
+/// The OS current-CPU oracle (§15.3, W13): the [`CoreProvider`] that reports the CPU the
+/// calling thread is **actually** running on, so [`Local`](topo_core::NumaPolicy::Local) /
+/// [`Interleave`](topo_core::NumaPolicy::Interleave) placement tracks the real thread, not a
+/// fixed core. On Linux it is `sched_getcpu()`; on other targets there is no portable query,
+/// so it reports core 0 (the conservative single-domain default). The returned [`CoreId`] is
+/// the **OS CPU id**, matching the CPU indexing of [`discover_topology`]'s snapshot
+/// (`Topology::node_of_cpu` takes that same id).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsCore;
+
+impl CoreProvider for OsCore {
+    #[inline]
+    fn current_core(&self) -> CoreId {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `sched_getcpu` takes no arguments and is always safe to call; it
+            // returns the current CPU or `-1` if unavailable (then we use core 0).
+            let c = unsafe { libc::sched_getcpu() };
+            CoreId(if c >= 0 { c as u32 } else { 0 })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            CoreId(0)
+        }
     }
 }
 
@@ -718,6 +834,19 @@ mod tests {
         assert_eq!(t.node_of_cpu(u32::MAX), topo_core::NodeId::DEFAULT);
         // The discovered node count never exceeds the bounded model.
         assert!(t.node_count() as usize <= topo_core::topology::MAX_NODES);
+    }
+
+    #[test]
+    fn os_core_reports_a_usable_running_cpu() {
+        // §15.3 (W13): the OS current-CPU oracle reads the running CPU without panicking,
+        // and it resolves to a node in the discovered topology (a total query). On Linux it
+        // is `sched_getcpu`; elsewhere it reports the conservative core 0.
+        use topo_core::CoreProvider;
+        let cpu = OsCore.current_core();
+        let t = discover_topology();
+        let _node = t.node_of_cpu(cpu.0); // total — never panics, even for an out-of-range id
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(cpu.0, 0, "non-Linux reports the conservative core 0");
     }
 
     #[cfg(target_os = "linux")]
@@ -906,6 +1035,27 @@ mod tests {
             p.commit(r, 0, usize::MAX),
             Err(BackendError::InvalidRequest)
         ));
+        p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[test]
+    fn bind_node_is_best_effort_and_counted() {
+        // §15.5 (W13): the NUMA bind is best-effort — it either succeeds or fails cleanly
+        // (never panics, never corrupts state), and the attempt is counted. We do NOT
+        // assert success: NUMA support varies by environment (a single-node container, a
+        // kernel without NUMA, a seccomp filter), and the contract is "lose locality, not
+        // correctness". Binding an unfaulted reservation only sets a policy.
+        let p = PosixBackingProvider::new();
+        let r = p.reserve(ArenaId::DEFAULT, PAGE, PAGE).expect("reserve");
+        let _ = p.bind_node(r, 0); // node 0 (or a no-op on non-Linux) — must not panic
+        assert_eq!(p.bind_node_calls(), 1, "the bind attempt is counted");
+        // A bind to a likely-absent node is also handled gracefully (Ok or Err, no panic).
+        let _ = p.bind_node(r, 3);
+        assert_eq!(p.bind_node_calls(), 2);
+        // The region is still usable after the bind attempts (commit + write).
+        p.commit(r, 0, r.len).expect("commit");
+        // SAFETY: committed for its whole length.
+        unsafe { r.base.write(0x5a) };
         p.release(ArenaId::DEFAULT, r).expect("release");
     }
 
