@@ -10,11 +10,18 @@
 //! * **no permanent stranding (§15.4):** the rebalancer driven to a fixpoint, asserting
 //!   every move preserves the donor (never strands it) and the iteration converges (no
 //!   churn) — the system-level property a single `plan` call cannot show.
+//! * **the live router over the real POSIX provider:** per-node backends route a request
+//!   by policy, free routes home, and the router's §15.4/§15.5 counters reconcile through
+//!   stats into the control namespace — the end-to-end placement path.
 
-use topo_backend_posix::discover_topology;
+use topo_backend_posix::{discover_topology, PosixBackingProvider};
 use topo_control::Control;
+use topo_core::bootstrap::BumpArena;
+use topo_core::generated::tables::PAGE_SIZE;
 use topo_core::{
-    topology::MAX_NODES, NodeId, NodePressure, NumaPolicy, Rebalancer, Topology, TopologyBuilder,
+    topology::MAX_NODES, CoreId, FixedCore, Hints, HugeConfig, HugePageBackend, NodeId,
+    NodePressure, NodeRouter, NumaPolicy, Rebalancer, RegionCacheHook, Topology, TopologyBuilder,
+    HUGEPAGE_SIZE,
 };
 use topo_stats::{Profile, Stats};
 
@@ -178,4 +185,149 @@ fn rebalancer_converges_without_ever_stranding_a_donor() {
         Rebalancer::plan(&nodes, &topo).is_none(),
         "nothing left stranded"
     );
+}
+
+// --- the live router over the real POSIX backing provider -------------------------------
+
+/// A leaked metadata arena, valid for the process (the shared test pattern), large enough
+/// for several per-node hugepage backends.
+fn meta(bytes: usize) -> &'static BumpArena {
+    let buf = vec![0u8; bytes].into_boxed_slice();
+    let len = buf.len();
+    let ptr = Box::into_raw(buf).cast::<u8>();
+    // SAFETY: the leaked buffer is live for the process; `len` bytes are valid.
+    Box::leak(Box::new(unsafe { BumpArena::new(ptr, len) }))
+}
+
+/// Build a two-node router over the real POSIX provider. Each "node" is a distinct
+/// reservation; on a single-node host both are physically node 0 and the node-1 `mbind` is
+/// a best-effort miss — but the **routing** is logical, so placement is exercised either way.
+fn real_two_node_router(cap: usize) -> NodeRouter<PosixBackingProvider, FixedCore> {
+    let m = meta(1 << 21);
+    let mut b = TopologyBuilder::new(2);
+    b.set_cpu(0, 0, 0).set_cpu(1, 1, 1);
+    NodeRouter::build(b.build(), FixedCore(CoreId::DEFAULT), |node, _os| {
+        HugePageBackend::new(
+            PosixBackingProvider::new(),
+            m,
+            topo_core::ids::ArenaId::DEFAULT,
+            HugeConfig::with_capacity(cap).with_home_node(node),
+        )
+        .ok()
+    })
+    .expect("router over the real POSIX provider")
+}
+
+fn hints(numa: NumaPolicy) -> Hints {
+    Hints {
+        numa,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn live_router_routes_by_policy_and_frees_home_over_real_posix() {
+    let r = real_two_node_router(8);
+    assert_eq!(r.node_count(), 2);
+    // A request bound to node 1 lands on node 1's backend; one bound to node 0 on node 0.
+    let p0 = r
+        .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(0))))
+        .expect("alloc node 0");
+    let p1 = r
+        .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
+        .expect("alloc node 1");
+    assert_eq!(r.node_of_addr(p0.base as usize), Some(0));
+    assert_eq!(r.node_of_addr(p1.base as usize), Some(1));
+    // The two nodes are distinct reservations.
+    assert_ne!(
+        r.node_of_addr(p0.base as usize),
+        r.node_of_addr(p1.base as usize)
+    );
+    // The allocation is real, committed memory.
+    // SAFETY: `p1` is a live 64 KiB allocation from the router.
+    unsafe {
+        p1.base.write(0xab);
+        assert_eq!(p1.base.read(), 0xab);
+    }
+    assert!(r.try_cache(p0), "free routes home to node 0's backend");
+    assert!(r.try_cache(p1), "free routes home to node 1's backend");
+    assert!(r.check_invariants());
+}
+
+#[test]
+fn live_router_counters_reconcile_into_stats_and_control() {
+    // The router's §15.4/§15.5 counters flow router → stats → control. We drive a rebalance
+    // tick so the move counter is exercised, then read it back through every layer.
+    let r = real_two_node_router(4);
+    // Node 0 holds an idle empty-backed hugepage (free); node 1 takes a demand miss.
+    let big = r
+        .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(0))))
+        .expect("whole hugepage on node 0");
+    assert!(r.try_cache(big), "freed ⇒ empty-backed on node 0");
+    // Fill node 1, then a Bind(1) miss records demand (and spills to node 0).
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        if let Some(p) = r.try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1)))) {
+            if r.node_of_addr(p.base as usize) == Some(1) {
+                held.push(p);
+            } else {
+                assert!(r.try_cache(p)); // a spillover to node 0
+            }
+        }
+    }
+    let _ = r.rebalance_tick(); // plans 0→1 and releases node 0's idle memory
+
+    let rs = r.stats();
+    let mut stats = Stats::default();
+    stats.record_node_router(rs);
+    let mut control = Control::new(Profile::HugepageOptimized);
+    control.set_stats(stats);
+    assert_eq!(
+        control.get("topo.numa.nodes").as_deref(),
+        Some(rs.nodes.to_string().as_str())
+    );
+    assert_eq!(
+        control.get("topo.numa.bind_failures").as_deref(),
+        Some(rs.bind_failures.to_string().as_str())
+    );
+    assert_eq!(
+        control.get("topo.numa.rebalance_moves").as_deref(),
+        Some(rs.rebalance_moves.to_string().as_str())
+    );
+    // The JSON topology block carries the same counters.
+    let json = control.get("topo.stats.json").expect("stats json");
+    assert!(json.contains(&format!("\"rebalance_moves\": {}", rs.rebalance_moves)));
+
+    for p in held {
+        assert!(r.try_cache(p));
+    }
+    assert!(r.check_invariants());
+}
+
+#[test]
+fn live_router_refresh_cycle_over_real_posix() {
+    // The §15.2 host-driven refresh: a moved CPU (detected via detect_mismatch inside
+    // refresh_if_mismatch) rebuilds + swaps the snapshot, changing Local placement.
+    let r = real_two_node_router(4);
+    let a = r
+        .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::Local))
+        .expect("local alloc");
+    assert_eq!(r.node_of_addr(a.base as usize), Some(0), "cpu 0 ⇒ node 0");
+    assert!(r.try_cache(a));
+    // cpu 0 observed on node 1 ⇒ refresh.
+    let refreshed = r.refresh_if_mismatch(0, NodeId(1), || {
+        let mut b = TopologyBuilder::new(2);
+        b.set_cpu(0, 1, 1).set_cpu(1, 0, 0);
+        b.build()
+    });
+    assert!(refreshed, "a moved cpu triggers a refresh");
+    let a2 = r
+        .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::Local))
+        .expect("local alloc after refresh");
+    assert_eq!(
+        r.node_of_addr(a2.base as usize),
+        Some(1),
+        "Local now follows the refreshed map"
+    );
+    assert!(r.try_cache(a2));
 }
