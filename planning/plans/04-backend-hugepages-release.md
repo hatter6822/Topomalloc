@@ -149,17 +149,24 @@ normal-frame runs (§36.9).
 > §21.2 vector (rates derived from cumulative-counter deltas). **W12-3a** `PressureMode` is the §21.5
 > Normal/Soft/Hard/Emergency ladder with escalate-now / de-escalate-past-the-margin hysteresis
 > (alloc-failure / cgroup-critical force Emergency, O-007). **W12-2c** `demand_reserve` is the §21.4
-> anti-oscillation brake (grows with the alloc rate + refill cost, caps at recent peak free, attenuates
-> with pressure; Emergency reserves nothing, §36.5). **W12-2b** the §21.3 six-rung ladder is gated by
+> anti-oscillation brake (grows with the alloc rate + refill cost, caps at the §21.4 **`recent_peak`** of
+> releasable-free memory — a *leaky peak-hold* that relaxes the peak **anchor** toward current free over
+> `PEAK_DECAY_MS`, decayed by the anchor's *age* so it is independent of tick cadence — so a transient free
+> spike does not pin the cap high and over-retain RSS, attenuates with pressure; Emergency
+> reserves nothing, §36.5). **W12-2b** the §21.3 six-rung ladder is gated by
 > mode + the §36.11 latency ceiling and rate-capped (§20.2) with the unmet remainder accrued as backlog
-> (§20.3, W12-1b). **W12-3b** a heap-independent emergency reserve is fixed at construction. It is wired
+> (§20.3, W12-1b). The backlog is the **max** of (carried backlog, this tick's desire), never their sum:
+> the plan is recomputed from the absolute current supply each tick, so summing would double-count a
+> rate-capped persistent supply and let the backlog diverge past the memory that exists. **W12-3b** a
+> heap-independent emergency reserve is fixed at construction. It is wired
 > **live** via `HugePageBackend::release_tick`, which drives the W11-1b `release_empty_excess`
 > demand-reserve hook from the plan — the W11→W12 handoff — and the §36.9 G-sim slice
 > (`release_outcome_is_identical_over_posix_and_the_sele4n_simulator`) proves it is backend-agnostic. The
 > running counters reconcile into `topo-stats` JSON + the `topo.release.*` control namespace. **No new
 > abstract transition:** the controller sequences mechanisms already certified by the §21.6
 > `release_to_os_preserves_live_objects` (`lean/TopoMalloc/Theorems/Release.lean`), so there is no new
-> Lean obligation. Tested by 18 `release` unit tests (incl. the §21.1 R2 oscillation property), the
+> Lean obligation. Tested by 28 `release` unit tests (incl. the §21.1 R2 oscillation property, the
+> `recent_peak` decay and its tick-cadence independence, and the bounded-backlog guard), the
 > `release_controller_plan_never_exceeds_supply` gating proptest, and the `tests/tests/release.rs` live
 > integration + G-sim slices. **What W12 leaves to M5/M6:** driving the extent-path rungs (purge dirty →
 > muzzy → release) and cold-sparse subrelease from a host pump over the live engine (the controller

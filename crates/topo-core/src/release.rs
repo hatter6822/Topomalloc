@@ -301,6 +301,14 @@ pub struct ReleaseStats {
 /// horizon — long enough to bridge a churn burst, short enough not to hoard.
 const RESERVE_WINDOW_MS: u64 = 1_000;
 
+/// The horizon over which the §21.4 `recent_peak` of releasable-free memory relaxes
+/// back toward the current free when no new peak occurs (a leaky peak-hold). Long
+/// enough to remember a churn burst's peak across several reserve windows, short
+/// enough that a one-off transient free spike is forgotten rather than pinning the
+/// demand-reserve cap high indefinitely — which would over-retain RSS long after the
+/// spike drained. Eight reserve windows.
+const PEAK_DECAY_MS: u64 = 8 * RESERVE_WINDOW_MS;
+
 /// The §21.4 demand reserve (W12-2c) — the anti-oscillation brake. Withholds from
 /// release roughly the bytes the application will allocate during one
 /// `RESERVE_WINDOW_MS` at `alloc_rate_bps`, enlarged when refills are expensive
@@ -365,7 +373,17 @@ pub struct ReleaseController {
     last_allocated_total: u64,
     last_freed_total: u64,
     last_pressure_notifications: u64,
+    /// The **anchor** of the §21.4 `recent_peak` cap: the last new high of releasable
+    /// free, or the current free once the prior anchor fully aged out. The *effective*
+    /// cap each tick is this anchor relaxed toward current free by its age (a leaky
+    /// peak-hold, computed in [`tick`](Self::tick)), so the reserve follows what has
+    /// *recently* existed rather than an all-time high-water mark. Written only at a
+    /// re-anchor, so the decay stays a pure function of elapsed time (tick-cadence
+    /// independent).
     recent_peak_free: u64,
+    /// The instant [`recent_peak_free`](Self::recent_peak_free) was last (re-)anchored,
+    /// from which the leaky peak-hold's age-based decay is measured.
+    peak_anchor_ms: u64,
     /// The §21.2 alloc/free rates observed on the most recent interval (bytes/sec).
     alloc_rate_bps: u64,
     free_rate_bps: u64,
@@ -416,6 +434,7 @@ impl ReleaseController {
             last_freed_total: 0,
             last_pressure_notifications: 0,
             recent_peak_free: 0,
+            peak_anchor_ms: 0,
             alloc_rate_bps: 0,
             free_rate_bps: 0,
             backlog_bytes: 0,
@@ -512,15 +531,43 @@ impl ReleaseController {
             0
         };
 
-        // Track the recent peak of releasable-free memory for the reserve cap.
+        // Track a *recent* peak of releasable-free memory for the §21.4 reserve cap
+        // (`recent_peak`). The cap is the peak **anchor** relaxed linearly toward the
+        // current free over `PEAK_DECAY_MS`, measured from the instant the anchor was set
+        // (a leaky peak-hold) — so it follows *recent* free rather than an all-time
+        // high-water mark that would keep the reserve stale-high (over-retaining RSS)
+        // long after a transient free burst had drained.
+        //
+        // Crucially the decay is computed from the anchor's *age*, not by subtracting a
+        // fraction of the remaining excess each tick: a per-tick fraction would compound
+        // (exponential) and make the cap depend on how *often* the pump ticks — N small
+        // ticks would leave ~1/e of a long-dead spike after a full horizon while one big
+        // tick fully decayed it. Anchoring makes the cap a pure function of elapsed time,
+        // so any tick cadence over the same span yields the same cap.
         let free_now = inputs
             .idle_cache_bytes
             .saturating_add(inputs.dirty_bytes)
             .saturating_add(inputs.muzzy_bytes)
             .saturating_add(inputs.empty_backed_hugepage_bytes);
-        if free_now > self.recent_peak_free {
+        // Re-anchor on a new high of releasable free, or once the old anchor has fully
+        // aged out (≥ PEAK_DECAY_MS): record both the value and the instant it was set.
+        if free_now >= self.recent_peak_free
+            || now_ms.saturating_sub(self.peak_anchor_ms) >= PEAK_DECAY_MS
+        {
             self.recent_peak_free = free_now;
+            self.peak_anchor_ms = now_ms;
         }
+        // The effective cap: anchor (≥ `free_now`) relaxed toward `free_now` by the
+        // anchor's age. Always ≥ `free_now`, so the cap can still cover the live free
+        // supply; just after a re-anchor (age 0) it equals the anchor itself.
+        let recent_peak = {
+            let age = now_ms
+                .saturating_sub(self.peak_anchor_ms)
+                .min(PEAK_DECAY_MS);
+            let excess = (self.recent_peak_free - free_now) as u128; // anchor ≥ free_now
+            let remaining = excess * (PEAK_DECAY_MS - age) as u128 / PEAK_DECAY_MS as u128;
+            free_now.saturating_add(remaining as u64)
+        };
 
         // Alloc/free rates (bytes/sec) from the cumulative counter deltas over the
         // interval (§21.2). The reserve keys on the *allocation* rate (the conservative
@@ -570,7 +617,7 @@ impl ReleaseController {
         // §21.4 demand reserve (the anti-oscillation brake).
         let reserve = demand_reserve(
             alloc_rate_bps,
-            self.recent_peak_free,
+            recent_peak,
             inputs.refill_miss_rate_ppk,
             self.mode,
         );
@@ -588,21 +635,28 @@ impl ReleaseController {
 
         let mut plan = self.plan_ladder(&inputs, reserve, dirty_aged, muzzy_aged);
 
-        // Per-tick rate budget (§20.2): bytes allowed this interval, plus any backlog
-        // carried from prior under-served ticks. `0` rate ⇒ unlimited.
-        let desired = plan.total_bytes().saturating_add(self.backlog_bytes);
+        // Per-tick rate budget (§20.2). The plan is recomputed from the *absolute*
+        // current supply every tick, so the carried backlog and this tick's plan
+        // describe the **same** persistent releasable memory — not two separate debts.
+        // `desired` is therefore the *max* of the two (the larger of "what we still owe"
+        // and "what we now see"), never their sum: summing would double-count a
+        // rate-capped persistent supply and let the backlog diverge far past the memory
+        // that actually exists (e.g. ~16 MiB of dirty held under a 1 MiB/s cap would
+        // accrue ~15 MiB of "owed" release *every* tick forever). `0` rate ⇒ unlimited.
+        let desired = plan.total_bytes().max(self.backlog_bytes);
         if self.config.release_rate_bytes_per_sec != 0 && self.mode != PressureMode::Emergency {
-            // The backlog is already folded into `desired`, so the budget is just this
-            // interval's allowance; the unmet remainder becomes the new backlog.
+            // The budget is just this interval's allowance; the unmet remainder of
+            // `desired` becomes the new backlog.
             let budget = rate_budget(self.config.release_rate_bytes_per_sec, elapsed_ms);
             let granted = budget.min(desired);
             scale_plan_to_budget(&mut plan, granted);
-            // The backlog carries everything desired that was NOT actually planned this
-            // tick. `scale_plan_to_budget` only fills the plan up to the work that
-            // currently exists, so when `granted` exceeds the available work the plan
-            // totals less than `granted`; crediting the full `granted` would silently
-            // forgive the unplanned remainder (RSS stays high while the controller
-            // reports progress). Credit only what was actually planned (§20.3).
+            // Credit only what was ACTUALLY planned this tick, not the full `granted`:
+            // `scale_plan_to_budget` fills the plan only up to the work that currently
+            // exists, so when `granted` exceeds the available work the plan totals less
+            // than `granted`; crediting the full `granted` would silently forgive the
+            // unplanned remainder (RSS stays high while the controller reports
+            // progress). The remainder stays owed as backlog, bounded by `desired` so it
+            // tracks the pending supply rather than accumulating without limit (§20.3).
             self.backlog_bytes = desired.saturating_sub(plan.total_bytes());
         } else {
             // Unlimited (or Emergency, which bypasses the cap): clear the backlog.
@@ -921,6 +975,94 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_pressure_notification_forces_at_least_soft() {
+        // §21.2/§21.5: a rise in the OS memory-pressure notification count (PSI-style)
+        // forces at least Soft even with no cgroup limit known, so the controller reacts
+        // to kernel pressure it cannot see as a utilization watermark. Once the
+        // notifications stop rising it de-escalates.
+        let mut c = ReleaseController::new(DecayConfig::default());
+        // Baseline establishes the notification count (0); no pressure ⇒ Normal.
+        c.tick(0, base_inputs());
+        assert_eq!(
+            c.mode(),
+            PressureMode::Normal,
+            "no notification yet ⇒ Normal"
+        );
+        // A fresh notification ⇒ at least Soft (no cgroup signal at all).
+        let plan = c.tick(
+            1_000,
+            ReleaseInputs {
+                pressure_notifications: 1,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(
+            plan.mode,
+            PressureMode::Soft,
+            "a fresh pressure notification forces Soft"
+        );
+        // Soft releases the empty-hugepage supply beyond the (idle ⇒ zero) reserve.
+        assert_eq!(plan.release_empty_hugepages_bytes, 8 * 1024 * 1024);
+        // No further notification and no cgroup pressure ⇒ de-escalate to Normal.
+        let plan = c.tick(
+            2_000,
+            ReleaseInputs {
+                pressure_notifications: 1,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(
+            plan.mode,
+            PressureMode::Normal,
+            "no fresh notification (count unchanged) ⇒ back to Normal"
+        );
+    }
+
+    #[test]
+    fn emergency_de_escalates_to_the_live_watermark_once_the_trigger_clears() {
+        // §21.5: Emergency is a transient trigger (alloc failure / cgroup-critical).
+        // When it clears, the mode falls back to whatever the cgroup watermark warrants
+        // — it must not latch in Emergency.
+        let mut c = ReleaseController::new(DecayConfig::default());
+        // Alloc failure at 80% utilization ⇒ Emergency (the trigger overrides the
+        // watermark).
+        c.tick(
+            0,
+            ReleaseInputs {
+                alloc_failed: true,
+                cgroup_current: 80,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(c.mode(), PressureMode::Emergency);
+        // Trigger clears but utilization is still 80% ⇒ falls back to Soft, not Normal.
+        let plan = c.tick(
+            1_000,
+            ReleaseInputs {
+                cgroup_current: 80,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(
+            plan.mode,
+            PressureMode::Soft,
+            "Emergency falls back to the live watermark mode, not all the way to Normal"
+        );
+        // Utilization then drops below the soft watermark ⇒ Normal.
+        let plan = c.tick(
+            2_000,
+            ReleaseInputs {
+                cgroup_current: 50,
+                cgroup_max: 100,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(plan.mode, PressureMode::Normal);
+    }
+
+    #[test]
     fn normal_mode_preserves_hugepages_and_respects_the_decay_timer() {
         let mut c = ReleaseController::new(DecayConfig::default());
         // First tick at t=0 establishes the dirty clock; no pressure.
@@ -1046,6 +1188,115 @@ mod tests {
         assert!(
             churn.release_empty_hugepages_bytes < idle.release_empty_hugepages_bytes,
             "churn releases strictly less (held back against refault, §21.1 R2)"
+        );
+    }
+
+    #[test]
+    fn recent_peak_free_decays_so_a_stale_spike_does_not_pin_the_reserve() {
+        // §21.4 keys the reserve cap on the *recent* peak free, not an all-time
+        // high-water mark. A one-off free spike must not hold the demand-reserve cap
+        // high forever: once free has been small for a full PEAK_DECAY_MS, a churn
+        // tick's reserve is bounded by the (small) recent free, not the stale spike —
+        // so the controller stops over-retaining RSS after the spike drains.
+        let mut c = ReleaseController::new(DecayConfig::default());
+        // t=0: a transient 100 MiB free spike establishes a high peak.
+        c.tick(
+            0,
+            ReleaseInputs {
+                idle_cache_bytes: 100 * 1024 * 1024,
+                ..ReleaseInputs::default()
+            },
+        );
+        // t=PEAK_DECAY_MS: free has collapsed to ~2 MiB and a 80 MiB/window allocation
+        // burst would, with a stale 100 MiB peak, reserve the whole alloc-rate base
+        // (10 MiB). With the leaky peak-hold the peak has relaxed to the recent ~2 MiB,
+        // so the reserve is capped there instead.
+        let plan = c.tick(
+            PEAK_DECAY_MS,
+            ReleaseInputs {
+                idle_cache_bytes: 1024 * 1024,
+                empty_backed_hugepage_bytes: 1024 * 1024,
+                allocated_bytes_total: 80 * 1024 * 1024,
+                ..ReleaseInputs::default()
+            },
+        );
+        assert_eq!(
+            plan.demand_reserve_bytes,
+            2 * 1024 * 1024,
+            "reserve capped by the decayed recent peak (~2 MiB), not the stale 100 MiB \
+             spike (which would have allowed the full 10 MiB alloc-rate reserve)"
+        );
+        // Decay never strands the cap low: when free regrows, the peak catches up
+        // immediately (a new high), so the reserve can again cover a large supply.
+        let regrown = c.tick(
+            PEAK_DECAY_MS + 1_000,
+            ReleaseInputs {
+                idle_cache_bytes: 50 * 1024 * 1024,
+                // +40 MiB allocated over the 1 s since the prior tick ⇒ 40 MiB/s.
+                allocated_bytes_total: (80 + 40) * 1024 * 1024,
+                ..ReleaseInputs::default()
+            },
+        );
+        assert!(
+            regrown.demand_reserve_bytes > 2 * 1024 * 1024,
+            "a regrown free pool lifts the recent peak again (new high adopted at once)"
+        );
+    }
+
+    #[test]
+    fn recent_peak_decay_is_independent_of_tick_frequency() {
+        // §21.4 review finding: the recent-peak cap must decay by *elapsed time*, not
+        // per-tick. A per-tick fractional decay compounds (exponential) and leaves a
+        // long-dead spike capping the reserve high when the pump ticks often — e.g. ~1/e
+        // of the excess still present after a full horizon of 1 ms ticks. The anchored
+        // decay makes the cap a pure function of elapsed time, so fine and coarse tick
+        // cadences over the same span yield the *same* reserve.
+        //
+        // Drive a 100 MiB spike then hold ~1 MiB free across a half-horizon, ticking at
+        // `step_ms`, with a steady 128 MiB/s allocation so the (cap, not the rate) bounds
+        // the reserve. Returns the resulting demand reserve.
+        fn reserve_after(step_ms: u64) -> u64 {
+            const SPIKE: u64 = 100 * 1024 * 1024;
+            const LOW: u64 = 1024 * 1024;
+            const RATE: u64 = 128 * 1024 * 1024; // base ≫ the half-decayed cap
+            let mut c = ReleaseController::new(DecayConfig::default());
+            c.tick(
+                0,
+                ReleaseInputs {
+                    idle_cache_bytes: SPIKE,
+                    ..ReleaseInputs::default()
+                },
+            );
+            let span = PEAK_DECAY_MS / 2;
+            let mut now = 0u64;
+            let mut allocated = 0u64;
+            while now < span {
+                now += step_ms;
+                allocated += RATE * step_ms / 1_000;
+                c.tick(
+                    now,
+                    ReleaseInputs {
+                        idle_cache_bytes: LOW,
+                        allocated_bytes_total: allocated,
+                        ..ReleaseInputs::default()
+                    },
+                );
+            }
+            c.stats().demand_reserve_bytes
+        }
+        // 1 ms ticks vs one half-horizon tick: identical cadence-independent result.
+        let fine = reserve_after(1);
+        let coarse = reserve_after(PEAK_DECAY_MS / 2);
+        assert_eq!(
+            fine, coarse,
+            "recent-peak decay must not depend on tick cadence (frequency independence)"
+        );
+        // At half-life the cap is roughly halfway between the 1 MiB floor and the 100 MiB
+        // spike (~50 MiB), i.e. the spike is half-remembered — emphatically not the ~37%
+        // (1/e) the old per-tick compounding bug left after a *full* horizon.
+        assert!(
+            fine > 40 * 1024 * 1024 && fine < 60 * 1024 * 1024,
+            "half-decayed cap ~50 MiB (linear age-based decay), got {fine}"
         );
     }
 
@@ -1189,6 +1440,47 @@ mod tests {
         assert_eq!(
             plan.subrelease_cold_sparse_bytes, 0,
             "no BoundedSlow subrelease"
+        );
+    }
+
+    #[test]
+    fn bounded_slow_arena_converts_dirty_to_muzzy_instead_of_blocking_purge() {
+        // §21.3/§36.11: a `bounded_slow_path` arena cannot take the MayBlock direct
+        // purge (rung 3, MADV_DONTNEED) but CAN take the cheaper BoundedSlow lazy
+        // conversion (rung 4, MADV_FREE → muzzy). So aged dirty is converted to muzzy
+        // rather than force-purged, and the MayBlock empty-hugepage release is skipped
+        // even though Soft pressure would otherwise fire it — the rung is gated by the
+        // arena's latency ceiling, not just the mode.
+        let mut c = ReleaseController::with(
+            DecayConfig::low_rss(), // zero decay ⇒ dirty immediately aged
+            PressureThresholds::default(),
+            LatencyClass::BoundedSlow,
+            0,
+        );
+        let plan = c.tick(
+            0,
+            ReleaseInputs {
+                cgroup_current: 80, // Soft: rung 2 would fire but for the latency gate
+                cgroup_max: 100,
+                dirty_bytes: 3_000_000,
+                hot_dirty_bytes: 1_000_000,
+                ..base_inputs()
+            },
+        );
+        assert_eq!(plan.mode, PressureMode::Soft);
+        // FastOnly cache drain is permitted.
+        assert!(plan.drain_caches_bytes > 0, "FastOnly drain permitted");
+        // No MayBlock work: neither the direct dirty purge nor the empty-hugepage
+        // release, despite Soft pressure.
+        assert_eq!(plan.purge_dirty_bytes, 0, "no MayBlock direct purge");
+        assert_eq!(
+            plan.release_empty_hugepages_bytes, 0,
+            "no MayBlock hugepage release on a bounded-slow arena"
+        );
+        // The non-hot aged dirty (3M − 1M) is lazily converted to muzzy (rung 4).
+        assert_eq!(
+            plan.dirty_to_muzzy_bytes, 2_000_000,
+            "aged non-hot dirty is converted to muzzy (the BoundedSlow lazy purge)"
         );
     }
 
@@ -1371,5 +1663,50 @@ mod tests {
             backlog,
             "the backlog is not forgiven by an idle, well-budgeted tick"
         );
+    }
+
+    #[test]
+    fn backlog_stays_bounded_by_supply_under_a_persistent_rate_capped_drop() {
+        // §20.3: the backlog is "release work owed," so it must track the *remaining*
+        // pending supply and never balloon past it. The plan is recomputed from the
+        // absolute current supply each tick, so summing this tick's desire onto the
+        // carried backlog would double-count the *same* unreleased bytes and diverge
+        // (~15 MiB accrued every tick under the cap below). Taking the max keeps it
+        // bounded by the actual supply.
+        let cfg = DecayConfig {
+            release_rate_bytes_per_sec: 1024 * 1024, // 1 MiB/s — far below the supply
+            ..DecayConfig::low_rss()
+        };
+        // The absolute releasable desire of one Hard-pressure tick, measured with no
+        // rate cap, is the bound the backlog must never exceed.
+        let supply = ReleaseInputs {
+            cgroup_current: 95,
+            cgroup_max: 100,
+            ..base_inputs()
+        };
+        let total_supply = ReleaseController::new(DecayConfig::low_rss())
+            .tick(0, supply)
+            .total_bytes();
+        assert!(
+            total_supply > 4 * 1024 * 1024,
+            "a meaningful supply to defer"
+        );
+
+        // Drive 200 rate-capped ticks against the *same* persistent supply (the host has
+        // not drained it yet, so every tick re-sees the full ~16 MiB).
+        let mut c = ReleaseController::new(cfg);
+        for t in 0..=200u64 {
+            c.tick(t * 1_000, supply);
+        }
+        // A summing accumulator would report ~200× the real supply here; the max-based
+        // accounting stays within the actual pending memory.
+        assert!(
+            c.backlog_bytes() <= total_supply,
+            "backlog {} must stay bounded by the ~{} of pending supply, not diverge",
+            c.backlog_bytes(),
+            total_supply
+        );
+        // And it is still nonzero (the cap genuinely defers most of the supply).
+        assert!(c.backlog_bytes() > 0, "the rate cap still defers real work");
     }
 }
