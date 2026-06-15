@@ -120,7 +120,8 @@ hierarchy, built from Linux sysfs (`topo-backend-posix::discover_topology`) and
 **always falling back to a conservative single domain** on missing or inconsistent data
 (§15.2). `preferred_node` is the §15.3/§15.5 placement decision over the NUMA policy
 (local / bind / interleave / OS-default / arena), a `Rebalancer` plans nearest-donor →
-most-pressured-node moves so memory is never permanently stranded (§15.4), and
+most-pressured-node moves so memory is never permanently stranded (§15.4) — moving only a
+donor's **surplus** (free beyond its own demand) so a move never strands the donor — and
 `detect_mismatch` is the periodic-refresh probe. This fills the hugepage filler score's
 locality / cross-NUMA terms (W11 left them at 0 "until W13"): a request's explicit node
 preference is rewarded on a matching region and penalized cross-node, neutral with no

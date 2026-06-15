@@ -289,13 +289,42 @@ pub enum RebalanceTier {
     RemoteReuse,
 }
 
-/// One node's movable-free / unmet-demand observation, the rebalancer input (§15.4).
+/// One node's movable-free / demand observation, the rebalancer input (§15.4). The two
+/// fields are **gross**: the node's spare memory and the node's total local demand. The
+/// rebalancer derives the *net* quantities it acts on — [`unmet_need`](Self::unmet_need)
+/// (what makes a node a recipient) and [`movable_surplus`](Self::movable_surplus) (what a
+/// node may safely donate) — from them, so a node holding both free memory and live demand
+/// is read correctly (it donates only its surplus, §15.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NodePressure {
     /// Free, movable bytes currently parked on this node (empty spans / cached batches).
     pub free_bytes: u64,
-    /// Unmet allocation demand (pressure) on this node — what it cannot satisfy locally.
+    /// **Gross** allocation demand (pressure) on this node — the bytes it wants live, of
+    /// which [`free_bytes`](Self::free_bytes) covers what it can; the shortfall is its
+    /// [`unmet_need`](Self::unmet_need).
     pub demand_bytes: u64,
+}
+
+impl NodePressure {
+    /// The node's **net unmet demand** (§15.4): gross demand beyond the free memory it
+    /// holds locally — the shortfall that makes it a rebalance *recipient*. Zero when the
+    /// node can satisfy its own demand from its parked free memory.
+    #[inline]
+    pub const fn unmet_need(&self) -> u64 {
+        self.demand_bytes.saturating_sub(self.free_bytes)
+    }
+
+    /// The node's **movable surplus** (§15.4): free memory beyond its *own* demand — the
+    /// bytes it can donate without stranding itself (donating more would create the very
+    /// unmet need the rebalancer exists to relieve). Zero when the node has no spare.
+    ///
+    /// Complementary to [`unmet_need`](Self::unmet_need): for any node exactly one of the
+    /// two is nonzero (or both zero when `free == demand`), since one is `demand − free`
+    /// and the other `free − demand`.
+    #[inline]
+    pub const fn movable_surplus(&self) -> u64 {
+        self.free_bytes.saturating_sub(self.demand_bytes)
+    }
 }
 
 /// A planned cross-domain move (§15.4): take `bytes` of free memory from `src` to relieve
@@ -303,34 +332,46 @@ pub struct NodePressure {
 /// `src` and re-providing on `dst`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RebalanceMove {
-    /// The donor node (has free memory).
+    /// The donor node (has movable surplus beyond its own demand).
     pub src: NodeId,
     /// The pressured node (has unmet demand).
     pub dst: NodeId,
-    /// Bytes to move (bounded by the donor's free and the recipient's net need).
+    /// Bytes to move — bounded by the donor's [`movable_surplus`](NodePressure::movable_surplus)
+    /// and the recipient's [`unmet_need`](NodePressure::unmet_need), so the move never
+    /// strands the donor (§15.4).
     pub bytes: u64,
     /// The §15.4 preference tier this move uses.
     pub tier: RebalanceTier,
 }
 
 /// **The §15.4 cross-domain rebalancer (W13-3).** A pure policy that, given each node's
-/// free/demand and the topology, plans a move from the nearest donor to the most-pressured
-/// node so memory is **never permanently stranded** (§15.4): if any node has unmet demand
-/// it cannot satisfy locally *and* another node has free memory, [`plan`](Self::plan)
-/// returns a move. Node-granularity (same-node cache moves are the M2 cache layer's job).
+/// free/demand and the topology, plans a move from the nearest *surplus* donor to the
+/// most-pressured node so memory is **never permanently stranded** (§15.4): if any node has
+/// unmet demand it cannot satisfy locally *and* another node has movable surplus,
+/// [`plan`](Self::plan) returns a move. Node-granularity (same-node cache moves are the M2
+/// cache layer's job).
 pub struct Rebalancer;
 
 impl Rebalancer {
     /// Plan one move (the most valuable this round), or `None` if nothing is stranded —
-    /// every pressured node can satisfy itself locally, or no donor has free memory.
+    /// every pressured node can satisfy itself locally, or no node has movable surplus.
     ///
     /// `nodes[i]` is node `i`'s pressure; entries beyond [`Topology::node_count`] are
-    /// ignored. The recipient is the node with the greatest *net* unmet demand
-    /// (`demand − local free`); the donor is the **nearest** (by [`Topology::distance`])
-    /// other node with free memory, so a move prefers a close source (§15.4). The tier is
+    /// ignored. The recipient is the node with the greatest
+    /// [`unmet_need`](NodePressure::unmet_need) (`demand − local free`); the donor is the
+    /// **nearest** (by [`Topology::distance`]) other node with
+    /// [`movable_surplus`](NodePressure::movable_surplus) (`free − own demand`), ties
+    /// broken toward the **larger** surplus so one move covers more of the need (§15.4
+    /// prefer-close). Using *surplus* rather than raw free is what keeps the move from
+    /// stranding the donor: it never gives away memory the donor needs for its own demand,
+    /// so it can never create the unmet need it exists to relieve (and a round where no
+    /// node has spare memory plans nothing rather than churning memory between equally
+    /// starved nodes).
+    ///
+    /// The move size is `min(recipient need, donor surplus)`. The tier is
     /// [`BackendReallocTargetNode`](RebalanceTier::BackendReallocTargetNode) normally, or
     /// [`RemoteReuse`](RebalanceTier::RemoteReuse) when the recipient is under acute
-    /// pressure (its net need exceeds the donor's free — pressure "demands it", §15.4).
+    /// pressure (its net need exceeds the donor's surplus — pressure "demands it", §15.4).
     pub fn plan(nodes: &[NodePressure], topo: &Topology) -> Option<RebalanceMove> {
         let n = (topo.node_count() as usize).min(nodes.len());
         if n < 2 {
@@ -340,7 +381,7 @@ impl Rebalancer {
         let mut dst = None;
         let mut dst_need = 0u64;
         for (i, p) in nodes.iter().enumerate().take(n) {
-            let need = p.demand_bytes.saturating_sub(p.free_bytes);
+            let need = p.unmet_need();
             if need > dst_need {
                 dst_need = need;
                 dst = Some(i);
@@ -348,26 +389,34 @@ impl Rebalancer {
         }
         let dst = dst?; // nobody has net unmet demand ⇒ nothing stranded
 
-        // Donor: the nearest *other* node holding free memory (§15.4 prefer-close).
+        // Donor: the nearest *other* node with movable surplus — free memory beyond its
+        // OWN demand, so donating it never strands the donor (§15.4 prefer-close). Among
+        // equidistant donors, the one with the larger surplus wins (covers more in one
+        // move). A node with net need has zero surplus, so it is never picked as a donor.
         let mut src = None;
-        let mut best_dist = u8::MAX;
+        let mut best: (u8, u64) = (u8::MAX, 0); // (distance, surplus): min dist, then max surplus
         for (i, p) in nodes.iter().enumerate().take(n) {
-            if i == dst || p.free_bytes == 0 {
+            let surplus = p.movable_surplus();
+            if i == dst || surplus == 0 {
                 continue;
             }
             let d = topo.distance(NodeId(i as u32), NodeId(dst as u32));
-            if d < best_dist {
-                best_dist = d;
+            if d < best.0 || (d == best.0 && surplus > best.1) {
+                best = (d, surplus);
                 src = Some(i);
             }
         }
-        let src = src?; // no donor has free memory ⇒ cannot rebalance
+        let src = src?; // no donor has surplus ⇒ cannot rebalance without stranding someone
 
-        let donor_free = nodes[src].free_bytes;
-        let bytes = dst_need.min(donor_free);
-        // Acute pressure (the donor cannot fully cover the need) justifies remote reuse;
-        // otherwise return-to-backend-and-realloc-on-target is the cheaper default.
-        let tier = if dst_need > donor_free {
+        let donor_surplus = nodes[src].movable_surplus();
+        let bytes = dst_need.min(donor_surplus);
+        // Every returned move transfers a positive amount: the recipient has `dst_need > 0`
+        // and the donor `donor_surplus > 0` (both gates above), so their min is ≥ 1 — the
+        // rebalancer never emits a no-op move.
+        debug_assert!(bytes > 0, "a planned move always transfers ≥ 1 byte");
+        // Acute pressure (the donor's surplus cannot fully cover the need) justifies remote
+        // reuse; otherwise return-to-backend-and-realloc-on-target is the cheaper default.
+        let tier = if dst_need > donor_surplus {
             RebalanceTier::RemoteReuse
         } else {
             RebalanceTier::BackendReallocTargetNode
@@ -545,7 +594,7 @@ mod tests {
             },
         ];
         let m = Rebalancer::plan(&nodes, &t).unwrap();
-        assert_eq!(m.bytes, 1 << 20, "bounded by the donor's free");
+        assert_eq!(m.bytes, 1 << 20, "bounded by the donor's surplus");
         assert_eq!(m.tier, RebalanceTier::RemoteReuse);
     }
 
@@ -601,6 +650,109 @@ mod tests {
         let m = Rebalancer::plan(&nodes, &t).unwrap();
         assert_eq!(m.src, NodeId(1), "the nearer donor is chosen (§15.4)");
         assert_eq!(m.dst, NodeId(2));
+    }
+
+    #[test]
+    fn node_pressure_need_and_surplus_are_complementary() {
+        // The two derived quantities are exact complements: at most one is nonzero, and
+        // each is the saturating difference in its direction (the rebalancer's algebra).
+        for (free, demand) in [(0u64, 0u64), (10, 0), (0, 10), (10, 4), (4, 10), (7, 7)] {
+            let p = NodePressure {
+                free_bytes: free,
+                demand_bytes: demand,
+            };
+            assert_eq!(p.unmet_need(), demand.saturating_sub(free));
+            assert_eq!(p.movable_surplus(), free.saturating_sub(demand));
+            // Never both positive — a node is a recipient xor a donor (or neither).
+            assert!(p.unmet_need() == 0 || p.movable_surplus() == 0);
+        }
+    }
+
+    #[test]
+    fn rebalancer_never_strands_the_donor() {
+        // A donor that holds free memory **and** its own demand must give away only its
+        // *surplus* (free − demand), never the memory it needs for itself — otherwise the
+        // move would create the very stranding §15.4 forbids. Node 0 has 4 MiB free but
+        // 1 MiB of its own demand (surplus 3 MiB); node 1 needs 5 MiB.
+        let t = two_node();
+        let nodes = [
+            NodePressure {
+                free_bytes: 4 << 20,
+                demand_bytes: 1 << 20, // donor keeps this for itself
+            },
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 5 << 20,
+            },
+        ];
+        let m = Rebalancer::plan(&nodes, &t).expect("a stranded node ⇒ a move");
+        assert_eq!(m.src, NodeId(0));
+        assert_eq!(m.dst, NodeId(1));
+        assert_eq!(
+            m.bytes,
+            3 << 20,
+            "only the 3 MiB surplus moves — the donor's own 1 MiB demand is preserved"
+        );
+        assert_eq!(
+            m.tier,
+            RebalanceTier::RemoteReuse,
+            "need 5 MiB > surplus 3 MiB"
+        );
+        // The move leaves the donor able to satisfy itself: free − bytes == its demand.
+        assert_eq!(nodes[0].free_bytes - m.bytes, nodes[0].demand_bytes);
+    }
+
+    #[test]
+    fn rebalancer_prefers_larger_surplus_among_equidistant_donors() {
+        // Two equidistant donors (default remote distance) and one starved recipient: the
+        // donor with the *larger* surplus is chosen, so a single move covers more (§15.4).
+        let mut b = TopologyBuilder::new(3);
+        b.set_cpu(0, 0, 0).set_cpu(1, 1, 1).set_cpu(2, 2, 2);
+        let t = b.build(); // node 0 and node 1 are equidistant (default) from node 2
+        let nodes = [
+            NodePressure {
+                free_bytes: 2 << 20,
+                demand_bytes: 0,
+            }, // node 0: small surplus
+            NodePressure {
+                free_bytes: 5 << 20,
+                demand_bytes: 0,
+            }, // node 1: larger surplus
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 10 << 20,
+            }, // node 2: starved
+        ];
+        assert_eq!(
+            t.distance(NodeId(0), NodeId(2)),
+            t.distance(NodeId(1), NodeId(2))
+        );
+        let m = Rebalancer::plan(&nodes, &t).unwrap();
+        assert_eq!(
+            m.src,
+            NodeId(1),
+            "the larger-surplus equidistant donor wins"
+        );
+        assert_eq!(m.bytes, 5 << 20, "its full surplus moves");
+    }
+
+    #[test]
+    fn rebalancer_plans_nothing_when_no_node_has_surplus() {
+        // Both nodes are under-supplied (free < demand): neither has surplus to give.
+        // Moving one's small free to the other would only worsen the donor (churn without
+        // progress), so the rebalancer plans **nothing** — surplus, not raw free, gates it.
+        let t = two_node();
+        let nodes = [
+            NodePressure {
+                free_bytes: 2 << 20,
+                demand_bytes: 5 << 20,
+            },
+            NodePressure {
+                free_bytes: 1 << 20,
+                demand_bytes: 4 << 20,
+            },
+        ];
+        assert_eq!(Rebalancer::plan(&nodes, &t), None);
     }
 
     #[test]

@@ -215,7 +215,9 @@ the §15.2 `Topology` snapshot (CPU→LLC→NUMA maps + a node-distance matrix, 
 a `TopologyBuilder` that **falls back to a conservative single domain** on any missing/inconsistent
 data (W13-1); the §15.3/§15.5 `preferred_node` placement decision over the existing `NumaPolicy`
 (Local / Bind / Interleave / OsDefault / ArenaPolicy, W13-2); the §15.4 `Rebalancer` that plans a move
-from the nearest donor to the most-pressured node so memory is never permanently stranded (W13-3); and
+from the nearest donor to the most-pressured node so memory is never permanently stranded (W13-3) —
+moving only a donor's **movable surplus** (`free − own demand`, via `NodePressure::movable_surplus`/
+`unmet_need`) so a move can never strand the donor or churn when no node has spare memory; and
 `detect_mismatch`, the §15.2 periodic-refresh probe (W13-4). `topo-backend-posix::discover_topology`
 parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same
 single-domain fallback. The W11 filler score's locality / cross-NUMA terms (stubbed at 0 "until W13")
@@ -226,7 +228,7 @@ not modeled transitions, so there is no Lean obligation. The §15.2 node/LLC cou
 `topo-stats` JSON and the `topo.numa.*` control namespace; NUMA bind failures remain visible (§15.5).
 
 **Test counts:**
-- Rust: ~625 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~639 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
