@@ -2256,6 +2256,23 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         self.region
     }
 
+    /// Whether `addr` lies within this backend's reserved region (used by the live
+    /// [`NodeRouter`](crate::NodeRouter) to route a freed region back to its owner).
+    #[inline]
+    pub fn owns_addr(&self, addr: usize) -> bool {
+        let base = self.region.base as usize;
+        addr >= base && addr < base + self.region.len
+    }
+
+    /// **Best-effort NUMA-bind this backend's whole region to OS node `os_node`** (§15.5,
+    /// W13) — applied once, before the region is faulted, so future faults prefer
+    /// `os_node` ([`TopoBackingProvider::bind_node`](crate::TopoBackingProvider::bind_node),
+    /// Linux `mbind`). Returns `true` on success; a `false` is a recorded bind failure the
+    /// caller surfaces in stats, never fatal (a missed bind only loses locality, §2.4).
+    pub fn bind_region(&self, os_node: u32) -> bool {
+        self.provider.bind_node(self.region, os_node).is_ok()
+    }
+
     /// **Allocate `bytes` at `align` with placement `hints`** (the richer entry point;
     /// the [`RegionCacheHook`] seam uses [`PlaceHints::default`]). Packs a sub-hugepage
     /// request into a hugepage via the filler, or serves a whole-hugepage run
