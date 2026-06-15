@@ -1613,6 +1613,20 @@ impl ArenaTable {
         s
     }
 
+    /// `arena`'s NUMA placement policy (§15.5, W13), read under the table lock. An
+    /// out-of-range id reads as [`OsDefault`](NumaPolicy::OsDefault) (no override). The
+    /// engine calls this on the large path to steer the live router's placement.
+    pub fn numa_of(&self, arena: ArenaId) -> NumaPolicy {
+        self.lock.acquire();
+        let numa = match self.slot(arena) {
+            // SAFETY: the table lock is held, so reading `meta[arena]` is race-free.
+            Some(_) => unsafe { (*self.meta.get())[arena.0 as usize].numa },
+            None => NumaPolicy::OsDefault,
+        };
+        self.lock.release();
+        numa
+    }
+
     fn stats_locked(&self, arena: ArenaId) -> Option<ArenaStats> {
         let a = self.slot(arena)?;
         // SAFETY: the table lock is held by every caller of `stats_locked`.
