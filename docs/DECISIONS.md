@@ -1349,3 +1349,46 @@ cross-crate integration tests (discovery → stats → control, the multi-node r
 the `rebalancer_never_strands_a_donor_and_converges` gating proptest, and the new
 `fuzz/fuzz_targets/topology.rs` target (builder totality + rebalancer convergence over
 arbitrary inputs).
+
+### W13 optimal-completion pass (first-touch, real CPU, control surface)
+
+A follow-up pass closed the live-behavior gaps a self-audit surfaced.
+
+* **`OsDefault` is genuine first-touch (an unbound default backend), not node 0.** The
+  earlier router resolved `OsDefault` to node 0 and served it from a bound backend,
+  pinning the *common* case to node 0 + `mbind` on a multi-node box and defeating the
+  kernel's first-touch policy (place the page on the node of the touching thread — usually
+  optimal). The router now holds an **unbound** default backend (no `mbind`) serving
+  `OsDefault`/`ArenaPolicy`, so the OS places those pages first-touch; the per-node *bound*
+  backends serve only explicit `Local`/`Bind`/`Interleave`. On a single node there is no
+  separate default (binding the only node is a no-op, so the lone backend *is* first-touch),
+  so the single-node path is byte-for-byte unchanged. The `make` factory takes
+  `Option<NodeId>` (`Some` = bound per-node, `None` = unbound default); the ABI sizes the
+  default at full capacity (it serves the common case) and the per-node set at `capacity/n`.
+  Rejected alternatives: routing `OsDefault` to the current node (`≈ Local` — simpler but
+  binds to the *allocator's* node, wrong for producer/consumer); per-allocation `mbind`
+  (would drop the per-node backends the rebalancer samples).
+* **`Local` uses the real running CPU (`sched_getcpu`), not a fixed core.** A new `OsCore`
+  `CoreProvider` (`topo-backend-posix`, Linux `sched_getcpu`, core 0 elsewhere) replaces
+  `FixedCore(0)` in the live ABI, so `Local` tracks the actual thread. The seam stays
+  injectable, so the RSEQ per-CPU identity (plan 05 W7) is still a drop-in.
+* **The filler's NUMA score term was removed as dead code.** With placement done by
+  *routing* to per-node backends (each one node), the per-candidate `locality_bonus`/
+  `cross_numa_penalty` never discriminated anything on the live path — so `PlaceHints`/
+  `HugeConfig`/`HugePageFiller` lost their `home_node` and the score lost its NUMA terms.
+* **Spillover prefers the nearest node; `Interleave` rotates over the backend count.** A
+  full preferred node spills to the nearest other node by `Topology::distance` (then the
+  default backend), not index order (§15.4); and `Interleave` round-robins over the actual
+  backend count, so a node-count-changing refresh can never bias it.
+* **The rebalancer/refresh/idle-release are reachable on the deployed C ABI.** A type-erased
+  `RouterControl` trait + a global handle let the C `topomalloc_numa_rebalance_tick` /
+  `_refresh` / `_release` / `_nodes` / `_bind_failures` / `_rebalance_moves` / `_spillovers`
+  entry points drive the live router (host-driven, no background thread — matching the
+  chosen model). Each is a graceful no-op when no router is wired. `release_idle` is the
+  W12 idle-memory handoff driven router-wide.
+
+Verified by the expanded router unit tests (first-touch default, single-node default,
+nearest-node spillover, `MAX_NODES` scale), the `numa_api` control-surface test (both feature
+configs), the multi-node integration tests over the real provider (first-touch + W12 release,
+and a concurrent alloc/free/rebalance/refresh stress test), and the W8-8 header↔symbol
+cross-check over the seven new C symbols.

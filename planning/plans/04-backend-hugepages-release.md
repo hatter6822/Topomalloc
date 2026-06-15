@@ -1,10 +1,11 @@
 # Plan 04 — Backend, Hugepages, Release & Topology
 
 **Workstreams:** W4 (backend seam + POSIX), W11 (hugepage/large-mapping), W12 (release controller), W13
-(topology) · **Status:** rev 2.5 — **plan 04 complete: W4 + W11 + W12 + W13 all landed.** (rev 2.5 takes W13
-*live*: the `NodeRouter` — per-node hugepage backends + best-effort `mbind` + live rebalancer execution +
-host-driven refresh — makes placement/rebalancing affect real allocations under the `hugepage-optimized`
-ABI. rev 2.4 hardened the §15.4 rebalancer to move only a donor's *surplus*.) W4 (the seam + POSIX backend + extents + large path);
+(topology) · **Status:** rev 2.6 — **plan 04 complete: W4 + W11 + W12 + W13 all landed.** (rev 2.6 completes
+W13 *optimally*: genuine first-touch for `OsDefault` — an unbound default backend — real `sched_getcpu`
+`Local`, nearest-node spillover, and a host-driven `topomalloc_numa_*` C control surface for
+rebalance/refresh/idle-release. rev 2.5 took W13 live via the `NodeRouter`; rev 2.4 hardened the §15.4
+rebalancer to move only a donor's *surplus*.) W4 (the seam + POSIX backend + extents + large path);
 **W11 landed (all units, ahead of M5): the hugepage filler / huge cache / region cache as a real,
 backend-agnostic placement subsystem over the provider seam, wired into the live large path through the
 §18.6 `RegionCacheHook`**; **W12 landed (all units, ahead of M5): the memory release controller &
@@ -193,7 +194,7 @@ normal-frame runs (§36.9).
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|
 | W13-1 | Topology discovery (§15.2) from sysfs/CPUID/OS; **conservative single-domain fallback**. | M | | missing/inconsistent data ⇒ one domain, still correct. | ✅ `topology::Topology`/`TopologyBuilder` (single-domain fallback on any inconsistency); `topo-backend-posix::discover_topology` parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same fallback. |
-| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. | ✅ **Live.** `Topology::preferred_node`/`preferred_node_at` over `NumaPolicy` (Local/Bind/Interleave/OsDefault/ArenaPolicy), consumed by the `NodeRouter` (one `HugePageBackend` per node, each `mbind`-bound to it) that routes the live large path to the preferred node's backend. The engine resolves the arena's `NumaPolicy` into `Hints::numa` (`ArenaTable::numa_of`); on a single-node host the router is one backend (unchanged). Wired into the `hugepage-optimized` ABI. |
+| W13-2 | Placement policy (§15.3): LLC-local alloc, NUMA-local backing, arena overrides. | M | ∥ | placement honors topology where present. | ✅ **Live.** The `NodeRouter` routes the live large path: explicit `Local` (real `sched_getcpu` CPU) / `Bind` / `Interleave` → `mbind`-bound per-node backends; **`OsDefault`/`ArenaPolicy` → an unbound default backend (genuine kernel first-touch, not pinned to node 0)**. A full node spills to the *nearest* other node (§15.4). The engine resolves the arena's `NumaPolicy` into `Hints::numa` (`ArenaTable::numa_of`, lock-free); single-node = one backend (unchanged). Wired into the `hugepage-optimized` ABI. (LLC-local alloc is the M2 transfer-cache layer's job; the LLC map is discovered.) |
 | W13-3 | Cross-domain rebalancer (§15.4): preference order; no permanent stranding. | M | | stranded-memory test: rebalancer moves batches/spans under pressure. | ✅ **Live.** `Rebalancer::plan` — nearest-donor → most-pressured-node moves with the §15.4 tiers, moving only a donor's **movable surplus** (`free − own demand`) so a move **never strands the donor** and a no-surplus round plans nothing (no churn); ties prefer the larger surplus. `NodeRouter::rebalance_tick` executes it live (sample per-node free + approximate demand → plan → return the donor's idle empty hugepages to the OS via `release_empty_excess`). Driven to a fixpoint + executed in tests. |
 | W13-4 | Hotplug/affinity/cgroup refresh (§15.2). | S | ∥ | snapshot refreshes on notification or periodic mismatch. | ✅ **Live.** `Topology::detect_mismatch` + `NodeRouter::refresh`/`refresh_if_mismatch` — the host-driven swap (no background thread, matching the release pump); a moved CPU rebuilds + swaps the snapshot, changing placement (tested over the real provider). |
 
@@ -215,10 +216,15 @@ normal-frame runs (§36.9).
 > single-node host are byte-for-byte unchanged**. Placement / rebalancing are **policy, not modeled
 > transitions** (§2.4), so there is no Lean obligation. The router's §15.4/§15.5 counters (bind failures,
 > rebalancer moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON and the
-> `topo.numa.*` control namespace. **What W13 leaves to M3/M5:** the current-CPU source for
-> `Local`/`Interleave` is a `FixedCore(0)` until the RSEQ per-CPU identity lands (plan 05 W7) — the seam is
-> injectable, so it is a drop-in; and a first-class per-node *demand* signal (the rebalancer uses an
-> approximate alloc-failure-derived one today).
+> `topo.numa.*` control namespace. The optimal-completion pass added: **genuine first-touch** for
+> `OsDefault` (an unbound default backend, so the common case is not pinned to node 0 on multi-node);
+> real `sched_getcpu` `Local` (`OsCore`); nearest-node spillover; `Interleave` over the backend count;
+> the W12 `release_idle` handoff; and the **host-driven `topomalloc_numa_*` C control surface**
+> (`RouterControl`) so the rebalancer / refresh / idle-release are reachable on the deployed allocator —
+> while the now-redundant per-candidate NUMA score term was removed. **What W13 still leaves to M2/M5:** a
+> first-class per-node *demand* signal (the rebalancer uses an approximate alloc-failure-derived one
+> today, M5) and LLC-domain placement (the transfer-cache layer, plan 05 W6 / M2 — the LLC map is
+> discovered but not yet consumed for placement).
 
 ---
 

@@ -123,10 +123,12 @@ the raw id is kept for `mbind`) (§15.2). `preferred_node` is the §15.3/§15.5 
 decision over the NUMA policy (local / bind / interleave / OS-default / arena), and a
 `Rebalancer` plans nearest-donor → most-pressured-node moves that strand no one — moving
 only a donor's **surplus** (free beyond its own demand) (§15.4). A **`NodeRouter`** makes
-it all act on real allocations: one hugepage backend per node (each best-effort
-`mbind`-bound, §15.5), routing the live large path to the preferred node's backend (with
-spillover on a full node), executing the rebalancer live (returning a donor's idle memory
-to the OS), and refreshing host-driven — installed into the `hugepage-optimized` build
+it all act on real allocations: one `mbind`-bound hugepage backend per node serving explicit
+local/bind/interleave, **plus an unbound default backend** so `OS-default` allocations land
+**first-touch** on the using thread's node (never pinned to node 0). `Local` tracks the real
+running CPU (`sched_getcpu`), a full node spills to the **nearest** other node, and the host
+drives the rebalancer, the §15.2 refresh, and W12 idle-release through a C
+`topomalloc_numa_*` control surface. It is installed into the `hugepage-optimized` build
 through the existing region-cache seam, so the **default path and a single-node host are
 byte-for-byte unchanged**. Placement is policy, not a modeled transition, so it adds no
 proof obligation. The router's bind-failure / rebalance / spillover counters and the

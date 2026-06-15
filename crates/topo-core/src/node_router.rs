@@ -701,6 +701,54 @@ mod tests {
     }
 
     #[test]
+    fn router_scales_to_max_nodes() {
+        // Build a router across the full MAX_NODES bound backends (+ the unbound default) and
+        // route a request to each node and the default, confirming all are built + addressable.
+        let m = meta(1 << 22);
+        let mut tb = TopologyBuilder::new(MAX_NODES as u32);
+        for c in 0..MAX_NODES as u32 {
+            tb.set_cpu(c, c, c);
+        }
+        let r = NodeRouter::build(tb.build(), FixedCore(CoreId(0)), |_target| {
+            HugePageBackend::new(
+                MockProvider::new(false),
+                m,
+                ArenaId::DEFAULT,
+                HugeConfig::with_capacity(1),
+            )
+            .ok()
+        })
+        .expect("MAX_NODES router");
+        assert_eq!(r.node_count(), MAX_NODES);
+        let mut regions = Vec::new();
+        for node in 0..MAX_NODES {
+            let p = r
+                .try_alloc(
+                    64 * 1024,
+                    PAGE_SIZE,
+                    hints(NumaPolicy::Bind(NodeId(node as u32))),
+                )
+                .expect("bind alloc");
+            assert_eq!(
+                r.node_of_addr(p.base as usize),
+                Some(node),
+                "Bind({node}) → node {node}"
+            );
+            regions.push(p);
+        }
+        // OsDefault lands in the unbound default backend (distinct from every bound node).
+        let d = r
+            .try_alloc(64 * 1024, PAGE_SIZE, hints(NumaPolicy::OsDefault))
+            .expect("default");
+        assert!(r.addr_in_default(d.base as usize));
+        regions.push(d);
+        for p in regions {
+            assert!(r.try_cache(p));
+        }
+        assert!(r.check_invariants());
+    }
+
+    #[test]
     fn routes_to_the_bound_node_and_frees_home() {
         let r = router(two_node_topo(), 8, false);
         assert_eq!(r.node_count(), 2);

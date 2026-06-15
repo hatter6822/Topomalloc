@@ -358,3 +358,48 @@ fn live_router_first_touch_and_release_over_real_posix() {
     assert!(r.try_cache(d));
     assert!(r.check_invariants());
 }
+
+#[test]
+fn live_router_is_thread_safe_under_concurrent_use() {
+    // Concurrency (the lock-guarded topology + per-backend locks + atomics): allocator
+    // threads race alloc/free across every NUMA mode while a maintenance thread concurrently
+    // drives rebalance / release / refresh. The router must stay well-formed (no data race,
+    // no panic) — exercised over the real provider.
+    use std::sync::Arc;
+    let r = Arc::new(real_two_node_router(64));
+    std::thread::scope(|s| {
+        for t in 0..6usize {
+            let r = Arc::clone(&r);
+            s.spawn(move || {
+                for i in 0..200usize {
+                    let numa = match (t + i) % 4 {
+                        0 => NumaPolicy::OsDefault,
+                        1 => NumaPolicy::Bind(NodeId((i % 2) as u32)),
+                        2 => NumaPolicy::Local,
+                        _ => NumaPolicy::Interleave,
+                    };
+                    if let Some(p) = r.try_alloc(64 * 1024, PAGE_SIZE, hints(numa)) {
+                        // SAFETY: a live allocation we just made; write then free it home.
+                        unsafe { p.base.write(0x5a) };
+                        assert!(r.try_cache(p), "concurrent free routes home");
+                    }
+                }
+            });
+        }
+        // Maintenance thread: concurrent rebalance / idle-release / topology refresh.
+        let rm = Arc::clone(&r);
+        s.spawn(move || {
+            for _ in 0..200usize {
+                let _ = rm.rebalance_tick();
+                let _ = rm.release_idle(1);
+                let mut b = TopologyBuilder::new(2);
+                b.set_cpu(0, 1, 1).set_cpu(1, 0, 0);
+                rm.refresh(b.build());
+            }
+        });
+    });
+    assert!(
+        r.check_invariants(),
+        "router well-formed after concurrent alloc/free/rebalance/refresh"
+    );
+}

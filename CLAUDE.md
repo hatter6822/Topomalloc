@@ -220,22 +220,26 @@ ArenaPolicy, W13-2); the §15.4 `Rebalancer` plans a nearest-donor → most-pres
 no one — moving only a donor's **movable surplus** (`free − own demand`, via
 `NodePressure::movable_surplus`/`unmet_need`), so a move can never strand the donor or churn when no
 node has spare memory (W13-3); `detect_mismatch` is the §15.2 refresh probe (W13-4).
-`topo-backend-posix::discover_topology` parses Linux sysfs with the single-domain fallback, and
-`PosixBackingProvider::bind_node` is the best-effort Linux `mbind(MPOL_PREFERRED)` (no-op elsewhere).
-The **`NodeRouter`** (`crates/topo-core/src/node_router.rs`) makes it all *live*: one `HugePageBackend`
-per node (a fixed `[…; MAX_NODES]` array — `no_std`), each bound to its node, routing the large path to
-the preferred node's backend (the engine resolves the arena's policy into `Hints::numa`), with spillover
-on a full node, free-routes-home by address, live `rebalance_tick` execution (returns a donor's idle
-empty hugepages to the OS), and host-driven `refresh`. It is installed into the `hugepage-optimized` ABI
-via the existing `new_with_huge(&dyn RegionCacheHook)` seam — **the default extent path and a single-node
-host are byte-for-byte unchanged**. Placement/rebalancing are policy, not modeled transitions (§2.4), so
-there is no Lean obligation. The router's §15.4/§15.5 counters (bind failures — now a *driven* §15.5
-counter — rebalancer moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON and
-the `topo.numa.*` control namespace. The current-CPU source is a `FixedCore` until the RSEQ per-CPU
-identity lands (plan 05 W7); the seam is injectable, so it is a drop-in.
+`topo-backend-posix::discover_topology` parses Linux sysfs with the single-domain fallback;
+`PosixBackingProvider::bind_node` is the best-effort Linux `mbind(MPOL_PREFERRED)` (no-op elsewhere); and
+`OsCore` is the real `sched_getcpu` current-CPU oracle. The **`NodeRouter`**
+(`crates/topo-core/src/node_router.rs`) makes it all *live*: one `mbind`-bound `HugePageBackend` per node
+(a fixed `[…; MAX_NODES]` array — `no_std`) serving explicit Local/Bind/Interleave, **plus an unbound
+default backend** serving `OsDefault`/`ArenaPolicy` so the kernel places those pages **first-touch** (on
+the using thread's node — never pinning the common case to node 0). `Local` tracks the real running CPU
+(`OsCore`), `Interleave` round-robins over the backend count, a full node spills to the **nearest** other
+node, frees route home by address, and `rebalance_tick`/`release_idle`/`refresh` are host-driven. It is
+installed into the `hugepage-optimized` ABI via the existing `new_with_huge(&dyn RegionCacheHook)` seam —
+**the default extent path and a single-node host are byte-for-byte unchanged**. The host drives the §15.4
+rebalancer, §15.2 refresh, and W12 idle-release through the C `topomalloc_numa_*` control surface (a
+type-erased `RouterControl` handle). Placement/rebalancing are policy, not modeled transitions (§2.4), so
+there is no Lean obligation. The router's §15.4/§15.5 counters (driven bind failures, rebalancer
+moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON and the `topo.numa.*`
+control namespace. A first-class per-node *demand* signal (the rebalancer uses an alloc-failure
+approximation) and LLC-domain placement (transfer caches, M2) remain the deferred pieces.
 
 **Test counts:**
-- Rust: ~657 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~668 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 8 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, and `topology`)
@@ -260,7 +264,7 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 |-------|------|---------|----------|
 | `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
-| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery (W13) | MIT | No |
+| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery; `OsCore` — `sched_getcpu` current-CPU oracle (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
 | `topo-stats` | statistics snapshot, additive JSON, version wiring | MIT | Yes |
