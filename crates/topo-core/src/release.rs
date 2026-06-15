@@ -373,12 +373,17 @@ pub struct ReleaseController {
     last_allocated_total: u64,
     last_freed_total: u64,
     last_pressure_notifications: u64,
-    /// A *recent* peak of releasable-free memory, capping the §21.4 demand reserve
-    /// (`recent_peak`). A leaky peak-hold: a new high is adopted at once, otherwise it
-    /// relaxes toward the current free over `PEAK_DECAY_MS`, so the cap follows what
-    /// has *recently* existed rather than an all-time high-water mark. Always kept ≥
-    /// the current free, so the cap can never fall below the live free supply.
+    /// The **anchor** of the §21.4 `recent_peak` cap: the last new high of releasable
+    /// free, or the current free once the prior anchor fully aged out. The *effective*
+    /// cap each tick is this anchor relaxed toward current free by its age (a leaky
+    /// peak-hold, computed in [`tick`](Self::tick)), so the reserve follows what has
+    /// *recently* existed rather than an all-time high-water mark. Written only at a
+    /// re-anchor, so the decay stays a pure function of elapsed time (tick-cadence
+    /// independent).
     recent_peak_free: u64,
+    /// The instant [`recent_peak_free`](Self::recent_peak_free) was last (re-)anchored,
+    /// from which the leaky peak-hold's age-based decay is measured.
+    peak_anchor_ms: u64,
     /// The §21.2 alloc/free rates observed on the most recent interval (bytes/sec).
     alloc_rate_bps: u64,
     free_rate_bps: u64,
@@ -429,6 +434,7 @@ impl ReleaseController {
             last_freed_total: 0,
             last_pressure_notifications: 0,
             recent_peak_free: 0,
+            peak_anchor_ms: 0,
             alloc_rate_bps: 0,
             free_rate_bps: 0,
             backlog_bytes: 0,
@@ -526,26 +532,42 @@ impl ReleaseController {
         };
 
         // Track a *recent* peak of releasable-free memory for the §21.4 reserve cap
-        // (`recent_peak`). A new high is adopted immediately; otherwise the prior peak
-        // relaxes toward the current free linearly over one `PEAK_DECAY_MS` (a leaky
-        // peak-hold), so the cap follows *recent* free rather than an all-time
-        // high-water mark — which would keep the reserve stale-high (over-retaining RSS)
-        // long after a transient free burst had drained. The relaxed peak stays ≥
-        // `free_now`, so the cap can always still cover the current free supply.
+        // (`recent_peak`). The cap is the peak **anchor** relaxed linearly toward the
+        // current free over `PEAK_DECAY_MS`, measured from the instant the anchor was set
+        // (a leaky peak-hold) — so it follows *recent* free rather than an all-time
+        // high-water mark that would keep the reserve stale-high (over-retaining RSS)
+        // long after a transient free burst had drained.
+        //
+        // Crucially the decay is computed from the anchor's *age*, not by subtracting a
+        // fraction of the remaining excess each tick: a per-tick fraction would compound
+        // (exponential) and make the cap depend on how *often* the pump ticks — N small
+        // ticks would leave ~1/e of a long-dead spike after a full horizon while one big
+        // tick fully decayed it. Anchoring makes the cap a pure function of elapsed time,
+        // so any tick cadence over the same span yields the same cap.
         let free_now = inputs
             .idle_cache_bytes
             .saturating_add(inputs.dirty_bytes)
             .saturating_add(inputs.muzzy_bytes)
             .saturating_add(inputs.empty_backed_hugepage_bytes);
-        if free_now >= self.recent_peak_free {
+        // Re-anchor on a new high of releasable free, or once the old anchor has fully
+        // aged out (≥ PEAK_DECAY_MS): record both the value and the instant it was set.
+        if free_now >= self.recent_peak_free
+            || now_ms.saturating_sub(self.peak_anchor_ms) >= PEAK_DECAY_MS
+        {
             self.recent_peak_free = free_now;
-        } else {
-            // Decay the excess (peak − free_now) toward zero over one PEAK_DECAY_MS;
-            // `elapsed_ms == 0` (first tick / same-instant re-tick) decays nothing.
-            let excess = (self.recent_peak_free - free_now) as u128;
-            let decayed = (excess * elapsed_ms as u128 / PEAK_DECAY_MS as u128).min(excess);
-            self.recent_peak_free -= decayed as u64;
+            self.peak_anchor_ms = now_ms;
         }
+        // The effective cap: anchor (≥ `free_now`) relaxed toward `free_now` by the
+        // anchor's age. Always ≥ `free_now`, so the cap can still cover the live free
+        // supply; just after a re-anchor (age 0) it equals the anchor itself.
+        let recent_peak = {
+            let age = now_ms
+                .saturating_sub(self.peak_anchor_ms)
+                .min(PEAK_DECAY_MS);
+            let excess = (self.recent_peak_free - free_now) as u128; // anchor ≥ free_now
+            let remaining = excess * (PEAK_DECAY_MS - age) as u128 / PEAK_DECAY_MS as u128;
+            free_now.saturating_add(remaining as u64)
+        };
 
         // Alloc/free rates (bytes/sec) from the cumulative counter deltas over the
         // interval (§21.2). The reserve keys on the *allocation* rate (the conservative
@@ -595,7 +617,7 @@ impl ReleaseController {
         // §21.4 demand reserve (the anti-oscillation brake).
         let reserve = demand_reserve(
             alloc_rate_bps,
-            self.recent_peak_free,
+            recent_peak,
             inputs.refill_miss_rate_ppk,
             self.mode,
         );
@@ -1218,6 +1240,63 @@ mod tests {
         assert!(
             regrown.demand_reserve_bytes > 2 * 1024 * 1024,
             "a regrown free pool lifts the recent peak again (new high adopted at once)"
+        );
+    }
+
+    #[test]
+    fn recent_peak_decay_is_independent_of_tick_frequency() {
+        // §21.4 review finding: the recent-peak cap must decay by *elapsed time*, not
+        // per-tick. A per-tick fractional decay compounds (exponential) and leaves a
+        // long-dead spike capping the reserve high when the pump ticks often — e.g. ~1/e
+        // of the excess still present after a full horizon of 1 ms ticks. The anchored
+        // decay makes the cap a pure function of elapsed time, so fine and coarse tick
+        // cadences over the same span yield the *same* reserve.
+        //
+        // Drive a 100 MiB spike then hold ~1 MiB free across a half-horizon, ticking at
+        // `step_ms`, with a steady 128 MiB/s allocation so the (cap, not the rate) bounds
+        // the reserve. Returns the resulting demand reserve.
+        fn reserve_after(step_ms: u64) -> u64 {
+            const SPIKE: u64 = 100 * 1024 * 1024;
+            const LOW: u64 = 1024 * 1024;
+            const RATE: u64 = 128 * 1024 * 1024; // base ≫ the half-decayed cap
+            let mut c = ReleaseController::new(DecayConfig::default());
+            c.tick(
+                0,
+                ReleaseInputs {
+                    idle_cache_bytes: SPIKE,
+                    ..ReleaseInputs::default()
+                },
+            );
+            let span = PEAK_DECAY_MS / 2;
+            let mut now = 0u64;
+            let mut allocated = 0u64;
+            while now < span {
+                now += step_ms;
+                allocated += RATE * step_ms / 1_000;
+                c.tick(
+                    now,
+                    ReleaseInputs {
+                        idle_cache_bytes: LOW,
+                        allocated_bytes_total: allocated,
+                        ..ReleaseInputs::default()
+                    },
+                );
+            }
+            c.stats().demand_reserve_bytes
+        }
+        // 1 ms ticks vs one half-horizon tick: identical cadence-independent result.
+        let fine = reserve_after(1);
+        let coarse = reserve_after(PEAK_DECAY_MS / 2);
+        assert_eq!(
+            fine, coarse,
+            "recent-peak decay must not depend on tick cadence (frequency independence)"
+        );
+        // At half-life the cap is roughly halfway between the 1 MiB floor and the 100 MiB
+        // spike (~50 MiB), i.e. the spike is half-remembered — emphatically not the ~37%
+        // (1/e) the old per-tick compounding bug left after a *full* horizon.
+        assert!(
+            fine > 40 * 1024 * 1024 && fine < 60 * 1024 * 1024,
+            "half-decayed cap ~50 MiB (linear age-based decay), got {fine}"
         );
     }
 

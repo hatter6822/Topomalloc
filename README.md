@@ -98,7 +98,8 @@ allocation failure or cgroup-critical forces Emergency), computes the §21.4 dem
 reserve — the anti-oscillation brake that withholds release proportional to recent
 demand so freed memory is not faulted straight back (§21.1 R2), capped at the
 `recent_peak` of releasable-free memory (a leaky peak-hold that relaxes toward current
-free, so a transient free spike does not pin the reserve high) — and plans the §21.3
+free over a fixed horizon, decayed by age so it is tick-cadence independent, so a
+transient free spike does not pin the reserve high) — and plans the §21.3
 priority ladder (drain caches → release empty hugepages beyond the reserve → purge aged
 dirty-not-on-hot → convert aged dirty→muzzy → subrelease cold-sparse → release aged
 muzzy → emergency shrink) — where dirty and muzzy are each retained for reuse until

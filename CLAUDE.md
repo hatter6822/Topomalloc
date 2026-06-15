@@ -191,8 +191,9 @@ memory returns to the OS (§20–§21). It covers the §20.2 decay config (W12-1
 `arena::DecayConfig`), the §21.2 observation vector (W12-2a), the §21.5 Normal/Soft/Hard/Emergency
 pressure modes with hysteresis (W12-3a, alloc-failure/cgroup-critical force Emergency, O-007), the
 §21.4 demand-reserve anti-oscillation brake (W12-2c — capped at the §21.4 `recent_peak` of
-releasable-free memory, a *leaky peak-hold* relaxing toward current free over `PEAK_DECAY_MS` so a
-transient free spike never pins the cap high and over-retains RSS), the §21.3 priority ladder gated by
+releasable-free memory, a *leaky peak-hold* relaxing the peak anchor toward current free over
+`PEAK_DECAY_MS`, decayed by the anchor's age so it is tick-cadence independent, so a transient free spike
+never pins the cap high and over-retains RSS), the §21.3 priority ladder gated by
 mode and the §36.11 latency ceiling (W12-2b) — drain caches → release empty hugepages → purge
 aged dirty → convert aged dirty→muzzy → subrelease cold-sparse → release aged muzzy
 (`muzzy_decay_ms`) → emergency shrink, with dirty/muzzy each retained until their decay interval —

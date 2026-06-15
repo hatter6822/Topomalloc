@@ -150,8 +150,9 @@ normal-frame runs (§36.9).
 > Normal/Soft/Hard/Emergency ladder with escalate-now / de-escalate-past-the-margin hysteresis
 > (alloc-failure / cgroup-critical force Emergency, O-007). **W12-2c** `demand_reserve` is the §21.4
 > anti-oscillation brake (grows with the alloc rate + refill cost, caps at the §21.4 **`recent_peak`** of
-> releasable-free memory — a *leaky peak-hold* that relaxes toward current free over `PEAK_DECAY_MS`, so a
-> transient free spike does not pin the cap high and over-retain RSS — attenuates with pressure; Emergency
+> releasable-free memory — a *leaky peak-hold* that relaxes the peak **anchor** toward current free over
+> `PEAK_DECAY_MS`, decayed by the anchor's *age* so it is independent of tick cadence — so a transient free
+> spike does not pin the cap high and over-retain RSS, attenuates with pressure; Emergency
 > reserves nothing, §36.5). **W12-2b** the §21.3 six-rung ladder is gated by
 > mode + the §36.11 latency ceiling and rate-capped (§20.2) with the unmet remainder accrued as backlog
 > (§20.3, W12-1b). The backlog is the **max** of (carried backlog, this tick's desire), never their sum:
@@ -164,8 +165,8 @@ normal-frame runs (§36.9).
 > running counters reconcile into `topo-stats` JSON + the `topo.release.*` control namespace. **No new
 > abstract transition:** the controller sequences mechanisms already certified by the §21.6
 > `release_to_os_preserves_live_objects` (`lean/TopoMalloc/Theorems/Release.lean`), so there is no new
-> Lean obligation. Tested by 27 `release` unit tests (incl. the §21.1 R2 oscillation property, the
-> `recent_peak` decay, and the bounded-backlog guard), the
+> Lean obligation. Tested by 28 `release` unit tests (incl. the §21.1 R2 oscillation property, the
+> `recent_peak` decay and its tick-cadence independence, and the bounded-backlog guard), the
 > `release_controller_plan_never_exceeds_supply` gating proptest, and the `tests/tests/release.rs` live
 > integration + G-sim slices. **What W12 leaves to M5/M6:** driving the extent-path rungs (purge dirty →
 > muzzy → release) and cold-sparse subrelease from a host pump over the live engine (the controller
