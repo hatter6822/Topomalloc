@@ -67,7 +67,7 @@ use crate::error::BackendError;
 use crate::extent::{BackendLock, RegionCacheHook};
 use crate::flags::{Hints, HugepagePolicy, Lifetime};
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
-use crate::ids::{ArenaId, NodeId};
+use crate::ids::ArenaId;
 use crate::overflow::pages_for;
 use crate::release::{ReleaseController, ReleaseInputs, ReleasePlan};
 
@@ -203,18 +203,16 @@ fn lifetime_join(a: Lifetime, b: Lifetime) -> Lifetime {
 /// [`Unspecified`](Lifetime::Unspecified)); the richer
 /// [`HugePageBackend::allocate`] entry point (used by the engine's large path under
 /// the `hugepage_optimized` profile) carries the real hints.
+///
+/// NUMA placement is **not** a per-candidate score term: the live [`NodeRouter`](crate::NodeRouter)
+/// places by routing the request to the right node's backend (W13), so the filler — which
+/// owns one node's region — needs no node hint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PlaceHints {
     /// Hotness class (§19.3 `hotness_match` / §19.5 dense packing).
     pub hotness: Hotness,
     /// Expected lifetime (§19.5 same-lifetime grouping).
     pub lifetime: Lifetime,
-    /// The request's **explicit** preferred NUMA node (§15.3, W13), or `None` for no
-    /// preference (OS default). When `Some`, the §19.3 score rewards placement on a
-    /// region whose [`home_node`](HugePageFiller::home_node) matches and penalizes a
-    /// cross-node region. The engine fills it from the topology
-    /// ([`Topology::preferred_node`](crate::topology::Topology::preferred_node)).
-    pub home_node: Option<NodeId>,
 }
 
 impl PlaceHints {
@@ -224,7 +222,6 @@ impl PlaceHints {
         PlaceHints {
             hotness,
             lifetime: Lifetime::Unspecified,
-            home_node: None,
         }
     }
 }
@@ -707,11 +704,6 @@ pub struct HugePageFiller {
     bins: [u32; HugeBin::COUNT],
     /// Cumulative subreleases performed (the §19.6 metric the control plane reads).
     subrelease_events: u64,
-    /// The NUMA node this region's physical backing is on (§15.3, W13). The backend
-    /// sets it from [`HugeConfig::home_node`]; the §19.3 score rewards a request whose
-    /// explicit `home_node` preference matches it and penalizes a cross-node one. The
-    /// default ([`NodeId::DEFAULT`]) with no request preference is locality-neutral.
-    home_node: NodeId,
 }
 
 // SAFETY: `HugePageFiller` owns its slot memory exclusively (a `NonNull` into
@@ -753,20 +745,7 @@ impl HugePageFiller {
             next_untouched: 0,
             bins: [NIL; HugeBin::COUNT],
             subrelease_events: 0,
-            home_node: NodeId::DEFAULT,
         })
-    }
-
-    /// Set the NUMA node this region's backing is on (§15.3, W13) — the backend calls
-    /// this from [`HugeConfig::home_node`] after construction, so the §19.3 score's
-    /// locality term reflects where the physical pages actually live.
-    pub fn set_home_node(&mut self, node: NodeId) {
-        self.home_node = node;
-    }
-
-    /// The NUMA node this region's backing is on (§15.3).
-    pub fn home_node(&self) -> NodeId {
-        self.home_node
     }
 
     // --- slot pool accessors (the only `unsafe` in the bookkeeping) ----------
@@ -981,22 +960,14 @@ impl HugePageFiller {
     /// better; ties break on lower base in [`place`](Self::place). A wrong score never
     /// misplaces a live object (the run is carved from the free bitmap regardless).
     ///
-    /// The §19.3 score, exactly as returned below. `region_node` is the NUMA node the
-    /// region's backing is on (§15.3, W13): the locality term rewards a request whose
-    /// explicit `home_node` matches it and penalizes a cross-node one (DD-2 keeps every
-    /// input backend-agnostic — a node id is meaningful on POSIX *and* seLe4n). The sum
-    /// is `packing + hotness_match + lifetime_match + locality_bonus +
-    /// release_preservation + commit_bonus − fragmentation − cross_numa_penalty −
+    /// The §19.3 score, exactly as returned below: `packing + hotness_match +
+    /// lifetime_match + release_preservation + commit_bonus − fragmentation −
     /// partial_subrelease`, where `lifetime_match` is *itself* negative on a mismatch
     /// (there is no separate lifetime-mismatch penalty term — the mismatch is the
-    /// negative match).
-    fn score(
-        s: &HugePageSlot,
-        hints: PlaceHints,
-        run_offset: usize,
-        pages: usize,
-        region_node: NodeId,
-    ) -> i64 {
+    /// negative match). NUMA locality is not a term here: the live router segregates nodes
+    /// by routing to per-node backends (W13), so every candidate in this filler shares a
+    /// node and there is nothing to discriminate.
+    fn score(s: &HugePageSlot, hints: PlaceHints, run_offset: usize, pages: usize) -> i64 {
         let used = s.used() as i64;
         let total = PAGES_PER_HUGEPAGE as i64;
         let subreleased = s.subreleased() as i64;
@@ -1026,16 +997,9 @@ impl HugePageFiller {
         } else {
             -life_gap * LIFETIME_MISMATCH_WEIGHT
         };
-        // locality_bonus / cross_numa_penalty (§19.3, W13): a request that explicitly
-        // prefers this region's NUMA node is rewarded; one that prefers a *different*
-        // node is penalized (it would fault remote pages — better served from its own
-        // node's backend). No explicit preference (`None`, the OS default) is
-        // locality-neutral, so the single-node/no-NUMA case is unaffected (both 0).
-        let (locality_bonus, cross_numa_penalty): (i64, i64) = match hints.home_node {
-            Some(want) if want == region_node => (LOCALITY_BONUS, 0),
-            Some(_) => (0, CROSS_NUMA_PENALTY),
-            None => (0, 0),
-        };
+        // NUMA locality is **not** a score term: the live router places a request on the
+        // right node's backend by routing (W13), so every candidate in this filler is on the
+        // same node — there is nothing to discriminate here.
         // release_preservation_bonus: avoid disturbing an empty hugepage held for
         // release/reuse (the HugeCache reserve) — a small penalty for opening one.
         let release_pres = if used == 0 { -3 } else { 0 };
@@ -1055,9 +1019,8 @@ impl HugePageFiller {
         let fragmentation = (backed_free_after / 8) + (run_offset as i64).min(8);
         // partial_subrelease_penalty (§19.3): avoid re-filling a subreleased hugepage.
         let subrelease_pen = subreleased;
-        packing + hotness_match + lifetime_match + locality_bonus + release_pres + commit_bonus
+        packing + hotness_match + lifetime_match + release_pres + commit_bonus
             - fragmentation
-            - cross_numa_penalty
             - subrelease_pen
     }
 
@@ -1067,23 +1030,15 @@ impl HugePageFiller {
     /// hugepage has `used == 0` (so packing 0, no resident lifetime to match), is not
     /// yet committed (no commit bonus), and carries the `release_preservation`
     /// penalty for opening it.
-    fn fresh_score(hints: PlaceHints, region_node: NodeId) -> i64 {
+    fn fresh_score(hints: PlaceHints) -> i64 {
         let hotness_match = if hints.hotness == Hotness::Neutral {
             4
         } else {
             0
         };
-        // A fresh hugepage is on the region's node, so it carries the *same* locality
-        // term as any existing candidate — including it here keeps the open-fresh
-        // decision node-neutral (the term cancels in `place`'s `sc < fresh_score`).
-        let locality: i64 = match hints.home_node {
-            Some(want) if want == region_node => LOCALITY_BONUS,
-            Some(_) => -CROSS_NUMA_PENALTY,
-            None => 0,
-        };
         // packing(0) + hotness_match + lifetime_match(0) + release_pres(-3) +
-        // commit_bonus(0) − fragmentation(0) − subrelease(0) + locality.
-        hotness_match - 3 + locality
+        // commit_bonus(0) − fragmentation(0) − subrelease(0).
+        hotness_match - 3
     }
 
     /// **Place a `pages`-page run** at `align` with placement `hints` (§19.3/§19.5,
@@ -1115,7 +1070,7 @@ impl HugePageFiller {
                 let s = self.get(i);
                 if let Some(off) = find_run_aligned(&s.live, pages, stride) {
                     found_in_bin = true;
-                    let sc = Self::score(&s, hints, off, pages, self.home_node);
+                    let sc = Self::score(&s, hints, off, pages);
                     let better = match best {
                         None => true,
                         Some((bi, _, bsc)) => {
@@ -1149,9 +1104,7 @@ impl HugePageFiller {
             // well-matched candidate keeps a score above the fresh threshold and is
             // used, preserving coverage and density.
             Some((hp, off, sc)) => {
-                if sc < Self::fresh_score(hints, self.home_node)
-                    && self.next_untouched < self.capacity
-                {
+                if sc < Self::fresh_score(hints) && self.next_untouched < self.capacity {
                     match self.open_fresh() {
                         Some(fresh) => (fresh, 0),
                         None => (hp, off),
@@ -1909,17 +1862,6 @@ const FRAGMENTATION_COST_DIVISOR: usize = 8;
 /// possible".
 const LIFETIME_MISMATCH_WEIGHT: i64 = 4;
 
-/// The §19.3/§15.3 locality bonus (W13): added to a candidate's score when the request
-/// *explicitly* prefers this region's NUMA node. Weighted to influence the choice
-/// *between* node-bound backends without overriding the in-region packing/lifetime
-/// signals (locality is a preference, not a correctness input — §2.4).
-const LOCALITY_BONUS: i64 = 6;
-
-/// The §19.3/§15.3 cross-NUMA penalty (W13): subtracted when the request explicitly
-/// prefers a *different* node than this region provides (remote pages would fault from
-/// the wrong node). Symmetric in magnitude with [`LOCALITY_BONUS`].
-const CROSS_NUMA_PENALTY: i64 = 6;
-
 // ===========================================================================
 // §18.6 region cache for awkward sizes (W11-3)
 // ===========================================================================
@@ -2085,26 +2027,15 @@ pub struct HugeConfig {
     pub capacity_hugepages: usize,
     /// §18.6 region-cache capacity (awkward-size runs retained for reuse, W11-3).
     pub region_cache_slots: usize,
-    /// The NUMA node this backend's region backing is on (§15.3, W13). Default
-    /// [`NodeId::DEFAULT`]; the engine sets it (from the topology) when it stands up a
-    /// per-node hugepage backend, so the §19.3 score's locality term is meaningful.
-    pub home_node: NodeId,
 }
 
 impl HugeConfig {
-    /// A modest default (`capacity` hugepages, a small region cache, node 0).
+    /// A modest default (`capacity` hugepages, a small region cache).
     pub const fn with_capacity(capacity_hugepages: usize) -> HugeConfig {
         HugeConfig {
             capacity_hugepages,
             region_cache_slots: 16,
-            home_node: NodeId::DEFAULT,
         }
-    }
-
-    /// Set the NUMA node this backend's region is on (§15.3, W13).
-    pub const fn with_home_node(mut self, node: NodeId) -> HugeConfig {
-        self.home_node = node;
-        self
     }
 
     /// The metadata bytes a [`HugePageBackend`] built from this config consumes up
@@ -2197,12 +2128,9 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             .reserve(arena, region_len, HUGEPAGE_SIZE)
             .map_err(HugeError::Backend)?;
         let base = region.base as usize;
-        let built =
-            HugePageFiller::new(meta, base, cfg.capacity_hugepages).and_then(|mut filler| {
-                // §15.3 (W13): the filler's score locality term reflects the region's node.
-                filler.set_home_node(cfg.home_node);
-                RegionCache::new(meta, cfg.region_cache_slots).map(|cache| (filler, cache))
-            });
+        let built = HugePageFiller::new(meta, base, cfg.capacity_hugepages).and_then(|filler| {
+            RegionCache::new(meta, cfg.region_cache_slots).map(|cache| (filler, cache))
+        });
         match built {
             Some((filler, cache)) => Ok(Self {
                 provider,
@@ -2618,9 +2546,6 @@ impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
             PlaceHints {
                 hotness: Hotness::from_hint(hints.hotness),
                 lifetime: hints.lifetime,
-                // The flags `Hints` carry no NUMA node; topology-derived placement
-                // reaches the filler via an explicit `PlaceHints.home_node` (W13).
-                home_node: None,
             },
         )
     }
@@ -2933,12 +2858,10 @@ mod filler_tests {
         let short = PlaceHints {
             hotness: Hotness::Neutral,
             lifetime: Lifetime::Short,
-            home_node: None,
         };
         let long = PlaceHints {
             hotness: Hotness::Neutral,
             lifetime: Lifetime::Long,
-            home_node: None,
         };
         let mut f = filler(4);
         // Build two equally-occupied candidates — hugepage 0 (Long) and hugepage 1
@@ -2981,12 +2904,10 @@ mod filler_tests {
         let long = PlaceHints {
             hotness: Hotness::Neutral,
             lifetime: Lifetime::Long,
-            home_node: None,
         };
         let short = PlaceHints {
             hotness: Hotness::Neutral,
             lifetime: Lifetime::Short,
-            home_node: None,
         };
         let mut f = filler(4);
         let a = f.place(1, PAGE_SIZE, long).unwrap();
@@ -3054,56 +2975,6 @@ mod filler_tests {
         let b = place_ok(&mut f, 4, PAGE_SIZE, Hotness::Neutral); // must open hugepage 1
         assert_ne!(a.hugepage, b.hugepage);
         assert_eq!(f.touched(), 2);
-        assert!(f.check_invariants());
-    }
-
-    #[test]
-    fn score_rewards_node_local_and_penalizes_cross_numa_requests() {
-        // §19.3/§15.3 (W13): on a region homed on node 1, a request that explicitly
-        // prefers node 1 outscores a no-preference request by exactly LOCALITY_BONUS,
-        // and a request preferring node 0 falls short by exactly CROSS_NUMA_PENALTY —
-        // the only term that differs across the three (same slot, hotness, lifetime).
-        let mut f = filler(2);
-        f.set_home_node(NodeId(1));
-        assert_eq!(f.home_node(), NodeId(1));
-        let a = place_ok(&mut f, 8, PAGE_SIZE, Hotness::Neutral);
-        let s = f.get(a.hugepage);
-
-        let base = PlaceHints {
-            hotness: Hotness::Neutral,
-            lifetime: Lifetime::Unspecified,
-            home_node: None,
-        };
-        let local = PlaceHints {
-            home_node: Some(NodeId(1)),
-            ..base
-        };
-        let remote = PlaceHints {
-            home_node: Some(NodeId(0)),
-            ..base
-        };
-
-        let neutral_score = HugePageFiller::score(&s, base, 0, 8, f.home_node());
-        let local_score = HugePageFiller::score(&s, local, 0, 8, f.home_node());
-        let remote_score = HugePageFiller::score(&s, remote, 0, 8, f.home_node());
-
-        assert_eq!(
-            local_score - neutral_score,
-            LOCALITY_BONUS,
-            "node-local bonus"
-        );
-        assert_eq!(
-            neutral_score - remote_score,
-            CROSS_NUMA_PENALTY,
-            "cross-NUMA penalty"
-        );
-        assert!(local_score > neutral_score && neutral_score > remote_score);
-
-        // Placement remains safe + well-formed regardless of the preference.
-        let p = f
-            .place(4, PAGE_SIZE, remote)
-            .expect("cross-node request still placed");
-        f.mark_committed(&p);
         assert!(f.check_invariants());
     }
 

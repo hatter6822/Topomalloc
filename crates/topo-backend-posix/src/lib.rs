@@ -51,7 +51,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use topo_core::{ArenaId, BackendError, Region, TopoBackingProvider, Topology};
+use topo_core::{
+    ArenaId, BackendError, CoreId, CoreProvider, Region, TopoBackingProvider, Topology,
+};
 
 /// A live reservation owned by the provider: its base, the bytes mapped (for
 /// `munmap`/free — `>=` the requested size, rounded to the OS page), and the
@@ -667,6 +669,33 @@ fn online_cpus() -> u32 {
     }
 }
 
+/// The OS current-CPU oracle (§15.3, W13): the [`CoreProvider`] that reports the CPU the
+/// calling thread is **actually** running on, so [`Local`](topo_core::NumaPolicy::Local) /
+/// [`Interleave`](topo_core::NumaPolicy::Interleave) placement tracks the real thread, not a
+/// fixed core. On Linux it is `sched_getcpu()`; on other targets there is no portable query,
+/// so it reports core 0 (the conservative single-domain default). The returned [`CoreId`] is
+/// the **OS CPU id**, matching the CPU indexing of [`discover_topology`]'s snapshot
+/// (`Topology::node_of_cpu` takes that same id).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsCore;
+
+impl CoreProvider for OsCore {
+    #[inline]
+    fn current_core(&self) -> CoreId {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `sched_getcpu` takes no arguments and is always safe to call; it
+            // returns the current CPU or `-1` if unavailable (then we use core 0).
+            let c = unsafe { libc::sched_getcpu() };
+            CoreId(if c >= 0 { c as u32 } else { 0 })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            CoreId(0)
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux_topology {
     use super::Topology;
@@ -805,6 +834,19 @@ mod tests {
         assert_eq!(t.node_of_cpu(u32::MAX), topo_core::NodeId::DEFAULT);
         // The discovered node count never exceeds the bounded model.
         assert!(t.node_count() as usize <= topo_core::topology::MAX_NODES);
+    }
+
+    #[test]
+    fn os_core_reports_a_usable_running_cpu() {
+        // §15.3 (W13): the OS current-CPU oracle reads the running CPU without panicking,
+        // and it resolves to a node in the discovered topology (a total query). On Linux it
+        // is `sched_getcpu`; elsewhere it reports the conservative core 0.
+        use topo_core::CoreProvider;
+        let cpu = OsCore.current_core();
+        let t = discover_topology();
+        let _node = t.node_of_cpu(cpu.0); // total — never panics, even for an out-of-range id
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(cpu.0, 0, "non-Linux reports the conservative core 0");
     }
 
     #[cfg(target_os = "linux")]

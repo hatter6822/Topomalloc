@@ -453,7 +453,7 @@ mod tests {
                 MockProvider::new(fail),
                 m,
                 ArenaId::DEFAULT,
-                HugeConfig::with_capacity(cap).with_home_node(node),
+                HugeConfig::with_capacity(cap),
             )
             .ok()
         })
@@ -470,7 +470,7 @@ mod tests {
                 MockProvider::new(false),
                 m,
                 ArenaId::DEFAULT,
-                HugeConfig::with_capacity(cap).with_home_node(node),
+                HugeConfig::with_capacity(cap),
             )
             .ok()
         })

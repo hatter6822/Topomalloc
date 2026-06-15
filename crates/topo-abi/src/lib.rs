@@ -288,12 +288,12 @@ fn build_posix_allocator(
         // (no capacity regression from the split); on a single node this is exactly
         // `capacity`. The extra is virtual address space (lazily faulted), so it is free.
         let per_node = capacity.div_ceil(n).max(1);
-        let router = NodeRouter::build(topo, FixedCore(CoreId::DEFAULT), |node, _os| {
+        let router = NodeRouter::build(topo, FixedCore(CoreId::DEFAULT), |_node, _os| {
             HugePageBackend::new(
                 PosixBackingProvider::new(),
                 meta,
                 ArenaId::DEFAULT,
-                HugeConfig::with_capacity(per_node).with_home_node(node),
+                HugeConfig::with_capacity(per_node),
             )
             .ok()
         })?;

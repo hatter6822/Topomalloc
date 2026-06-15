@@ -206,12 +206,12 @@ fn real_two_node_router(cap: usize) -> NodeRouter<PosixBackingProvider, FixedCor
     let m = meta(1 << 21);
     let mut b = TopologyBuilder::new(2);
     b.set_cpu(0, 0, 0).set_cpu(1, 1, 1);
-    NodeRouter::build(b.build(), FixedCore(CoreId::DEFAULT), |node, _os| {
+    NodeRouter::build(b.build(), FixedCore(CoreId::DEFAULT), |_node, _os| {
         HugePageBackend::new(
             PosixBackingProvider::new(),
             m,
             topo_core::ids::ArenaId::DEFAULT,
-            HugeConfig::with_capacity(cap).with_home_node(node),
+            HugeConfig::with_capacity(cap),
         )
         .ok()
     })
