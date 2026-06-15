@@ -455,6 +455,23 @@ mod tests {
         .expect("router")
     }
 
+    /// A two-node router with an explicit per-node hugepage capacity (so a test can make
+    /// one node trivially fillable for deterministic demand).
+    fn router_caps(cap0: usize, cap1: usize) -> NodeRouter<MockProvider, FixedCore> {
+        let m = meta(1 << 21);
+        NodeRouter::build(two_node_topo(), FixedCore(CoreId(0)), |node, _os| {
+            let cap = if node.0 == 0 { cap0 } else { cap1 };
+            HugePageBackend::new(
+                MockProvider::new(false),
+                m,
+                ArenaId::DEFAULT,
+                HugeConfig::with_capacity(cap).with_home_node(node),
+            )
+            .ok()
+        })
+        .expect("router")
+    }
+
     fn hints(numa: NumaPolicy) -> Hints {
         Hints {
             numa,
@@ -568,32 +585,31 @@ mod tests {
     fn rebalance_tick_releases_idle_donor_memory() {
         // Node 0 holds an idle empty-backed hugepage (free); node 1 is starved (an alloc
         // failure → demand). A rebalance tick plans 0→1 and releases node 0's idle memory.
-        let r = router(two_node_topo(), 4, false);
+        // Deterministic capacities: node 1 holds exactly one hugepage (trivially full), node
+        // 0 has room so its donated empty hugepage cannot be consumed by the spillover.
+        let r = router_caps(3, 1);
         // Make node 0 hold one empty-backed (committed-then-freed) hugepage.
         let big = r
             .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(0))))
             .expect("whole hugepage on node 0");
         assert_eq!(r.node_of_addr(big.base as usize), Some(0));
         assert!(r.try_cache(big), "freed ⇒ empty-backed on node 0");
-        // Starve node 1: fill it, then a Bind(1) fails and is recorded as demand. With a
-        // 4-hugepage capacity, reserve all of it first.
-        let mut fillers = Vec::new();
-        for _ in 0..4 {
-            if let Some(p) =
-                r.try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
-            {
-                // A spillover to node 0 does not signal node-1 demand; keep only node-1 ones.
-                if r.node_of_addr(p.base as usize) == Some(1) {
-                    fillers.push(p);
-                } else {
-                    assert!(r.try_cache(p));
-                }
-            }
-        }
-        // Now node 1 is full: this Bind(1) misses node 1 (demand++), spilling to node 0.
-        if let Some(p) = r.try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1)))) {
-            assert!(r.try_cache(p));
-        }
+        // Fill node 1's single hugepage and hold it, so node 1 is genuinely full.
+        let held = r
+            .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
+            .expect("node 1's one hugepage");
+        assert_eq!(r.node_of_addr(held.base as usize), Some(1));
+        // A Bind(1) now misses node 1 (demand++), spilling to node 0; free the spillover.
+        let spill = r
+            .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
+            .expect("a spillover to node 0");
+        assert_eq!(
+            r.node_of_addr(spill.base as usize),
+            Some(0),
+            "spilled to node 0"
+        );
+        assert!(r.try_cache(spill));
+        assert_eq!(r.stats().spillovers, 1, "the miss was a recorded spillover");
         let m = r
             .rebalance_tick()
             .expect("node 0 free + node 1 demand ⇒ a move");
@@ -605,6 +621,7 @@ mod tests {
             s.rebalance_released_bytes > 0,
             "idle donor memory returned to the OS"
         );
+        let fillers = vec![held];
         for p in fillers {
             assert!(r.try_cache(p));
         }

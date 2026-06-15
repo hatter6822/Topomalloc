@@ -2266,9 +2266,9 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 
     /// **Best-effort NUMA-bind this backend's whole region to OS node `os_node`** (§15.5,
     /// W13) — applied once, before the region is faulted, so future faults prefer
-    /// `os_node` ([`TopoBackingProvider::bind_node`](crate::TopoBackingProvider::bind_node),
-    /// Linux `mbind`). Returns `true` on success; a `false` is a recorded bind failure the
-    /// caller surfaces in stats, never fatal (a missed bind only loses locality, §2.4).
+    /// `os_node` ([`TopoBackingProvider::bind_node`], Linux `mbind`). Returns `true` on
+    /// success; a `false` is a recorded bind failure the caller surfaces in stats, never
+    /// fatal (a missed bind only loses locality, §2.4).
     pub fn bind_region(&self, os_node: u32) -> bool {
         self.provider.bind_node(self.region, os_node).is_ok()
     }

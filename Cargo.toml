@@ -36,10 +36,13 @@ exclude = ["fuzz", "vendor/sele4n"]
 # surface. 0.1.3: W11 (plan 04) adds the hugepage-aware backend (filler / huge
 # cache / region cache + §19.7 coverage stats). 0.1.8: W13 (plan 04) hardens the
 # §15.4 cross-domain rebalancer to move only a donor's *surplus* (never stranding
-# it) + `NodePressure::unmet_need`/`movable_surplus` accessors. In a 0.x series new
-# backwards-compatible functionality is a patch bump (the 0.x minor is the
-# breaking axis), which also keeps the `^0.1.0` inter-crate requirements satisfied.
-version = "0.1.8"
+# it) + `NodePressure::unmet_need`/`movable_surplus` accessors. 0.1.9: W13 live
+# integration — the `NodeRouter` (per-node hugepage backends + best-effort `mbind`)
+# makes placement/rebalancing affect real allocations, wired into the
+# `hugepage-optimized` ABI. In a 0.x series new backwards-compatible functionality
+# is a patch bump (the 0.x minor is the breaking axis), which also keeps the
+# `^0.1.0` inter-crate requirements satisfied.
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

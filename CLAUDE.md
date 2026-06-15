@@ -210,28 +210,35 @@ certified by the §21.6 release-safety theorem (`release_to_os_preserves_live_ob
 (pressure mode, backlog, demand reserve, planned bytes) reconcile into `topo-stats` JSON and the
 `topo.release.*` control namespace.
 
-Topology awareness (W13) completes plan 04, in `crates/topo-core/src/topology.rs` (pure, `no_std`):
-the §15.2 `Topology` snapshot (CPU→LLC→NUMA maps + a node-distance matrix, all queries total) built by
-a `TopologyBuilder` that **falls back to a conservative single domain** on any missing/inconsistent
-data (W13-1); the §15.3/§15.5 `preferred_node` placement decision over the existing `NumaPolicy`
-(Local / Bind / Interleave / OsDefault / ArenaPolicy, W13-2); the §15.4 `Rebalancer` that plans a move
-from the nearest donor to the most-pressured node so memory is never permanently stranded (W13-3) —
-moving only a donor's **movable surplus** (`free − own demand`, via `NodePressure::movable_surplus`/
-`unmet_need`) so a move can never strand the donor or churn when no node has spare memory; and
-`detect_mismatch`, the §15.2 periodic-refresh probe (W13-4). `topo-backend-posix::discover_topology`
-parses Linux sysfs (`node*/cpulist`, `physical_package_id`, `node*/distance`) with the same
-single-domain fallback. The W11 filler score's locality / cross-NUMA terms (stubbed at 0 "until W13")
-are now **filled**: `PlaceHints::home_node` (an explicit node preference) is rewarded on a region whose
-`HugeConfig::home_node` matches and penalized cross-node, neutral under no-preference — so the
-single-node case is unaffected and safety is never involved (§2.4). Placement/rebalancing are policy,
-not modeled transitions, so there is no Lean obligation. The §15.2 node/LLC counts reconcile into
-`topo-stats` JSON and the `topo.numa.*` control namespace; NUMA bind failures remain visible (§15.5).
+Topology awareness (W13) completes plan 04 and is **live**. The §15.2 `Topology` snapshot
+(`crates/topo-core/src/topology.rs`, pure/`no_std`; CPU→LLC→NUMA maps + a node-distance matrix, all
+queries total) is built by a `TopologyBuilder` that **falls back to a conservative single domain** on
+any inconsistency and **densely renumbers the OS node ids in use** (so a sparse platform has no phantom
+node; the raw OS id is kept in `os_node_of` for `mbind`) — W13-1. `preferred_node`/`preferred_node_at`
+is the §15.3/§15.5 placement decision over `NumaPolicy` (Local / Bind / Interleave / OsDefault /
+ArenaPolicy, W13-2); the §15.4 `Rebalancer` plans a nearest-donor → most-pressured move that strands
+no one — moving only a donor's **movable surplus** (`free − own demand`, via
+`NodePressure::movable_surplus`/`unmet_need`), so a move can never strand the donor or churn when no
+node has spare memory (W13-3); `detect_mismatch` is the §15.2 refresh probe (W13-4).
+`topo-backend-posix::discover_topology` parses Linux sysfs with the single-domain fallback, and
+`PosixBackingProvider::bind_node` is the best-effort Linux `mbind(MPOL_PREFERRED)` (no-op elsewhere).
+The **`NodeRouter`** (`crates/topo-core/src/node_router.rs`) makes it all *live*: one `HugePageBackend`
+per node (a fixed `[…; MAX_NODES]` array — `no_std`), each bound to its node, routing the large path to
+the preferred node's backend (the engine resolves the arena's policy into `Hints::numa`), with spillover
+on a full node, free-routes-home by address, live `rebalance_tick` execution (returns a donor's idle
+empty hugepages to the OS), and host-driven `refresh`. It is installed into the `hugepage-optimized` ABI
+via the existing `new_with_huge(&dyn RegionCacheHook)` seam — **the default extent path and a single-node
+host are byte-for-byte unchanged**. Placement/rebalancing are policy, not modeled transitions (§2.4), so
+there is no Lean obligation. The router's §15.4/§15.5 counters (bind failures — now a *driven* §15.5
+counter — rebalancer moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON and
+the `topo.numa.*` control namespace. The current-CPU source is a `FixedCore` until the RSEQ per-CPU
+identity lands (plan 05 W7); the seam is injectable, so it is a drop-in.
 
 **Test counts:**
-- Rust: ~639 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~657 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 7 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, and `huge_filler`)
+- Fuzzing: 8 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, and `topology`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
@@ -251,9 +258,9 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer (W13) | MIT | Yes |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13) | MIT | Yes |
 | `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, errno, Rust `GlobalAlloc` | MIT | No |
-| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery (W13) | MIT | No |
+| `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
 | `topo-stats` | statistics snapshot, additive JSON, version wiring | MIT | Yes |
