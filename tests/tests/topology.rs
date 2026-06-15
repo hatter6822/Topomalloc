@@ -14,8 +14,7 @@
 use topo_backend_posix::discover_topology;
 use topo_control::Control;
 use topo_core::{
-    topology::MAX_NODES, NodeId, NodePressure, NumaPolicy, RebalanceMove, Rebalancer, Topology,
-    TopologyBuilder,
+    topology::MAX_NODES, NodeId, NodePressure, NumaPolicy, Rebalancer, Topology, TopologyBuilder,
 };
 use topo_stats::{Profile, Stats};
 
@@ -124,16 +123,6 @@ fn placement_covers_every_numa_mode() {
     );
 }
 
-/// Execute a planned move on a mutable pressure array: the donor parts with `bytes` of
-/// its surplus, relieving that much of the recipient's unmet demand.
-fn apply(nodes: &mut [NodePressure], m: &RebalanceMove) {
-    let (s, d) = (m.src.0 as usize, m.dst.0 as usize);
-    // Bounded by construction: bytes ≤ donor surplus ≤ donor free, and bytes ≤ recipient
-    // need ≤ recipient demand — so neither subtraction can underflow.
-    nodes[s].free_bytes -= m.bytes;
-    nodes[d].demand_bytes -= m.bytes;
-}
-
 #[test]
 fn rebalancer_converges_without_ever_stranding_a_donor() {
     // §15.4 system-level: drive the rebalancer to a fixpoint. A donor (node 0) holds
@@ -167,7 +156,7 @@ fn rebalancer_converges_without_ever_stranding_a_donor() {
             nodes[s].movable_surplus() >= m.bytes,
             "a move never exceeds the donor's surplus"
         );
-        apply(&mut nodes, &m);
+        assert!(m.apply(&mut nodes), "the canonical move semantics apply it");
         assert_eq!(
             nodes[s].unmet_need(),
             0,

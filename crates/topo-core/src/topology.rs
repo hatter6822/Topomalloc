@@ -43,17 +43,29 @@ pub const DISTANCE_REMOTE: u8 = 20;
 /// hundred bytes of mapping tables); the host keeps one, refreshing it on hotplug.
 /// Every query is total — an out-of-range CPU reads as the default domain, so the
 /// placement path never panics on a stale CPU id.
+///
+/// **Node ids are dense and internal.** Discovery densely renumbers the OS NUMA node
+/// ids actually in use to `0..node_count()` (as it already does for LLC domains), so
+/// every id in that range is a real node — there are no phantom gaps even when the
+/// platform numbers nodes sparsely (OS nodes 0 and 2 present, 1 absent). The raw OS id
+/// is preserved in `node_os_id` and recovered by [`os_node_of`](Self::os_node_of) for
+/// syscalls (`mbind`/`set_mempolicy`), which need the kernel's node number.
 #[derive(Clone)]
 pub struct Topology {
     n_cpus: u16,
     n_nodes: u16,
     n_llc: u16,
-    /// `cpu_node[c]` = the NUMA node index of CPU `c` (`0` beyond `n_cpus`).
+    /// `cpu_node[c]` = the dense NUMA node index of CPU `c` (`0` beyond `n_cpus`).
     cpu_node: [u16; MAX_CPUS],
     /// `cpu_llc[c]` = the LLC-domain index of CPU `c` (`0` beyond `n_cpus`).
     cpu_llc: [u16; MAX_CPUS],
-    /// `node_dist[a][b]` = the §15.4 distance from node `a` to node `b` (10 = local).
+    /// `node_dist[a][b]` = the §15.4 distance from dense node `a` to dense node `b`
+    /// (10 = local).
     node_dist: [[u8; MAX_NODES]; MAX_NODES],
+    /// `node_os_id[d]` = the **OS** NUMA node number of dense node `d` (the identity map
+    /// `node_os_id[d] == d` for the common dense-numbered platform; `0` beyond
+    /// `n_nodes`). Used only by the backing provider's `mbind` path (§15.5, W13).
+    node_os_id: [u16; MAX_NODES],
 }
 
 impl Topology {
@@ -63,10 +75,13 @@ impl Topology {
     pub fn single_domain(n_cpus: u32) -> Topology {
         let n = (n_cpus.max(1) as usize).min(MAX_CPUS) as u16;
         let mut node_dist = [[DISTANCE_REMOTE; MAX_NODES]; MAX_NODES];
-        // The diagonal is local distance; only node 0 is populated here.
+        let mut node_os_id = [0u16; MAX_NODES];
+        // The diagonal is local distance; the OS-id map is the identity (dense node `i`
+        // ⇒ OS node `i`) so a stray `os_node_of` past `n_nodes` reads sanely.
         let mut i = 0;
         while i < MAX_NODES {
             node_dist[i][i] = DISTANCE_LOCAL;
+            node_os_id[i] = i as u16;
             i += 1;
         }
         Topology {
@@ -76,6 +91,7 @@ impl Topology {
             cpu_node: [0; MAX_CPUS],
             cpu_llc: [0; MAX_CPUS],
             node_dist,
+            node_os_id,
         }
     }
 
@@ -85,6 +101,19 @@ impl Topology {
             NodeId(self.cpu_node[cpu as usize] as u32)
         } else {
             NodeId::DEFAULT
+        }
+    }
+
+    /// The **OS** NUMA node number of dense node `node` (§15.5, W13) — the kernel id the
+    /// backing provider's `mbind`/`set_mempolicy` needs. The identity (`os == dense`) on
+    /// the common dense-numbered platform; differs only when the OS numbers nodes
+    /// sparsely. Out-of-range dense ids read as `0` (the default node).
+    pub fn os_node_of(&self, node: NodeId) -> u32 {
+        let d = node.0 as usize;
+        if d < self.n_nodes as usize {
+            self.node_os_id[d] as u32
+        } else {
+            0
         }
     }
 
@@ -154,6 +183,23 @@ impl Topology {
         current_cpu: u32,
         interleave: &mut u32,
     ) -> Option<NodeId> {
+        let node = self.preferred_node_at(policy, current_cpu, *interleave);
+        if matches!(policy, NumaPolicy::Interleave) {
+            *interleave = interleave.wrapping_add(1);
+        }
+        node
+    }
+
+    /// The pure form of [`preferred_node`](Self::preferred_node): the decision for an
+    /// explicit `interleave` counter *value*, with no mutation — so a lock-free caller
+    /// (the [live router](crate::NodeRouter)) can drive the round-robin from an atomic it
+    /// advances itself. Identical otherwise; `Interleave` rotates by `interleave % nodes`.
+    pub fn preferred_node_at(
+        &self,
+        policy: NumaPolicy,
+        current_cpu: u32,
+        interleave: u32,
+    ) -> Option<NodeId> {
         match policy {
             // Prefer the current CPU's node (§15.3 "prefer current NUMA node").
             NumaPolicy::Local => Some(self.node_of_cpu(current_cpu)),
@@ -168,9 +214,7 @@ impl Topology {
             // counter, so test mode is reproducible.
             NumaPolicy::Interleave => {
                 let n = self.n_nodes.max(1) as u32;
-                let node = *interleave % n;
-                *interleave = interleave.wrapping_add(1);
-                Some(NodeId(node))
+                Some(NodeId(interleave % n))
             }
             // Defer: the OS default, or the arena's own placement, is honored by the
             // caller (§15.5).
@@ -248,6 +292,13 @@ impl TopologyBuilder {
     /// Build the snapshot (§15.2). Returns the discovered [`Topology`] only if every
     /// online CPU was set consistently; otherwise the conservative single-domain
     /// fallback over the same CPU count.
+    ///
+    /// The OS node ids actually in use are **densely renumbered** to `0..node_count()`
+    /// (as the LLC ids already are), so a sparsely-numbered platform (e.g. OS nodes 0 and
+    /// 2 present, 1 absent) yields exactly two nodes rather than a three-node model with a
+    /// phantom node 1. The raw OS id is kept in `node_os_id` for the `mbind` path
+    /// ([`Topology::os_node_of`]). On a dense-numbered platform the renumbering is the
+    /// identity, so the common case is unchanged.
     pub fn build(self) -> Topology {
         if !self.consistent || self.n_cpus == 0 {
             return Topology::single_domain(self.n_cpus.max(1) as u32);
@@ -260,13 +311,66 @@ impl TopologyBuilder {
             }
             c += 1;
         }
+
+        // Which OS node ids are actually used by an online CPU? (`cpu_node[k] < MAX_NODES`
+        // is guaranteed by `set_cpu`, and the no-gap check above means every CPU is set.)
+        let mut used = [false; MAX_NODES];
+        let mut k = 0usize;
+        while k < self.n_cpus as usize {
+            used[self.cpu_node[k] as usize] = true;
+            k += 1;
+        }
+        // Assign dense ids in increasing OS-id order (so a dense platform is the identity).
+        let mut dense_of_os = [0u16; MAX_NODES];
+        let mut node_os_id = [0u16; MAX_NODES];
+        let mut n_nodes = 0u16;
+        let mut os = 0usize;
+        while os < MAX_NODES {
+            if used[os] {
+                dense_of_os[os] = n_nodes;
+                node_os_id[n_nodes as usize] = os as u16;
+                n_nodes += 1;
+            }
+            os += 1;
+        }
+        // At least one CPU is set (n_cpus ≥ 1, no gaps), so at least one node is used.
+        debug_assert!(n_nodes >= 1, "a consistent build has at least one node");
+
+        // Remap each CPU's node to its dense id.
+        let mut cpu_node = [0u16; MAX_CPUS];
+        let mut k = 0usize;
+        while k < self.n_cpus as usize {
+            cpu_node[k] = dense_of_os[self.cpu_node[k] as usize];
+            k += 1;
+        }
+        // Project the OS-indexed distance matrix onto the dense ids (dropping absent
+        // rows/cols, so `distance(a, b)` indexes by dense id like every other query).
+        let mut node_dist = [[DISTANCE_REMOTE; MAX_NODES]; MAX_NODES];
+        let mut da = 0usize;
+        while da < n_nodes as usize {
+            let mut db = 0usize;
+            while db < n_nodes as usize {
+                node_dist[da][db] =
+                    self.node_dist[node_os_id[da] as usize][node_os_id[db] as usize];
+                db += 1;
+            }
+            da += 1;
+        }
+        // Identity-fill the unused dense slots' OS map so a stray `os_node_of` is sane.
+        let mut d = n_nodes as usize;
+        while d < MAX_NODES {
+            node_os_id[d] = d as u16;
+            d += 1;
+        }
+
         Topology {
             n_cpus: self.n_cpus,
-            n_nodes: self.max_node + 1,
+            n_nodes,
             n_llc: self.max_llc + 1,
-            cpu_node: self.cpu_node,
+            cpu_node,
             cpu_llc: self.cpu_llc,
-            node_dist: self.node_dist,
+            node_dist,
+            node_os_id,
         }
     }
 }
@@ -342,6 +446,28 @@ pub struct RebalanceMove {
     pub bytes: u64,
     /// The §15.4 preference tier this move uses.
     pub tier: RebalanceTier,
+}
+
+impl RebalanceMove {
+    /// Apply this move to a per-node pressure array — the **canonical move semantics**
+    /// shared by the rebalancer's tests and the live executor ([`NodeRouter`](crate::NodeRouter)):
+    /// the donor parts with `bytes` of its free memory and the recipient's gross demand is
+    /// relieved by the same amount. Bounded by construction (`bytes ≤ donor surplus ≤
+    /// donor free` and `bytes ≤ recipient need ≤ recipient demand`), so neither field
+    /// underflows; out-of-range `src`/`dst` for `nodes` are ignored (total, never panics).
+    ///
+    /// Returns `true` if it was applied (both endpoints in range). Applying a
+    /// [`plan`](Rebalancer::plan) result never strands the donor: afterwards `nodes[src]`
+    /// still satisfies its own demand ([`unmet_need`](NodePressure::unmet_need) stays 0).
+    pub fn apply(&self, nodes: &mut [NodePressure]) -> bool {
+        let (s, d) = (self.src.0 as usize, self.dst.0 as usize);
+        if s >= nodes.len() || d >= nodes.len() {
+            return false;
+        }
+        nodes[s].free_bytes = nodes[s].free_bytes.saturating_sub(self.bytes);
+        nodes[d].demand_bytes = nodes[d].demand_bytes.saturating_sub(self.bytes);
+        true
+    }
 }
 
 /// **The §15.4 cross-domain rebalancer (W13-3).** A pure policy that, given each node's
@@ -481,6 +607,81 @@ mod tests {
 
         // Zero CPUs ⇒ a valid one-CPU single domain (never empty).
         assert_eq!(TopologyBuilder::new(0).build().cpu_count(), 1);
+    }
+
+    #[test]
+    fn build_densely_renumbers_sparse_os_nodes_no_phantom() {
+        // A platform that numbers NUMA nodes sparsely — OS nodes 0 and 2 present, node 1
+        // absent — must yield exactly TWO dense nodes, not a three-node model with a
+        // phantom node 1. The OS ids are recoverable for the mbind path (§15.5).
+        let mut b = TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0) // OS node 0
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 2, 1) // OS node 2 (node 1 never appears)
+            .set_cpu(3, 2, 1);
+        // Distances are given with OS ids; the diagonal stays local after renumbering.
+        b.set_distance(0, 2, 22).set_distance(2, 0, 22);
+        let t = b.build();
+
+        assert_eq!(t.node_count(), 2, "two real nodes, no phantom node 1");
+        assert!(!t.is_single_domain());
+        // CPUs are remapped to dense ids: OS 0 ⇒ dense 0, OS 2 ⇒ dense 1.
+        assert_eq!(t.node_of_cpu(1), NodeId(0));
+        assert_eq!(t.node_of_cpu(2), NodeId(1));
+        // The OS ids round-trip for the syscall path: dense 0 ⇒ OS 0, dense 1 ⇒ OS 2.
+        assert_eq!(t.os_node_of(NodeId(0)), 0);
+        assert_eq!(t.os_node_of(NodeId(1)), 2);
+        // The distance matrix is projected onto the dense ids (OS 0↔2 distance at 0↔1).
+        assert_eq!(t.distance(NodeId(0), NodeId(1)), 22);
+        assert_eq!(t.distance(NodeId(0), NodeId(0)), DISTANCE_LOCAL);
+        // An out-of-range dense id reads as the default OS node (total).
+        assert_eq!(t.os_node_of(NodeId(9)), 0);
+    }
+
+    #[test]
+    fn build_is_identity_on_a_dense_numbered_platform() {
+        // The common case (OS nodes 0..k all present) renumbers to the identity, so
+        // os_node_of is the identity and nothing about the dense path changes behavior.
+        let mut b = TopologyBuilder::new(3);
+        b.set_cpu(0, 0, 0).set_cpu(1, 1, 1).set_cpu(2, 2, 2);
+        let t = b.build();
+        assert_eq!(t.node_count(), 3);
+        for d in 0..3 {
+            assert_eq!(
+                t.os_node_of(NodeId(d)),
+                d,
+                "identity map on a dense platform"
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_node_at_is_the_pure_form_of_preferred_node() {
+        let mut b = TopologyBuilder::new(4);
+        b.set_cpu(0, 0, 0)
+            .set_cpu(1, 0, 0)
+            .set_cpu(2, 1, 1)
+            .set_cpu(3, 1, 1);
+        let t = b.build();
+        // For every policy and counter value, the pure form agrees with what the mutating
+        // form returns for that same counter value (the router relies on this).
+        for il in 0u32..6 {
+            for (pol, cpu) in [
+                (NumaPolicy::Local, 3u32),
+                (NumaPolicy::Bind(NodeId(1)), 0),
+                (NumaPolicy::Interleave, 0),
+                (NumaPolicy::OsDefault, 0),
+            ] {
+                let mut counter = il;
+                let mutating = t.preferred_node(pol, cpu, &mut counter);
+                assert_eq!(t.preferred_node_at(pol, cpu, il), mutating);
+                // Only Interleave advances the counter.
+                assert_eq!(
+                    counter,
+                    il + u32::from(matches!(pol, NumaPolicy::Interleave))
+                );
+            }
+        }
     }
 
     #[test]
@@ -666,6 +867,38 @@ mod tests {
             // Never both positive — a node is a recipient xor a donor (or neither).
             assert!(p.unmet_need() == 0 || p.movable_surplus() == 0);
         }
+    }
+
+    #[test]
+    fn rebalance_move_apply_relieves_demand_without_stranding_the_donor() {
+        // The canonical move semantics: the donor's free drops by `bytes` and the
+        // recipient's demand drops by `bytes`, leaving the donor still self-satisfiable.
+        let t = two_node();
+        let mut nodes = [
+            NodePressure {
+                free_bytes: 4 << 20,
+                demand_bytes: 1 << 20,
+            },
+            NodePressure {
+                free_bytes: 0,
+                demand_bytes: 5 << 20,
+            },
+        ];
+        let m = Rebalancer::plan(&nodes, &t).unwrap();
+        assert!(m.apply(&mut nodes), "endpoints in range ⇒ applied");
+        assert_eq!(nodes[0].free_bytes, (4 << 20) - m.bytes);
+        assert_eq!(nodes[1].demand_bytes, (5 << 20) - m.bytes);
+        assert_eq!(nodes[0].unmet_need(), 0, "donor still satisfies itself");
+        // An out-of-range endpoint is ignored (total, never panics or underflows).
+        let bad = RebalanceMove {
+            src: NodeId(9),
+            dst: NodeId(0),
+            bytes: 1,
+            tier: RebalanceTier::RemoteReuse,
+        };
+        let before = nodes;
+        assert!(!bad.apply(&mut nodes), "out-of-range endpoint ⇒ no-op");
+        assert_eq!(nodes, before, "no mutation on an out-of-range move");
     }
 
     #[test]

@@ -1277,3 +1277,61 @@ O(1) path), the strict-teardown + reclaim tests, and the §34.8 extent-stream fu
 dedicated arena-lifecycle fuzz target is the one deferred item (the per-arena path is
 covered deterministically and concurrently; a nightly fuzz target could not be
 compiled-verified in the work environment).
+
+## W13 — topology awareness & live NUMA placement (plan 04)
+
+These decisions close the live-integration gaps of the §15 topology workstream.
+
+* **NUMA node ids are dense + internal, with a preserved OS-id map.** Discovery
+  densely renumbers the OS node ids actually in use to `0..node_count()` (as it already
+  does for LLC), so a sparsely-numbered platform (OS nodes 0 and 2 present, 1 absent)
+  yields **two** nodes, not a three-node model with a phantom node 1 — keeping
+  `node_count()`/stats exact and every dense id `< node_count()` a real node (the
+  rebalancer, interleave, and the per-node router can iterate `0..node_count()` with no
+  holes). Because `mbind`/`set_mempolicy` need the *kernel's* node number, the raw OS id
+  is kept in `node_os_id` and recovered by `Topology::os_node_of`. On a dense platform
+  the renumbering is the identity, so the common case is unchanged. The alternative
+  (raw OS ids + a "present" mask) was rejected: it pushes present-awareness into every
+  consumer, whereas dense ids give the clean invariant "all ids `< node_count()` are
+  real".
+* **The rebalancer donates only a node's *surplus*, never its raw free.** A move is
+  sized and gated by `movable_surplus = free − own demand` (not raw free), so it can
+  never strand the donor it draws from, and a round with no surplus anywhere plans
+  nothing rather than churning memory between equally-starved nodes. Proven to converge
+  in `≤ nodes` moves (the need/surplus node-potential strictly decreases each move).
+* **Live placement is a per-node-backend *router*, not a NUMA-aware filler.** The
+  formally-modeled, fuzzed `HugePageFiller` is left **untouched**; instead a `NodeRouter`
+  (`RegionCacheHook`) holds one `HugePageBackend` per node in a fixed `[…; MAX_NODES]`
+  array (no `Vec` — the core is `no_std` without `alloc`) and routes the large path to
+  the preferred node's backend. Installed via the existing
+  `new_with_huge(&dyn RegionCacheHook)` seam, so the engine change is one resolved
+  `Hints.numa` field and the **default path stays byte-for-byte unchanged**. A
+  single-node machine builds exactly one backend — identical to today — so the
+  integration degrades cleanly where there is nothing to place.
+* **The router computes the node from `Hints.numa`; the topology lives in the router.**
+  The engine resolves the arena's `NumaPolicy` into a `Hints.numa` field and the router
+  (holding the swappable `Topology`, a `CoreProvider`, and an atomic interleave counter)
+  computes `preferred_node_at` and routes. This keeps the placement state in one
+  cohesive, host-refreshable component (`refresh` swaps the snapshot under the router's
+  lock — host-driven, matching the release pump's model, no background thread) rather
+  than threading current-CPU + interleave + topology through the engine.
+* **`mbind` is best-effort; a bind failure is recorded, never fatal (§15.5).** Each
+  backend's region is bound to its node's OS id at construction via a new defaulted
+  `TopoBackingProvider::bind_node` (no-op on seLe4n / non-Linux, real `set_mempolicy`/
+  `mbind` on Linux). A failure increments `numa_bind_failures` (now a *driven*, non-vacuous
+  counter) and placement proceeds — "safety before policy": a missed bind hurts locality,
+  never correctness.
+* **Per-node demand is approximated from per-node allocation failures.** The allocator
+  has no first-class per-node *demand* signal, so the rebalancer's live driver derives it
+  from each node-backend's recent alloc-failure count (free comes from each backend's
+  empty-backed coverage). This is an explicit approximation — documented as such — that
+  is honest enough to drive the §15.4 ladder without inventing per-node demand
+  accounting (a real demand model is M5).
+
+Verified by the topology unit tests (dense renumbering, `os_node_of` round-trip,
+`preferred_node_at` equivalence, the move helper), the cross-crate integration tests
+(discovery → stats → control, the multi-node router placement + mbind-failure path, the
+host-driven refresh cycle, the live rebalancer drive-to-fixpoint), the
+`rebalancer_never_strands_a_donor_and_converges` gating proptest, and the new
+`fuzz/fuzz_targets/topology.rs` target (builder totality + rebalancer convergence over
+arbitrary inputs).

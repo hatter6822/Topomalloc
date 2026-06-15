@@ -788,9 +788,8 @@ proptest! {
                 "the move is bounded by the recipient's need"
             );
 
-            // Apply it: the donor parts with surplus, relieving the recipient's demand.
-            nodes[s].free_bytes -= m.bytes;
-            nodes[d].demand_bytes -= m.bytes;
+            // Apply it via the canonical move semantics (donor → surplus, recipient ← relief).
+            prop_assert!(m.apply(&mut nodes), "endpoints in range");
 
             prop_assert_eq!(nodes[s].unmet_need(), 0, "a move never strands the donor");
             let now_total = total_need(&nodes);
