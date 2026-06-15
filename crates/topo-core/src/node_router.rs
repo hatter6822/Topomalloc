@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::arena::NumaPolicy;
 use crate::backend::{Region, TopoBackingProvider};
 use crate::extent::{BackendLock, RegionCacheHook};
-use crate::flags::Hints;
+use crate::flags::{Hints, HugepagePolicy};
 use crate::huge::{HugePageBackend, HUGEPAGE_SIZE};
 use crate::ids::{ArenaId, NodeId};
 use crate::pinned::CoreProvider;
@@ -297,8 +297,13 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
 
 impl<P: TopoBackingProvider, C: CoreProvider> RegionCacheHook for NodeRouter<P, C> {
     fn try_alloc(&self, bytes: usize, align: usize, hints: Hints) -> Option<Region> {
-        // The per-node backends each re-check `NO_HUGEPAGE` (`HugepagePolicy::Avoid`), so a
-        // request that must avoid hugepages declines here too and falls to the extent path.
+        // Honor `NO_HUGEPAGE` (§10.4) **here**, before choosing a node or touching a
+        // backend: an avoid-decline is policy, not an allocation failure, so it must not
+        // pollute the per-node demand signal. Declining lets the large path fall through to
+        // the plain extent manager. (Each backend also re-checks this defensively.)
+        if matches!(hints.hugepage, HugepagePolicy::Avoid) {
+            return None;
+        }
         let node = self.choose_node(hints.numa);
         // Serve from the preferred node; the backend mbind keeps its faults node-local.
         if let Some(b) = self.backend(node) {
@@ -477,6 +482,42 @@ mod tests {
             numa,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn avoid_hugepage_declines_without_polluting_demand() {
+        // A NO_HUGEPAGE request must decline (so the large path uses the extent manager)
+        // WITHOUT recording a per-node demand signal — an avoid is policy, not an
+        // allocation failure. Regression: a decline used to increment alloc_failures.
+        let r = router_caps(2, 2);
+        // Give node 1 an idle empty-backed hugepage (a would-be donor).
+        let big = r
+            .try_alloc(HUGEPAGE_SIZE, PAGE_SIZE, hints(NumaPolicy::Bind(NodeId(1))))
+            .expect("hugepage on node 1");
+        assert!(r.try_cache(big), "freed ⇒ empty-backed on node 1");
+        // Several NO_HUGEPAGE requests: each declines, none spills.
+        let avoid = Hints {
+            hugepage: HugepagePolicy::Avoid,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            assert!(
+                r.try_alloc(64 * 1024, PAGE_SIZE, avoid).is_none(),
+                "NO_HUGEPAGE declines the hugepage backend"
+            );
+        }
+        assert_eq!(
+            r.stats().spillovers,
+            0,
+            "an avoid-decline is not a spillover"
+        );
+        // No demand was fabricated, so nothing is stranded ⇒ no rebalance. (With the bug
+        // the four avoids would have inflated node-0 demand and triggered a spurious move.)
+        assert!(
+            r.rebalance_tick().is_none(),
+            "an avoid never fabricates rebalancer demand"
+        );
+        assert_eq!(r.stats().rebalance_moves, 0);
     }
 
     #[test]

@@ -250,6 +250,31 @@ impl NumaPolicy {
             NumaPolicy::OsDefault => "os_default",
         }
     }
+
+    /// Encode into a `u64` for the per-arena **lock-free** atomic read on the placement
+    /// path (W13; mirrors `hook_slot`). The tag is the low 32 bits; a [`Bind`](Self::Bind)
+    /// node id is the high 32 bits. Round-trips with [`decode`](Self::decode).
+    const fn encode(self) -> u64 {
+        match self {
+            NumaPolicy::Local => 0,
+            NumaPolicy::Interleave => 1,
+            NumaPolicy::ArenaPolicy => 2,
+            NumaPolicy::OsDefault => 3,
+            NumaPolicy::Bind(n) => 4 | ((n.0 as u64) << 32),
+        }
+    }
+
+    /// Decode an [`encode`](Self::encode)d value; an unknown tag reads as the safe default
+    /// [`OsDefault`](Self::OsDefault) (no override), so a torn/garbage read never misbehaves.
+    const fn decode(v: u64) -> NumaPolicy {
+        match v & 0xFFFF_FFFF {
+            0 => NumaPolicy::Local,
+            1 => NumaPolicy::Interleave,
+            2 => NumaPolicy::ArenaPolicy,
+            4 => NumaPolicy::Bind(NodeId((v >> 32) as u32)),
+            _ => NumaPolicy::OsDefault,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +870,12 @@ struct ArenaAtomics {
     /// registry scan. Set when the backing is registered, cleared on teardown;
     /// **survives a reset** (the region is kept). A `u8` bounds `MAX_HOOK_BACKENDS`.
     hook_slot: AtomicU8,
+    /// The arena's NUMA placement policy (§15.5, W13), [`encode`](NumaPolicy::encode)d so
+    /// the placement path reads it **lock-free** (like `hook_slot`) rather than taking the
+    /// table lock — preserving the lock-free alloc path `try_charge` establishes. Set under
+    /// the table lock at create/configure; **survives a reset** (placement config is
+    /// sticky). Purely a policy value: a wrong read loses locality, never correctness.
+    numa: AtomicU64,
 }
 
 impl ArenaAtomics {
@@ -862,6 +893,7 @@ impl ArenaAtomics {
             quota_limit: AtomicU64::new(QUOTA_UNLIMITED),
             numa_bind_failures: AtomicU64::new(0),
             hook_slot: AtomicU8::new(0),
+            numa: AtomicU64::new(NumaPolicy::OsDefault.encode()),
         }
     }
 }
@@ -870,7 +902,6 @@ impl ArenaAtomics {
 #[derive(Clone, Copy)]
 struct ArenaMeta {
     label: Label,
-    numa: NumaPolicy,
     decay: DecayConfig,
     huge: HugepagePolicy,
     cache_budget_bytes: u64,
@@ -889,7 +920,6 @@ impl ArenaMeta {
     const fn empty() -> ArenaMeta {
         ArenaMeta {
             label: Label::PUBLIC,
-            numa: NumaPolicy::OsDefault,
             decay: DecayConfig::DEFAULT,
             huge: HugepagePolicy::Default,
             cache_budget_bytes: 0,
@@ -969,12 +999,12 @@ impl ArenaTable {
         a.generation
             .store(Generation::FIRST.next().0, Ordering::Relaxed);
         a.quota_limit.store(p.quota_limit, Ordering::Relaxed);
+        a.numa.store(p.numa.encode(), Ordering::Relaxed);
         // SAFETY: no other thread can observe `table` before `new` returns, so the
         // single-threaded initialization of `meta[0]` needs no lock.
         unsafe {
             (*table.meta.get())[ArenaId::DEFAULT.0 as usize] = ArenaMeta {
                 label: p.label,
-                numa: p.numa,
                 decay: p.decay,
                 huge: p.huge,
                 cache_budget_bytes: p.cache_budget_bytes,
@@ -1102,6 +1132,8 @@ impl ArenaTable {
         a.numa_bind_failures.store(0, Ordering::Relaxed);
         // A fresh incarnation has no hooked backing until one is registered (W10).
         a.hook_slot.store(0, Ordering::Relaxed);
+        // The §15.5 placement policy (read lock-free on the alloc path, W13).
+        a.numa.store(policy.numa.encode(), Ordering::Relaxed);
         // Initializing: descriptive fields written before the id is published.
         a.state
             .store(ArenaState::Initializing as u8, Ordering::Relaxed);
@@ -1110,7 +1142,6 @@ impl ArenaTable {
         unsafe {
             (*self.meta.get())[id as usize] = ArenaMeta {
                 label: policy.label,
-                numa: policy.numa,
                 decay: policy.decay,
                 huge: policy.huge,
                 cache_budget_bytes: policy.cache_budget_bytes,
@@ -1613,18 +1644,16 @@ impl ArenaTable {
         s
     }
 
-    /// `arena`'s NUMA placement policy (§15.5, W13), read under the table lock. An
-    /// out-of-range id reads as [`OsDefault`](NumaPolicy::OsDefault) (no override). The
-    /// engine calls this on the large path to steer the live router's placement.
+    /// `arena`'s NUMA placement policy (§15.5, W13), read **lock-free** from the per-arena
+    /// atomic (so the large/medium alloc path keeps the lock-free property `try_charge`
+    /// establishes — no table lock). An out-of-range id reads as
+    /// [`OsDefault`](NumaPolicy::OsDefault) (no override). The engine calls this on the
+    /// large path to steer the live router's placement.
     pub fn numa_of(&self, arena: ArenaId) -> NumaPolicy {
-        self.lock.acquire();
-        let numa = match self.slot(arena) {
-            // SAFETY: the table lock is held, so reading `meta[arena]` is race-free.
-            Some(_) => unsafe { (*self.meta.get())[arena.0 as usize].numa },
+        match self.slot(arena) {
+            Some(a) => NumaPolicy::decode(a.numa.load(Ordering::Relaxed)),
             None => NumaPolicy::OsDefault,
-        };
-        self.lock.release();
-        numa
+        }
     }
 
     fn stats_locked(&self, arena: ArenaId) -> Option<ArenaStats> {
@@ -1647,7 +1676,7 @@ impl ArenaTable {
             reserved: a.reserved.load(Ordering::Relaxed),
             generation: Generation(a.generation.load(Ordering::Relaxed)),
             reset_generation: Generation(a.reset_gen.load(Ordering::Relaxed)),
-            numa: m.numa,
+            numa: NumaPolicy::decode(a.numa.load(Ordering::Relaxed)),
             decay: m.decay,
             huge: m.huge,
             cache_budget_bytes: m.cache_budget_bytes,
@@ -1680,13 +1709,14 @@ impl ArenaTable {
             if ArenaState::from_u8(a.state.load(Ordering::Acquire)) == ArenaState::Destroyed {
                 return Err(ArenaError::NotFound);
             }
+            // The §15.5 placement policy lives in the lock-free atomic (W13), not `meta`.
+            a.numa.store(cfg.numa.encode(), Ordering::Relaxed);
             // SAFETY: the table lock is held, so this is the exclusive writer of
             // `meta[arena]` (the authority atomics are untouched).
             unsafe {
                 let m = &mut (*self.meta.get())[arena.0 as usize];
                 m.decay = cfg.decay;
                 m.huge = cfg.huge;
-                m.numa = cfg.numa;
                 m.cache_budget_bytes = cfg.cache_budget_bytes;
                 m.name = cfg.name;
             }
@@ -2234,6 +2264,56 @@ mod tests {
         t.record_numa_bind_failure(id);
         t.record_numa_bind_failure(id);
         assert_eq!(t.stats(id).unwrap().numa_bind_failures, 2);
+    }
+
+    #[test]
+    fn numa_policy_encode_decode_round_trips_every_variant() {
+        // The lock-free atomic encoding (W13) must round-trip every variant, including a
+        // Bind with a large node id (node in the high 32 bits, tag in the low). An unknown
+        // tag decodes to the safe default OsDefault (no override).
+        for p in [
+            NumaPolicy::Local,
+            NumaPolicy::Interleave,
+            NumaPolicy::ArenaPolicy,
+            NumaPolicy::OsDefault,
+            NumaPolicy::Bind(NodeId(0)),
+            NumaPolicy::Bind(NodeId(1)),
+            NumaPolicy::Bind(NodeId(u32::MAX)),
+        ] {
+            assert_eq!(NumaPolicy::decode(p.encode()), p, "round-trip {p:?}");
+        }
+        assert_eq!(
+            NumaPolicy::decode(0xDEAD),
+            NumaPolicy::OsDefault,
+            "unknown tag ⇒ default"
+        );
+    }
+
+    #[test]
+    fn numa_policy_is_lock_free_and_survives_reset() {
+        // numa_of reads the lock-free atomic and agrees with stats(); a reset keeps the
+        // placement policy (it is sticky config), and configure updates it.
+        let t = ArenaTable::new();
+        assert_eq!(t.numa_of(ArenaId::DEFAULT), NumaPolicy::OsDefault);
+        let id = t
+            .create(&ArenaPolicy::explicit().with_numa(NumaPolicy::Interleave))
+            .unwrap();
+        assert_eq!(t.numa_of(id), NumaPolicy::Interleave);
+        assert_eq!(
+            t.numa_of(id),
+            t.stats(id).unwrap().numa,
+            "lock-free agrees with stats"
+        );
+        // A reset keeps the policy.
+        t.begin_reset(id).unwrap();
+        t.finish_reset(id).unwrap();
+        assert_eq!(
+            t.numa_of(id),
+            NumaPolicy::Interleave,
+            "reset keeps placement policy"
+        );
+        // An out-of-range id reads as the no-override default.
+        assert_eq!(t.numa_of(ArenaId(9999)), NumaPolicy::OsDefault);
     }
 
     #[test]

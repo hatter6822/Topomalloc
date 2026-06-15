@@ -344,8 +344,16 @@ impl TopologyBuilder {
             k += 1;
         }
         // Project the OS-indexed distance matrix onto the dense ids (dropping absent
-        // rows/cols, so `distance(a, b)` indexes by dense id like every other query).
+        // rows/cols, so `distance(a, b)` indexes by dense id like every other query). The
+        // full diagonal is local (as `single_domain`/`new` establish), so `distance(d, d)`
+        // is `DISTANCE_LOCAL` even for the unused dense slots; the projection below
+        // overwrites the in-range submatrix (whose diagonal is also local in `self`).
         let mut node_dist = [[DISTANCE_REMOTE; MAX_NODES]; MAX_NODES];
+        let mut i = 0;
+        while i < MAX_NODES {
+            node_dist[i][i] = DISTANCE_LOCAL;
+            i += 1;
+        }
         let mut da = 0usize;
         while da < n_nodes as usize {
             let mut db = 0usize;
@@ -682,6 +690,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn build_distance_diagonal_is_local_for_every_slot() {
+        // `distance(d, d)` must be local for every dense slot — including the unused ones
+        // past node_count() — as single_domain/new establish. Regression: build left the
+        // unused-slot diagonal at REMOTE.
+        let mut b = TopologyBuilder::new(2);
+        b.set_cpu(0, 0, 0).set_cpu(1, 1, 1);
+        let t = b.build();
+        assert_eq!(t.node_count(), 2);
+        for d in 0..MAX_NODES as u32 {
+            assert_eq!(
+                t.distance(NodeId(d), NodeId(d)),
+                DISTANCE_LOCAL,
+                "self-distance is local for slot {d}"
+            );
+        }
+        // A real off-diagonal in-range distance still projects correctly (default remote).
+        assert_eq!(t.distance(NodeId(0), NodeId(1)), DISTANCE_REMOTE);
     }
 
     #[test]

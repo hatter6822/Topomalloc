@@ -1326,12 +1326,26 @@ These decisions close the live-integration gaps of the §15 topology workstream.
   from each node-backend's recent alloc-failure count (free comes from each backend's
   empty-backed coverage). This is an explicit approximation — documented as such — that
   is honest enough to drive the §15.4 ladder without inventing per-node demand
-  accounting (a real demand model is M5).
+  accounting (a real demand model is M5). An `Avoid` (`NO_HUGEPAGE`) decline is **not**
+  counted as demand — it is short-circuited at the router before any node is chosen, so a
+  policy decline never fabricates a rebalancer signal.
+* **The arena's NUMA policy is read lock-free on the alloc path.** Resolving the arena's
+  policy into the request's hints sits on the large/medium allocation path, and
+  `try_charge` is deliberately lock-free (an atomic CAS, no table lock). So the policy
+  lives in a per-arena `AtomicU64` (encoded, like `hook_slot`), read with a single
+  `Relaxed` load — *not* under the table lock — keeping the alloc path lock-free. It is
+  purely a policy value (a torn/garbage read decodes to the safe `OsDefault`, never a
+  capability or quota), so a relaxed atomic with no lock is sound; it survives a reset
+  (placement config is sticky) and is the single source of truth (`stats` decodes the same
+  atomic, so the two can never disagree).
 
-Verified by the topology unit tests (dense renumbering, `os_node_of` round-trip,
-`preferred_node_at` equivalence, the move helper), the cross-crate integration tests
-(discovery → stats → control, the multi-node router placement + mbind-failure path, the
-host-driven refresh cycle, the live rebalancer drive-to-fixpoint), the
-`rebalancer_never_strands_a_donor_and_converges` gating proptest, and the new
+Verified by the topology unit tests (dense renumbering, the local-for-every-slot distance
+diagonal, `os_node_of` round-trip, `preferred_node_at` equivalence, the move helper), the
+router unit tests (routing-by-policy, the avoid-decline-does-not-fabricate-demand
+regression, deterministic bind-failure counting, refresh, interleave, live rebalance), the
+arena unit tests (the lock-free `numa` encode/decode round-trip + survives-reset), the
+cross-crate integration tests (discovery → stats → control, the multi-node router placement
++ mbind-failure path, the host-driven refresh cycle, the live rebalancer drive-to-fixpoint),
+the `rebalancer_never_strands_a_donor_and_converges` gating proptest, and the new
 `fuzz/fuzz_targets/topology.rs` target (builder totality + rebalancer convergence over
 arbitrary inputs).

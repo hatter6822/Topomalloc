@@ -284,7 +284,10 @@ fn build_posix_allocator(
         // per-CPU identity lands (plan 05 W7), so `Local`/`Interleave` use core 0 today.
         let topo = discover_topology();
         let n = (topo.node_count() as usize).max(1);
-        let per_node = (capacity / n).max(1);
+        // Round up so the per-node backends total *at least* the single-backend capacity
+        // (no capacity regression from the split); on a single node this is exactly
+        // `capacity`. The extra is virtual address space (lazily faulted), so it is free.
+        let per_node = capacity.div_ceil(n).max(1);
         let router = NodeRouter::build(topo, FixedCore(CoreId::DEFAULT), |node, _os| {
             HugePageBackend::new(
                 PosixBackingProvider::new(),
@@ -669,12 +672,29 @@ mod tests {
             ptr::write_bytes(p, 1, 128);
             g.dealloc(p, layout);
         }
-        // The engine genuinely freed it: the same class slot comes back.
-        // SAFETY: valid layout; q freed below.
-        let q = unsafe { g.alloc(layout) };
-        assert_eq!(q, p, "freed object must be recycled by the engine");
-        // SAFETY: q is live.
-        unsafe { g.dealloc(q, layout) };
+        // The engine genuinely freed it (not leaked): the slot is vended again. No
+        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
+        // central free list, which a parallel test thread can transiently touch — confirm
+        // recycling by membership in a bounded batch (held to drain toward the freed slot,
+        // then freed), not by asserting the exact next call.
+        let mut batch = Vec::with_capacity(64);
+        let mut recycled = false;
+        for _ in 0..64 {
+            // SAFETY: valid layout; every allocation is freed in the loop below.
+            let x = unsafe { g.alloc(layout) };
+            recycled |= x == p;
+            batch.push(x);
+        }
+        for x in batch {
+            if !x.is_null() {
+                // SAFETY: a non-null `x` came from `g.alloc(layout)` above and is freed once.
+                unsafe { g.dealloc(x, layout) };
+            }
+        }
+        assert!(
+            recycled,
+            "freed object must be recycled by the engine (within a batch)"
+        );
     }
 
     #[test]

@@ -39,10 +39,13 @@ exclude = ["fuzz", "vendor/sele4n"]
 # it) + `NodePressure::unmet_need`/`movable_surplus` accessors. 0.1.9: W13 live
 # integration — the `NodeRouter` (per-node hugepage backends + best-effort `mbind`)
 # makes placement/rebalancing affect real allocations, wired into the
-# `hugepage-optimized` ABI. In a 0.x series new backwards-compatible functionality
-# is a patch bump (the 0.x minor is the breaking axis), which also keeps the
-# `^0.1.0` inter-crate requirements satisfied.
-version = "0.1.9"
+# `hugepage-optimized` ABI. 0.1.10: W13 audit — read the arena NUMA policy lock-free
+# on the alloc path (an `AtomicU64`, like `hook_slot`), don't count a NO_HUGEPAGE
+# decline as rebalancer demand, and make the built distance diagonal local for every
+# slot. In a 0.x series new backwards-compatible functionality is a patch bump (the
+# 0.x minor is the breaking axis), which also keeps the `^0.1.0` inter-crate
+# requirements satisfied.
+version = "0.1.10"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
