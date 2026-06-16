@@ -28,7 +28,10 @@
 //! [`ReleaseController`]: crate::ReleaseController
 //! [`PlaceHints`]: crate::huge::PlaceHints
 
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
 use crate::flags::Lifetime;
+use crate::generated::tables::SIZE_CLASSES;
 use crate::huge::{Hotness, PlaceHints};
 
 /// An opaque **allocation-site identity** (§24.4 `stack_id`): a hash of the captured
@@ -318,6 +321,102 @@ impl SizeClassDist {
     }
 }
 
+/// The number of placement **buckets** the learned-hint table is keyed by: one per small
+/// size class plus the two non-small kinds ([`BUCKET_MEDIUM`](SizeClassDist::BUCKET_MEDIUM)
+/// / [`BUCKET_LARGE`](SizeClassDist::BUCKET_LARGE)). A request's bucket is the coarse,
+/// hot-path-cheap key the engine has for free (size class), the §24.1-sanctioned
+/// "size class" placement input.
+pub const NUM_BUCKETS: usize = SIZE_CLASSES.len() + 2;
+
+/// Map a [`SizeClassDist`] bucket id to its dense `0..NUM_BUCKETS` index: a small size
+/// class maps to itself; the medium / large sentinels map to the two trailing slots. Total
+/// (an out-of-range small index clamps to the large slot, never panics).
+#[inline]
+pub fn bucket_index(bucket: u16) -> usize {
+    match bucket {
+        SizeClassDist::BUCKET_LARGE => SIZE_CLASSES.len() + 1,
+        SizeClassDist::BUCKET_MEDIUM => SIZE_CLASSES.len(),
+        sc if (sc as usize) < SIZE_CLASSES.len() => sc as usize,
+        _ => SIZE_CLASSES.len() + 1,
+    }
+}
+
+/// A coarse, bounded **placement class** (§24.6–§24.8) derived from a [`PlaceHints`], used
+/// to *group* objects — it tags the hugepage/span pool an object joins so like-placed
+/// objects cluster. Kept to four values so grouping never multiplies pools unboundedly:
+///
+/// * [`Hot`](PlaceClass::Hot) — hot **or** long-lived ⇒ pack densely, keep stable (§24.8);
+/// * [`Cold`](PlaceClass::Cold) — cold (rarely accessed) ⇒ segregate from hot (§24.6);
+/// * [`Short`](PlaceClass::Short) — neutral-hotness, short-lived ⇒ group so a whole
+///   span/hugepage empties together (§24.7);
+/// * [`Default`](PlaceClass::Default) — no actionable signal.
+///
+/// Hotness dominates the choice (it is the §24.6/§24.8 separation axis); lifetime breaks
+/// the neutral-hotness tie (§24.7). Like every W14 output it is **advisory** — a wrong
+/// class changes only *where* an object lands, never its size/alignment/validity (§24.5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum PlaceClass {
+    /// No actionable placement signal.
+    #[default]
+    Default = 0,
+    /// Cold / rarely accessed — segregate from hot (§24.6).
+    Cold = 1,
+    /// Hot or long-lived — dense, stable (§24.8).
+    Hot = 2,
+    /// Neutral-hotness, short-lived — group to empty together (§24.7).
+    Short = 3,
+}
+
+impl PlaceClass {
+    /// The number of distinct classes (for bounding pool fan-out).
+    pub const COUNT: usize = 4;
+
+    /// Derive the class from advisory [`PlaceHints`] (§24.6–§24.8).
+    #[inline]
+    pub fn from_hints(h: PlaceHints) -> PlaceClass {
+        match h.hotness {
+            Hotness::Hot => PlaceClass::Hot,
+            Hotness::Cold => PlaceClass::Cold,
+            Hotness::Neutral => match h.lifetime {
+                // Long-lived neutral objects are stable ⇒ pack with the dense set (§24.8).
+                Lifetime::Long => PlaceClass::Hot,
+                // Short-lived neutral objects churn ⇒ group to empty together (§24.7).
+                Lifetime::Short => PlaceClass::Short,
+                _ => PlaceClass::Default,
+            },
+        }
+    }
+
+    /// The `u8` tag stored on a span / in stats.
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a class from its tag (total: an unknown tag reads as
+    /// [`Default`](PlaceClass::Default)).
+    #[inline]
+    pub const fn from_u8(v: u8) -> PlaceClass {
+        match v {
+            1 => PlaceClass::Cold,
+            2 => PlaceClass::Hot,
+            3 => PlaceClass::Short,
+            _ => PlaceClass::Default,
+        }
+    }
+
+    /// The stable string used in stats/diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PlaceClass::Default => "default",
+            PlaceClass::Cold => "cold",
+            PlaceClass::Hot => "hot",
+            PlaceClass::Short => "short",
+        }
+    }
+}
+
 /// The §24.4 **sample count** at which a single learned dimension (hotness from allocs,
 /// lifetime from frees) reaches full per-dimension maturity. Below it confidence scales
 /// linearly with evidence; at/above it the dimension is "well-sampled". Policy, tunable.
@@ -347,9 +446,15 @@ pub struct AllocationSiteProfile {
     /// Lifetime histogram, incl. right-censored still-live objects (§24.4
     /// `lifetime_histogram`).
     lifetimes: LifetimeHistogram,
-    /// Running sum of the `0..=255` hotness hints seen, for the mean estimate
+    /// Recency-weighted (event-driven EWMA) hotness estimate, in Q8 fixed point
+    /// (`value × 256`), so a hotness *phase change* is tracked rather than averaged away
     /// (§24.4 `hotness_estimate`).
-    hotness_sum: u64,
+    hotness_q8: u16,
+    /// EWMA of the absolute deviation of the hotness samples from
+    /// [`hotness_q8`](Self::hotness_q8) (Q8) — a cheap mean-absolute-deviation *stability*
+    /// signal: a noisy/bimodal site has high MAD and is treated as unconfident (so it never
+    /// drives a confident hot/cold grouping), while a steady site has ~0 MAD.
+    hotness_mad_q8: u16,
     /// Sampled allocations observed (the hotness/size evidence count).
     alloc_count: u32,
     /// Sampled completed frees observed (the lifetime evidence count).
@@ -357,12 +462,32 @@ pub struct AllocationSiteProfile {
     /// Sampled live bytes currently attributed to this site (§24.4 `sampled_live_bytes`):
     /// allocated minus freed sampled bytes, saturating at 0.
     sampled_live_bytes: u64,
-    /// First observation time (ms), for the §24.4 rate windows.
-    first_ms: u64,
-    /// Last allocation time (ms).
+    /// EWMA of the inter-allocation interval (ms, Q8), for a recency-weighted
+    /// §24.4 `allocation_rate` that reflects recent behaviour rather than a lifetime
+    /// average (`0` until a second allocation gives a first interval).
+    alloc_interval_q8: u32,
+    /// EWMA of the inter-free interval (ms, Q8), for `free_rate`.
+    free_interval_q8: u32,
+    /// Last allocation time (ms), for the inter-allocation interval.
     last_alloc_ms: u64,
-    /// Last free time (ms).
+    /// Last free time (ms), for the inter-free interval.
     last_free_ms: u64,
+}
+
+/// Event-driven EWMA shift (smoothing `α = 1/8`): `ewma += (sample − ewma) / 8`. A fixed
+/// fraction per *event* (not per unit time), so it is recency-weighted without needing a
+/// floating-point time-decay (§6 keeps the core FP-free).
+const EWMA_SHIFT: u32 = 3;
+
+/// Mean-absolute-deviation (hotness units, `0..=255`) at/above which the hotness signal is
+/// considered too noisy to act on (stability `0`). Tunable policy.
+const HOTNESS_MAD_MAX: u32 = 48;
+
+/// One step of the event-driven EWMA over `u32` Q-values (signed delta, clamped ≥ 0).
+#[inline]
+fn ewma_step(cur: u32, sample: u32) -> u32 {
+    let delta = sample as i64 - cur as i64;
+    (cur as i64 + (delta >> EWMA_SHIFT)).max(0) as u32
 }
 
 impl AllocationSiteProfile {
@@ -373,11 +498,13 @@ impl AllocationSiteProfile {
             stack_id,
             size_dist: SizeClassDist::default(),
             lifetimes: LifetimeHistogram::default(),
-            hotness_sum: 0,
+            hotness_q8: 0,
+            hotness_mad_q8: 0,
             alloc_count: 0,
             free_count: 0,
             sampled_live_bytes: 0,
-            first_ms: now_ms,
+            alloc_interval_q8: 0,
+            free_interval_q8: 0,
             last_alloc_ms: now_ms,
             last_free_ms: now_ms,
         }
@@ -393,20 +520,40 @@ impl AllocationSiteProfile {
     /// usable, and the `0..=255` hotness hint, at `now_ms`.
     pub fn record_alloc(&mut self, bucket: u16, bytes: u64, hotness_hint: u8, now_ms: u64) {
         self.size_dist.observe(bucket);
-        self.hotness_sum = self.hotness_sum.saturating_add(hotness_hint as u64);
+        let sample_q8 = (hotness_hint as u32) << 8;
+        if self.alloc_count == 0 {
+            // Seed the EWMA on the first sample (no deviation yet).
+            self.hotness_q8 = sample_q8 as u16;
+            self.hotness_mad_q8 = 0;
+        } else {
+            // Deviation against the *current* estimate, then update both EWMAs.
+            let dev = (sample_q8 as i64 - self.hotness_q8 as i64).unsigned_abs() as u32;
+            self.hotness_q8 = ewma_step(self.hotness_q8 as u32, sample_q8) as u16;
+            self.hotness_mad_q8 = ewma_step(self.hotness_mad_q8 as u32, dev) as u16;
+            // Inter-allocation interval EWMA (recency-weighted rate).
+            let dt = (now_ms.saturating_sub(self.last_alloc_ms) << 8).min(u32::MAX as u64) as u32;
+            self.alloc_interval_q8 = if self.alloc_interval_q8 == 0 {
+                dt
+            } else {
+                ewma_step(self.alloc_interval_q8, dt)
+            };
+        }
         self.alloc_count = self.alloc_count.saturating_add(1);
         self.sampled_live_bytes = self.sampled_live_bytes.saturating_add(bytes);
         self.last_alloc_ms = now_ms;
-        // A profile reused after eviction could see `now_ms < first_ms`; keep `first_ms`
-        // the earliest so the rate window never goes negative.
-        if now_ms < self.first_ms {
-            self.first_ms = now_ms;
-        }
     }
 
     /// Record a sampled **completed free**: the object lived `age_ms`, returning `bytes`.
     pub fn record_free(&mut self, age_ms: u64, bytes: u64, now_ms: u64) {
         self.lifetimes.record(LifetimeClass::from_age_ms(age_ms));
+        if self.free_count > 0 {
+            let dt = (now_ms.saturating_sub(self.last_free_ms) << 8).min(u32::MAX as u64) as u32;
+            self.free_interval_q8 = if self.free_interval_q8 == 0 {
+                dt
+            } else {
+                ewma_step(self.free_interval_q8, dt)
+            };
+        }
         self.free_count = self.free_count.saturating_add(1);
         self.sampled_live_bytes = self.sampled_live_bytes.saturating_sub(bytes);
         self.last_free_ms = now_ms;
@@ -421,14 +568,21 @@ impl AllocationSiteProfile {
             .record_censored(LifetimeClass::from_age_ms(age_ms));
     }
 
-    /// The mean hotness hint (`0..=255`), or `0` (cold/neutral) if nothing seen yet.
+    /// The recency-weighted hotness estimate (`0..=255`), or `0` (cold/neutral) if nothing
+    /// has been seen yet.
     #[inline]
     pub fn hotness_estimate(&self) -> u8 {
-        if self.alloc_count == 0 {
-            0
-        } else {
-            (self.hotness_sum / self.alloc_count as u64) as u8
-        }
+        (self.hotness_q8 >> 8) as u8
+    }
+
+    /// The dominant size-class **bucket** (§24.4), or [`BUCKET_LARGE`](SizeClassDist::BUCKET_LARGE)
+    /// when nothing has been observed (the conservative catch-all).
+    #[inline]
+    pub fn dominant_bucket(&self) -> u16 {
+        self.size_dist
+            .dominant()
+            .map(|(b, _)| b)
+            .unwrap_or(SizeClassDist::BUCKET_LARGE)
     }
 
     /// The lifetime histogram (§24.4).
@@ -455,39 +609,52 @@ impl AllocationSiteProfile {
         (self.alloc_count, self.free_count)
     }
 
-    /// The §24.4 sampled **allocation rate** in events per second over the observed
-    /// window (sampled events — scale by the sampling ratio for an absolute rate).
-    /// `0` until at least one full millisecond of window has elapsed.
+    /// The §24.4 sampled **allocation rate** in *sampled* events per second, recency-weighted
+    /// (the EWMA of the recent inter-allocation interval — scale by the sampling ratio for an
+    /// absolute rate). `0` until a second allocation establishes a first interval.
     #[inline]
     pub fn allocation_rate(&self) -> u64 {
-        Self::rate(self.alloc_count, self.first_ms, self.last_alloc_ms)
+        Self::rate_from_interval(self.alloc_interval_q8)
     }
 
-    /// The §24.4 sampled **free rate** in events per second over the observed window.
+    /// The §24.4 sampled **free rate** in sampled events per second, recency-weighted.
     #[inline]
     pub fn free_rate(&self) -> u64 {
-        Self::rate(self.free_count, self.first_ms, self.last_free_ms)
+        Self::rate_from_interval(self.free_interval_q8)
     }
 
-    /// `count` events spread over `[first, last]` ms, as whole events per second. Integer
-    /// throughout (§6); a sub-millisecond or empty window yields `0` rather than dividing
-    /// by zero or reporting a spike off a single sample.
+    /// Convert an inter-event interval EWMA (ms, Q8) to whole events per second. Integer
+    /// throughout (§6); a zero interval (fewer than two events) yields `0`.
     #[inline]
-    fn rate(count: u32, first_ms: u64, last_ms: u64) -> u64 {
-        let window = last_ms.saturating_sub(first_ms);
-        if window == 0 {
+    fn rate_from_interval(interval_q8: u32) -> u64 {
+        if interval_q8 == 0 {
             return 0;
         }
-        (count as u64).saturating_mul(1_000) / window
+        // events/sec = 1000 ms/sec ÷ interval_ms = (1000 << 8) ÷ interval_q8.
+        (1_000u64 << 8) / interval_q8 as u64
     }
 
-    /// The **hotness** confidence (bp): how well-sampled the hotness signal is, scaling
-    /// linearly with allocation samples up to [`CONFIDENT_SAMPLES`]. A mixed-hotness site
-    /// is self-correcting — its mean drifts to the neutral middle, so high confidence in
-    /// a *neutral* estimate yields no grouping pressure anyway.
+    /// The hotness signal's **stability** (bp): full when the mean-absolute-deviation of the
+    /// hotness samples is ~0, falling linearly to `0` at `HOTNESS_MAD_MAX`. A bimodal /
+    /// noisy site is unstable, so it never drives a confident hot/cold grouping (the
+    /// recency-weighted estimate alone could otherwise flip-flop).
+    #[inline]
+    pub fn hotness_stability_bp(&self) -> u32 {
+        let mad = (self.hotness_mad_q8 >> 8) as u32; // hotness units 0..=255
+        if mad >= HOTNESS_MAD_MAX {
+            0
+        } else {
+            ((HOTNESS_MAD_MAX - mad) as u64 * BP_ONE / HOTNESS_MAD_MAX as u64) as u32
+        }
+    }
+
+    /// The **hotness** confidence (bp): sample maturity × signal stability. High only when
+    /// the site is both well-sampled *and* steady in its hotness — a noisy/bimodal site
+    /// stays low (treated as neutral) even after many samples.
     #[inline]
     pub fn hotness_confidence_bp(&self) -> u32 {
-        maturity_bp(self.alloc_count)
+        ((maturity_bp(self.alloc_count) as u64) * self.hotness_stability_bp() as u64 / BP_ONE)
+            as u32
     }
 
     /// The **lifetime** confidence (bp): lifetime-observation maturity × histogram
@@ -609,11 +776,13 @@ impl Slot {
                 counts: [0; LifetimeClass::COUNT],
                 censored: 0,
             },
-            hotness_sum: 0,
+            hotness_q8: 0,
+            hotness_mad_q8: 0,
             alloc_count: 0,
             free_count: 0,
             sampled_live_bytes: 0,
-            first_ms: 0,
+            alloc_interval_q8: 0,
+            free_interval_q8: 0,
             last_alloc_ms: 0,
             last_free_ms: 0,
         },
@@ -622,10 +791,11 @@ impl Slot {
 
 /// The **learning-policy table** (§24.4) and the W17-3d profile aggregator: a
 /// fixed-capacity, allocation-free, host-driven map from [`StackId`] to
-/// [`AllocationSiteProfile`]. Open addressing with bounded linear probing keeps every
-/// operation `O(PROBE)` and `no_std`; when a site's probe window is full the
-/// **least-useful** (lowest-confidence, oldest-tie) slot in the window is evicted, so the
-/// table converges on the sites that matter without ever allocating or growing.
+/// [`AllocationSiteProfile`]. It is a **16-way set-associative cache** (the textbook
+/// fixed-capacity design): a site hashes to one set of `WAYS` slots and lives in exactly
+/// one of them, so every operation is `O(WAYS)` and `no_std`. A full set evicts its
+/// **least-useful** (lowest-confidence, stalest-tie) slot — every slot is used (no
+/// overlapping probe windows to waste capacity), and replacement is clean and local.
 ///
 /// `CAP` must be a power of two (asserted) so the hash maps with a mask. The table is
 /// large (profiles stored inline); construct it behind a `Box`/`static` rather than on
@@ -648,19 +818,26 @@ pub struct SiteProfileTable<const CAP: usize> {
     min_confidence_bp: u32,
 }
 
-/// How far linear probing walks before it evicts within the window. Small (the table is
-/// sparsely loaded in practice) so every operation is tightly bounded.
-const PROBE_LEN: usize = 8;
+/// Set associativity: a site lives in one of this many slots of its set. 16-way keeps the
+/// forced-eviction rate low while the table has room, and bounds every operation to 16
+/// steps. `CAP` must be a multiple (a power-of-two ≥ this).
+const WAYS: usize = 16;
 
 impl<const CAP: usize> SiteProfileTable<CAP> {
-    /// `CAP` must be a non-zero power of two (the hash masks with `CAP - 1`).
-    const _CAP_POW2: () = assert!(CAP.is_power_of_two(), "SiteProfileTable CAP must be 2^k");
+    /// `CAP` must be a power of two and at least [`WAYS`] (so it splits into whole sets).
+    const _CAP_OK: () = assert!(
+        CAP.is_power_of_two() && CAP >= WAYS,
+        "SiteProfileTable CAP must be a power of two >= WAYS"
+    );
+
+    /// The number of associativity sets (`CAP / WAYS`, a power of two).
+    const NUM_SETS: usize = CAP / WAYS;
 
     /// An empty table with the default §24.6 confidence gate.
     #[allow(clippy::new_without_default)] // `CAP` makes a blanket `Default` awkward; `new` is clearer.
     pub const fn new() -> Self {
-        // Touch the const assertion so a non-power-of-two `CAP` is a compile error.
-        let () = Self::_CAP_POW2;
+        // Touch the const assertion so a bad `CAP` is a compile error.
+        let () = Self::_CAP_OK;
         SiteProfileTable {
             slots: [Slot::EMPTY; CAP],
             occupied: 0,
@@ -691,17 +868,18 @@ impl<const CAP: usize> SiteProfileTable<CAP> {
         CAP
     }
 
-    /// The first probe index for `key` (multiplicative hash, masked to `CAP`).
+    /// The base slot index of `key`'s associativity set (its `WAYS` slots are
+    /// `[base, base + WAYS)`).
     #[inline]
-    fn home(key: StackId) -> usize {
-        (splitmix64(key.0) as usize) & (CAP - 1)
+    fn set_base(key: StackId) -> usize {
+        let set = (splitmix64(key.0) as usize) & (Self::NUM_SETS - 1);
+        set * WAYS
     }
 
-    /// Find the occupied slot holding `key`, if present (bounded probe).
+    /// Find the slot holding `key` within its set, if present (`O(WAYS)`).
     fn find(&self, key: StackId) -> Option<usize> {
-        let home = Self::home(key);
-        for step in 0..PROBE_LEN {
-            let i = (home + step) & (CAP - 1);
+        let base = Self::set_base(key);
+        for i in base..base + WAYS {
             let s = &self.slots[i];
             if s.occupied && s.profile.stack_id == key {
                 return Some(i);
@@ -710,19 +888,29 @@ impl<const CAP: usize> SiteProfileTable<CAP> {
         None
     }
 
-    /// Find `key`'s slot or choose a slot to (re)use for it within the probe window.
-    /// Returns `(index, evicted)`: a free slot if any, else the least-useful occupied slot
-    /// (evicting its profile). Never fails — the window always has a victim.
+    /// Find `key`'s slot in its set, or choose one to (re)use for it: an exact hit, else a
+    /// free slot in the set, else the **least-useful** occupied slot (lowest confidence,
+    /// stalest tie — evicted). Never fails: a full set always yields a victim. The evicted
+    /// profile's evidence is dropped, a bounded, intended loss that keeps the table on the
+    /// sites that matter.
     fn find_or_make(&mut self, key: StackId, now_ms: u64) -> usize {
-        let home = Self::home(key);
-        // First pass: an exact hit or a free slot in the window.
+        let base = Self::set_base(key);
         let mut free: Option<usize> = None;
-        for step in 0..PROBE_LEN {
-            let i = (home + step) & (CAP - 1);
+        let mut victim = base;
+        let mut victim_conf = u32::MAX;
+        let mut victim_age = u64::MAX;
+        for i in base..base + WAYS {
             let s = &self.slots[i];
             if s.occupied {
                 if s.profile.stack_id == key {
                     return i;
+                }
+                let c = s.profile.confidence_bp();
+                let age = s.profile.last_alloc_ms;
+                if c < victim_conf || (c == victim_conf && age < victim_age) {
+                    victim = i;
+                    victim_conf = c;
+                    victim_age = age;
                 }
             } else if free.is_none() {
                 free = Some(i);
@@ -734,25 +922,10 @@ impl<const CAP: usize> SiteProfileTable<CAP> {
             self.occupied += 1;
             return i;
         }
-        // Window full of *other* sites: evict the least-useful (lowest confidence; ties to
-        // the older `last_alloc_ms`, i.e. the stalest). The victim's evidence is dropped —
-        // a bounded, intended loss that keeps the table converging on live sites.
-        let mut victim = home & (CAP - 1);
-        let mut victim_conf = self.slots[victim].profile.confidence_bp();
-        let mut victim_age = self.slots[victim].profile.last_alloc_ms;
-        for step in 1..PROBE_LEN {
-            let i = (home + step) & (CAP - 1);
-            let c = self.slots[i].profile.confidence_bp();
-            let age = self.slots[i].profile.last_alloc_ms;
-            if c < victim_conf || (c == victim_conf && age < victim_age) {
-                victim = i;
-                victim_conf = c;
-                victim_age = age;
-            }
-        }
+        // Full set: replace the least-useful slot in place (no slot freed, so no other
+        // site's lookup is disturbed — clean set-associative replacement).
         self.slots[victim].profile = AllocationSiteProfile::new(key, now_ms);
         self.evictions += 1;
-        // `occupied` is unchanged (one out, one in).
         victim
     }
 
@@ -849,6 +1022,168 @@ impl<const CAP: usize> SiteProfileTable<CAP> {
             sampled_live_bytes: live_bytes,
         }
     }
+
+    /// Publish the learned, confident per-bucket placement hints into `out` for the
+    /// allocator's hot path to apply (closing the learn → place loop). For each placement
+    /// **bucket** (size class / medium / large) it computes the *consensus* hint across the
+    /// confident profiles whose dominant bucket is that one: if they agree, that hint is
+    /// published; if they disagree, or none is confident, the bucket is left neutral — so a
+    /// learned hint steers placement only when the evidence is both confident **and**
+    /// consistent. Cheap (`O(tracked sites)`); the host calls it from the rare sampled path.
+    ///
+    /// Keyed by bucket (not by arena): the bucket is the hot-path-cheap key the engine has
+    /// for free (§24.1 "size class"); arena-scoped learning is a future refinement (per-arena
+    /// *NUMA* placement is already explicit via [`NumaPolicy`](crate::NumaPolicy), and the
+    /// span path additionally carries its arena tag).
+    pub fn write_learned_hints(&self, out: &LearnedHints) {
+        out.reset();
+        for s in self.slots.iter() {
+            if !s.occupied {
+                continue;
+            }
+            let p = &s.profile;
+            // Only confident profiles steer placement (§24.6 "when … confidence").
+            let h = p.place_hints(self.min_confidence_bp);
+            if h == PlaceHints::default() {
+                continue; // nothing actionable learned for this site
+            }
+            out.merge(bucket_index(p.dominant_bucket()), h);
+        }
+        out.publish();
+    }
+}
+
+/// The lock-free **applied-hints table** the allocator's hot path reads to place an
+/// allocation by its learned profile (the live end of the learn → place loop). One packed
+/// [`PlaceHints`] per placement bucket; the sampler republishes it from
+/// [`SiteProfileTable::write_learned_hints`] on the rare sampled path, and the engine reads
+/// it with a single relaxed atomic load per allocation (no lock — §31.4). When nothing has
+/// been published it short-circuits to the neutral default, so it is free when profiling is
+/// off. Like every W14 output the value is **advisory** (§24.5): it can only change *where*
+/// an object lands, never its size/alignment/validity.
+pub struct LearnedHints {
+    /// One packed-hint byte per bucket (see [`pack_hint`] / [`unpack_hint`]).
+    slots: [AtomicU8; NUM_BUCKETS],
+    /// `true` once any non-neutral hint has been published — lets the reader skip the per-
+    /// bucket load entirely in the common (nothing-learned / profiling-off) case.
+    any: AtomicBool,
+}
+
+impl Default for LearnedHints {
+    fn default() -> Self {
+        LearnedHints::new()
+    }
+}
+
+impl LearnedHints {
+    /// An empty table (no hints published).
+    pub const fn new() -> LearnedHints {
+        LearnedHints {
+            slots: [const { AtomicU8::new(0) }; NUM_BUCKETS],
+            any: AtomicBool::new(false),
+        }
+    }
+
+    /// The learned hint for `bucket`, or the neutral default if nothing is published for it
+    /// (or nothing at all). One relaxed load in the common case. Total for any `bucket`.
+    #[inline]
+    pub fn lookup(&self, bucket: u16) -> PlaceHints {
+        if !self.any.load(Ordering::Acquire) {
+            return PlaceHints::default();
+        }
+        unpack_hint(self.slots[bucket_index(bucket)].load(Ordering::Relaxed))
+    }
+
+    /// Clear every bucket to neutral, so [`lookup`](Self::lookup) returns the default and the
+    /// allocation path stops applying learned placement (e.g. when profiling is disabled).
+    /// Also the start of a republish, before `publish` re-arms it.
+    pub fn reset(&self) {
+        self.any.store(false, Ordering::Release);
+        for s in self.slots.iter() {
+            s.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Fold a confident site's hint into `bucket`'s consensus: set it if empty, keep it if it
+    /// agrees, or mark the bucket conflicted (→ neutral) if it disagrees.
+    fn merge(&self, bucket: usize, h: PlaceHints) {
+        let cur = self.slots[bucket].load(Ordering::Relaxed);
+        let next = match unpack_state(cur) {
+            HintState::Unset => pack_hint(h),
+            HintState::Set if unpack_hint(cur) == h => cur, // agrees
+            _ => CONFLICT, // disagreement or already conflicted ⇒ neutral
+        };
+        self.slots[bucket].store(next, Ordering::Relaxed);
+    }
+
+    /// Re-arm the table after a republish if any bucket carries an actionable hint.
+    fn publish(&self) {
+        let any = self
+            .slots
+            .iter()
+            .any(|s| unpack_state(s.load(Ordering::Relaxed)) == HintState::Set);
+        self.any.store(any, Ordering::Release);
+    }
+}
+
+/// Publication state of a packed learned-hint byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HintState {
+    /// No confident site has claimed this bucket.
+    Unset,
+    /// Exactly one consensus hint (the low bits encode it).
+    Set,
+    /// Confident sites disagreed ⇒ read as neutral.
+    Conflict,
+}
+
+/// The reserved "conflict ⇒ neutral" byte (state bits = 2).
+const CONFLICT: u8 = 0b10;
+
+/// Pack a [`PlaceHints`] into a learned-hint byte: state(bits0-1)=Set, hotness(bits2-3),
+/// lifetime(bits4-5).
+#[inline]
+fn pack_hint(h: PlaceHints) -> u8 {
+    let hot = h.hotness as u8 & 0b11;
+    let life = match h.lifetime {
+        Lifetime::Unspecified => 0,
+        Lifetime::Short => 1,
+        Lifetime::Medium => 2,
+        Lifetime::Long => 3,
+    };
+    0b01 | (hot << 2) | (life << 4)
+}
+
+/// The publication state encoded in a learned-hint byte.
+#[inline]
+fn unpack_state(b: u8) -> HintState {
+    match b & 0b11 {
+        0 => HintState::Unset,
+        1 => HintState::Set,
+        _ => HintState::Conflict,
+    }
+}
+
+/// Decode a learned-hint byte to [`PlaceHints`]; an unset or conflicted byte is the neutral
+/// default (so a disagreement never steers placement).
+#[inline]
+fn unpack_hint(b: u8) -> PlaceHints {
+    if unpack_state(b) != HintState::Set {
+        return PlaceHints::default();
+    }
+    // Inverse of `h.hotness as u8` (Cold=0, Neutral=1, Hot=2).
+    let hotness = match (b >> 2) & 0b11 {
+        0 => Hotness::Cold,
+        2 => Hotness::Hot,
+        _ => Hotness::Neutral,
+    };
+    let lifetime = match (b >> 4) & 0b11 {
+        1 => Lifetime::Short,
+        2 => Lifetime::Medium,
+        3 => Lifetime::Long,
+        _ => Lifetime::Unspecified,
+    };
+    PlaceHints { hotness, lifetime }
 }
 
 /// A fast, well-mixed integer hash (SplitMix64 finalizer). Deterministic and `const`, so
@@ -981,9 +1316,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_mixed_hotness_self_corrects_to_neutral() {
-        // Alternating cold(0)/hot(255) allocations average to ~127 ⇒ Neutral, so even a
-        // confidently-sampled but inconsistent hotness exerts no grouping pressure.
+    fn noisy_hotness_is_unstable_and_does_not_steer_placement() {
+        // Alternating cold(0)/hot(255) allocations give a high mean-absolute-deviation, so
+        // the hotness signal is *unstable*: its confidence stays low and it exerts no
+        // grouping pressure (the recency-weighted estimate alone could otherwise flip-flop).
+        // The lifetime axis, observed consistently, is unaffected.
         let mut p = AllocationSiteProfile::new(StackId(2), 0);
         let mut t = 0;
         for k in 0..CONFIDENT_SAMPLES {
@@ -992,9 +1329,23 @@ mod tests {
             p.record_free(2_000, 64, t); // medium lifetimes, consistent
             t += 1;
         }
-        let h = p.place_hints(0); // even with the gate wide open…
-        assert_eq!(h.hotness, Hotness::Neutral, "averaged hotness is neutral");
-        assert_eq!(h.lifetime, Lifetime::Medium);
+        // High MAD ⇒ ~zero stability ⇒ hotness confidence below the gate ⇒ Neutral.
+        assert!(
+            p.hotness_stability_bp() < 2_000,
+            "noisy hotness is unstable"
+        );
+        assert!(p.hotness_confidence_bp() < DEFAULT_MIN_CONFIDENCE_BP);
+        let h = p.place_hints(DEFAULT_MIN_CONFIDENCE_BP);
+        assert_eq!(
+            h.hotness,
+            Hotness::Neutral,
+            "unstable hotness does not steer"
+        );
+        assert_eq!(
+            h.lifetime,
+            Lifetime::Medium,
+            "consistent lifetime still steers"
+        );
     }
 
     #[test]
@@ -1118,5 +1469,103 @@ mod tests {
         // The (0,0) counts surface as no *completed* frees, but the histogram has evidence.
         assert_eq!(p.counts(), (CONFIDENT_SAMPLES, 0));
         assert_eq!(p.lifetimes().total(), CONFIDENT_SAMPLES);
+    }
+
+    #[test]
+    fn place_class_derivation_covers_the_grouping_axes() {
+        use PlaceClass::*;
+        let hc = |hot, life| {
+            PlaceClass::from_hints(PlaceHints {
+                hotness: hot,
+                lifetime: life,
+            })
+        };
+        // Hotness dominates (§24.6/§24.8).
+        assert_eq!(hc(Hotness::Hot, Lifetime::Short), Hot);
+        assert_eq!(hc(Hotness::Cold, Lifetime::Long), Cold);
+        // Neutral hotness: lifetime breaks the tie (§24.7/§24.8).
+        assert_eq!(hc(Hotness::Neutral, Lifetime::Long), Hot);
+        assert_eq!(hc(Hotness::Neutral, Lifetime::Short), Short);
+        assert_eq!(hc(Hotness::Neutral, Lifetime::Medium), Default);
+        assert_eq!(hc(Hotness::Neutral, Lifetime::Unspecified), Default);
+        // u8 round-trips.
+        for c in [Default, Cold, Hot, Short] {
+            assert_eq!(PlaceClass::from_u8(c.as_u8()), c);
+        }
+    }
+
+    #[test]
+    fn ewma_rate_is_recency_weighted() {
+        // A site that allocates slowly, then bursts, reports a rate that reflects the recent
+        // burst — not a lifetime average dragged down by the slow start.
+        let mut p = AllocationSiteProfile::new(StackId(11), 0);
+        let mut t = 0u64;
+        for _ in 0..8 {
+            t += 1000; // 1 alloc/sec
+            p.record_alloc(8, 64, 0, t);
+        }
+        let slow = p.allocation_rate();
+        for _ in 0..16 {
+            t += 10; // 100 allocs/sec burst
+            p.record_alloc(8, 64, 0, t);
+        }
+        let fast = p.allocation_rate();
+        assert!(slow <= 2, "slow phase ~1/sec, got {slow}");
+        assert!(
+            fast > slow * 5,
+            "rate tracks the recent burst: {slow} -> {fast}"
+        );
+    }
+
+    #[test]
+    fn learned_hints_publish_consensus_and_neutralize_conflict() {
+        let mut t: SiteProfileTable<64> = SiteProfileTable::new();
+        let learned = LearnedHints::new();
+        // Nothing learned yet ⇒ neutral, and the `any` short-circuit holds.
+        t.write_learned_hints(&learned);
+        assert_eq!(learned.lookup(8), PlaceHints::default());
+
+        // Two confident sites whose dominant bucket is size-class 8 AGREE on cold+short.
+        let mut clock = 0u64;
+        for site in [StackId(100), StackId(101)] {
+            for _ in 0..CONFIDENT_SAMPLES {
+                t.record_alloc(site, 8, 64, 0 /* cold */, clock);
+                clock += 1;
+                t.record_free(site, 5 /* short */, 64, clock);
+                clock += 1;
+            }
+        }
+        // A confident site on bucket 9 is hot+long.
+        for _ in 0..CONFIDENT_SAMPLES {
+            t.record_alloc(StackId(102), 9, 64, 255, clock);
+            clock += 1;
+            t.record_free(StackId(102), 120_000, 64, clock);
+            clock += 1;
+        }
+        t.write_learned_hints(&learned);
+        // Bucket 8: consensus cold+short.
+        let h8 = learned.lookup(8);
+        assert_eq!(h8.hotness, Hotness::Cold);
+        assert_eq!(h8.lifetime, Lifetime::Short);
+        // Bucket 9: hot+long.
+        let h9 = learned.lookup(9);
+        assert_eq!(h9.hotness, Hotness::Hot);
+        assert_eq!(h9.lifetime, Lifetime::Long);
+
+        // Now add a confident site on bucket 8 that DISAGREES (hot+long) ⇒ conflict ⇒ neutral.
+        for _ in 0..CONFIDENT_SAMPLES {
+            t.record_alloc(StackId(103), 8, 64, 255, clock);
+            clock += 1;
+            t.record_free(StackId(103), 120_000, 64, clock);
+            clock += 1;
+        }
+        t.write_learned_hints(&learned);
+        assert_eq!(
+            learned.lookup(8),
+            PlaceHints::default(),
+            "disagreeing confident sites neutralize the bucket"
+        );
+        // Bucket 9 still confident (unaffected by bucket 8's conflict).
+        assert_eq!(learned.lookup(9).hotness, Hotness::Hot);
     }
 }

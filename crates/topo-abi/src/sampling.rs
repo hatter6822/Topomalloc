@@ -51,6 +51,9 @@ const LIVE_SAMPLES: usize = 2048;
 struct SamplingState {
     profiles: SiteProfileTable<PROFILE_SITES>,
     objects: SampledObjects<LIVE_SAMPLES>,
+    /// Monotonic (wrapping) count of fired allocation samples, driving the publish /
+    /// bloom-refresh cadences below — so neither runs on every sample.
+    fired_samples: u32,
 }
 
 impl SamplingState {
@@ -58,9 +61,18 @@ impl SamplingState {
         SamplingState {
             profiles: SiteProfileTable::new(),
             objects: SampledObjects::new(),
+            fired_samples: 0,
         }
     }
 }
+
+/// Republish the learned per-bucket placement consensus to the engine every this many fired
+/// allocation samples (the live W14 learn → place loop), amortizing its `O(sites)` scan.
+const PUBLISH_EVERY: u32 = 32;
+
+/// Rebuild the membership filter every this many fired samples, bounding its false-positive
+/// rate over a long run (else the free path's lock-free reject slowly degrades, §31.4 / DD-1).
+const BLOOM_REFRESH_EVERY: u32 = 1024;
 
 /// `true` once profiling has been enabled. The hot path reads this first; `false` (the
 /// default) short-circuits before touching any other sampling state.
@@ -163,6 +175,14 @@ pub fn set_rate(rate_bytes: u64) {
     GENERATION.fetch_add(1, Ordering::Relaxed);
     // Release so a reader that sees ENABLED also sees STATE/RATE (paired Acquire below).
     ENABLED.store(rate_bytes != 0, Ordering::Release);
+    if rate_bytes == 0 {
+        // Disabling reverts the allocation path to default placement: drop the learned
+        // hints so the engine stops applying them (the default path is then byte-for-byte
+        // unchanged).
+        if let Some(eng) = crate::global() {
+            eng.clear_learned_hints();
+        }
+    }
 }
 
 /// Read `$TOPOMALLOC_SAMPLE_RATE` (mean bytes between samples) at startup and enable
@@ -240,16 +260,30 @@ fn sample_alloc_slow(ptr: *mut u8, size: usize, align: usize, flags: RequestFlag
         bytes: size as u64,
         alloc_ms: now,
     };
-    {
-        let st = state();
-        let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
-        g.profiles
-            .record_alloc(stack_id, bucket, size as u64, hotness, now);
-        g.objects.on_alloc(ptr as usize, rec);
-    }
-    // Publish to the lock-free filter so the free path can find it (after the precise set
-    // is updated, so a concurrent free never sees the bloom bit without the record).
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    g.profiles
+        .record_alloc(stack_id, bucket, size as u64, hotness, now);
+    g.objects.on_alloc(ptr as usize, rec);
+    // Publish to the lock-free membership filter *before* releasing the lock, so a concurrent
+    // free of this object never sees the bloom bit without the precise record behind it.
     BLOOM.insert(ptr as usize);
+    g.fired_samples = g.fired_samples.wrapping_add(1);
+    // Refresh the live learn → place loop on a bounded cadence (the consensus scan reads the
+    // table under this lock and writes the engine's lock-free hint atomics — no extra lock,
+    // no allocation).
+    if g.fired_samples.is_multiple_of(PUBLISH_EVERY) {
+        if let Some(eng) = crate::global() {
+            eng.publish_learned_hints(&g.profiles);
+        }
+    }
+    // Periodically rebuild the membership filter from the live set so its false-positive rate
+    // stays bounded. A concurrent sampled free during the brief rebuild window may be missed
+    // (the object lingers and is later right-censored) — a bounded, accepted inaccuracy.
+    if g.fired_samples.is_multiple_of(BLOOM_REFRESH_EVERY) {
+        BLOOM.reset();
+        g.objects.for_each_addr(|a| BLOOM.insert(a));
+    }
 }
 
 /// Sample hook for a free of `ptr`. Lock-free fast reject via the [`SampleBloom`]; only a
@@ -384,12 +418,13 @@ pub fn dump_json() -> String {
                 let _ = write!(
                     out,
                     "{{\"stack_id\":{},\"lifetime\":\"{}\",\"hotness\":{},\"confidence_bp\":{},\
-                     \"sampled_live_bytes\":{},\"alloc_samples\":{},\"free_samples\":{},\
-                     \"alloc_rate\":{},\"free_rate\":{}}}",
+                     \"dominant_size_bucket\":{},\"sampled_live_bytes\":{},\"alloc_samples\":{},\
+                     \"free_samples\":{},\"alloc_rate\":{},\"free_rate\":{}}}",
                     p.stack_id().0,
                     p.dominant_lifetime().as_str(),
                     p.hotness_estimate(),
                     p.confidence_bp(),
+                    p.dominant_bucket(),
                     p.sampled_live_bytes(),
                     allocs,
                     frees,

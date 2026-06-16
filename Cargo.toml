@@ -52,7 +52,7 @@ exclude = ["fuzz", "vendor/sele4n"]
 # exact on a sparsely-numbered LLC space; dropped the now-dead `max_node`/`max_llc` builder
 # fields. In a 0.x series new backwards-compatible functionality is a patch bump
 # (the 0.x minor is the breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

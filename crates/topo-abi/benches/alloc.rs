@@ -7,7 +7,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use topo_abi::{topomalloc_free, topomalloc_malloc};
+use topo_abi::{topomalloc_free, topomalloc_malloc, topomalloc_profile_set_rate};
 use topo_core::{classify, size_class, RequestFlags};
 
 fn bench_size_class(c: &mut Criterion) {
@@ -49,11 +49,41 @@ fn bench_malloc_free(c: &mut Criterion) {
     });
 }
 
+/// The W17-3 sampling overhead budget (§31.4 / DD-1 *F3*): the hot-path cost of the
+/// sampling decision + the lock-free free-side membership reject, *enabled* vs *off*
+/// (the default). The two lines should sit close together — sampling adds a thread-local
+/// counter decrement on malloc and a couple of relaxed atomic loads on free, with the
+/// capture/record work only on the rare fired sample. Non-gating; `xtask bench` reports it.
+fn bench_sampling_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling_overhead");
+    // Baseline: sampling off (the default artifact's path).
+    topomalloc_profile_set_rate(0);
+    group.bench_function("malloc(64)+free [sampling off]", |b| {
+        b.iter(|| {
+            let p = topomalloc_malloc(black_box(64));
+            // SAFETY: just-returned, owned, freed once.
+            unsafe { topomalloc_free(black_box(p)) };
+        })
+    });
+    // Enabled at a realistic 1 MiB mean interval (samples fire rarely vs. 64-byte allocs).
+    topomalloc_profile_set_rate(1 << 20);
+    group.bench_function("malloc(64)+free [sampling on, 1MiB]", |b| {
+        b.iter(|| {
+            let p = topomalloc_malloc(black_box(64));
+            // SAFETY: just-returned, owned, freed once.
+            unsafe { topomalloc_free(black_box(p)) };
+        })
+    });
+    topomalloc_profile_set_rate(0); // restore the default
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_size_class,
     bench_classify,
     bench_classify_flags,
-    bench_malloc_free
+    bench_malloc_free,
+    bench_sampling_overhead
 );
 criterion_main!(benches);

@@ -139,6 +139,22 @@ impl AnyAllocator {
         p
     }
 
+    /// Publish the heap sampler's confident per-bucket placement consensus into the engine's
+    /// learned-hint table (the live W14 learn → place loop). Lock-free for the allocation
+    /// path that reads it.
+    pub fn publish_learned_hints<const CAP: usize>(
+        &self,
+        table: &topo_core::SiteProfileTable<CAP>,
+    ) {
+        dispatch!(self, a => a.publish_learned_hints(table))
+    }
+
+    /// Clear the engine's learned-hint table, so the allocation path stops applying learned
+    /// placement (called when profiling is disabled, restoring the default placement path).
+    pub fn clear_learned_hints(&self) {
+        dispatch!(self, a => a.learned_hints().reset())
+    }
+
     /// Free a pointer; see [`FreeOutcome`] for the validation outcomes.
     ///
     /// # Safety

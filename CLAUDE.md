@@ -245,12 +245,21 @@ record (stack id, a bounded Space-Saving `SizeClassDist`, a right-censored `Life
 hotness, alloc/free rates, `sampled_live_bytes`, per-dimension + combined confidence), and the
 `SiteProfileTable` learning policy — a **pure, `no_std`, host-driven** object (the W12 `ReleaseController`
 pattern) whose `place_hints` distils a *confident* profile into the advisory `PlaceHints` (hotness +
-lifetime) the W11 filler already groups by (§24.6–§24.8: cold → cold/sparse, same-lifetime via
-open-fresh-on-mismatch, long+hot → hot-dense). W14-1 reuses the existing W11 hint plumbing. The single
+lifetime) the placement layers group by (§24.6–§24.8). The **learn → place loop is closed live**: confident,
+consistent per-bucket consensus is published into a lock-free `LearnedHints` table the allocation path reads
+(one relaxed load; `Allocator::{publish_learned_hints,learned_hints}`), so a *placement-unhinted* request
+adopts its site's learned profile — an explicit hint always winning, and the default path byte-for-byte
+unchanged when nothing is learned. Grouping acts at **two layers**: the W11 hugepage filler (medium/large:
+cold → cold/sparse, same-lifetime via open-fresh-on-mismatch, long+hot → hot-dense), and §24.6/§24.7
+`PlaceClass`-tagged **span pools** for small objects (a class-preferring `CentralCache::remove_batch` with an
+`ANY_PLACE_CLASS` availability fallback, so grouping never causes a spurious OOM, §2.4; an all-default
+program keeps one pool per size class). The profile is recency-aware (event-driven EWMA rates, a MAD-stability
+-gated hotness) over a 16-way set-associative table. W14-1 reuses the existing W11 hint plumbing. The single
 non-negotiable, the §24.5 safety boundary, holds **by construction** — the policy's only output is
 score-only `PlaceHints`, so a missing/wrong/adversarial profile can change *where* an object lands but
 never its size/alignment/validity/free path — and is pinned by the fixed-wall test
-(`engine_size_align_validity_free_are_invariant_under_hints` + pure-filler + proptest + fuzz companions).
+(`engine_size_align_validity_free_are_invariant_under_hints` + pure-filler + proptest + fuzz companions,
+re-proved over `Sele4nSim` by a §36.9 G-sim test).
 The **minimal W17-3 sampling slice** landed alongside to feed the policy live (`crates/topo-core/src/sampling.rs`
 + the `topo-abi` glue): a lock-free per-thread Poisson `Sampler` (W17-3a, fixed-point exponential, FP-free
 core), an allocation-free `libc::backtrace` capture into a fixed `StackBuf` (W17-3b, warmed up at enable),
@@ -258,14 +267,17 @@ a `SampleBloom`-gated `SampledObjects` lifecycle with right-censored lifetimes (
 stays lock-free), and `SiteProfileTable` as the aggregator (W17-3d) with a `topomalloc_profile_dump_json`
 dump. Sampling is wired into `AnyAllocator::{allocate,free,realloc}`, **off by default** (one relaxed
 atomic load on the hot path), enabled by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`, and a
-thread-local re-entrancy guard keeps the sampler from re-entering the allocator (§31.4). Placement is
+thread-local re-entrancy guard keeps the sampler from re-entering the allocator (§31.4) — proved by the
+`sampler_no_alloc` test (a counting `#[global_allocator]` shows the sampled path makes **zero** heap
+allocations across 50k samples), with a sampling-overhead criterion bench bounding the hot-path cost and the
+membership filter auto-refreshing to cap its false-positive rate. Placement is
 policy, not a modeled transition (§2.4, as for W13), so there is **no Lean obligation and no trace-grammar
 change**; the profiler's counters reconcile into `topo-stats` JSON (`placement` block) and the
 `topo.placement.*` control namespace (profiling estimates, outside the §8.6 byte reconciliation). The full
 W17 stats core / epoch snapshot / flags / redaction / `explain` remain for M6.
 
 **Test counts:**
-- Rust: ~702 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~712 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)

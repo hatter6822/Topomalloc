@@ -108,8 +108,18 @@ pub fn refill(
 
     // Step 3: transfer was empty. Try the central free list.
     // The transfer lock was released in step 1 (by try_pop_batch dropping
-    // its guard). Now acquire the central lock.
-    match central.remove_batch(node, arena, label, sc, batch_size) {
+    // its guard). Now acquire the central lock. The cache-refill path carries no per-request
+    // placement class (it batches across requests), so it does not bias span grouping
+    // (`ANY_PLACE_CLASS`); per-request §24 grouping happens on the central small path. Cache-
+    // layer grouping is an M2 concern (W6).
+    match central.remove_batch(
+        node,
+        arena,
+        label,
+        sc,
+        crate::central::ANY_PLACE_CLASS,
+        batch_size,
+    ) {
         RemoveResult::NeedSpan => RefillResult {
             filled: 0,
             need_span: true,
@@ -584,6 +594,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             for i in 0..batch.len() {
@@ -667,6 +678,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             for i in 0..batch.len() {
@@ -895,6 +907,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             for i in 0..batch.len() {

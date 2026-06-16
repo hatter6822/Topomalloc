@@ -70,7 +70,9 @@ pub use backend::{
     TopoBackingProvider, VWindow,
 };
 pub use bootstrap::{Bootstrap, BumpArena, MetadataAlloc};
-pub use central::{Batch, CentralCache, CentralError, InsertResult, RemoveResult, MAX_BATCH_LEN};
+pub use central::{
+    Batch, CentralCache, CentralError, InsertResult, RemoveResult, ANY_PLACE_CLASS, MAX_BATCH_LEN,
+};
 pub use classify::{classify, Request, RequestKind};
 pub use compat::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use error::BackendError;
@@ -91,8 +93,9 @@ pub use large::{LargeAllocator, LargeBacking, LargeConfig};
 pub use node_router::{NodeRouter, NodeRouterStats, RouterControl};
 pub use pagemap::{PageEntry, PageMap, PagemapError};
 pub use placement::{
-    AllocationSiteProfile, LifetimeClass, LifetimeHistogram, PlacementStats, SiteProfileTable,
-    SizeClassDist, StackId, CONFIDENT_SAMPLES, DEFAULT_MIN_CONFIDENCE_BP, SIZE_DIST_K,
+    bucket_index, AllocationSiteProfile, LearnedHints, LifetimeClass, LifetimeHistogram,
+    PlaceClass, PlacementStats, SiteProfileTable, SizeClassDist, StackId, CONFIDENT_SAMPLES,
+    DEFAULT_MIN_CONFIDENCE_BP, NUM_BUCKETS, SIZE_DIST_K,
 };
 pub use profile::{active_profile, debug_checks_enabled};
 pub use ptr_class::{

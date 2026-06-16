@@ -1477,3 +1477,61 @@ the learned-profile→hint loop, and the live off→on→concurrent sampling lif
 `learned_profile_never_breaks_placement_geometry` proptest, the `placement` fuzz target, the
 stats/control reconciliation tests, and the W8-8 header↔symbol cross-check over the six new
 `topomalloc_profile_*` C symbols.
+
+### W14 optimal-completion pass (closing the loop + span grouping + verification)
+
+These decisions close the gaps the first pass left (learned profiles were observational; grouping
+was hugepage-only; the policy heuristics and W17-3 verification were thin).
+
+* **The learn → place loop is closed with a coarse, lock-free, per-bucket applied-hint table —
+  not online per-call-site stack capture.** A `LearnedHints` table (one packed `PlaceHints` per
+  placement bucket + an `any` short-circuit) is published from the confident, *consistent*
+  per-bucket consensus (`SiteProfileTable::write_learned_hints`; disagreement neutralizes a bucket)
+  and read by the allocation path with a single relaxed load. The key is the bucket (size class /
+  medium / large) — the §24.1-sanctioned input the engine has for free — because capturing a stack
+  on *every* allocation to key by site would violate the §31.4 hot-path budget (this mirrors how
+  TCMalloc applies hot/cold via cheap explicit hints, with the online sampler steering aggregate
+  policy). An explicit per-call hint always wins; when nothing is learned the lookup short-circuits
+  to neutral, so the default (profiling-off) path is **byte-for-byte unchanged**. Per-arena
+  learned scoping was deliberately *not* added (it would churn `record_alloc`'s signature across
+  fuzz/property/integration tests for marginal benefit, since arena placement is already explicit
+  via `NumaPolicy` and the span carries its arena tag) — documented, not a gap.
+* **The "hotness 0 = cold vs. unhinted" ambiguity is resolved by an all-or-nothing merge.** The
+  flag encoding has no "unspecified hotness" sentinel (`TOPO_COLD ≡ TOPO_HOT(0)`), so a learned
+  hint is applied only to a request that is *fully* placement-unhinted (hotness 0 **and** lifetime
+  Unspecified); any explicit placement hint disables the learned override entirely. A bare
+  `TOPO_COLD` is therefore indistinguishable from unhinted and may adopt a learned hint — an
+  accepted, documented edge (the hint is advisory regardless). This avoided adding a flag bit (and
+  the ABI churn it implies) for a corner case.
+* **Small-object span grouping is a span-selection *preference* (one bin per size class), not a
+  per-(class) bin shard.** The `PlaceClass` (Default / Cold / Hot / Short — hotness dominant,
+  lifetime breaking the neutral tie) is packed into spare `SpanFlags` bits (no descriptor growth —
+  the 104-byte footprint and its pin test are unchanged) and set at create / empty-reuse re-tag.
+  `CentralCache::remove_batch(place_class)` prefers a class-matching partial, else re-tags an empty,
+  else `NeedSpan`; the caller creates a class-tagged span and, only on backend exhaustion, falls
+  back to `ANY_PLACE_CLASS` (reuse any partial) — so grouping is **availability-first** (§2.4) and
+  never a spurious OOM. Because every unhinted request maps to one class, an all-default program
+  keeps a single pool per size class (no RSS regression); only differing hints segregate spans.
+  This rides the existing single-bin-per-sc structure, orthogonal to the M2 per-node/per-label
+  sharding (W5-4d), and changes no abstract transition (which span an object is carved from is
+  policy) — so no Lean obligation.
+* **The profile heuristics are recency-aware and bounded.** Rates are an event-driven EWMA of the
+  inter-event interval (recency-weighted, no fragile fixed-point `exp`); hotness is an event-driven
+  EWMA gated by its mean-absolute-deviation, so a noisy/bimodal site is *unstable* and never drives
+  a confident hot/cold grouping (the recency estimate alone could flip-flop) while a phase change is
+  tracked. The table is a 16-way **set-associative** cache with least-confidence replacement — the
+  textbook fixed-capacity design, using all capacity with clean local eviction (no overlapping
+  probe windows).
+* **W17-3 verification matches the SPEC's prescribed methods.** The `sampler_no_alloc` integration
+  test installs a counting `#[global_allocator]` and asserts the sampled path makes **zero** heap
+  allocations across 50k sampled allocations — the §31.4 / Appendix-F "the unwinder never re-enters
+  the allocator" invariant, the depth-counter method DD-1 calls for. A `sampling_overhead` criterion
+  bench (off vs on) bounds the hot-path cost (DD-1 *F3*); the `SampleBloom` auto-refreshes on a
+  bounded cadence so its false-positive rate stays bounded over a long run; and a §36.9 G-sim test
+  re-proves the §24.5 safety wall and the learn → place loop identically over `Sele4nSim`.
+
+Verified additionally by the new `learned_hot_profile_steers_unhinted_large_allocations_hot` (+
+`no_learned_hint_*` contrast), `remove_batch_prefers_a_class_matching_span`,
+`place_class_round_trips_and_is_orthogonal_to_quarantine`, `learned_hints_publish_consensus_and_*`,
+`ewma_rate_is_recency_weighted`, the `sampler_no_alloc` proof, and the `gsim` module — all green
+under `cargo xtask ci` (dual-arch build + test + the eight Lean gates).

@@ -22,12 +22,12 @@
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::bootstrap::BumpArena;
 use topo_core::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE, SMALL_MAX};
-use topo_core::huge::Hotness;
+use topo_core::huge::{Hotness, HugeBin};
 use topo_core::ids::ArenaId;
 use topo_core::{
     Allocator, AllocatorConfig, FreeOutcome, HugeConfig, HugePageBackend, HugePageFiller, Lifetime,
-    PageMap, PlaceHints, RequestFlags, SiteProfileTable, StackId, CONFIDENT_SAMPLES, HUGEPAGE_SIZE,
-    PAGES_PER_HUGEPAGE,
+    PageMap, PlaceHints, RequestFlags, SiteProfileTable, SizeClassDist, StackId, CONFIDENT_SAMPLES,
+    HUGEPAGE_SIZE, PAGES_PER_HUGEPAGE,
 };
 
 type Engine = Allocator<'static, PosixBackingProvider>;
@@ -288,7 +288,108 @@ fn learned_profile_hints_uphold_the_wall() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. W14-3 grouping is observable in stats
+// 2. The learn → place loop: a learned profile steers live placement
+// ---------------------------------------------------------------------------
+
+/// Feed a confident profile for the LARGE bucket into a table.
+fn confident_large_site(hotness: u8, lifetime_ms: u64) -> SiteProfileTable<64> {
+    let mut table: SiteProfileTable<64> = SiteProfileTable::new();
+    let mut clk = 0u64;
+    for _ in 0..CONFIDENT_SAMPLES {
+        table.record_alloc(
+            StackId(1),
+            SizeClassDist::BUCKET_LARGE,
+            1 << 21,
+            hotness,
+            clk,
+        );
+        clk += 1;
+        table.record_free(StackId(1), lifetime_ms, 1 << 21, clk);
+        clk += 1;
+    }
+    table
+}
+
+#[test]
+fn learned_hot_profile_steers_unhinted_large_allocations_hot() {
+    // The live end of the loop: a confident HOT+long profile, published into the engine,
+    // makes *unhinted* (RequestFlags::NONE) large allocations land in the hot-dense bin —
+    // the learned profile, not an explicit per-call flag, drives placement.
+    let (engine, hp) = huge_engine();
+    let table = confident_large_site(255 /* hot */, 120_000 /* long */);
+    engine.publish_learned_hints(&table);
+    // The engine now serves the learned hint for the LARGE bucket.
+    let lh = engine.learned_hints().lookup(SizeClassDist::BUCKET_LARGE);
+    assert_eq!(lh.hotness, Hotness::Hot);
+    assert_eq!(lh.lifetime, Lifetime::Long);
+
+    // Unhinted hugepage-sized allocations adopt it and land hot-dense.
+    let mut live = Vec::new();
+    for _ in 0..4 {
+        let p = engine.allocate(HUGE_THRESHOLD, PAGE_SIZE, RequestFlags::NONE);
+        assert!(!p.is_null());
+        live.push(p);
+    }
+    let bins = hp.coverage().bins;
+    assert!(
+        bins[HugeBin::HotDense as usize] > 0,
+        "learned-hot profile steered unhinted large allocs to hot-dense: {bins:?}"
+    );
+    for p in live {
+        // SAFETY: each `p` is a distinct live allocation from this engine that we own.
+        assert_eq!(unsafe { engine.free(p) }, FreeOutcome::Freed);
+    }
+}
+
+#[test]
+fn no_learned_hint_leaves_unhinted_large_placement_at_default() {
+    // The contrast: with no learned profile (and no explicit hint), unhinted large
+    // allocations are *not* hot — they fill ordinary `Full` hugepages, never hot-dense. This
+    // pins that the previous test's hot placement came from the learned profile, and that the
+    // default path is unchanged when nothing is learned.
+    let (engine, hp) = huge_engine();
+    let mut live = Vec::new();
+    for _ in 0..4 {
+        let p = engine.allocate(HUGE_THRESHOLD, PAGE_SIZE, RequestFlags::NONE);
+        assert!(!p.is_null());
+        live.push(p);
+    }
+    let bins = hp.coverage().bins;
+    assert_eq!(
+        bins[HugeBin::HotDense as usize],
+        0,
+        "no learned hint ⇒ unhinted large allocs are never hot-dense: {bins:?}"
+    );
+    assert!(
+        bins[HugeBin::Full as usize] > 0,
+        "they fill ordinary hugepages"
+    );
+    for p in live {
+        // SAFETY: each `p` is a distinct live allocation from this engine that we own.
+        assert_eq!(unsafe { engine.free(p) }, FreeOutcome::Freed);
+    }
+}
+
+#[test]
+fn disabling_clears_learned_placement() {
+    // Publishing then clearing the learned hints reverts the engine to default placement
+    // (what the ABI does when sampling is turned off).
+    let (engine, _hp) = huge_engine();
+    let table = confident_large_site(255, 120_000);
+    engine.publish_learned_hints(&table);
+    assert_ne!(
+        engine.learned_hints().lookup(SizeClassDist::BUCKET_LARGE),
+        PlaceHints::default()
+    );
+    engine.learned_hints().reset();
+    assert_eq!(
+        engine.learned_hints().lookup(SizeClassDist::BUCKET_LARGE),
+        PlaceHints::default()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. W14-3 grouping is observable in stats
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -328,7 +429,7 @@ fn cold_and_hot_grouping_is_observable_in_hugepage_bins() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. W17-3 live sampling through the public C ABI
+// 4. W17-3 live sampling through the public C ABI
 // ---------------------------------------------------------------------------
 
 use topo_abi::{
@@ -415,4 +516,119 @@ fn sampling_lifecycle_off_then_live_then_concurrent() {
     // Restore the default (off) so nothing leaks into other test binaries' expectations.
     topomalloc_profile_set_rate(0);
     assert_eq!(topomalloc_profile_enabled(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5. G-sim: the §24.5 safety wall holds over the seLe4n simulator (DoD G-sim)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sele4n-sim")]
+mod gsim {
+    use super::*;
+    use topo_backend_sele4n::Sele4nSim;
+
+    /// A hugepage-backed engine over the seLe4n host simulator (each provider is an
+    /// independent sim pool), mirroring `huge_engine` but on the capability backend.
+    fn sim_huge_engine() -> &'static Allocator<'static, Sele4nSim> {
+        let m = meta(16 << 20);
+        let pm: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+        let cfg = AllocatorConfig {
+            span_region_bytes: 16 * 1024 * 1024,
+            span_extent_slots: 2048,
+            span_slots: 2048,
+            large_region_bytes: 48 * 1024 * 1024,
+            large_extent_slots: 2048,
+            large_slots: 2048,
+        };
+        let capacity = (cfg.large_region_bytes / HUGEPAGE_SIZE).max(1);
+        let hp: &'static HugePageBackend<Sele4nSim> = Box::leak(Box::new(
+            HugePageBackend::new(
+                Sele4nSim::new(cfg.large_region_bytes),
+                m,
+                ArenaId::DEFAULT,
+                HugeConfig::with_capacity(capacity),
+            )
+            .expect("sim hugepage backend"),
+        ));
+        Box::leak(Box::new(
+            Allocator::new_with_huge(
+                Sele4nSim::new(cfg.span_region_bytes),
+                Sele4nSim::new(cfg.large_region_bytes),
+                hp,
+                m,
+                m,
+                pm,
+                ArenaId::DEFAULT,
+                cfg,
+            )
+            .expect("sim engine"),
+        ))
+    }
+
+    #[test]
+    fn safety_wall_holds_identically_over_sele4n_sim() {
+        // §36.9 G-sim: the §24.5 placement safety boundary is backend-agnostic — over the
+        // capability simulator, exactly as over POSIX, no hint changes an allocation's usable
+        // size, alignment, validity, or free path. A representative sweep (the full matrix is
+        // exercised over POSIX) keeps the sim pool modest.
+        let engine = sim_huge_engine();
+        let sizes = [
+            64usize,
+            4096,
+            SMALL_MAX + 1,
+            1 << 20,
+            HUGE_THRESHOLD,
+            2 * HUGE_THRESHOLD,
+        ];
+        let aligns = [1usize, 16, PAGE_SIZE];
+        for &size in &sizes {
+            for &align in &aligns {
+                let base = engine.allocate(size, align, RequestFlags::NONE);
+                assert!(
+                    !base.is_null(),
+                    "sim baseline alloc failed ({size},{align})"
+                );
+                let want = engine.usable_size(base).expect("usable");
+                assert_eq!(base as usize % align, 0);
+                // SAFETY: `base` is a live allocation from this engine that we own.
+                assert_eq!(unsafe { engine.free(base) }, FreeOutcome::Freed);
+
+                for flags in all_hint_flags() {
+                    let p = engine.allocate(size, align, flags);
+                    assert!(!p.is_null(), "sim hinted alloc failed ({size},{align})");
+                    assert_eq!(
+                        engine.usable_size(p),
+                        Some(want),
+                        "hint changed size on sim"
+                    );
+                    assert_eq!(p as usize % align, 0, "hint changed alignment on sim");
+                    // SAFETY: `p` is a live allocation of `want` writable bytes that we own.
+                    unsafe {
+                        core::ptr::write_bytes(p, 0xC3, want);
+                        assert_eq!(p.add(want - 1).read(), 0xC3);
+                        assert_eq!(
+                            engine.free(p),
+                            FreeOutcome::Freed,
+                            "hint changed free on sim"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn learned_hint_loop_works_over_sele4n_sim() {
+        // The learn → place loop is backend-agnostic: a published hot profile steers unhinted
+        // large allocations hot-dense over the simulator too.
+        let engine = sim_huge_engine();
+        let table = confident_large_site(255, 120_000);
+        engine.publish_learned_hints(&table);
+        let lh = engine.learned_hints().lookup(SizeClassDist::BUCKET_LARGE);
+        assert_eq!(lh.hotness, Hotness::Hot);
+        let p = engine.allocate(HUGE_THRESHOLD, PAGE_SIZE, RequestFlags::NONE);
+        assert!(!p.is_null());
+        // SAFETY: `p` is the live allocation just returned by this engine.
+        assert_eq!(unsafe { engine.free(p) }, FreeOutcome::Freed);
+    }
 }
