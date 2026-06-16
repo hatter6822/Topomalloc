@@ -400,6 +400,23 @@ pub trait TopoBackingProvider {
     /// A short, stable name for diagnostics and trace output (e.g. `"posix"`).
     fn name(&self) -> &'static str;
 
+    /// Whether memory **freshly committed from an unbacked extent** (Reserved or
+    /// Released) is guaranteed to read as all-zero (§26.2 "OS-provided zero pages for
+    /// newly committed memory"). When `true`, `calloc` may **skip the redundant
+    /// `memset`** for a large/medium allocation served by a just-committed extent —
+    /// the W15-5 zeroed-state optimization (§26.3). Defaults to `false` (conservative:
+    /// `calloc` always zeroes), so a backend opts in only when it can promise it.
+    ///
+    /// POSIX promises it: the region is `mmap(MAP_ANONYMOUS)` (zero-filled), and
+    /// `decommit` is `MADV_DONTNEED`/`MADV_FREE` so a recommitted page zero-faults.
+    /// A custom backing ([`HookProvider`](crate::HookProvider)) does **not** opt in —
+    /// the user's allocator hook makes no zeroing promise — so `calloc` keeps zeroing
+    /// it. This is the trust boundary the §26.2 guarantee rests on; the allocator
+    /// debug-asserts the bytes really are zero whenever it skips the `memset`.
+    fn committed_memory_is_zeroed(&self) -> bool {
+        false
+    }
+
     // --- the full §36.6 typed surface (plan 09 overrides these) --------------
     //
     // Default implementations express the POSIX collapse by composing the methods

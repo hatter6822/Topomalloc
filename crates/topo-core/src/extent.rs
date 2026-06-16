@@ -1013,6 +1013,58 @@ impl ExtentMap {
         survivor
     }
 
+    /// The address-adjacent successor of `id` (the next-higher-based extent), or
+    /// `None` at the region tail. Used by in-place **grow** to find the free
+    /// neighbour to absorb (W15-3a).
+    fn addr_next(&self, id: ExtentId) -> Option<ExtentId> {
+        let n = self.get(id.0).addr_next;
+        (n != NIL).then_some(ExtentId(n))
+    }
+
+    /// Grow the **Active** extent `id` by absorbing its address-adjacent **free**
+    /// neighbour `next` — exactly the bytes to add, which the caller has already
+    /// committed so both halves are fully backed (§18.3 grow, the dual of
+    /// [`split_in`](Self::split_in)). `next`'s descriptor is retired behind a
+    /// generation bump so no reader resolves the recycled slot (DD-1 F2). The
+    /// kept extent `id` keeps its id and generation (live pointers stay valid);
+    /// only its length grows.
+    ///
+    /// SPEC-transition: `extent_merge` (§18.3 / §33.4 `span_merge_preserves_disjointness`)
+    fn absorb_next_in(&mut self, id: ExtentId, next: ExtentId, notify: &dyn ExtentNotify) {
+        let lv = self.get(id.0);
+        let rv = self.get(next.0);
+        debug_assert_eq!(
+            ExtentState::from_u8(lv.state),
+            ExtentState::Active,
+            "absorb grows an Active extent"
+        );
+        debug_assert!(
+            ExtentState::from_u8(rv.state).is_free(),
+            "absorb consumes a free neighbour"
+        );
+        debug_assert_eq!(lv.base + lv.len, rv.base, "absorb requires adjacency");
+        debug_assert_eq!(
+            rv.committed_len, rv.len,
+            "absorbed neighbour must be fully committed (M-005)"
+        );
+        let (lbase, llen, rbase, rlen) = (lv.base, lv.len, rv.base, rv.len);
+        // Unlink the neighbour from the free index + address list, fold its bytes
+        // into the active extent, and retire its slot.
+        self.bin_remove(next.0);
+        self.addr_remove(next.0);
+        let mut s = self.get(id.0);
+        s.len += rlen;
+        s.committed_len += rv.committed_len;
+        s.split_gen = s.split_gen.wrapping_add(1);
+        self.put(id.0, s);
+        self.free_bytes -= rlen;
+        self.push_slot(next.0);
+        debug_assert!(self.check_invariants());
+        // §23.2 merge notification (W10): the active range absorbed the free one; a
+        // custom backing tracks the new boundary. Both fully backed (asserted above).
+        notify.on_merge(lbase, llen, rbase, rlen, true);
+    }
+
     // --- allocation (W4-2b) --------------------------------------------------
 
     /// Find a free extent that can satisfy `needed_len` bytes at `align`, returning
@@ -1460,6 +1512,18 @@ pub trait RegionCacheHook {
         let _ = arena;
         self.try_cache(region)
     }
+
+    /// **In-place tail trim** of a cache-served large allocation (§25.3 / W15-3b
+    /// cache-served shrink): shrink the live allocation described by `region` (its
+    /// current base + usable length) to `new_len` page-rounded bytes, returning the
+    /// **freed tail byte count** if the cache trimmed it in place, or `None` to leave
+    /// it whole (the realloc caller then keeps the allocation as-is). The default
+    /// declines — a cache that owns no page geometry has no tail to return. A
+    /// hugepage backend trims the allocation's tail pages back to its filler (W11).
+    fn try_trim(&self, region: Region, new_len: usize) -> Option<usize> {
+        let _ = (region, new_len);
+        None
+    }
 }
 
 /// The no-op region cache used until W11-3 supplies a real one (§18.6).
@@ -1770,6 +1834,22 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     ///
     /// SPEC-transition: `extent_alloc` + commit (§18.3 / object `* -> Live`, §7.2)
     pub fn alloc(&self, size: usize, align: usize, fit: Fit) -> Result<ExtentRef, ExtentError> {
+        self.alloc_z(size, align, fit).map(|(r, _)| r)
+    }
+
+    /// [`alloc`](Self::alloc), additionally reporting whether the handed-out extent
+    /// is **freshly OS-zeroed** (W15-5 / §26.2/§26.3): `true` iff it was carved from
+    /// an **unbacked** source (Reserved or Released — `committed_len == 0`, no
+    /// retained data) and then committed by a provider that
+    /// [`committed_memory_is_zeroed`](TopoBackingProvider::committed_memory_is_zeroed).
+    /// A carve from a retained-dirty/muzzy extent keeps old data ⇒ `false`. The large
+    /// path uses this so `calloc` can skip the redundant `memset` on a fresh extent.
+    fn alloc_z(
+        &self,
+        size: usize,
+        align: usize,
+        fit: Fit,
+    ) -> Result<(ExtentRef, bool), ExtentError> {
         if size == 0 || !align.is_power_of_two() {
             return Err(ExtentError::InvalidRequest);
         }
@@ -1785,6 +1865,10 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         // a freshly carved extent `committed_len` is `0` (was Reserved/Released) or
         // `len` (was Dirty/Muzzy), so this commits the whole extent or nothing.
         let e = g.map.view(id).expect("just carved");
+        // An unbacked source (committed_len == 0) carries no retained data; once
+        // committed by a zeroing provider it reads as zero (§26.2). A retained-dirty
+        // source (committed_len == len) keeps old data — never zero.
+        let from_unbacked = e.committed_len == 0;
         let uncommitted = e.len - e.committed_len;
         if uncommitted > 0 {
             let offset = self.sub_offset(e.base) + e.committed_len;
@@ -1805,7 +1889,8 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         }
         debug_assert!(g.map.check_invariants());
         let generation = g.map.view(id).expect("just carved").generation;
-        Ok(ExtentRef { id, generation })
+        let zeroed = from_unbacked && self.provider.committed_memory_is_zeroed();
+        Ok((ExtentRef { id, generation }, zeroed))
     }
 
     /// The large-allocation path (§18.5, W4-4): page-round `bytes` overflow-safely,
@@ -1816,6 +1901,12 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     /// [`ExtentRef`] (a cache-served region is owned by the cache, so its ref is
     /// `None`).
     ///
+    /// The third tuple element is whether the returned region is **freshly
+    /// OS-zeroed** (W15-5): `true` for an extent-served region carved fresh from
+    /// unbacked backing under a zeroing provider (so `calloc` may skip its `memset`),
+    /// `false` for a cache-served region (the region cache / hugepage filler may hand
+    /// back a reused page, so it is conservatively treated as possibly-non-zero).
+    ///
     /// SPEC-transition: `large_allocate` (§18.5)
     pub fn alloc_large(
         &self,
@@ -1823,7 +1914,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         align: usize,
         hints: Hints,
         hook: &dyn RegionCacheHook,
-    ) -> Result<(Region, Option<ExtentRef>), ExtentError> {
+    ) -> Result<(Region, Option<ExtentRef>, bool), ExtentError> {
         if bytes == 0 || !align.is_power_of_two() {
             return Err(ExtentError::InvalidRequest);
         }
@@ -1835,11 +1926,156 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         // carrying the placement hints so a hugepage backend can pack by hotness/
         // lifetime (§19.3/§19.5, W11).
         if let Some(region) = hook.try_alloc(rounded, align, hints) {
-            return Ok((region, None));
+            // Cache-served: the cache may return a reused page — conservatively
+            // not-known-zero, so `calloc` still zeroes it (correct, just not elided).
+            return Ok((region, None, false));
         }
-        let r = self.alloc(rounded, align, Fit::Best)?;
+        let (r, zeroed) = self.alloc_z(rounded, align, Fit::Best)?;
         let region = self.region_of(r).expect("just allocated");
-        Ok((region, Some(r)))
+        Ok((region, Some(r), zeroed))
+    }
+
+    /// Split the **live** ([`Active`](ExtentState::Active)) extent `r` at
+    /// `prefix_len` page-aligned bytes, keeping `[base, base + prefix_len)` in `r`
+    /// (its [`ExtentRef`] stays valid — `split` bumps only `split_generation`, not
+    /// the recycle `generation`) and returning the tail
+    /// `[base + prefix_len, base + len)` as a **fresh, still-`Active`** extent
+    /// (§18.3, plan 06 W15-3b — the large/medium in-place shrink).
+    ///
+    /// The tail is deliberately **not** freed here: the caller owns the
+    /// retire-before-free ordering (clear the tail's pagemap entries, shrink the
+    /// owning descriptor, *then* [`free`](Self::free) the returned ref), so a reuse
+    /// of the eventually-freed tail can never collide with stale pagemap entries —
+    /// the same discipline `Allocator::retire_span` follows.
+    ///
+    /// On **any** failure — `r` stale or not `Active`, `prefix_len` not a nonzero
+    /// page multiple strictly inside the extent, or the descriptor-slot pool
+    /// exhausted — **nothing is mutated** (`split_in`'s slot pop is the first and
+    /// only fallible step) and the error is returned, so the original extent stays
+    /// exactly as it was. This is the W4-5 / §25.3 safety guarantee a failed
+    /// in-place shrink relies on: it falls back to keeping the allocation whole.
+    ///
+    /// SPEC-transition: `extent_split` (§18.3 / §33.4 `span_split_preserves_disjointness`)
+    pub fn split_tail(&self, r: ExtentRef, prefix_len: usize) -> Result<ExtentRef, ExtentError> {
+        let notify = self.notifier();
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        // Only a live allocation can be shrunk in place; a free extent has no owner
+        // to keep the prefix for (M-004: never resize a range with no live object).
+        if e.state != ExtentState::Active {
+            return Err(ExtentError::NotFree);
+        }
+        // `split_in` validates `prefix_len` (a nonzero page multiple `< len`) and is
+        // the sole fallible step — a `None` leaves the back-end untouched (W4-5).
+        let tail = g
+            .map
+            .split_in(r.id, prefix_len, &notify)
+            .ok_or(ExtentError::Exhausted)?;
+        // The tail inherits the parent's `Active` state and full backing; report a
+        // generation-checked ref so the caller's subsequent `free` cannot resolve a
+        // stale slot (DD-1 F2).
+        let generation = g.map.view(tail).expect("just split").generation;
+        debug_assert!(g.map.check_invariants());
+        Ok(ExtentRef {
+            id: tail,
+            generation,
+        })
+    }
+
+    /// Whether [`grow_in_place`](Self::grow_in_place) could currently extend `r` to
+    /// `new_len` — `r` is a live extent and its address-adjacent successor is **free**
+    /// and large enough to supply the deficit. A cheap **O(1)** feasibility probe (a
+    /// single address-list step) the large path consults to **fail fast** — falling to
+    /// a move (`realloc`) or reporting no-grow (`xallocx`) *before* any pagemap work —
+    /// so a grow that cannot happen costs nothing (the common "no adjacent free" case).
+    /// Advisory and mirrors [`grow_in_place`](Self::grow_in_place)'s precondition: the
+    /// grow re-checks under its own lock, so a neighbour that changes between this probe
+    /// and the grow is harmless (the grow simply declines).
+    pub fn can_grow_in_place(&self, r: ExtentRef, new_len: usize) -> bool {
+        let needed = match align_up(new_len, PAGE_SIZE) {
+            Some(n) => n,
+            None => return false,
+        };
+        let g = self.lock();
+        let e = match g.map.resolve(r) {
+            Some(e) => e,
+            None => return false,
+        };
+        if e.state != ExtentState::Active || needed <= e.len {
+            return false;
+        }
+        let additional = needed - e.len;
+        match g.map.addr_next(r.id) {
+            Some(next_id) => g
+                .map
+                .view(next_id)
+                .is_some_and(|nv| nv.state.is_free() && nv.len >= additional),
+            None => false,
+        }
+    }
+
+    /// Grow the **live** ([`Active`](ExtentState::Active)) extent `r` in place to
+    /// `new_len` page-aligned bytes by **absorbing the front of its address-adjacent
+    /// free neighbour** (§18.3 grow — the dual of [`split_tail`](Self::split_tail),
+    /// and the medium/large in-place grow of §25.2 / W15-3a). `r` keeps its base,
+    /// id, and generation (live pointers stay valid); only its length grows.
+    ///
+    /// Succeeds only when the immediately-following extent is **free** and large
+    /// enough to supply the deficit; otherwise the caller must move (`realloc`) or
+    /// report no-grow (`xallocx`). On **any** failure — no adjacent free neighbour,
+    /// the neighbour too small, a slot-pool-exhausted trim, or a provider commit
+    /// failure — **nothing is mutated** (the neighbour trim is rolled back by a
+    /// re-coalesce), so the allocation stays exactly as it was (the W4-5 / §25.1
+    /// in-place-grow safety guarantee).
+    ///
+    /// SPEC-transition: `extent_merge` (§18.3 / §33.4 `span_merge_preserves_disjointness`)
+    pub fn grow_in_place(&self, r: ExtentRef, new_len: usize) -> Result<(), ExtentError> {
+        let needed = align_up(new_len, PAGE_SIZE).ok_or(ExtentError::Overflow)?;
+        let notify = self.notifier();
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        if e.state != ExtentState::Active {
+            return Err(ExtentError::NotFree); // only a live allocation grows in place
+        }
+        if needed <= e.len {
+            return Ok(()); // already large enough (caller pre-checks; defensive no-op)
+        }
+        let additional = needed - e.len;
+        // The deficit must come from the address-adjacent successor, which must be
+        // free and cover it. The address list guarantees adjacency (no gaps, §18 tiling).
+        let next_id = g.map.addr_next(r.id).ok_or(ExtentError::Exhausted)?;
+        let nv = g.map.view(next_id).ok_or(ExtentError::Exhausted)?;
+        if !nv.state.is_free() || nv.len < additional {
+            return Err(ExtentError::Exhausted);
+        }
+        debug_assert_eq!(
+            e.base + e.len,
+            nv.base,
+            "addr_next must be adjacent (§18 tiling)"
+        );
+        // Trim the neighbour down to exactly `additional` (if larger) — the only
+        // bookkeeping that needs a slot; a `None` here leaves the back-end untouched
+        // (W4-5: the trim's slot pop is its first, only fallible, step).
+        if nv.len > additional && g.map.split_in(next_id, additional, &notify).is_none() {
+            return Err(ExtentError::Exhausted);
+        }
+        // Commit the neighbour's uncommitted backing so the grown extent stays fully
+        // backed (M-005). On a provider failure, re-coalesce the (still-free) neighbour
+        // to undo the trim, leaving the original free geometry — nothing is mutated.
+        let ne = g.map.view(next_id).expect("trimmed neighbour");
+        let uncommitted = ne.len - ne.committed_len;
+        if uncommitted > 0 {
+            let offset = self.sub_offset(ne.base) + ne.committed_len;
+            if let Err(err) = self.provider.commit(self.region, offset, uncommitted) {
+                g.map.coalesce_in(next_id, &notify);
+                return Err(ExtentError::Backend(err));
+            }
+            g.map.mark_committed(next_id);
+        }
+        // Absorb the now-fully-committed neighbour into the active extent.
+        g.map.absorb_next_in(r.id, next_id, &notify);
+        debug_assert!(g.map.check_invariants());
+        Ok(())
     }
 
     /// Free extent `r`, applying the retain/unmap policy (§20.5, W4-3b): retain
@@ -2810,11 +3046,17 @@ mod tests {
     fn alloc_large_rounds_and_bypasses_with_region_cache_hook() {
         let mgr = manager(64);
         // An "awkward" size (just over 2 pages) rounds up to whole pages, no wrap.
-        let (region, r) = mgr
+        let (region, r, zeroed) = mgr
             .alloc_large(2 * PAGE + 1, PAGE, Hints::default(), &NoRegionCache)
             .expect("large");
         assert_eq!(region.len, 3 * PAGE, "rounded up to whole pages");
         assert!(r.is_some(), "served from the extent manager (no cache)");
+        // The host test provider does not promise zeroed commits, so the extent is
+        // conservatively reported not-known-zero (calloc would memset it).
+        assert!(
+            !zeroed,
+            "default test provider does not opt into committed_memory_is_zeroed"
+        );
         assert!(mgr.check_invariants());
     }
 

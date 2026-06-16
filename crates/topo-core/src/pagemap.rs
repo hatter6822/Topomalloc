@@ -278,6 +278,63 @@ impl PageMap {
         self.publish_range(meta, (large.base(), large.end()), entry)
     }
 
+    /// Install the page-aligned sub-range `[base, stop)` of a large allocation,
+    /// mapping each page to `large` — used by an **in-place grow** that absorbed the
+    /// adjacent free extent and must now cover the *new* pages (§25.2, plan 06
+    /// W15-3a). Like [`install_large`](Self::install_large) it is two-phase and
+    /// **atomic on metadata exhaustion** (`publish_range` creates every node before
+    /// publishing any entry), so a failed grow leaves the new pages `Empty` and the
+    /// caller can roll the extent back without a half-mapped range.
+    ///
+    /// `base`/`stop` must be page-aligned (the large base and both the old and new
+    /// page-rounded usable sizes are) and lie within `large`'s grown range. The
+    /// caller installs this **before** publishing the grown `usable_size`, so the
+    /// descriptor never advertises pages the pagemap does not yet cover.
+    ///
+    /// SPEC-transition: pagemap publish for large in-place grow (§17.2 P-Map-006)
+    pub fn install_large_range(
+        &self,
+        meta: &dyn MetadataAlloc,
+        large: &LargeDescriptor,
+        base: usize,
+        stop: usize,
+    ) -> Result<(), PagemapError> {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "grow range base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "grow range stop must be page-aligned");
+        let entry = PageEntry::Large(large as *const LargeDescriptor).encode();
+        self.publish_range(meta, (base, stop), entry)
+    }
+
+    /// **Phase 1 only** of [`install_large_range`](Self::install_large_range): create
+    /// the radix leaves covering `[base, stop)` **without publishing any entry** (every
+    /// page stays whatever it was — `Empty` for the free neighbour an in-place grow is
+    /// about to absorb). This lets the grow perform its single metadata-fallible step
+    /// **before** it irreversibly absorbs that neighbour, so the matching
+    /// [`install_large_range`](Self::install_large_range) afterward publishes into
+    /// already-created nodes and **cannot fail** — it allocates nothing (phase 1 finds
+    /// every leaf present). That removes the only fallible step *after* the absorb, and
+    /// with it the best-effort rollback that could itself fail (§25.2, plan 06 W15-3a;
+    /// PR #19 review). Atomic on metadata exhaustion (nothing is published either way);
+    /// if the grow later aborts, the created nodes are simply unused — monotonic
+    /// metadata is never freed, the same bounded behavior as a lost publish race.
+    ///
+    /// `base`/`stop` must be page-aligned and lie within the descriptor's grown range.
+    ///
+    /// SPEC-transition: pagemap node reservation for large in-place grow (§17.2 P-Map-006)
+    pub fn reserve_large_range(
+        &self,
+        meta: &dyn MetadataAlloc,
+        base: usize,
+        stop: usize,
+    ) -> Result<(), PagemapError> {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "grow range base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "grow range stop must be page-aligned");
+        for p in page_range(base, stop) {
+            self.leaf_or_create(meta, p)?;
+        }
+        Ok(())
+    }
+
     /// Transition a span's pages to **released-but-retained** (P-Map-005): the
     /// entries keep pointing at the descriptor (now `state == Released`) so the
     /// pages cannot be reused without recommit. The caller MUST set the span's state
@@ -307,6 +364,28 @@ impl PageMap {
     /// SPEC-transition: pagemap clear on large free (§17.2 P-Map-006)
     pub fn retire_large(&self, large: &LargeDescriptor) {
         self.overwrite_existing_range((large.base(), large.end()), TAG_EMPTY);
+    }
+
+    /// Retire the page-aligned sub-range `[base, stop)` of a large allocation to
+    /// `Empty` (P-Map-002), used by an **in-place shrink** that returns the
+    /// allocation's tail pages to the backend (§25.3, plan 06 W15-3b). Like
+    /// [`retire_large`](Self::retire_large) it is allocation-free and only
+    /// overwrites pages that were mapped (the suffix the allocation still owns at
+    /// the call); after it a classifier sees `Empty` for the returned tail.
+    ///
+    /// **Ordering (load-bearing).** The caller MUST retire the tail here **before**
+    /// the underlying extent is freed (so it can be reallocated), exactly as
+    /// [`Allocator::retire_span`](crate::Allocator) clears the pagemap before
+    /// returning the extent — otherwise a reuse of the freed tail could collide
+    /// with the stale `Large` entries this clears (P-Map-001: one page → one
+    /// descriptor). `base`/`stop` must be page-aligned (the large base and both the
+    /// old and new page-rounded usable sizes are).
+    ///
+    /// SPEC-transition: pagemap clear on large in-place shrink (§17.2 P-Map-006)
+    pub fn retire_large_range(&self, base: usize, stop: usize) {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "shrink tail base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "shrink tail stop must be page-aligned");
+        self.overwrite_existing_range((base, stop), TAG_EMPTY);
     }
 
     // --- internal radix walk + publish --------------------------------------
@@ -792,6 +871,48 @@ mod tests {
             assert!(
                 pm.lookup(p << PAGE_SHIFT).is_empty(),
                 "page {p:#x} left mapped after a failed install (non-atomic)"
+            );
+        }
+    }
+
+    #[test]
+    fn install_large_range_after_reserve_allocates_nothing_and_publishes() {
+        // W15-3a (PR #19 review): `reserve_large_range` pre-creates the leaves, so the
+        // matching `install_large_range` publishes into existing nodes — allocating
+        // **zero** further metadata, hence unable to fail. That is what lets the
+        // in-place grow place its only fallible (metadata) step *before* the
+        // irreversible absorb, leaving no fallible step afterward (no rollback to fail).
+        let base = 0x4000_0000usize;
+        let usable = SLOTS * PAGE_SIZE + PAGE_SIZE; // a multi-leaf range (crosses a boundary)
+        let d = LargeDescriptor::new(LargeId(7), ArenaId::DEFAULT, base, usable, PAGE_SIZE);
+        let m = meta(1 << 20);
+        let pm = PageMap::new();
+
+        // Reserve the range's leaves — nothing is published yet.
+        pm.reserve_large_range(&m, base, base + usable)
+            .expect("reserve creates the leaves");
+        for p in page_range(base, base + usable) {
+            assert!(
+                pm.lookup(p << PAGE_SHIFT).is_empty(),
+                "reserve_large_range must publish no entry"
+            );
+        }
+        let after_reserve = pm.metadata_bytes();
+
+        // Publish over the reserved range: it must allocate no further metadata and
+        // succeed — exactly the infallibility the grow relies on.
+        pm.install_large_range(&m, &d, base, base + usable)
+            .expect("publish into already-reserved leaves");
+        assert_eq!(
+            pm.metadata_bytes(),
+            after_reserve,
+            "install after reserve allocated metadata — it could then fail (the gap)"
+        );
+        for p in page_range(base, base + usable) {
+            assert_eq!(
+                pm.lookup(p << PAGE_SHIFT).large_ptr(),
+                Some(&d as *const LargeDescriptor),
+                "page {p:#x} not published to the descriptor"
             );
         }
     }

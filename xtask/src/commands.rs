@@ -296,6 +296,10 @@ pub fn lint(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record(
+        "obligation citations (V-004)",
+        check_obligation_citations(root),
+    );
     r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
@@ -345,6 +349,10 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     clippy_steps(&mut r);
     r.record("SPDX headers", check_spdx(root));
     r.record("Lean style", check_lean_style(root));
+    r.record(
+        "obligation citations (V-004)",
+        check_obligation_citations(root),
+    );
     r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
@@ -778,6 +786,155 @@ fn check_lean_style(root: &Path) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Formal-obligation citation governance (the W15-3b review lesson, V-004).
+//
+// A claim that a change carries *no* formal-model obligation — "policy, not safety",
+// "no Lean obligation", "adds no abstract transition", "composes certified mechanisms"
+// — is exactly the kind of assertion that, left unbacked, lets real proof work slip
+// by under a plausible-sounding label (it happened to W15-3b before review). So every
+// such claim in crate source MUST cite a concrete, auditable artifact **in the same
+// comment block**: either a named Lean theorem (the "sequences certified transitions"
+// pattern — W12/W15-3b) or a fixed-wall safety test (the "pure policy" pattern —
+// W13/W14). This lint makes that a gate, not a convention.
+
+/// Phrases that assert the absence of a formal-model obligation (lowercased match).
+const OBLIGATION_CLAIM_PHRASES: &[&str] = &[
+    "no lean obligation",
+    "no lean theorem",
+    "no new abstract transition",
+    "adds no abstract transition",
+    "no abstract state-machine transition",
+    "not a modeled transition",
+    "no new §33.4 obligation",
+    "no §33.4 obligation",
+];
+
+/// Keywords marking a concrete citation: a Lean theorem (`theorem`/`certif`/`proven`/
+/// `proved`/`discharg`) or a pinning safety test (`pin`/`fixed wall`/`fixed-wall`).
+const OBLIGATION_CITATION_KEYWORDS: &[&str] = &[
+    "pin",
+    "certif",
+    "proven",
+    "proved",
+    "discharg",
+    "theorem",
+    "fixed wall",
+    "fixed-wall",
+];
+
+/// Flag every contiguous comment block that asserts "no formal obligation" without
+/// citing a backing artifact in the **same block** (pure; tested). Joining the block
+/// first means a phrase that wraps across doc-comment lines is still seen, and the
+/// citation window is exactly the block. Returns `(start_line, phrase)` pairs.
+fn obligation_citation_issues(content: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut issues = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].trim_start().starts_with("//") {
+            i += 1;
+            continue;
+        }
+        let mut block = String::new();
+        // `spans[k] = (block_offset, source_line_idx)` for the start of each joined line,
+        // so a block byte-offset maps back to a source line. Joining strips the comment
+        // marker (`//`, `///`, `//!`) so a phrase that wraps across doc-comment lines
+        // reconstructs ("no Lean" + "/// obligation" → "no lean obligation").
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        while i < lines.len() && lines[i].trim_start().starts_with("//") {
+            spans.push((block.len(), i));
+            let text = lines[i]
+                .trim_start()
+                .trim_start_matches('/')
+                .trim_start_matches('!')
+                .trim();
+            block.push_str(&text.to_lowercase());
+            block.push(' ');
+            i += 1;
+        }
+        // The source line (0-based) a block offset came from.
+        let line_of = |off: usize| -> usize {
+            spans
+                .iter()
+                .rev()
+                .find(|(bo, _)| *bo <= off)
+                .map(|(_, ln)| *ln)
+                .unwrap_or(0)
+        };
+        // A claim is "cited" only if a citation keyword sits within `LINE_WINDOW` source
+        // lines of it (≈ the same paragraph) — local enough that a stray keyword elsewhere
+        // in a long module doc cannot launder an unrelated bare claim, yet forgiving of a
+        // genuine claim and its citation spread over adjacent sentences. Lines (not bytes)
+        // are the unit, so the multibyte `§`/`—` never distort the distance.
+        const LINE_WINDOW: usize = 6;
+        for phrase in OBLIGATION_CLAIM_PHRASES {
+            let Some(pos) = block.find(phrase) else {
+                continue;
+            };
+            let pline = line_of(pos);
+            let cited = OBLIGATION_CITATION_KEYWORDS.iter().any(|c| {
+                block.match_indices(c).any(|(cpos, _)| {
+                    // Word-boundary on the left so a citation stem matches only as a word
+                    // (`pin`→"pinned"/"pins"), never inside another word ("map**pin**g",
+                    // "ap**proved**") — an accidental substring must not launder a claim.
+                    let at_word_start = cpos == 0
+                        || !block[..cpos]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|ch| ch.is_alphanumeric());
+                    at_word_start && line_of(cpos).abs_diff(pline) <= LINE_WINDOW
+                })
+            });
+            if !cited {
+                issues.push((pline + 1, (*phrase).to_string()));
+            }
+        }
+    }
+    issues
+}
+
+/// Gate the "no formal obligation" claims (the W15-3b review lesson): every such claim
+/// in crate source must cite a backing theorem or fixed-wall safety test in the same
+/// comment block, so "no Lean obligation" is never a bare, unverifiable assertion.
+/// Scans `crates/**/src/**/*.rs`.
+fn check_obligation_citations(root: &Path) -> bool {
+    let mut issues = Vec::new();
+    visit_files(root, SKIP_DIRS, &mut |path| {
+        let s = path.to_string_lossy();
+        if !(s.contains("crates") && s.contains("src") && s.ends_with(".rs")) {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for (line, phrase) in obligation_citation_issues(&content) {
+            issues.push(format!(
+                "{}:{}: \"{phrase}\" with no backing theorem / fixed-wall test cited in the block",
+                path.display(),
+                line
+            ));
+        }
+    });
+    if issues.is_empty() {
+        println!(
+            "  · obligation citations: every \"no formal obligation\" claim cites a theorem or fixed-wall test"
+        );
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ obligation citation: {it}");
+        }
+        eprintln!(
+            "  → a \"policy, not safety / no Lean obligation\" claim MUST cite a backing artifact: \
+             a named Lean theorem (the W12/W15-3b 'sequences certified transitions' pattern) or a \
+             fixed-wall safety test (the W13/W14 'pure policy' pattern, e.g. \
+             `placement_never_breaks_the_allocation_contract`). See docs/CONVENTIONS.md."
+        );
+        false
+    }
+}
+
 /// The RSEQ no-call discipline (W7-2d, §12.3): a restartable critical section
 /// MUST contain no calls and no branch-with-link, because the kernel does not
 /// restart across them. The per-architecture sequences in `topo-arch` are the
@@ -1206,6 +1363,55 @@ mod tests {
     fn compile_verb_uses_build_for_host_targets() {
         assert_eq!(compile_verb(None), "build");
         assert_eq!(compile_verb(Some("x86_64-unknown-linux-gnu")), "build");
+    }
+
+    #[test]
+    fn obligation_citation_lint_requires_a_backing_citation() {
+        // A bare "no Lean obligation" claim is flagged.
+        let bare = "//! Placement is policy, so there is no Lean obligation.\n";
+        assert_eq!(obligation_citation_issues(bare).len(), 1);
+
+        // A claim citing a Lean theorem passes (the W12/W15-3b "sequences certified" pattern).
+        let cited_thm =
+            "//! Sequences the certified extent split; no Lean obligation\n//! (pinned by the `foo_preserves_bar` theorem).\n";
+        assert!(obligation_citation_issues(cited_thm).is_empty());
+
+        // A claim citing a fixed-wall safety test passes (the W13/W14 "pure policy" pattern).
+        let cited_test =
+            "/// adds no abstract transition — the fixed wall\n/// `x_never_breaks_y` pins it.\n";
+        assert!(obligation_citation_issues(cited_test).is_empty());
+
+        // A phrase that wraps across doc-comment lines is still seen (here uncited ⇒ flagged):
+        // the block join is what makes this robust to comment wrapping.
+        let wrapped = "/// … so it carries no Lean\n/// obligation for the policy.\n";
+        assert_eq!(obligation_citation_issues(wrapped).len(), 1);
+
+        // Two separate uncited blocks are flagged independently; a citation in block A does
+        // not excuse block B.
+        let two =
+            "/// no Lean obligation (pinned by `t`).\nfn a() {}\n/// not a modeled transition here.\nfn b() {}\n";
+        assert_eq!(obligation_citation_issues(two).len(), 1);
+
+        // A citation FAR from the claim (same block, but beyond the line window) does not
+        // excuse it — the window is local, so a stray keyword elsewhere in a long module
+        // doc cannot launder an unrelated bare claim.
+        let filler = "/// lorem ipsum dolor sit amet.\n".repeat(8); // 8 comment lines > LINE_WINDOW
+        let far = format!("/// no Lean obligation.\n{filler}/// (proved by `t`).\n");
+        assert_eq!(
+            obligation_citation_issues(&far).len(),
+            1,
+            "a citation beyond the line window must not excuse the claim"
+        );
+
+        // An accidental substring is NOT a citation: "map**pin**g" must not satisfy the
+        // `pin` keyword (the real bug a profile.rs scan hit). Word-boundary matching flags
+        // this claim despite the nearby "mapping".
+        let substring = "//! the feature→profile mapping; so there is no Lean obligation.\n";
+        assert_eq!(
+            obligation_citation_issues(substring).len(),
+            1,
+            "a citation stem inside another word (mapPINg) must not launder the claim"
+        );
     }
 
     #[test]

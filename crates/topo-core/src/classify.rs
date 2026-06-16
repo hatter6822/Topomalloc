@@ -220,9 +220,11 @@ mod tests {
 
     #[test]
     fn over_aligned_small_request_routes_out_not_into_a_slab() {
-        // A small *size* with an alignment beyond every class's natural alignment
+        // A small *size* whose alignment is beyond **every** class (`> MAX_ALIGN`)
         // must NOT be served by a small class (which would force a slab stride
-        // change, §9.3 / §25.5). It routes to a page-rounded extent instead.
+        // change, §9.3 / §25.5). It routes to a page-rounded extent instead. (An
+        // alignment *within* MAX_ALIGN is served by a naturally-aligned class — see
+        // `over_aligned_small_request_uses_an_aligned_class`.)
         let a = MAX_ALIGN * 2;
         let r = classify(64, a, 0).unwrap();
         match r.kind {
@@ -233,6 +235,38 @@ mod tests {
             RequestKind::Small { .. } => panic!("over-aligned request stayed in a small slab"),
         }
         assert_eq!(r.align, a);
+    }
+
+    #[test]
+    fn over_aligned_small_request_uses_an_aligned_class() {
+        // W15-4 aligned classes: a small object with an alignment up to MAX_ALIGN is
+        // served from a **naturally-aligned size class** — a slab slot, not a whole
+        // page — so cache-line-aligned (64) small allocations cost a slot, not 16 KiB.
+        for &(size, align) in &[
+            (64usize, 64usize), // cache line
+            (16, 32),
+            (200, 128),
+            (1, 256),
+            (4096, 4096),
+        ] {
+            let r = classify(size, align, 0).unwrap();
+            match r.kind {
+                RequestKind::Small { usable, .. } => {
+                    assert!(usable >= size, "({size},{align}) class too small: {usable}");
+                    assert!(
+                        usable >= align,
+                        "({size},{align}) class under-aligned: {usable}"
+                    );
+                    // The win: an in-MAX_ALIGN over-aligned small request does not burn a page.
+                    assert!(
+                        usable < PAGE_SIZE,
+                        "({size},{align}) small over-aligned wasted a page ({usable})"
+                    );
+                }
+                other => panic!("({size},{align}) expected Small (aligned class), got {other:?}"),
+            }
+            assert_eq!(r.align, align);
+        }
     }
 
     #[test]

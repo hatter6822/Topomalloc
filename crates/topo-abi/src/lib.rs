@@ -55,7 +55,8 @@ pub use c_api::{
     topomalloc_aligned_alloc, topomalloc_backend, topomalloc_calloc, topomalloc_free,
     topomalloc_free_aligned_sized, topomalloc_free_sized, topomalloc_malloc,
     topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
-    topomalloc_realloc, topomalloc_reallocarray, topomalloc_version,
+    topomalloc_pvalloc, topomalloc_realloc, topomalloc_reallocarray, topomalloc_valloc,
+    topomalloc_version,
 };
 pub use extended::{
     topo_align_lg, topo_arena, topo_dallocx, topo_hot, topo_mallocx, topo_nallocx, topo_rallocx,
@@ -190,6 +191,26 @@ impl AnyAllocator {
         let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
         crate::sampling::on_alloc(p, new_size, min_align, flags);
         p
+    }
+
+    /// Resize `ptr` **in place only** (the extended `xallocx`, §10.3): shrink or
+    /// grow toward `new_size` without moving, returning the achieved usable size, or
+    /// `None` for a non-owned/interior pointer or an alignment the base cannot
+    /// satisfy in place. See [`topo_core::Allocator::resize_in_place`].
+    ///
+    /// # Safety
+    ///
+    /// As [`realloc`](Self::realloc): `ptr` is a live resize target the caller owns;
+    /// not concurrently freed/realloc'd.
+    pub unsafe fn resize_in_place(
+        &self,
+        ptr: *mut u8,
+        new_size: usize,
+        min_align: usize,
+        flags: RequestFlags,
+    ) -> Option<usize> {
+        // SAFETY: the caller upholds this method's identical contract.
+        dispatch!(self, a => unsafe { a.resize_in_place(ptr, new_size, min_align, flags) })
     }
 
     /// The usable size of a live allocation (`None` for null/foreign/interior).
@@ -666,6 +687,44 @@ mod tests {
         unsafe {
             assert_eq!(a.free(s), FreeOutcome::Freed);
         }
+    }
+
+    /// W15-3b D: an in-place **shrink** of a *cache-served* (hugepage-filler)
+    /// medium allocation trims its tail pages back to the filler — same base, usable
+    /// drops, prefix preserved, `live_bytes` reconciles — the hugepage-profile
+    /// counterpart of the extent-path tail return.
+    #[cfg(feature = "hugepage-optimized")]
+    #[test]
+    fn hugepage_realloc_shrink_trims_the_cache_served_tail() {
+        let a = new_allocator_named("posix").expect("hugepage_optimized posix engine builds");
+        // A sub-hugepage medium allocation is cache-served by the filler.
+        let p = a.allocate(200 * 1024, 16, RequestFlags::NONE);
+        assert!(!p.is_null());
+        let old = a.usable_size(p).unwrap();
+        assert_eq!(a.stats().live_bytes, old as u64);
+        // SAFETY: `old` writable bytes.
+        unsafe { std::ptr::write_bytes(p, 0x5a, old) };
+
+        // Shrink across a page boundary: the filler trims the tail in place.
+        // SAFETY: `p` is the live allocation this test owns.
+        let q = unsafe { a.realloc(p, 100 * 1024, 16, RequestFlags::NONE) };
+        assert_eq!(q, p, "cache-served shrink stays in place");
+        let new = a.usable_size(q).unwrap();
+        assert!(
+            new < old,
+            "the cache-served tail was trimmed: {old} -> {new}"
+        );
+        assert!(new >= 100 * 1024);
+        // The prefix survived (no move), and the accounting reconciles (§8.6/§36.17).
+        // SAFETY: `new` readable bytes carry the pattern.
+        unsafe {
+            assert_eq!(*q, 0x5a);
+            assert_eq!(*q.add(new - 1), 0x5a);
+        }
+        assert_eq!(a.stats().live_bytes, new as u64);
+        // SAFETY: `q` is the live shrunk allocation.
+        unsafe { assert_eq!(a.free(q), FreeOutcome::Freed) };
+        assert_eq!(a.stats().live_bytes, 0);
     }
 
     /// Reclaim-on-failure invariant for `build_posix_allocator`'s hugepage arm

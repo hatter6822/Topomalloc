@@ -45,7 +45,10 @@ The public API runs over the real central-path allocator: classify → central
 free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`,
 errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++
 operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the
-seLe4n simulator (G-sim).
+seLe4n simulator (G-sim). The full reallocation surface (W15) is complete: the
+§25 move path (failure preserves the original), in-place grow, and in-place
+**shrink** that returns a medium/large allocation's tail pages to the backend,
+plus aligned-allocation validation and overflow-safe calloc zeroing.
 
 ## Quick start
 

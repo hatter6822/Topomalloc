@@ -20,7 +20,11 @@
 //! Like the release controller (W12) and the hugepage filler's score (W11), placement
 //! is **policy, not safety** (§2.4): a misread topology degrades fragmentation/locality
 //! but can never hand back an unsound pointer. So there is no abstract state-machine
-//! transition here and no Lean obligation.
+//! transition here and no Lean obligation — a claim **pinned by tests, not asserted**:
+//! `preferred_node` totality (every policy, incl. a stale `Bind`, yields an in-range node
+//! or `DEFAULT`) by `placement_covers_every_numa_mode`, and the end-to-end size /
+//! alignment / validity / free-home boundary by the `NodeRouter`'s fixed-wall
+//! `placement_never_breaks_the_allocation_contract` (the W13 analogue of W14's wall).
 
 use crate::arena::NumaPolicy;
 use crate::ids::NodeId;
@@ -178,7 +182,11 @@ impl Topology {
     /// (`ArenaPolicy`).
     ///
     /// Placement is **policy, not a modeled transition** (§2.4): it steers locality, so
-    /// it carries no `SPEC-transition` tag and no Lean obligation.
+    /// it carries no `SPEC-transition` tag and no Lean obligation. Its one safety-relevant
+    /// property — **totality**: every policy (incl. a stale `Bind`) returns an in-range
+    /// node or `DEFAULT`, never an out-of-range one — is pinned by the
+    /// `placement_covers_every_numa_mode` test, and the end-to-end pointer contract by the
+    /// `NodeRouter` fixed-wall `placement_never_breaks_the_allocation_contract`.
     pub fn preferred_node(
         &self,
         policy: NumaPolicy,

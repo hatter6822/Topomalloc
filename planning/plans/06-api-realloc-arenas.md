@@ -1,8 +1,13 @@
 # Plan 06 — Public API, Reallocation & Arenas
 
 **Workstreams:** W8 (public API/ABI), W15 (realloc/aligned/calloc), W9 (capability-backed arenas), W10
-(extent hooks) · **Status:** rev 2.4 — W8 landed (all units); W15-1/2/3a basics shipped with the W8
-realloc core; **W9 landed (all units, ahead of M4): the live multi-arena data path, the §22.3/§36.13
+(extent hooks) · **Status:** rev 2.6 — W8 landed (all units); **W15 complete & optimal (all units, no
+deferrals): the realloc state machine + move path; in-place *grow* incl. extent-merge (absorb adjacent
+free, no copy) and *shrink* incl. cache-served hugepage tail-trim, both via `realloc` and the dedicated
+in-place `xallocx`; calloc `memset` elision over freshly-OS-zeroed extents; aligned size classes
+(over-aligned small served from a slab, not a page); and `valloc`/`pvalloc` — pinned by the
+`realloc_{shrink,grow}_inplace_*` Lean theorems and re-verified G-table/`maxAlign` gates**; **W9 landed
+(all units, ahead of M4): the live multi-arena data path, the §22.3/§36.13
 lifecycle, capability-monotonic delegation, quotas, NUMA policy, and the C arena API**; **W10 landed
 (all units, ahead of M4): the §23.2 extent-hook interface + `HookProvider` over the backing seam, the
 §23.3 contract enforcement, the §23.4 Lean conditional-correctness model, and §34.8 hook failure
@@ -94,14 +99,49 @@ W16-4 owns the transition). **Enables:** every consumer + tests.
 **Depends on:** plan 03 W2 (size classify) + W3 (pointer classify), plan 04 W4 (extent grow/shrink), W8.
 **Enables:** M1 (basic), M5 (in-place via extents).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W15-1 | realloc semantics (§25.1): `realloc(NULL,n)`, `realloc(p,0)` policy, content preservation, failure keeps the original. | M | | property test: content preserved; failure safety. **Basics shipped with W8-1a** (contract + dispatch + property tests); W15 owns the remaining depth. |
-| W15-2 | Move realloc (§25.4): allocate-before-free, copy `min(old_usable,new)`, alignment/arena preserved, profiled as realloc when sampled. | M | | old object preserved on OOM. **Move path shipped with W8-1a** (+ Lean `reallocMove` theorems); realloc-profiling lands with plan 07 sampling. |
-| W15-3a | In-place **grow** (§25.2): same-size-class fast path now; extent-merge growth for medium/large at M5. | M | ∥ | same-class grow is in-place; large via plan 04 extents. **Same-class + within-extent fast paths shipped with W8-1a**; extent-merge growth at M5. |
-| W15-3b | In-place **shrink** (§25.3): same-class; large tail-page split/return; no unusable tiny fragments unless policy permits. | M | ∥ | shrink returns tail safely. |
-| W15-4 | Aligned-allocation validation (§25.5) + over-aligned routing (§9.3, plan 03 W2-3b). | S | ∥ | power-of-two/min checks; over-aligned never offset-adjusts a shared slab. |
-| W15-5 | calloc zeroing (§26.2/§26.3) + overflow+rounding guard (§26.1, with plan 03 W2-4). | M | | zeroed result; zero-state metadata invalidated on reuse; overflow safe. |
+> **▸ Implementation status.** W15 is **landed** (all units). The realloc state machine is
+> [`topo_core::Allocator::realloc`](../../crates/topo-core/src/allocator.rs) (the DD-1 dispatch):
+> `realloc(NULL,n)≡malloc`, the `realloc(p,0)` policy at the ABI, content preservation, and
+> **failure-preserves-the-original** via the always-correct **move** path (allocate-before-free, copy
+> `min(old_usable,new)`, the original's arena preserved — §25.4 — sampled as a realloc by the W17-3
+> slice). In-place **grow** (W15-3a) is the same-small-class and within-extent fast path *layered under*
+> move; in-place **shrink** (W15-3b) now returns a medium/large allocation's tail pages to the backend
+> across a page boundary: [`ExtentManager::split_tail`](../../crates/topo-core/src/extent.rs) splits the
+> backing extent (the modeled `extent_split`), [`PageMap::retire_large_range`](../../crates/topo-core/src/pagemap.rs)
+> retires the tail's pagemap entries **before** the tail is freed (the retire-before-free discipline),
+> [`LargeDescriptor::shrink_usable`](../../crates/topo-core/src/span.rs) shrinks the descriptor under its
+> seqlock, and the tail extent is freed — with exact `live_bytes`/arena-quota accounting (§8.6/§36.17).
+> The shrink is **best-effort under always-correct semantics** (§25.3 SHOULD): a cache-served (hugepage
+> filler, W11) allocation or a slot-pool-exhausted split keeps the allocation whole — never failing the
+> call. Aligned-allocation validation (W15-4, power-of-two/min/size-multiple + over-aligned routing to
+> the medium/large path, §9.3/§25.5) and calloc's `n*size` **and** rounding overflow guard + full-usable
+> zeroing (W15-5, §26.1–§26.3) shipped with W8-2/W8-1a. **No new abstract transition (precise reason).**
+> A large allocation is **not** a core `Block` (clause 12 `WfSlabLayout` keys every block to a size
+> class), so it is modeled in the *extent backend*, where the in-place shrink is `extent_split` (§18.3,
+> the certified `span_split_preserves_disjointness` geometry) then `extent free` (§20.1 `ExtentState`, on
+> the `extent state machine` gate). The shrink **sequences** these two certified transitions — the
+> **W12** "sequence certified backend mechanisms" pattern, **not** the W13/W14 "policy invisible to
+> abstract state" one (those do not mutate geometry; this does, but only via certified extent
+> transitions), and **not** `reallocMove` (whose copy window needs two simultaneously-live disjoint
+> ranges — impossible for two same-base ranges; the shrink frees the tail so nothing overlapping is ever
+> live at once). The geometric premise is named + machine-checked by
+> `realloc_shrink_inplace_tail_tiles_disjointly` (discharged via `span_split_preserves_disjointness`);
+> the `reallocMove` theorems (`lean/TopoMalloc/Theorems/Realloc.lean`) still pin the move path.
+> Verified by the realloc content-preservation+failure-safety property test
+> ([`property.rs`](../../tests/tests/property.rs)), the engine shrink tests
+> (`realloc_large_shrink_returns_the_tail_pages` / `…_credits_the_owning_arena`, incl. backend `active`
+> drop + §36.17 reconciliation), the C-ABI shrink test
+> ([`abi.rs`](../../tests/tests/abi.rs)), and the `malloc_api` fuzz target (which reconciles `live_bytes`
+> across every shrink). See [docs/DECISIONS.md](../../docs/DECISIONS.md) (W15).
+
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W15-1 | realloc semantics (§25.1): `realloc(NULL,n)`, `realloc(p,0)` policy, content preservation, failure keeps the original. | M | | property test: content preserved; failure safety. | **DONE** — `Allocator::realloc` contract + dispatch; content+failure-safety property test |
+| W15-2 | Move realloc (§25.4): allocate-before-free, copy `min(old_usable,new)`, alignment/arena preserved, profiled as realloc when sampled. | M | | old object preserved on OOM. | **DONE** — q-before-free move; arena preserved (`allocate_in(old_arena,…)`); Lean `reallocMove` theorems; sampled as realloc (W17-3) |
+| W15-3a | In-place **grow** (§25.2): same-size-class fast path now; extent-merge growth for medium/large at M5. | M | ∥ | same-class grow is in-place; large via plan 04 extents. | **DONE (optimal)** — same-class + within-extent fast paths **and** extent-merge grow that absorbs the address-adjacent free extent with no copy (`ExtentManager::grow_in_place`→`absorb_next_in`; charge-then-grow, fall to move if no adjacent free); exposed via `realloc` and the dedicated in-place `xallocx` (`resize_in_place`); pinned by `realloc_grow_inplace_absorbs_disjointly` (via `span_merge_preserves_disjointness`) |
+| W15-3b | In-place **shrink** (§25.3): same-class; large tail-page split/return; no unusable tiny fragments unless policy permits. | M | ∥ | shrink returns tail safely. | **DONE (optimal)** — small same-class in place; **extent path** splits off + returns the tail (`split_tail`→retire→`shrink_usable`→free); **cache-served hugepage path** trims the tail in the filler (`HugePageFiller::trim` via `RegionCacheHook::try_trim`); exact accounting; via `realloc` + `xallocx`; pinned by `realloc_shrink_inplace_tail_tiles_disjointly` |
+| W15-4 | Aligned-allocation validation (§25.5) + over-aligned routing (§9.3, plan 03 W2-3b). | S | ∥ | power-of-two/min checks; over-aligned never offset-adjusts a shared slab. | **DONE (optimal)** — validation across `aligned_alloc`/`posix_memalign`/`memalign`/`valloc`/`pvalloc`; **aligned size classes** — the generated table records each class's natural alignment (largest pow2 dividing its size, capped at the page-aligned slab base), so a power-of-two-aligned small request ≤ a page is slab-served (the already-proven over-alignment walk; `MAX_ALIGN` = page size), never offset-adjusting a slab; `> MAX_ALIGN` still routes to medium/large |
+| W15-5 | calloc zeroing (§26.2/§26.3) + overflow+rounding guard (§26.1, with plan 03 W2-4). | M | | zeroed result; zero-state metadata invalidated on reuse; overflow safe. | **DONE (optimal)** — `array_bytes` checks `n*size`; `classify` checks rounding; the §26.3 zeroed-state is tracked at the extent granularity (`committed_memory_is_zeroed` provider contract): a large/medium calloc over a **freshly OS-zeroed** extent **elides the `memset`** (debug-verified), a recycled extent is re-zeroed; small always memsets |
 
 > **▸ Decomposition — W15 (realloc).** Split *semantics* (W15-1, the contract incl. failure-preserves-original),
 > *move* (W15-2, allocate-before-free so OOM cannot lose the original), and *in-place grow/shrink* (W15-3a/b,
@@ -394,7 +434,7 @@ failed revoke → the non-DESTROYED failure state.
 |---|---|
 | M1 | W8-1..W8-4, W8-7/8, W15-1, W15-2, W15-3a (same-class), W15-4, W15-5; a single default capability-backed arena (W9-1, ambient). |
 | M2 | W8-5/6 (C++/extended) as caches arrive; arena-qualified routing prep (W6-6). |
-| M4 | W9-2..W9-7 (lifecycle, delegation, revocation), W10 (hooks); W15-3 extent-merge growth lands with plan 04 M5. |
+| M4 | W9-2..W9-7 (lifecycle, delegation, revocation), W10 (hooks). (W15-3 extent-merge grow + cache-served shrink + aligned classes were pulled forward and completed ahead of M5.) |
 
 ## Domain risks
 

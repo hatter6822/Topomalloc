@@ -215,7 +215,11 @@ normal-frame runs (§36.9).
 > idle empty hugepages to the OS), and host-driven `refresh`. It is installed into the `hugepage-optimized`
 > ABI via the existing `new_with_huge(&dyn RegionCacheHook)` seam — **the default extent path and a
 > single-node host are byte-for-byte unchanged**. Placement / rebalancing are **policy, not modeled
-> transitions** (§2.4), so there is no Lean obligation. The router's §15.4/§15.5 counters (bind failures,
+> transitions** (§2.4), so there is no Lean obligation — a claim pinned (not asserted) by the fixed-wall
+> `placement_never_breaks_the_allocation_contract` (size/alignment/validity/free-home invariant under
+> every NUMA policy and a bind failure) and `placement_covers_every_numa_mode` (`preferred_node`
+> totality), the W13 analogue of W14's `engine_size_align_validity_free_are_invariant_under_hints`.
+> The router's §15.4/§15.5 counters (bind failures,
 > rebalancer moves/bytes, spillovers) + the node/LLC counts reconcile into `topo-stats` JSON and the
 > `topo.numa.*` control namespace. The optimal-completion pass added: **genuine first-touch** for
 > `OsDefault` (an unbound default backend, so the common case is not pinned to node 0 on multi-node);

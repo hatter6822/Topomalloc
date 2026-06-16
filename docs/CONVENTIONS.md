@@ -97,3 +97,38 @@ Generated files (`crates/topo-core/src/generated/`, `include/topomalloc_tables.h
 * Public items are documented (`missing_docs` is a warning, denied in CI).
 * `rustfmt` and `clippy -D warnings` are gates (`cargo xtask fmt --check`,
   `cargo xtask lint`). Markdown under `planning/` and `docs/` is markdownlinted.
+
+## 8. Formal-obligation citations (V-004, gated)
+
+A change that claims it carries *no* formal-model obligation — "policy, not
+safety", "no Lean obligation", "adds no abstract transition", "composes /
+sequences certified mechanisms" — MUST back that claim with a concrete,
+auditable artifact **in the same comment block** (within a few lines of the
+claim). A bare assertion is not acceptable: it is exactly how real proof work
+slips by under a plausible label (the W15-3b review caught precisely this).
+
+Two legitimate patterns, each requiring its own kind of citation:
+
+* **Sequences certified transitions** (W12 release controller, W15-3b in-place
+  shrink). The operation mutates abstract state, but only by composing
+  transitions the model already certifies. Cite the **named Lean theorem(s)** it
+  rests on — e.g. `release_to_os_preserves_live_objects`,
+  `realloc_shrink_inplace_tail_tiles_disjointly`, `span_split_preserves_disjointness`.
+* **Pure policy, invisible to abstract state** (W13 NUMA router, W14 placement).
+  The decision steers locality/timing/placement and provably cannot change an
+  allocation's size/alignment/validity/free path (§2.4/§24.5). Cite the
+  **fixed-wall safety test** that pins the boundary — e.g.
+  `placement_never_breaks_the_allocation_contract` (W13),
+  `engine_size_align_validity_free_are_invariant_under_hints` (W14),
+  `controller_driven_release_preserves_live_objects` (W12 end-to-end).
+
+Do **not** conflate the two: "pure policy" is a *stronger* claim (the abstract
+state never moves) than "sequences certified transitions" (it moves, but only
+through proved steps). Citing the right one keeps the argument honest.
+
+**Enforcement.** `cargo xtask lint` runs the `obligation citations (V-004)`
+check: it scans `crates/**/src/**/*.rs`, and any comment block making an
+obligation claim without a citation keyword (a theorem reference, or `pin`/
+`certified`/`proven`/`discharged`/`fixed wall`) within `LINE_WINDOW` lines fails
+the gate. The matcher joins wrapped doc-comment lines and matches citation stems
+on word boundaries (so "map**pin**g" is not mistaken for a `pin` citation).

@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. The hugepage-aware backend (W11) rides on the §18.6 region-cache seam: the four §19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a real, backend-agnostic placement subsystem over the provider seam — nine §19.4 occupancy bins (each hugepage in exactly one, H-003), packing-scored placement (§19.3), partial subrelease guarded by H-005, §19.7 coverage metrics in stats, and the §19.8 H-001..H-005 invariants checked in debug — wired into the live large path through the existing `RegionCacheHook`, identical over POSIX and the seLe4n simulator. The release controller (W12), live NUMA topology router (W13), and the lifetime/hotness/site-profile **placement policy** (W14) — fed live by a **minimal, off-by-default heap-sampling slice** (W17-3: lock-free per-thread Poisson decision, alloc-free `libc::backtrace` capture, right-censored sampled-object lifecycle, all behind a re-entrancy guard) — ride on top, the placement policy upholding the §24.5 safety boundary (it changes locality, never size/alignment/validity) by construction. Front-end caches (M2) and the remaining M1 pieces land per the plan.
+**Current Status:** M0 closed; M1 (central-path allocator) under way. The public API runs over the real central-path allocator: classify → central free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`, errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++ operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the seLe4n simulator (G-sim). The full §25 realloc state machine (W15) is complete: move with failure-preserves-the-original (allocate-before-free, arena preserved), same-class/within-extent in-place grow, and in-place **shrink** that splits off and returns a medium/large allocation's tail pages to the backend across a page boundary (best-effort under always-correct semantics; cache-served/exhausted-split keep the allocation whole), plus aligned-allocation validation and calloc multiply+rounding overflow guards with full-usable zeroing. Capability-backed arenas (W9) ride on top: a live multi-arena data path with the full §22/§36.4/§36.13 lifecycle (create/delegate/reset/destroy/revocation), per-arena isolation, quota/authority/label enforcement, NUMA policy modes, and a C arena API (`topo_arena_create/delegate/reset/destroy`). Extent hooks & custom backing (W10) ride on the same seam: the §23.2 `ExtentHooks` interface + `HookProvider` adapter run the whole central path over a user-supplied backing, with §23.3 contracts enforced and the §23.4 conditional-correctness assumption modeled in Lean. The hugepage-aware backend (W11) rides on the §18.6 region-cache seam: the four §19.2 components (HugeAllocator / HugeCache / HugePageFiller / RegionCache) as a real, backend-agnostic placement subsystem over the provider seam — nine §19.4 occupancy bins (each hugepage in exactly one, H-003), packing-scored placement (§19.3), partial subrelease guarded by H-005, §19.7 coverage metrics in stats, and the §19.8 H-001..H-005 invariants checked in debug — wired into the live large path through the existing `RegionCacheHook`, identical over POSIX and the seLe4n simulator. The release controller (W12), live NUMA topology router (W13), and the lifetime/hotness/site-profile **placement policy** (W14) — fed live by a **minimal, off-by-default heap-sampling slice** (W17-3: lock-free per-thread Poisson decision, alloc-free `libc::backtrace` capture, right-censored sampled-object lifecycle, all behind a re-entrancy guard) — ride on top, the placement policy upholding the §24.5 safety boundary (it changes locality, never size/alignment/validity) by construction. Front-end caches (M2) and the remaining M1 pieces land per the plan.
 
 ## Essential Build Commands
 
@@ -17,7 +17,7 @@ cargo xtask build [--target T] [--profile debug|performance]
 cargo xtask gen [--check]             # regenerate / verify the size-class tables (G-table)
 cargo xtask test [--kind unit|prop|diff|fuzz|loom|tsan|rseq]
 cargo xtask fmt --check               # rustfmt gate
-cargo xtask lint                      # clippy -D warnings + SPDX + Lean style + license boundary + markdownlint + shellcheck + deny
+cargo xtask lint                      # clippy -D warnings + SPDX + Lean style + obligation citations (V-004) + license boundary + markdownlint + shellcheck + deny
 cargo xtask lean [--check]            # build the Lean package and run `lake exe check`
 cargo xtask bench                     # criterion micro-benchmarks (non-gating)
 cargo xtask abi-test                  # compile + link + run the C/C++ ABI harness (§34.1)
@@ -37,7 +37,7 @@ The kernel has **zero external Lean-package dependencies** beyond Lean core. Rus
 
 **No `sorry` in proofs (ABSOLUTE):** The Lean model contains no `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the four §33.5 RSEQ primitives/contracts (the trusted hardware boundary). Every §33.4/§36.17 theorem rests only on Lean's standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
 
-**Formal model in lockstep (ABSOLUTE, SPEC §33, V-004):** A change that adds or alters an abstract state-machine transition updates the Lean model in the same change, or records a tracked `V-004` refinement debt.
+**Formal model in lockstep (ABSOLUTE, SPEC §33, V-004):** A change that adds or alters an abstract state-machine transition updates the Lean model in the same change, or records a tracked `V-004` refinement debt. A claim that a change carries **no** formal obligation ("policy, not safety", "no Lean obligation", "sequences certified mechanisms") MUST cite a concrete backing artifact **in the same comment block** — a named Lean theorem (the "sequences certified transitions" pattern, e.g. `realloc_shrink_inplace_tail_tiles_disjointly`) or a fixed-wall safety test (the "pure policy" pattern, e.g. `placement_never_breaks_the_allocation_contract`) — never a bare assertion. This is gated by `cargo xtask lint` (`obligation citations (V-004)`) and detailed in `docs/CONVENTIONS.md` §8.
 
 **SPDX headers (ABSOLUTE, D5):** Every source file starts with an `SPDX-License-Identifier` header. Core files use `MIT`; seLe4n-integration files (`crates/topo-backend-sele4n`, `lean/TopoMalloc/SeLe4n/`, `sele4n/`) use `GPL-3.0-or-later`. CI enforces this (`cargo xtask lint`). Vendored code under `vendor/` is exempt (carries upstream headers).
 
@@ -149,6 +149,31 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 ## Current Development Status
 
 **Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next.
+Reallocation, aligned allocation & calloc zeroing (W15) is **complete and optimal** (all units, no
+deferrals): the §25 realloc state machine — `realloc(NULL,n)`/`realloc(p,0)` policy, content
+preservation, failure-preserves-the-original via the always-correct move path (§25.4, arena preserved,
+sampled as a realloc), in-place **grow** (§25.2, W15-3a) — same-class/within-extent *and* **extent-merge
+grow** that absorbs the address-adjacent free extent (no copy; `ExtentManager::grow_in_place`), and
+in-place **shrink** (§25.3, W15-3b) that returns a medium/large allocation's tail pages to the backend:
+the extent path splits off the tail (`split_tail` → `retire_large_range` → `shrink_usable` → free), the
+**cache-served hugepage path trims the tail in the filler** (`HugePageFiller::trim` via the
+`RegionCacheHook::try_trim` seam), both with exact `live_bytes`/arena-quota accounting (§8.6/§36.17). The
+dedicated in-place-resize API `xallocx` shares this via `Allocator::resize_in_place` (shrink + grow, never
+move). calloc zeroing (§26) elides the redundant `memset` when the backing is **freshly OS-zeroed**
+(`TopoBackingProvider::committed_memory_is_zeroed`, POSIX `true`), guarded by a debug check; it re-zeroes a
+recycled extent. **Aligned classes (W15-4):** the generated size-class table records each class's
+**natural alignment** (largest power of two dividing its size, capped at the page-aligned slab base), so a
+cache-line-aligned (or any power-of-two ≤ page) small request is served from a **slab slot, not a page**
+(via the already-proven over-alignment walk; `MAX_ALIGN` is now the page size). `valloc`/`pvalloc` round
+out the §10.1 surface. A large allocation is modeled in the **extent backend**, not as a core `Block`
+(clause 12 keys every block to a size class), so the in-place grow/shrink **sequence the certified extent
+transitions** `extent_split`/`extent_merge` (§18.3) + `extent free` (§20.1) — the W12 "sequence certified
+backend mechanisms" pattern, **not** `reallocMove` (whose copy window needs two simultaneously-live
+disjoint ranges that two same-base ranges can never be). They add no new §33.4 obligation; the geometric
+premises are pinned by `realloc_shrink_inplace_tail_tiles_disjointly` (via `span_split_preserves_disjointness`)
+and `realloc_grow_inplace_absorbs_disjointly` (via `span_merge_preserves_disjointness`), and aligned
+classes need no proof change (the over-alignment walk + `maxAlign` bound were already proven, re-verified by
+the G-table/`maxAlignOkB` gates).
 Capability-backed arenas (W9) are implemented ahead of their M4 slot: the full §22/§36.4/§36.13
 lifecycle (create / delegate / reset / destroy / revocation), a live multi-arena data path with
 per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA policy modes (§15.5).
@@ -276,14 +301,25 @@ change**; the profiler's counters reconcile into `topo-stats` JSON (`placement` 
 `topo.placement.*` control namespace (profiling estimates, outside the §8.6 byte reconciliation). The full
 W17 stats core / epoch snapshot / flags / redaction / `explain` remain for M6.
 
+**Formal-obligation hardening (W12/W13/W14 review).** A review of the "policy, not safety / no
+Lean obligation" claims confirmed each is sound but tightened how it is *backed*. W15-3b's in-place
+shrink now cites the `realloc_shrink_inplace_tail_tiles_disjointly` theorem (the W12 "sequence
+certified backend mechanisms" pattern — not the W13/W14 "policy invisible to abstract state" one).
+W13's §2.4 boundary is now pinned by the fixed-wall `placement_never_breaks_the_allocation_contract`
+(size/alignment/validity/free-home invariant under every NUMA policy + a bind failure — the analogue
+of W14's `engine_size_align_validity_free_are_invariant_under_hints`), and W12 by the end-to-end
+`controller_driven_release_preserves_live_objects`. A new `cargo xtask lint` gate (`obligation
+citations (V-004)`, `docs/CONVENTIONS.md` §8) makes a bare "no Lean obligation" claim — one without a
+cited theorem or fixed-wall test in the same comment block — fail CI, so the gap cannot recur.
+
 **Test counts:**
-- Rust: ~712 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~728 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)
 
 **Lean gates (`lake exe check`):**
-- G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
+- G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16384 — each class records its natural alignment so over-aligned small requests are slab-served, W15-4)
 - Trace oracle OK (§33.7 replay)
 - Pagemap differential OK (W3-3d)
 - Provider state machine OK (§36.6, W4-1)

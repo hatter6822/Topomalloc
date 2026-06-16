@@ -287,6 +287,43 @@ pub extern "C" fn topomalloc_memalign(alignment: usize, size: usize) -> *mut c_v
     .cast::<c_void>()
 }
 
+/// `void* topomalloc_valloc(size_t size)` (obsolete §10.1 compatibility): a
+/// page-aligned allocation of `size` bytes — `memalign(PAGE_SIZE, size)`. `NULL` +
+/// `errno = ENOMEM` on overflow/OOM; `valloc(0)` follows the zero-size policy.
+/// Provided for legacy ABI compatibility; new code should use `posix_memalign`.
+#[no_mangle]
+pub extern "C" fn topomalloc_valloc(size: usize) -> *mut c_void {
+    if let Some(p) = zero_size_gate(size) {
+        return p;
+    }
+    alloc_protocol(|| {
+        engine().map_or(ptr::null_mut(), |a| {
+            a.allocate(size, PAGE_SIZE.max(MIN_ALIGN), RequestFlags::NONE)
+        })
+    })
+    .cast::<c_void>()
+}
+
+/// `void* topomalloc_pvalloc(size_t size)` (obsolete §10.1 compatibility, glibc):
+/// like [`topomalloc_valloc`] but rounds `size` **up to a whole page** first;
+/// `pvalloc(0)` returns one page (never `NULL`). `NULL` + `errno = ENOMEM` if the
+/// page rounding overflows (§9.7) or on OOM.
+#[no_mangle]
+pub extern "C" fn topomalloc_pvalloc(size: usize) -> *mut c_void {
+    // glibc pvalloc rounds the request up to a page and pvalloc(0) yields one page,
+    // so treat 0 as one page (the zero-size policy does not apply).
+    let Some(rounded) = align_up(size.max(1), PAGE_SIZE) else {
+        set_errno(ENOMEM);
+        return ptr::null_mut();
+    };
+    alloc_protocol(|| {
+        engine().map_or(ptr::null_mut(), |a| {
+            a.allocate(rounded, PAGE_SIZE.max(MIN_ALIGN), RequestFlags::NONE)
+        })
+    })
+    .cast::<c_void>()
+}
+
 /// `size_t topomalloc_malloc_usable_size(void* ptr)` (§10.1): the number of
 /// usable bytes in the allocation at `ptr` (≥ the requested size). `0` for
 /// `NULL` and — defensively — for any pointer this allocator does not own
@@ -322,11 +359,15 @@ fn sized_hint_matches(a: &AnyAllocator, ptr: *mut u8, size: usize, align: usize)
             ..
         }) => class_usable == usable,
         Some(RequestKind::Medium { .. }) | Some(RequestKind::Large { .. }) => {
-            // Fit, not equality: an in-place shrink (`Allocator::realloc`)
-            // keeps the original extent, so the truthful (last-requested)
-            // size can round to *less* than the usable size. A false accept
-            // merely weakens a heuristic; a false reject would abort a
-            // correct program (found by the W8 self-audit; pinned by
+            // Fit, not equality: a medium/large allocation's usable size can
+            // *exceed* the page-rounded truthful size. A cache-served (hugepage)
+            // region rounds up to its awkward-size unit, and a best-effort
+            // in-place shrink that kept the whole extent (cache-served, or a
+            // slot-exhausted split — W15-3b) leaves a larger usable size; an
+            // extent-backed shrink returns the tail, so there usable equals the
+            // rounded size, which the `<=` also covers. A false accept merely
+            // weakens a heuristic; a false reject would abort a correct program
+            // (found by the W8 self-audit; pinned by
             // `free_sized_accepts_truthful_size_after_inplace_shrink`).
             align_up(size.max(1), PAGE_SIZE).is_some_and(|rounded| rounded <= usable)
         }
@@ -544,6 +585,51 @@ mod tests {
         assert_eq!(get_errno(), ENOMEM);
     }
 
+    /// W15-5 zeroed-state optimization: a **large/medium** calloc is fully zeroed
+    /// whether its extent is **freshly OS-zeroed** (the `memset` is elided over POSIX
+    /// since mmap pages are zero — §26.2) **or recycled** (a reused, possibly-dirtied
+    /// extent is re-zeroed by the `memset`). The result is all-zero either way — the
+    /// non-negotiable §26.2 guarantee that the elision must never weaken.
+    #[test]
+    fn calloc_large_is_fully_zeroed_fresh_and_after_recycle() {
+        // Fresh: over POSIX the extent is mmap-zero, so the engine elides the memset —
+        // the bytes must still be entirely zero.
+        let p = topomalloc_calloc(1, 300_000); // medium (> SMALL_MAX)
+        assert!(!p.is_null());
+        let usable = topomalloc_malloc_usable_size(p);
+        assert!(usable >= 300_000);
+        // SAFETY: `usable` readable bytes; must be entirely zero.
+        unsafe {
+            for i in 0..usable {
+                assert_eq!(
+                    p.cast::<u8>().add(i).read(),
+                    0,
+                    "fresh large calloc nonzero at {i}"
+                );
+            }
+        }
+        // Dirty it thoroughly, free it, then calloc the same size again. The reused
+        // extent (retained dirty, or decommitted-then-recommitted) must come back
+        // fully zero — exercising the re-zeroing path the elision must not skip.
+        // SAFETY: `usable` writable bytes.
+        unsafe { ptr::write_bytes(p.cast::<u8>(), 0xff, usable) };
+        tfree(p);
+        let q = topomalloc_calloc(1, 300_000);
+        assert!(!q.is_null());
+        let q_usable = topomalloc_malloc_usable_size(q);
+        // SAFETY: `q_usable` readable bytes; must be entirely zero despite the prior 0xff.
+        unsafe {
+            for i in 0..q_usable {
+                assert_eq!(
+                    q.cast::<u8>().add(i).read(),
+                    0,
+                    "recycled large calloc nonzero at {i}"
+                );
+            }
+        }
+        tfree(q);
+    }
+
     #[test]
     fn realloc_contract_at_the_c_boundary() {
         // realloc(NULL, n) == malloc(n).
@@ -642,6 +728,75 @@ mod tests {
         tfree(out);
     }
 
+    /// W15-4 aligned classes: an over-aligned **small** allocation is served from a
+    /// naturally-aligned slab class — correctly aligned and **small** (usable < a
+    /// page), not a wasted 16 KiB page — across the whole `aligned_alloc` /
+    /// `posix_memalign` / `memalign` family.
+    #[test]
+    fn aligned_small_allocations_use_a_slab_not_a_page() {
+        // aligned_alloc(64, 64): a cache-line-aligned 64-byte object → the 64-byte
+        // class (a slab slot), not a page.
+        let p = topomalloc_aligned_alloc(64, 64);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % 64, 0);
+        let usable = topomalloc_malloc_usable_size(p);
+        assert!(
+            (64..PAGE_SIZE).contains(&usable),
+            "aligned small must be a slab slot, got usable {usable}"
+        );
+        tfree(p);
+
+        // posix_memalign(128, 100): size 100 / 128-aligned → the 128-aligned class.
+        let mut out: *mut c_void = ptr::null_mut();
+        // SAFETY: `out` is a valid writable slot.
+        unsafe { assert_eq!(topomalloc_posix_memalign(&mut out, 128, 100), 0) };
+        assert_eq!(out as usize % 128, 0);
+        let u = topomalloc_malloc_usable_size(out);
+        assert!(
+            (100..PAGE_SIZE).contains(&u),
+            "over-aligned small wasted a page: {u}"
+        );
+        tfree(out);
+
+        // memalign(256, 200): 256-aligned small from the 256-aligned class.
+        let q = topomalloc_memalign(256, 200);
+        assert!(!q.is_null());
+        assert_eq!(q as usize % 256, 0);
+        assert!(
+            topomalloc_malloc_usable_size(q) < PAGE_SIZE,
+            "memalign small wasted a page"
+        );
+        tfree(q);
+    }
+
+    /// Obsolete §10.1 compatibility: `valloc` is page-aligned; `pvalloc` is
+    /// page-aligned with the size rounded up to a whole page (and `pvalloc(0)` is one
+    /// page, never null).
+    #[test]
+    fn valloc_and_pvalloc_are_page_aligned() {
+        let p = topomalloc_valloc(100);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % PAGE_SIZE, 0, "valloc must be page-aligned");
+        assert!(topomalloc_malloc_usable_size(p) >= 100);
+        tfree(p);
+
+        let q = topomalloc_pvalloc(PAGE_SIZE + 1);
+        assert!(!q.is_null());
+        assert_eq!(q as usize % PAGE_SIZE, 0, "pvalloc must be page-aligned");
+        assert!(
+            topomalloc_malloc_usable_size(q) >= 2 * PAGE_SIZE,
+            "pvalloc rounds the size up to whole pages"
+        );
+        tfree(q);
+
+        // pvalloc(0) yields one page, never null.
+        let z = topomalloc_pvalloc(0);
+        assert!(!z.is_null());
+        assert_eq!(z as usize % PAGE_SIZE, 0);
+        assert!(topomalloc_malloc_usable_size(z) >= PAGE_SIZE);
+        tfree(z);
+    }
+
     #[test]
     fn memalign_honors_alignment_without_size_multiple() {
         let p = topomalloc_memalign(512, 100); // 100 is not a multiple of 512
@@ -693,20 +848,34 @@ mod tests {
         }
     }
 
-    /// Regression (W8 self-audit): after an in-place medium shrink the
-    /// truthful (last-requested) size rounds to *less* than the usable size;
-    /// the debug cross-check must accept it, not abort a correct program.
+    /// After an in-place medium **shrink** the allocation stays at the same base
+    /// (W15-3a/b), and the truthful (last-requested) size is the one valid C23
+    /// `free_sized` hint the debug cross-check must accept — never aborting a
+    /// correct program (the W8 self-audit regression). Profile-robust: the
+    /// default extent-backed build **returns the tail pages**, so the usable size
+    /// drops to the page-rounded new size (W15-3b); a `hugepage-optimized` build
+    /// serves the allocation cache-side (the filler owns its page geometry) and
+    /// keeps it whole — both leave `usable >= the page-rounded new size`, which
+    /// the cross-check's fit test (not equality) accepts. The exact tail return is
+    /// pinned by the engine test `realloc_large_shrink_returns_the_tail_pages`.
     #[test]
     fn free_sized_accepts_truthful_size_after_inplace_shrink() {
         // SAFETY: pointers are test-owned; each is freed exactly once with
         // its truthful last-requested size.
         unsafe {
-            let p = topomalloc_malloc(80_000); // 5 pages: usable 81920
-            assert_eq!(topomalloc_malloc_usable_size(p), 81_920);
-            let q = topomalloc_realloc(p, 40_000); // rounds to 49152 <= 81920
-            assert_eq!(q, p, "page-rounded shrink stays in place");
-            assert_eq!(topomalloc_malloc_usable_size(q), 81_920);
-            topomalloc_free_sized(q, 40_000); // C23: the one valid hint
+            let p = topomalloc_malloc(80_000); // 5 pages (16 KiB pages)
+            let p_usable = topomalloc_malloc_usable_size(p);
+            assert!(p_usable >= 80_000);
+            let q = topomalloc_realloc(p, 40_000); // shrink: 40000 → 49152 (3 pages)
+            assert_eq!(q, p, "an in-place medium shrink keeps the same base");
+            let q_usable = topomalloc_malloc_usable_size(q);
+            assert!(
+                (49_152..=p_usable).contains(&q_usable),
+                "usable covers the page-rounded new size and never grows on a shrink \
+                 (extent-backed returns the tail to 49152; cache-served keeps it whole): \
+                 q_usable={q_usable}, p_usable={p_usable}"
+            );
+            topomalloc_free_sized(q, 40_000); // C23: the one valid hint, accepted
         }
     }
 

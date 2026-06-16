@@ -257,6 +257,35 @@ impl TopoBackingProvider for PosixBackingProvider {
     fn name(&self) -> &'static str {
         "posix"
     }
+
+    /// Whether a page committed from an **unbacked** extent is guaranteed to read as
+    /// zero (§26.2) — letting `calloc`/`TOPO_ZERO` skip the redundant `memset` for a
+    /// freshly-extent-backed large/medium allocation (W15-5 / §26.3).
+    ///
+    /// **`true` only on Linux**, the one platform where the guarantee holds for *both*
+    /// unbacked states this promise must cover: a reservation is `mmap(MAP_ANONYMOUS)`
+    /// (zero-filled, so a **Reserved** extent is zero), and `decommit` is
+    /// `MADV_DONTNEED`, after which the next fault yields a **fresh zero page** (so a
+    /// recommitted **Released** extent is zero). This is a *blanket* per-provider
+    /// promise that `alloc_z` applies whenever `committed_len == 0` — it cannot tell
+    /// Reserved from Released — so a platform may answer `true` only when both are
+    /// zero. Elsewhere we stay conservative (`false` ⇒ the engine always `memset`s,
+    /// never leaking recycled bytes): on Apple `decommit` is `MADV_FREE_REUSABLE`,
+    /// which may keep the old contents until the kernel reclaims them (a recommitted
+    /// Released extent is **not** guaranteed zero), and the non-unix fallback reserves
+    /// with the global allocator (uninitialized — a fresh Reserved extent is **not**
+    /// zero). Gating this by platform is the fix for the PR #19 review finding.
+    #[cfg(target_os = "linux")]
+    fn committed_memory_is_zeroed(&self) -> bool {
+        true
+    }
+
+    /// Conservative default off Linux: do not promise zeroed committed pages (see the
+    /// Linux variant's contract above), so `calloc`/`TOPO_ZERO` always `memset`.
+    #[cfg(not(target_os = "linux"))]
+    fn committed_memory_is_zeroed(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for PosixBackingProvider {
@@ -974,6 +1003,37 @@ mod tests {
             );
         }
         p.release(ArenaId::DEFAULT, r).expect("release");
+    }
+
+    #[test]
+    fn committed_memory_is_zeroed_matches_the_platform_guarantee() {
+        // PR #19 review: the zeroed-commit opt-in (§26.2 / W15-5) must answer `true`
+        // only where the guarantee actually holds — and it is a blanket promise
+        // covering both unbacked states (`alloc_z` applies it whenever
+        // `committed_len == 0`, i.e. a Reserved *or* a Released extent). On Linux both
+        // read zero; everywhere else it is conservatively off so `calloc`/`TOPO_ZERO`
+        // always `memset`s (never leaking recycled bytes).
+        let p = PosixBackingProvider::new();
+        assert_eq!(p.committed_memory_is_zeroed(), cfg!(target_os = "linux"));
+
+        // On Linux, back the `true` claim with the behavior calloc relies on for the
+        // **Reserved** case: a fresh `mmap(MAP_ANONYMOUS)` reservation reads zero. (The
+        // **Released** → recommit case is covered by
+        // `decommit_then_recommit_restores_writable_memory_m005` above.)
+        #[cfg(target_os = "linux")]
+        {
+            let r = p
+                .reserve(ArenaId::DEFAULT, 2 * PAGE, PAGE)
+                .expect("reserve");
+            p.commit(r, 0, r.len).expect("commit");
+            // SAFETY: committed for its full length.
+            unsafe {
+                for i in 0..r.len {
+                    assert_eq!(r.base.add(i).read(), 0, "fresh reservation must read zero");
+                }
+            }
+            p.release(ArenaId::DEFAULT, r).expect("release");
+        }
     }
 
     #[test]

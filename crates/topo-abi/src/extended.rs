@@ -325,14 +325,20 @@ pub unsafe extern "C" fn topo_rallocx(ptr: *mut c_void, size: usize, flags: u64)
 /// (usable) size — the caller checks `result >= size` for success, as with
 /// jemalloc's `xallocx`. Never moves, never frees, never fails destructively.
 ///
-/// At M1 the allocator cannot extend backing in place (extent-merge growth is
-/// plan 04 M5), so the call succeeds exactly when the current usable size
-/// already satisfies `size`. Deterministic failures — invalid flags, a flag
-/// naming a nonexistent/inactive arena (§10.4, as the sibling entry points), a
-/// pointer this allocator does not own, or a `TOPO_ALIGN_LG` the existing
-/// base cannot satisfy (in-place resizing can never change an address) —
-/// return `0` with `errno = EINVAL` (the standard declares these undefined;
-/// we document them instead).
+/// It performs a real in-place resize (W15-3a/b): a medium/large allocation
+/// **shrinks** (returning the tail pages to the backend, §25.3) or **grows** by
+/// absorbing the adjacent free extent (§25.2) — no copy, the base unchanged — and
+/// reports the achieved usable size; a small object's fixed slab slot cannot
+/// resize, so its usable size is reported unchanged (success iff it already
+/// satisfies `size`). A grow the backend cannot satisfy in place (no adjacent free
+/// extent) leaves the allocation as-is and reports the old size (`< size` ⇒ the
+/// caller sees the documented in-place failure and may `rallocx`). Deterministic
+/// `0`+`EINVAL` failures — invalid flags, a flag naming a nonexistent/inactive
+/// arena (§10.4, as the sibling entry points), a pointer this allocator does not
+/// own, or a `TOPO_ALIGN_LG` the existing base cannot satisfy (in-place resizing
+/// can never change an address) — the standard declares these undefined; we
+/// document them instead. `extra` is best-effort headroom that is accepted but not
+/// pursued (the resize targets `size`).
 ///
 /// # Safety
 ///
@@ -345,10 +351,12 @@ pub unsafe extern "C" fn topo_xallocx(
     extra: usize,
     flags: u64,
 ) -> usize {
-    // M1: no in-place extension exists, so `size` only matters through the
-    // caller's `result >= size` success test and `extra` is a dead
-    // best-effort bound (W15-3a/M5 wire them up).
-    let _ = (size, extra);
+    // `extra` is best-effort headroom we do not pursue: the resize targets `size`
+    // (which always satisfies the `result >= size` contract), so a non-zero `extra`
+    // is accepted but not chased (jemalloc permits "inability to allocate the extra
+    // by itself is not a failure"). `size` now drives a real in-place resize (W15-3a
+    // grow / W15-3b shrink).
+    let _ = extra;
     let Some((align, f)) = decode_flags(flags) else {
         set_errno(EINVAL);
         return 0;
@@ -366,15 +374,15 @@ pub unsafe extern "C" fn topo_xallocx(
     }
     preserving_errno(|| {
         let a = global()?;
-        let usable = a.usable_size(ptr.cast::<u8>())?;
-        // An alignment the existing base does not satisfy can never be fixed
-        // in place: deterministic invalid-request, not a quiet false success.
-        if !(ptr as usize).is_multiple_of(align) {
-            return None;
-        }
-        // Success ⇔ `usable >= size` (the caller's convention); either way
-        // the real, unchanged size is reported.
-        Some(usable)
+        // Resize **in place only** toward `size`: a medium/large allocation shrinks
+        // (returning the tail, W15-3b) or grows (absorbing the adjacent free extent,
+        // W15-3a); a small object's fixed slot reports its usable size unchanged.
+        // `None` (non-owned/interior pointer, or a base that cannot satisfy `align`
+        // in place — in-place can never re-base) is the deterministic invalid-request.
+        // The returned usable size is the caller's `result >= size` success signal.
+        // SAFETY: xallocx's contract — `ptr` is a live resize target the caller owns
+        // and does not concurrently free/realloc.
+        unsafe { a.resize_in_place(ptr.cast::<u8>(), size, align, f) }
     })
     .unwrap_or_else(|| {
         set_errno(EINVAL);

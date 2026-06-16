@@ -174,6 +174,83 @@ fn emergency_release_tick_drains_all_empty_hugepages() {
 }
 
 #[test]
+fn controller_driven_release_preserves_live_objects() {
+    // §21.6 end-to-end — the W12 analogue of W14's fixed-wall safety test. With live
+    // objects AND a releasable empty-backed supply on the *same* backend, executing the
+    // controller's plan returns the free supply to the OS while EVERY live object stays
+    // intact and writable. The mechanism theorems prove this in the abstract
+    // (`release_to_os_preserves_live_objects`, `subrelease_preserves_live_backing`); the
+    // other W12 live-wiring tests release only *empty* supply, so this pins the missing
+    // case: that the controller, driven as hard as it goes, never reclaims a live
+    // object's pages (the §2.4 "safety before policy" boundary, end to end).
+    let hp = huge_backend(64);
+
+    // Live objects, each stamped with a distinct pattern and KEPT live across the
+    // release: two whole hugepages plus six sub-hugepage objects (packed onto shared
+    // partial hugepages — the cold-sparse subrelease candidates rung 5 may touch, where
+    // H-005 must keep the live pages while returning only the free ones).
+    let mut live: Vec<(topo_core::Region, u8)> = Vec::new();
+    let alloc_live = |size: usize, pat: u8| -> (topo_core::Region, u8) {
+        let r = hp
+            .allocate(size, PAGE, PlaceHints::default())
+            .expect("live alloc");
+        assert!(r.len >= size);
+        // SAFETY: `r` is a live committed region of `r.len` bytes the backend just vended.
+        unsafe { core::ptr::write_bytes(r.base, pat, r.len) };
+        (r, pat)
+    };
+    live.push(alloc_live(HUGEPAGE_SIZE, 0x11));
+    live.push(alloc_live(HUGEPAGE_SIZE, 0x22));
+    for i in 0..6u8 {
+        live.push(alloc_live(64 * 1024, 0x30 + i));
+    }
+
+    // Releasable supply: empty-backed hugepages (allocated then freed).
+    build_empty_backed_supply(&hp, 6);
+
+    // Drive the controller hard (Emergency: alloc-failure forces it, §21.5/O-007) across
+    // several ticks so it reclaims everything it legitimately can.
+    let mut ctl = ReleaseController::new(DecayConfig::default());
+    let _ = hp.release_tick(&mut ctl, 0, normal_baseline());
+    let emergency = ReleaseInputs {
+        alloc_failed: true,
+        ..soft_inputs(0)
+    };
+    for t in 1..=8 {
+        let _ = hp.release_tick(&mut ctl, t * 1_000, emergency);
+    }
+
+    // The §21.6 safety property, end to end: every live object survived untouched.
+    for (r, pat) in &live {
+        // SAFETY: each `r` is still live (never freed); `r.len` committed bytes.
+        unsafe {
+            assert_eq!(
+                *r.base, *pat,
+                "live object head clobbered by a release tick"
+            );
+            assert_eq!(
+                *r.base.add(r.len - 1),
+                *pat,
+                "live object tail clobbered by a release tick"
+            );
+        }
+    }
+    // The free supply was returned to the OS; the backend stays well-formed.
+    assert_eq!(
+        hp.coverage().empty_backed_bytes,
+        0,
+        "the releasable empty supply was drained while the live objects were untouched"
+    );
+    assert!(hp.check_invariants());
+
+    // Clean teardown: every live object frees exactly once.
+    for (r, _) in live {
+        assert!(hp.free_region(r), "live object frees cleanly after release");
+    }
+    assert!(hp.check_invariants());
+}
+
+#[test]
 fn release_stats_reconcile_into_the_stats_snapshot() {
     // W12 stats wiring: the controller's running counters record into the topo_stats
     // snapshot and render in the JSON `release` block with the live pressure mode.

@@ -41,7 +41,9 @@ use crate::extent::{
     BackendLock, ExtentError, ExtentId, ExtentManager, ExtentRef, NoRegionCache, RegionCacheHook,
 };
 use crate::flags::Hints;
+use crate::generated::tables::PAGE_SIZE;
 use crate::ids::{ArenaId, LargeId};
+use crate::overflow::align_up;
 use crate::pagemap::PageMap;
 use crate::span::LargeDescriptor;
 
@@ -349,7 +351,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> *mut u8 {
-        let (region, backing) = match self.extents.alloc_large(bytes, align, hints, hook) {
+        let (region, backing, zeroed) = match self.extents.alloc_large(bytes, align, hints, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
         };
@@ -403,6 +405,32 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             return ptr::null_mut();
         }
         self.lock.release();
+        // W15-5 calloc zeroing (§26.2/§26.3): a `TOPO_ZERO` request returns zeroed
+        // memory. **Skip the redundant `memset` when the backing is freshly OS-zeroed**
+        // (a fresh extent under a zeroing provider — `alloc_large`'s `zeroed`); zero it
+        // otherwise (a reused/cache-served region). The skip rests on the provider's
+        // `committed_memory_is_zeroed` promise (§26.2); debug builds spot-check it so a
+        // lying provider is caught, never silently trusted.
+        if hints.zero && !zeroed {
+            // SAFETY: `region` is `region.len` committed, owned bytes just vended.
+            unsafe { ptr::write_bytes(region.base, 0, region.len) };
+        }
+        #[cfg(debug_assertions)]
+        if hints.zero && zeroed {
+            let n = region.len;
+            // SAFETY: `region` is `n` committed, owned bytes; the head slice is in bounds.
+            let head_zero = unsafe { core::slice::from_raw_parts(region.base, n.min(PAGE_SIZE)) }
+                .iter()
+                .all(|&b| b == 0);
+            // SAFETY: `region.len` is a nonzero page multiple (≥ one page), so `n - 1`
+            // is an in-bounds offset of this committed, owned region.
+            let tail_zero = n <= PAGE_SIZE || unsafe { region.base.add(n - 1).read() } == 0;
+            debug_assert!(
+                head_zero && tail_zero,
+                "committed_memory_is_zeroed promised zero but the freshly-committed \
+                 region was not (a provider contract violation)"
+            );
+        }
         region.base
     }
 
@@ -687,6 +715,277 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         res
     }
 
+    /// **In-place shrink** (§25.3, plan 06 W15-3b): reduce the live large
+    /// allocation at base `ptr` to `new_usable` page-rounded bytes, splitting off
+    /// and returning its tail `[base + new_usable, base + old_usable)` to the
+    /// backend. Returns `Some(old_usable - new_usable)` — the freed tail byte count,
+    /// for the caller's `freed_bytes` / arena-quota accounting (§36.17) — when it
+    /// shrank in place, leaving `ptr` valid at its new size.
+    ///
+    /// An **extent-served** allocation splits off and frees its tail extent; a
+    /// **cache-served** one (hugepage filler) asks the region cache to trim its tail
+    /// pages in place (W15-3b D). Returns `None` (leaving the allocation **completely
+    /// untouched**) when it cannot shrink in place: `ptr` is null / not live here / an
+    /// interior pointer, `new_usable` is not a *strict* page-rounded shrink, the
+    /// descriptor-slot pool is exhausted (extent split), or the cache declines (a
+    /// multi-hugepage run). In every `None` case the caller keeps the allocation
+    /// whole, which is still a correct realloc result (§25.3 SHOULD).
+    ///
+    /// Ordering (race-free): split the tail off as a still-`Active` extent, retire
+    /// its pagemap entries, shrink the descriptor, **then** free the tail — so the
+    /// tail only becomes reusable after its pagemap is `Empty` (the retire-before-
+    /// free discipline of span retirement, P-Map-001).
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free): `ptr` must be a live base pointer this allocator
+    /// handed out and the caller owns (the §25 realloc contract). The caller must
+    /// not concurrently free or realloc the same pointer (it would be the classic
+    /// double-free / use-after-free — C UB, as for `free`).
+    pub unsafe fn shrink(&self, ptr: *mut u8, new_usable: usize) -> Option<usize> {
+        if ptr.is_null() {
+            return None;
+        }
+        // Resolve the descriptor, its backing, and the old usable size under the
+        // pool lock — exactly as `usable_size`/`free_inner` do, so a concurrent free
+        // of a *different* large pointer (which recycles its own slot under this
+        // lock) cannot race the read. We capture the pagemap-rooted descriptor
+        // pointer (not a slot pointer borrowed from the pool) plus plain values, then
+        // release the lock before the extent-manager calls — the pool lock and the
+        // extent lock are never held together (the alloc path's discipline). The
+        // realloc contract excludes a concurrent free/realloc of *this* `ptr`, so its
+        // slot is neither recycled nor mutated after the lock drops.
+        self.lock.acquire();
+        let resolved = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr).and_then(|idx| {
+                    let slot = pool.slot_ptr(idx);
+                    // SAFETY: `idx` is a live slot under the lock; descriptor + slot
+                    // fields live in never-freed metadata.
+                    unsafe {
+                        // §17.5: only the *base* pointer resizes (an interior pointer
+                        // maps to the same descriptor but is not a valid source). The
+                        // backing is `Some(ExtentRef)` for an extent-served allocation
+                        // (split off the tail) or `None` for a cache-served one (ask the
+                        // region cache to trim its tail — W15-3b D).
+                        if ptr as usize != (*slot).desc.base() {
+                            return None;
+                        }
+                        let backing = if (*slot).has_extent != 0 {
+                            Some(ExtentRef {
+                                id: ExtentId((*slot).backing_id),
+                                generation: (*slot).backing_gen,
+                            })
+                        } else {
+                            None
+                        };
+                        Some((desc_ptr, (*slot).desc.usable_size(), backing))
+                    }
+                })
+            }
+            None => None,
+        };
+        self.lock.release();
+        let (desc_ptr, old_usable, backing) = resolved?;
+
+        // Page-round the target (never trust the caller, §9.7) and require a
+        // **strict** shrink — an equal/larger page-rounded size has no tail to give.
+        let new_usable = align_up(new_usable.max(1), PAGE_SIZE)?;
+        if new_usable >= old_usable {
+            return None;
+        }
+        let base = ptr as usize;
+
+        match backing {
+            // Extent-served: split off the tail as a fresh `Active` extent — the **sole
+            // fallible step**; on failure (slot-pool exhaustion) nothing is mutated
+            // (W4-5), so the shrink degrades to keeping the allocation whole. Then
+            // retire the tail's pagemap entries **before** freeing the tail extent (so a
+            // reuse never collides with stale `Large` entries, P-Map-001/002 — the tail
+            // is still `Active` in that window), shrink the descriptor, and free the tail.
+            Some(backing) => {
+                let tail = self.extents.split_tail(backing, new_usable).ok()?;
+                self.pagemap
+                    .retire_large_range(base + new_usable, base + old_usable);
+                // SAFETY: `desc_ptr` is our live descriptor in never-freed metadata (the
+                // pagemap resolved `ptr` under the lock); the realloc contract excludes a
+                // concurrent free/realloc of `ptr`.
+                unsafe { (*desc_ptr).shrink_usable(new_usable) };
+                let _ = self.extents.free(tail);
+                Some(old_usable - new_usable)
+            }
+            // Cache-served (hugepage filler, W15-3b D): the filler frees the tail to its
+            // reuse pool **atomically**, so — unlike the extent split — we must retire the
+            // pagemap and shrink the descriptor **first** (while the tail is still live in
+            // the filler, hence un-reusable), *then* trim. On a declined trim (multi-
+            // hugepage run, or the cache does not own it) roll both back, restoring the
+            // allocation whole. The re-install cannot allocate (the nodes were mapped at
+            // alloc and never freed), so the rollback is infallible.
+            None => {
+                self.pagemap
+                    .retire_large_range(base + new_usable, base + old_usable);
+                // SAFETY: as above.
+                unsafe { (*desc_ptr).shrink_usable(new_usable) };
+                let region = Region {
+                    base: ptr,
+                    len: old_usable,
+                };
+                match self.region_cache.try_trim(region, new_usable) {
+                    Some(freed) => Some(freed),
+                    None => {
+                        // SAFETY: `desc_ptr` is our live descriptor; restore its size.
+                        unsafe { (*desc_ptr).grow_usable(old_usable) };
+                        // SAFETY: `desc_ptr` is our live descriptor in never-freed
+                        // metadata; re-mapping the suffix it owns is sound and (the nodes
+                        // already exist) cannot allocate, so the rollback cannot fail.
+                        let _ = unsafe {
+                            self.pagemap.install_large_range(
+                                self.meta,
+                                &*desc_ptr,
+                                base + new_usable,
+                                base + old_usable,
+                            )
+                        };
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// **In-place grow** (§25.2, plan 06 W15-3a): extend the live large allocation
+    /// at base `ptr` to `new_usable` page-rounded bytes by **absorbing the adjacent
+    /// free extent** (no copy). Returns `Some(new_usable - old_usable)` — the grown
+    /// byte count, for the caller's `allocated_bytes`/arena-quota accounting — when
+    /// it grew in place, leaving `ptr` valid at its new size with its old prefix
+    /// preserved.
+    ///
+    /// Returns `None` (and leaves the allocation **completely untouched**) when it
+    /// cannot grow in place: `ptr` is null / not live here / an interior pointer, the
+    /// allocation is **cache-served** (the hugepage filler owns its page geometry),
+    /// `new_usable` is not a *strict* page-rounded grow, the adjacent extent is not
+    /// free or is too small, a slot-pool-exhausted neighbour trim, a provider commit
+    /// failure, or pagemap metadata exhaustion. In every `None` case the caller
+    /// **moves** (`realloc`) or reports no-grow (`xallocx`), so the original survives.
+    ///
+    /// Ordering (no fallible step after the irreversible absorb): **pre-create** the
+    /// new range's pagemap leaves (the lone metadata-fallible step), **then** grow the
+    /// backing extent (absorb the neighbour — its own trim/commit failure self-unwinds
+    /// with no extra slot), **then** publish the new pages' entries (infallible: the
+    /// leaves already exist, so it allocates nothing), **then** the grown
+    /// `usable_size`. A failure can therefore occur only *before* the absorb (nothing
+    /// mutated → no-grow), never after — so the descriptor never advertises pages the
+    /// pagemap does not cover, and there is no best-effort rollback that could itself
+    /// fail.
+    ///
+    /// # Safety
+    ///
+    /// As [`shrink`](Self::shrink): `ptr` is a live base pointer the caller owns and
+    /// does not concurrently free/realloc (the §25 realloc contract).
+    pub unsafe fn grow(&self, ptr: *mut u8, new_usable: usize) -> Option<usize> {
+        if ptr.is_null() {
+            return None;
+        }
+        // Resolve the descriptor + backing under the pool lock (as `shrink`), then
+        // release before the extent-manager calls (the no-nesting lock order).
+        self.lock.acquire();
+        let resolved = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr).and_then(|idx| {
+                    let slot = pool.slot_ptr(idx);
+                    // SAFETY: `idx` is a live slot under the lock.
+                    unsafe {
+                        // §17.5 base-only; extent-backed only (a cache-served region
+                        // is the filler's page geometry — W11/D handles its grow).
+                        if ptr as usize == (*slot).desc.base() && (*slot).has_extent != 0 {
+                            Some((
+                                desc_ptr,
+                                (*slot).desc.usable_size(),
+                                ExtentRef {
+                                    id: ExtentId((*slot).backing_id),
+                                    generation: (*slot).backing_gen,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                })
+            }
+            None => None,
+        };
+        self.lock.release();
+        let (desc_ptr, old_usable, backing) = resolved?;
+
+        let new_usable = align_up(new_usable.max(1), PAGE_SIZE)?;
+        if new_usable <= old_usable {
+            return None; // not a strict grow
+        }
+        let base = ptr as usize;
+
+        // Fail fast (no pagemap work) when the grow cannot happen — the common "no
+        // adjacent free neighbour" case — so a growing `realloc`/`xallocx` that must
+        // move pays nothing here (the reserve below is O(grow pages); this probe is
+        // O(1)). Advisory: `grow_in_place` re-checks under its own lock.
+        if !self.extents.can_grow_in_place(backing, new_usable) {
+            return None;
+        }
+
+        // Pre-create the new range's pagemap leaves **before** the irreversible absorb
+        // (phase 1 of the publish — the only metadata-fallible step). On exhaustion
+        // nothing is mutated yet, so the grow degrades to a move at the caller. Doing
+        // this first makes the publish below infallible, so there is **no fallible step
+        // after the absorb** — and thus no best-effort rollback that could itself fail
+        // (the gap a failed rollback used to leave: an enlarged-but-unadvertised extent
+        // retained until free; PR #19 review).
+        if self
+            .pagemap
+            .reserve_large_range(self.meta, base + old_usable, base + new_usable)
+            .is_err()
+        {
+            return None;
+        }
+
+        // Grow the backing extent in place (absorb the adjacent free neighbour). On any
+        // failure the manager leaves it untouched (W4-5 — its own trim/commit unwind
+        // needs no extra slot), so the grow degrades to a move; the leaves reserved
+        // above are then simply unused (monotonic metadata, never published).
+        self.extents.grow_in_place(backing, new_usable).ok()?;
+
+        // Map the new pages to this descriptor **before** advertising the grown usable
+        // size. The leaves were reserved above, so this publishes into existing nodes
+        // and **cannot fail** (it allocates nothing) — the grow is past its last
+        // fallible step, so the descriptor never advertises pages the pagemap does not
+        // yet cover and no rollback is needed.
+        // SAFETY: `desc_ptr` is our live descriptor (resolved under the lock; the realloc
+        // contract excludes a concurrent free/realloc of `ptr`).
+        let mapped = unsafe {
+            self.pagemap.install_large_range(
+                self.meta,
+                &*desc_ptr,
+                base + old_usable,
+                base + new_usable,
+            )
+        };
+        if mapped.is_err() {
+            // Unreachable: `reserve_large_range` created every leaf, so this publish
+            // allocates nothing and cannot fail. Guard defensively anyway — never
+            // advertise pages the pagemap does not cover: report no-grow (the extent
+            // stays grown, harmlessly reclaimed whole on the eventual free, W4-5).
+            debug_assert!(false, "install after reserve_large_range cannot fail");
+            return None;
+        }
+
+        // Publish the grown usable size under the descriptor seqlock.
+        // SAFETY: as above.
+        unsafe { (*desc_ptr).grow_usable(new_usable) };
+        Some(new_usable - old_usable)
+    }
+
     /// Return an allocation's backing to wherever it came from: a cache-served
     /// region (`None` backing) is offered back to the region cache; an
     /// extent-served region is freed through the extent manager.
@@ -760,6 +1059,24 @@ pub trait LargeBacking {
     /// `ptr` is a base pointer this allocator handed out (or null/foreign — those
     /// are rejected); the caller upholds the [`LargeAllocator::free`] contract.
     unsafe fn free(&self, ptr: *mut u8) -> bool;
+    /// In-place shrink the large allocation at `ptr` to `new_usable` page-rounded
+    /// bytes *if it belongs to this backend and is extent-backed*, returning the
+    /// freed tail byte count (for the caller's §36.17 accounting) or `None` if it
+    /// stayed whole; see [`LargeAllocator::shrink`] (§25.3, W15-3b).
+    ///
+    /// # Safety
+    /// As [`free`](Self::free): `ptr` is a live base pointer the caller owns and
+    /// does not concurrently free/realloc.
+    unsafe fn shrink(&self, ptr: *mut u8, new_usable: usize) -> Option<usize>;
+    /// In-place grow the large allocation at `ptr` to `new_usable` page-rounded
+    /// bytes by absorbing the adjacent free extent *if it belongs to this backend
+    /// and is extent-backed*, returning the grown byte count (for the caller's
+    /// accounting) or `None` if it could not (caller moves); see
+    /// [`LargeAllocator::grow`] (§25.2, W15-3a).
+    ///
+    /// # Safety
+    /// As [`shrink`](Self::shrink).
+    unsafe fn grow(&self, ptr: *mut u8, new_usable: usize) -> Option<usize>;
     /// Free every live large of `arena` (reset/destroy); see
     /// [`LargeAllocator::free_arena`].
     ///
@@ -791,6 +1108,16 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
     unsafe fn free(&self, ptr: *mut u8) -> bool {
         // SAFETY: forwarded unchanged from the trait's `free` contract.
         unsafe { LargeAllocator::free(self, ptr) }
+    }
+    #[inline]
+    unsafe fn shrink(&self, ptr: *mut u8, new_usable: usize) -> Option<usize> {
+        // SAFETY: forwarded unchanged from the trait's `shrink` contract.
+        unsafe { LargeAllocator::shrink(self, ptr, new_usable) }
+    }
+    #[inline]
+    unsafe fn grow(&self, ptr: *mut u8, new_usable: usize) -> Option<usize> {
+        // SAFETY: forwarded unchanged from the trait's `grow` contract.
+        unsafe { LargeAllocator::grow(self, ptr, new_usable) }
     }
     #[inline]
     unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {

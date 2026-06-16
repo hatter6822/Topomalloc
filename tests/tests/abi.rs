@@ -207,6 +207,96 @@ fn realloc_full_contract_through_the_abi() {
     assert!(realloc(cur, 0).is_null());
 }
 
+/// W15-3b at the C ABI: a medium `realloc` shrink across a page boundary keeps
+/// the same base pointer but **returns the tail pages to the backend** — so
+/// `malloc_usable_size` drops to the page-rounded new size — while the preserved
+/// prefix survives (§25.3, DD-1 "shrink, large tail → split + return tail"). The
+/// `topo-tests` build is extent-backed (it never enables `hugepage-optimized`),
+/// so the tail is genuinely returned here; the cache-served hugepage path keeps
+/// the allocation whole and is covered by the engine tests.
+#[test]
+fn realloc_medium_shrink_returns_the_tail_through_the_abi() {
+    let p = topomalloc_malloc(200_000); // medium (> SMALL_MAX, < HUGE_THRESHOLD)
+    assert!(!p.is_null());
+    let big = topomalloc_malloc_usable_size(p);
+    assert!(big >= 200_000);
+    // SAFETY: `big` writable bytes per malloc_usable_size's contract.
+    unsafe {
+        for i in 0..200u8 {
+            p.cast::<u8>().add(i as usize).write(i ^ 0x77);
+        }
+    }
+    // Shrink to a still-medium size that crosses a page boundary.
+    let q = realloc(p, 100_000);
+    assert_eq!(q, p, "an in-place medium shrink keeps the base pointer");
+    let small = topomalloc_malloc_usable_size(q);
+    assert!(
+        small < big,
+        "the tail pages must be returned: usable shrank from {big} to {small}"
+    );
+    assert!(small >= 100_000, "usable still covers the new request");
+    // The preserved prefix survives the in-place shrink (§25.4).
+    // SAFETY: `small >= 100_000 > 200` readable bytes carry the pattern.
+    unsafe {
+        for i in 0..200u8 {
+            assert_eq!(
+                q.cast::<u8>().add(i as usize).read(),
+                i ^ 0x77,
+                "content lost shrinking at byte {i}"
+            );
+        }
+    }
+    free(q);
+}
+
+/// W15-3a/b at the C ABI through the dedicated in-place-resize entry point
+/// `topo_xallocx`: a medium allocation **shrinks** in place (reporting the smaller
+/// usable size, tail returned) and then **grows back** in place (absorbing the
+/// just-returned, now-adjacent free extent) — same base throughout, prefix
+/// preserved, no move. (`topo-tests` is extent-backed; the cache-served hugepage
+/// path keeps the size and is covered by the engine tests.)
+#[test]
+fn xallocx_resizes_a_large_allocation_in_place() {
+    let p = topo_mallocx(200_000, 0); // medium (> SMALL_MAX, < HUGE_THRESHOLD)
+    assert!(!p.is_null());
+    let big = topomalloc_malloc_usable_size(p);
+    assert!(big >= 200_000);
+    // SAFETY: `big` writable bytes; record a prefix to verify preservation.
+    unsafe {
+        for i in 0..200u8 {
+            p.cast::<u8>().add(i as usize).write(i ^ 0x44);
+        }
+    }
+    // Shrink in place: xallocx reports the new (smaller) usable size.
+    // SAFETY: `p` is a live resize target this test owns.
+    let shrunk = unsafe { topo_xallocx(p, 100_000, 0, 0) };
+    assert!(
+        shrunk >= 100_000 && shrunk < big,
+        "xallocx shrinks in place to {shrunk} (was {big})"
+    );
+    assert_eq!(topomalloc_malloc_usable_size(p), shrunk);
+    // Grow back in place: the just-returned tail is adjacent and free.
+    // SAFETY: `p` is still the live resize target.
+    let grown = unsafe { topo_xallocx(p, big, 0, 0) };
+    assert_eq!(
+        grown, big,
+        "xallocx grows back in place (absorbs the freed tail)"
+    );
+    assert_eq!(topomalloc_malloc_usable_size(p), grown);
+    // The prefix survived both in-place resizes (no move/copy).
+    // SAFETY: `big` readable bytes carry the pattern.
+    unsafe {
+        for i in 0..200u8 {
+            assert_eq!(
+                p.cast::<u8>().add(i as usize).read(),
+                i ^ 0x44,
+                "content lost at {i}"
+            );
+        }
+    }
+    free(p);
+}
+
 #[test]
 fn reallocarray_is_overflow_checked() {
     let p = topomalloc_malloc(16);
