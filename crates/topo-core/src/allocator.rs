@@ -654,10 +654,10 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Learned per-bucket placement hints (§24, plan 07 W14): the live end of the
     /// learn → place loop. The heap sampler publishes confident, consistent per-site
     /// profiles into this lock-free table ([`publish_learned_hints`](Self::publish_learned_hints));
-    /// the medium/large path reads it (one relaxed load) to place a *placement-unhinted*
-    /// allocation by its learned profile, the explicit hint always winning. Empty (and the
-    /// read short-circuits to neutral) until sampling is enabled, so the default path is
-    /// byte-for-byte unchanged.
+    /// the medium/large path reads it (one atomic acquire load) to place a
+    /// *placement-unhinted* allocation by its learned profile, the explicit hint always
+    /// winning. Empty (and the read short-circuits to neutral) until a confident hint is
+    /// published, so the medium/large placement outcome is unchanged when nothing is learned.
     learned: LearnedHints,
 }
 
@@ -1038,8 +1038,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// (§24, W14): if the request carries any explicit hotness/lifetime hint, it wins
     /// untouched; otherwise, when a confident, consistent learned hint exists for the bucket,
     /// adopt it (encoded back into the `u8`/[`Lifetime`] hint the filler decodes). When no
-    /// hint is learned (the default / profiling-off case) the request is left exactly as-is,
-    /// so the default placement path is byte-for-byte unchanged. The result is advisory —
+    /// hint is learned (the default / profiling-off case) the request's `hints` are left
+    /// exactly as-is, so the resulting placement is unchanged. The result is advisory —
     /// it can only steer placement, never size/alignment/validity (§24.5).
     #[inline]
     fn apply_learned(learned: &LearnedHints, hints: &mut Hints, bucket: u16) {
@@ -3556,5 +3556,64 @@ mod tests {
             .is_null());
         assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
+    }
+
+    #[test]
+    fn small_place_class_applies_learned_hint_to_unhinted_requests() {
+        // W14 small-path learn → place loop: after a confident cold profile is published for
+        // a small bucket, an *unhinted* request of that size class is tagged with the learned
+        // class — while an explicitly-hinted request keeps its own class (explicit wins).
+        use crate::placement::{PlaceClass, SiteProfileTable};
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // Pick a real small size class and its bucket.
+        let req = classify(64, MIN_ALIGN, 0).expect("classify");
+        let sc = match req.kind {
+            RequestKind::Small { sc, .. } => sc,
+            other => panic!("expected small, got {other:?}"),
+        };
+        let bucket = sc.index() as u16;
+
+        // Baseline: nothing learned ⇒ the unhinted small request maps to one class (the
+        // default pool); record it so we can prove the learned hint *changes* it.
+        let baseline = a.small_place_class(&req);
+
+        // Teach a confident cold + short profile for that bucket and publish it.
+        let mut table: SiteProfileTable<64> = SiteProfileTable::new();
+        let mut clk = 0u64;
+        for _ in 0..crate::placement::CONFIDENT_SAMPLES {
+            table.record_alloc(crate::StackId(7), bucket, 64, 0 /* cold */, clk);
+            clk += 1;
+            table.record_free(crate::StackId(7), 5 /* short */, 64, clk);
+            clk += 1;
+        }
+        a.publish_learned_hints(&table);
+
+        // The unhinted request now adopts the learned class (Cold ⇒ class tag 1).
+        let learned = a.small_place_class(&req);
+        assert_eq!(
+            learned,
+            PlaceClass::Cold.as_u8(),
+            "unhinted small request adopts the learned cold class (was {baseline})"
+        );
+
+        // An explicit hot hint wins over the learned cold hint (explicit always overrides).
+        let hot_raw = RequestFlags::NONE.with_hotness(255).raw();
+        let hot_req = classify(64, MIN_ALIGN, hot_raw).expect("classify hot");
+        assert_eq!(
+            a.small_place_class(&hot_req),
+            PlaceClass::Hot.as_u8(),
+            "explicit hot hint overrides the learned cold hint"
+        );
+
+        // Clearing the learned hints reverts the unhinted request to its baseline class.
+        a.learned_hints().reset();
+        assert_eq!(
+            a.small_place_class(&req),
+            baseline,
+            "clear reverts to default"
+        );
     }
 }

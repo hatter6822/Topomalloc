@@ -530,8 +530,11 @@ impl AllocationSiteProfile {
             let dev = (sample_q8 as i64 - self.hotness_q8 as i64).unsigned_abs() as u32;
             self.hotness_q8 = ewma_step(self.hotness_q8 as u32, sample_q8) as u16;
             self.hotness_mad_q8 = ewma_step(self.hotness_mad_q8 as u32, dev) as u16;
-            // Inter-allocation interval EWMA (recency-weighted rate).
-            let dt = (now_ms.saturating_sub(self.last_alloc_ms) << 8).min(u32::MAX as u64) as u32;
+            // Inter-allocation interval EWMA (recency-weighted rate). `saturating_mul`
+            // (not `<< 8`) so an absurd interval clamps rather than wrapping the shift.
+            let dt = (now_ms.saturating_sub(self.last_alloc_ms))
+                .saturating_mul(256)
+                .min(u32::MAX as u64) as u32;
             self.alloc_interval_q8 = if self.alloc_interval_q8 == 0 {
                 dt
             } else {
@@ -547,7 +550,9 @@ impl AllocationSiteProfile {
     pub fn record_free(&mut self, age_ms: u64, bytes: u64, now_ms: u64) {
         self.lifetimes.record(LifetimeClass::from_age_ms(age_ms));
         if self.free_count > 0 {
-            let dt = (now_ms.saturating_sub(self.last_free_ms) << 8).min(u32::MAX as u64) as u32;
+            let dt = (now_ms.saturating_sub(self.last_free_ms))
+                .saturating_mul(256)
+                .min(u32::MAX as u64) as u32;
             self.free_interval_q8 = if self.free_interval_q8 == 0 {
                 dt
             } else {
@@ -1057,7 +1062,7 @@ impl<const CAP: usize> SiteProfileTable<CAP> {
 /// allocation by its learned profile (the live end of the learn → place loop). One packed
 /// [`PlaceHints`] per placement bucket; the sampler republishes it from
 /// [`SiteProfileTable::write_learned_hints`] on the rare sampled path, and the engine reads
-/// it with a single relaxed atomic load per allocation (no lock — §31.4). When nothing has
+/// it with a single atomic load per allocation (no lock — §31.4). When nothing has
 /// been published it short-circuits to the neutral default, so it is free when profiling is
 /// off. Like every W14 output the value is **advisory** (§24.5): it can only change *where*
 /// an object lands, never its size/alignment/validity.
@@ -1085,7 +1090,7 @@ impl LearnedHints {
     }
 
     /// The learned hint for `bucket`, or the neutral default if nothing is published for it
-    /// (or nothing at all). One relaxed load in the common case. Total for any `bucket`.
+    /// (or nothing at all). One atomic acquire load in the common case. Total for any `bucket`.
     #[inline]
     pub fn lookup(&self, bucket: u16) -> PlaceHints {
         if !self.any.load(Ordering::Acquire) {

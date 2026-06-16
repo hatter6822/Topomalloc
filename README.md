@@ -143,9 +143,9 @@ the `SiteProfileTable` learning policy live in `crates/topo-core/src/placement.r
 confident profile into the advisory `PlaceHints` (hotness + lifetime) the placement layers
 group by (cold spans, short-lived together, long-lived-hot densely packed; §24.6–§24.8). The
 **learn → place loop is closed live**: confident, consistent per-bucket consensus is
-published into a lock-free `LearnedHints` table the allocation path reads (one relaxed load),
+published into a lock-free `LearnedHints` table the allocation path reads (one atomic load),
 so a *placement-unhinted* allocation adopts its site's learned profile — an explicit hint
-always winning, and the default path byte-for-byte unchanged when nothing is learned.
+always winning, and the placement unchanged when nothing is learned.
 Grouping acts at **two layers**: the W11 hugepage filler (medium/large), and new §24.6/§24.7
 `PlaceClass`-tagged **span pools** for small objects (cold / hot / short-lived spans, with an
 availability fallback so grouping never causes a spurious OOM). To feed the policy from

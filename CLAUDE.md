@@ -247,8 +247,8 @@ hotness, alloc/free rates, `sampled_live_bytes`, per-dimension + combined confid
 pattern) whose `place_hints` distils a *confident* profile into the advisory `PlaceHints` (hotness +
 lifetime) the placement layers group by (§24.6–§24.8). The **learn → place loop is closed live**: confident,
 consistent per-bucket consensus is published into a lock-free `LearnedHints` table the allocation path reads
-(one relaxed load; `Allocator::{publish_learned_hints,learned_hints}`), so a *placement-unhinted* request
-adopts its site's learned profile — an explicit hint always winning, and the default path byte-for-byte
+(one atomic load; `Allocator::{publish_learned_hints,learned_hints}`), so a *placement-unhinted* request
+adopts its site's learned profile — an explicit hint always winning, and the placement
 unchanged when nothing is learned. Grouping acts at **two layers**: the W11 hugepage filler (medium/large:
 cold → cold/sparse, same-lifetime via open-fresh-on-mismatch, long+hot → hot-dense), and §24.6/§24.7
 `PlaceClass`-tagged **span pools** for small objects (a class-preferring `CentralCache::remove_batch` with an
@@ -265,8 +265,8 @@ The **minimal W17-3 sampling slice** landed alongside to feed the policy live (`
 core), an allocation-free `libc::backtrace` capture into a fixed `StackBuf` (W17-3b, warmed up at enable),
 a `SampleBloom`-gated `SampledObjects` lifecycle with right-censored lifetimes (W17-3c, the free hot path
 stays lock-free), and `SiteProfileTable` as the aggregator (W17-3d) with a `topomalloc_profile_dump_json`
-dump. Sampling is wired into `AnyAllocator::{allocate,free,realloc}`, **off by default** (one relaxed
-atomic load on the hot path), enabled by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`, and a
+dump. Sampling is wired into `AnyAllocator::{allocate,free,realloc}`, **off by default** (one atomic
+load on the hot path), enabled by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`, and a
 thread-local re-entrancy guard keeps the sampler from re-entering the allocator (§31.4) — proved by the
 `sampler_no_alloc` test (a counting `#[global_allocator]` shows the sampled path makes **zero** heap
 allocations across 50k samples), with a sampling-overhead criterion bench bounding the hot-path cost and the

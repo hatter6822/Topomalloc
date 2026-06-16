@@ -9,7 +9,7 @@
 //!   [`AnyAllocator`](crate::AnyAllocator)'s `allocate`/`free`/`realloc`, so *every*
 //!   public entry point (C ABI, `topo_*x`, [`GlobalAlloc`](core::alloc::GlobalAlloc),
 //!   arena API) samples uniformly. When profiling is **off** (the default) each is a
-//!   single relaxed atomic load — the default artifact's path is unchanged. When on, the
+//!   single atomic load — the default artifact's path is unchanged. When on, the
 //!   decision is a thread-local [`Sampler`] (no lock, no syscall, no allocation); the
 //!   free path's "is this sampled?" test is a lock-free [`SampleBloom`] so the common
 //!   (non-sampled) free never takes the sampled-set lock (§31.4, DD-1 *F2*).
@@ -209,7 +209,7 @@ fn warm_up_unwinder() {
 // ---------------------------------------------------------------------------
 
 /// Sample hook for a completed allocation of `size` bytes at `ptr` under `flags`. A
-/// no-op (one relaxed load) when profiling is off; otherwise a thread-local Poisson
+/// no-op (one atomic load) when profiling is off; otherwise a thread-local Poisson
 /// decision, with the capture/record work only on a fired sample.
 #[inline]
 pub fn on_alloc(ptr: *mut u8, size: usize, align: usize, flags: RequestFlags) {
