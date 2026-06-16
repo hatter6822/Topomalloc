@@ -175,8 +175,9 @@ Four W2 implementation choices are ratified here; the module docs
   shipped lookup is a single direct map for the whole small range — no second code
   path, no arithmetic class derivation. Ratified over the hybrid. The over-aligned
   escape is factored into `align_walk` (table-parametric, so the integrated path is
-  unit-tested against synthetic tables with over-aligned classes — the shipped
-  table is uniformly 16-aligned) and **proved** in Lean: `alignWalk_sufficient`
+  unit-tested against synthetic tables with awkward over-aligned distributions the
+  shipped table does not contain — W15-4 later gave each shipped class its natural
+  alignment, see below) and **proved** in Lean: `alignWalk_sufficient`
   shows the walk only ever returns a class whose natural alignment covers the
   request (the W2-3b "never share a less-aligned slab" rule). The Lean `lake exe
   check` gate also runs a model-vs-emitted lookup differential (`lookupMatchesModelB`:

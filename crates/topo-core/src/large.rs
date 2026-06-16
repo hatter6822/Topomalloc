@@ -422,7 +422,8 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             let head_zero = unsafe { core::slice::from_raw_parts(region.base, n.min(PAGE_SIZE)) }
                 .iter()
                 .all(|&b| b == 0);
-            // SAFETY: `n >= 1` here (a strict shrink), so `n - 1` is an in-bounds offset.
+            // SAFETY: `region.len` is a nonzero page multiple (≥ one page), so `n - 1`
+            // is an in-bounds offset of this committed, owned region.
             let tail_zero = n <= PAGE_SIZE || unsafe { region.base.add(n - 1).read() } == 0;
             debug_assert!(
                 head_zero && tail_zero,

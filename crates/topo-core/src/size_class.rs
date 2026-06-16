@@ -94,10 +94,14 @@ fn size_class_in(
     align_walk(start, align, classes)
 }
 
-/// The over-alignment escape (§9.3 / §25.5, W2-3b), factored out so it can be
-/// exercised against tables that actually contain over-aligned classes (the
-/// shipped table is uniformly 16-aligned, so `size_class` short-circuits before
-/// reaching the walk).
+/// The over-alignment escape (§9.3 / §25.5, W2-3b), factored out so it can also be
+/// exercised against synthetic tables (the unit tests below build degenerate ones).
+/// Since W15-4 the **shipped** table records each class's *natural* alignment, so
+/// this walk runs for real at runtime: an over-aligned small request advances to the
+/// matching aligned class (e.g. a 40-byte/64-aligned request skips the 48-byte/
+/// 16-aligned class to land in the 64-byte/64-aligned one) instead of short-
+/// circuiting. (`align > max_align` is still rejected in O(1) by the caller before
+/// the walk; only an `align <= max_align` over-alignment reaches here.)
 ///
 /// From `start` — the smallest class whose *size* already covers the request —
 /// advance to the smallest class at or after it whose *natural* alignment is
@@ -317,12 +321,13 @@ mod tests {
 
     #[test]
     fn align_walk_routes_over_aligned_to_a_more_aligned_class() {
-        // A synthetic table WITH an over-aligned class (the shipped table is
-        // uniformly 16-aligned, so this is the only way to exercise the
-        // walk-forward branch, W2-3b). Class 2 is the lone 32-aligned class; it
-        // is deliberately in the *middle* so "the only aligned class is behind
-        // the size-start" is reachable. Sizes ascend; each size is a multiple of
-        // its align (§9.3), so the rows are well-formed.
+        // A synthetic table with a deliberately awkward over-aligned class: class 2
+        // is the lone 32-aligned class, placed in the *middle* so the degenerate
+        // "the only aligned class is behind the size-start" case (asserted below) is
+        // reachable — a distribution the shipped natural-alignment table (W15-4)
+        // does not contain, so this synthetic table pins the corner directly. Sizes
+        // ascend; each size is a multiple of its align (§9.3), so the rows are
+        // well-formed.
         fn r(size: u32, align: u32) -> SizeClassRow {
             SizeClassRow {
                 size,
@@ -354,8 +359,9 @@ mod tests {
     #[test]
     fn size_class_in_routes_over_aligned_to_a_distinct_aligned_class() {
         // The integrated granule-lookup → align-walk path on a synthetic table
-        // with an over-aligned class (class 2 is 32-aligned; the rest 16). This is
-        // the end-to-end W2-3b routing the shipped table can't exercise.
+        // with a lone middle over-aligned class (class 2 is 32-aligned; the rest
+        // 16) — an awkward distribution the shipped natural-alignment table (W15-4)
+        // does not contain, exercised here end-to-end (W2-3b).
         fn r(size: u32, align: u32) -> SizeClassRow {
             SizeClassRow {
                 size,
