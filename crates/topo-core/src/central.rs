@@ -52,6 +52,12 @@ use crate::span::{NonCentralResidency, SpanDescriptor, SpanState};
 /// Number of size classes in the generated table.
 const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 
+/// Placement-class sentinel meaning "any class" in [`CentralCache::remove_batch`] (§24, W14):
+/// the §24.6–§24.8 span grouping is advisory, so the allocator falls back to this to reuse
+/// any partial span before reporting OOM. Distinct from every real
+/// [`PlaceClass`](crate::PlaceClass) tag (`0..=3`).
+pub const ANY_PLACE_CLASS: u8 = u8::MAX;
+
 /// Maximum batch size across all size classes (the largest `batch` field).
 pub const MAX_BATCH_LEN: usize = max_batch_in_table();
 
@@ -479,12 +485,20 @@ impl CentralCache {
 
     // --- remove batch (W5-4b) ------------------------------------------------
 
-    /// Remove up to `desired` objects of size class `sc` (§A.4, W5-4b).
+    /// Remove up to `desired` objects of size class `sc` (§A.4, W5-4b), preferring a span of
+    /// the requested **placement class** `place_class` (§24.6–§24.8, W14) so cold / hot /
+    /// short-lived small objects cluster; pass [`ANY_PLACE_CLASS`] to ignore the class
+    /// (the availability fallback).
     ///
-    /// Tries, in order: (1) a partial span matching the requested arena,
-    /// (2) an empty-cached span matching the requested arena, (3) returns
+    /// Tries, in order: (1) a partial span matching the arena **and** `place_class`,
+    /// (2) an empty-cached span (re-tagged to `place_class`), (3) returns
     /// [`RemoveResult::NeedSpan`] so the caller can get a new span from the
     /// backend, [`activate_span`](Self::activate_span) it, and retry (§A.2).
+    ///
+    /// Class grouping is **advisory** (§24.5): it changes only *which* span an object is
+    /// carved from, never the object's size/alignment/validity. A class never causes a
+    /// spurious failure — the caller's [`ANY_PLACE_CLASS`] fallback reuses any partial before
+    /// reporting OOM.
     ///
     /// **C-001/C-002:** the returned batch is single-arena, single-label,
     /// correct-size (every object comes from one span of the right class).
@@ -496,6 +510,7 @@ impl CentralCache {
         arena: ArenaId,
         label: Label,
         sc: SizeClassId,
+        place_class: u8,
         desired: usize,
     ) -> RemoveResult {
         // C-002: at M1 only Label::PUBLIC is supported. Per-label partitioning
@@ -512,8 +527,8 @@ impl CentralCache {
         };
         let _guard = bin.lock();
 
-        // --- step 1: find an arena-matching partial span ---------------------
-        let span_ptr = self.find_partial_for_arena(bin, arena);
+        // --- step 1: find a partial span matching the arena and placement class -
+        let span_ptr = self.find_partial_for_arena(bin, arena, place_class);
 
         // --- step 2: if no partial match, try the empty cache ----------------
         let span_ptr = if span_ptr.is_null() {
@@ -528,6 +543,11 @@ impl CentralCache {
                 // Wrong arena — put it back (M1: can't happen).
                 bin.push_empty(empty_span);
                 return RemoveResult::NeedSpan;
+            }
+            // Re-tag the empty span (no live objects ⇒ safe) to the requested class, so it
+            // joins the right grouping pool (§24.6–§24.8). `ANY_PLACE_CLASS` leaves the tag.
+            if place_class != ANY_PLACE_CLASS {
+                empty_span.set_place_class(place_class);
             }
             // The empty span has a full bitmap (all central-free). Push to
             // partial so the carve logic below can process it uniformly.
@@ -584,10 +604,19 @@ impl CentralCache {
         }
     }
 
-    /// Scan the partial list for the first span matching `arena`. Returns
-    /// a pointer to it (leaving it in the list), or null if none matches.
-    /// The matching span is moved to the head for efficient future access.
-    fn find_partial_for_arena(&self, bin: &CentralBin, arena: ArenaId) -> *const SpanDescriptor {
+    /// Scan the partial list for the first span matching `arena` **and** `place_class`
+    /// (`ANY_PLACE_CLASS` matches any class — the §24 grouping is advisory). Returns a
+    /// pointer to it (leaving it in the list), or null if none matches. The matching span is
+    /// moved to the head for efficient future access.
+    fn find_partial_for_arena(
+        &self,
+        bin: &CentralBin,
+        arena: ArenaId,
+        place_class: u8,
+    ) -> *const SpanDescriptor {
+        let matches = |s: &SpanDescriptor| {
+            s.arena() == arena && (place_class == ANY_PLACE_CLASS || s.place_class() == place_class)
+        };
         let head = bin.partial_head.load(Ordering::Relaxed);
         if head.is_null() {
             return core::ptr::null();
@@ -597,7 +626,7 @@ impl CentralCache {
         // SAFETY: head was installed from a valid &SpanDescriptor; metadata
         // is never freed (§27.5).
         let head_span = unsafe { &*head };
-        if head_span.arena() == arena {
+        if matches(head_span) {
             return head;
         }
 
@@ -618,7 +647,7 @@ impl CentralCache {
             // SAFETY: same invariant — `next` was written by set_central_next
             // from a valid descriptor pointer.
             let next_span = unsafe { &*next };
-            if next_span.arena() == arena {
+            if matches(next_span) {
                 // Unlink `next` from its current position.
                 let after = next_span.central_next_ptr();
                 prev_span.set_central_next(after);
@@ -1013,6 +1042,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             for i in 0..batch.len() {
@@ -1033,7 +1063,14 @@ mod tests {
     fn empty_cache_returns_need_span() {
         let cache = CentralCache::new();
         let sc = SizeClassId::new(0);
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 1) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            1,
+        ) {
             RemoveResult::NeedSpan => {}
             RemoveResult::Ok(_) => panic!("expected NeedSpan from empty cache"),
         }
@@ -1059,7 +1096,14 @@ mod tests {
         assert!(span.conservation_holds_central_only());
 
         // Remove a batch.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(batch) => {
                 assert_eq!(batch.len(), 4);
                 // Verify batch addresses are valid.
@@ -1119,11 +1163,17 @@ mod tests {
         cache.activate_span(&span, &pm, &m).unwrap();
 
         // Remove 4 objects.
-        let batch =
-            match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
-                RemoveResult::Ok(b) => b,
-                RemoveResult::NeedSpan => panic!("expected batch"),
-            };
+        let batch = match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
+            RemoveResult::Ok(b) => b,
+            RemoveResult::NeedSpan => panic!("expected batch"),
+        };
         assert_eq!(batch.len(), 4);
 
         // Return 2 of the 4 — span is not empty, still has 2 live.
@@ -1156,7 +1206,14 @@ mod tests {
         assert_eq!(cache.bin(sc).unwrap().partial_count(), 1);
 
         // We can now remove from it again.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 2) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            2,
+        ) {
             RemoveResult::Ok(batch) => assert_eq!(batch.len(), 2),
             RemoveResult::NeedSpan => panic!("expected batch after re-add"),
         }
@@ -1216,7 +1273,14 @@ mod tests {
         assert_eq!(cache.bin(sc).unwrap().span_count(), 3);
 
         // Remove from the head (s3, last pushed).
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 1) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            1,
+        ) {
             RemoveResult::Ok(batch) => {
                 assert_eq!(batch.span(), &s3 as *const SpanDescriptor);
             }
@@ -1236,11 +1300,17 @@ mod tests {
 
         // Remove, check, insert, check — repeatedly.
         for _ in 0..10 {
-            let batch =
-                match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 8) {
-                    RemoveResult::Ok(b) => b,
-                    RemoveResult::NeedSpan => break,
-                };
+            let batch = match cache.remove_batch(
+                NodeId::DEFAULT,
+                ArenaId::DEFAULT,
+                Label::PUBLIC,
+                sc,
+                ANY_PLACE_CLASS,
+                8,
+            ) {
+                RemoveResult::Ok(b) => b,
+                RemoveResult::NeedSpan => break,
+            };
             assert!(span.conservation_holds_central_only());
 
             let indices: Vec<u16> = batch.indices().to_vec();
@@ -1262,7 +1332,14 @@ mod tests {
 
         let layout = SlabLayout::compute(sc, base, 0).unwrap();
 
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 8) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            8,
+        ) {
             RemoveResult::Ok(batch) => {
                 for i in 0..batch.len() {
                     let addr = batch.object_addr(i, &layout).unwrap();
@@ -1318,6 +1395,7 @@ mod tests {
                                 ArenaId::DEFAULT,
                                 Label::PUBLIC,
                                 sc,
+                                ANY_PLACE_CLASS,
                                 1,
                             ) {
                                 for i in 0..batch.len() {
@@ -1384,7 +1462,14 @@ mod tests {
         let sc = SizeClassId::new(3);
 
         // Step 1: empty cache returns NeedSpan.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::NeedSpan => {}
             RemoveResult::Ok(_) => panic!("expected NeedSpan from empty cache"),
         }
@@ -1394,7 +1479,14 @@ mod tests {
         cache.activate_span(&span, &pm, &m).unwrap();
 
         // Step 3: retry succeeds.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(batch) => {
                 assert_eq!(batch.len(), 4);
                 assert!(span.conservation_holds_central_only());
@@ -1418,13 +1510,27 @@ mod tests {
         cache.activate_span(&span_a, &pm, &m).unwrap();
 
         // Request for arena B should get NeedSpan (no matching span).
-        match cache.remove_batch(NodeId::DEFAULT, arena_b, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            arena_b,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::NeedSpan => {}
             RemoveResult::Ok(_) => panic!("should not get objects from wrong arena"),
         }
 
         // Request for arena A should succeed.
-        match cache.remove_batch(NodeId::DEFAULT, arena_a, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            arena_a,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(batch) => assert_eq!(batch.len(), 4),
             RemoveResult::NeedSpan => panic!("expected batch for matching arena"),
         }
@@ -1450,12 +1556,69 @@ mod tests {
         cache.activate_span(&span_b, &pm, &m).unwrap();
 
         // Head is B. Request for A should scan past B and find A.
-        match cache.remove_batch(NodeId::DEFAULT, arena_a, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            arena_a,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(batch) => {
                 assert_eq!(batch.span(), &span_a as *const SpanDescriptor);
                 assert_eq!(batch.len(), 4);
             }
             RemoveResult::NeedSpan => panic!("expected batch from scanned arena A"),
+        }
+    }
+
+    #[test]
+    fn remove_batch_prefers_a_class_matching_span() {
+        // W14 (§24.6–§24.8): with two partial spans of the same size class but different
+        // placement classes, `remove_batch(class)` carves from the class-matching span, so
+        // cold / hot / short-lived small objects cluster into separate spans.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let row = size_class::row(sc);
+        let span_bytes = row.slab_pages as usize * PAGE_SIZE;
+
+        let cold = make_span(1, sc, 0x5000_0000, &m);
+        let hot = make_span(2, sc, 0x5000_0000 + span_bytes, &m);
+        cold.set_place_class(1); // PlaceClass::Cold
+        hot.set_place_class(2); // PlaceClass::Hot
+        cache.activate_span(&cold, &pm, &m).unwrap();
+        cache.activate_span(&hot, &pm, &m).unwrap();
+
+        // A cold request lands in the cold span; a hot request in the hot span — regardless
+        // of which is at the list head.
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 1, 1) {
+            RemoveResult::Ok(b) => assert_eq!(b.span(), &cold as *const SpanDescriptor),
+            RemoveResult::NeedSpan => panic!("cold class should match the cold span"),
+        }
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 2, 1) {
+            RemoveResult::Ok(b) => assert_eq!(b.span(), &hot as *const SpanDescriptor),
+            RemoveResult::NeedSpan => panic!("hot class should match the hot span"),
+        }
+        // A class with no matching span (Short=3) and no empty cache reports NeedSpan rather
+        // than mixing into a different-class span — the caller then creates a class-tagged
+        // span (or, on OOM, falls back via ANY_PLACE_CLASS).
+        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 3, 1) {
+            RemoveResult::NeedSpan => {}
+            RemoveResult::Ok(_) => panic!("a non-matching class must not silently mix spans"),
+        }
+        // The ANY fallback still reuses an existing partial (availability before policy).
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            1,
+        ) {
+            RemoveResult::Ok(_) => {}
+            RemoveResult::NeedSpan => panic!("ANY_PLACE_CLASS should reuse any partial"),
         }
     }
 
@@ -1483,6 +1646,7 @@ mod tests {
                                 ArenaId::DEFAULT,
                                 Label::PUBLIC,
                                 sc,
+                                ANY_PLACE_CLASS,
                                 2,
                             ) {
                                 // Some threads return immediately.
@@ -1556,7 +1720,14 @@ mod tests {
         cache.activate_span(&span, &pm, &m).unwrap();
 
         // Remove some objects (span is NOT empty).
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(_) => {}
             RemoveResult::NeedSpan => panic!("expected batch"),
         }
@@ -1585,7 +1756,14 @@ mod tests {
         drop(sg);
 
         // After removing 8 objects: live=8, central_free=all-8.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 8) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            8,
+        ) {
             RemoveResult::Ok(batch) => assert_eq!(batch.len(), 8),
             RemoveResult::NeedSpan => panic!("expected batch"),
         }
@@ -1620,7 +1798,14 @@ mod tests {
         assert_eq!(cache.bin(sc).unwrap().partial_count(), 0);
 
         // Next remove should pull from the empty cache, NOT return NeedSpan.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::Ok(batch) => {
                 assert_eq!(batch.len(), 4);
                 assert_eq!(batch.span(), &span as *const SpanDescriptor);
@@ -1661,7 +1846,14 @@ mod tests {
         let mut s2_objects = Vec::new();
         while s2_objects.len() < obj_count {
             let want = (obj_count - s2_objects.len()).min(MAX_BATCH_LEN);
-            match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, want) {
+            match cache.remove_batch(
+                NodeId::DEFAULT,
+                ArenaId::DEFAULT,
+                Label::PUBLIC,
+                sc,
+                ANY_PLACE_CLASS,
+                want,
+            ) {
                 RemoveResult::Ok(batch) => {
                     for i in 0..batch.len() {
                         s2_objects.push(batch.index(i));
@@ -1694,11 +1886,17 @@ mod tests {
         assert_eq!(cache.bin(sc).unwrap().total_central_free(), obj_count);
 
         // After removing a batch: total decreases.
-        let batch =
-            match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 4) {
-                RemoveResult::Ok(b) => b,
-                _ => panic!("expected batch"),
-            };
+        let batch = match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
+            RemoveResult::Ok(b) => b,
+            _ => panic!("expected batch"),
+        };
         let removed = batch.len() as u64;
         assert_eq!(
             cache.bin(sc).unwrap().total_central_free(),
@@ -1786,6 +1984,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             RemoveResult::Ok(batch) => {
@@ -1814,9 +2013,14 @@ mod tests {
 
         let all1 = {
             let mut v = Vec::new();
-            while let RemoveResult::Ok(batch) =
-                cache.remove_batch(NodeId::DEFAULT, arena_a, Label::PUBLIC, sc, MAX_BATCH_LEN)
-            {
+            while let RemoveResult::Ok(batch) = cache.remove_batch(
+                NodeId::DEFAULT,
+                arena_a,
+                Label::PUBLIC,
+                sc,
+                ANY_PLACE_CLASS,
+                MAX_BATCH_LEN,
+            ) {
                 for i in 0..batch.len() {
                     v.push(batch.index(i));
                 }
@@ -1828,7 +2032,14 @@ mod tests {
 
         // Request from arena_b: the empty cache has arena_a's span.
         // Should put it back and return NeedSpan.
-        match cache.remove_batch(NodeId::DEFAULT, arena_b, Label::PUBLIC, sc, 4) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            arena_b,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            4,
+        ) {
             RemoveResult::NeedSpan => {}
             RemoveResult::Ok(_) => panic!("should not serve arena_b from arena_a's cache"),
         }
@@ -1867,6 +2078,7 @@ mod tests {
                                 ArenaId::DEFAULT,
                                 Label::PUBLIC,
                                 sc,
+                                ANY_PLACE_CLASS,
                                 MAX_BATCH_LEN,
                             ) {
                                 // SAFETY: batch.span() is a valid pointer to a SpanDescriptor
@@ -1972,6 +2184,7 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            ANY_PLACE_CLASS,
             MAX_BATCH_LEN,
         ) {
             let dst = if core::ptr::eq(batch.span(), &a) {
@@ -2012,7 +2225,14 @@ mod tests {
         assert_eq!(bin.span_count(), 1, "only A remains tracked");
 
         // A is still reusable straight from the empty cache.
-        match cache.remove_batch(NodeId::DEFAULT, ArenaId::DEFAULT, Label::PUBLIC, sc, 1) {
+        match cache.remove_batch(
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            ANY_PLACE_CLASS,
+            1,
+        ) {
             RemoveResult::Ok(batch) => assert!(core::ptr::eq(batch.span(), &a)),
             RemoveResult::NeedSpan => panic!("cached empty span A must be reusable"),
         }

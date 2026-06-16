@@ -27,6 +27,7 @@ use topo_core::{
     ReleaseInputs, HUGEPAGE_SIZE,
 };
 use topo_core::{NodePressure, Rebalancer, TopologyBuilder};
+use topo_core::{SiteProfileTable, StackId, PAGES_PER_HUGEPAGE};
 use topo_test_support::{parse_trace_line, LiveModel, TraceRecord};
 
 proptest! {
@@ -808,5 +809,67 @@ proptest! {
         let any_need = nodes.iter().any(|p| p.unmet_need() > 0);
         let any_surplus = nodes.iter().any(|p| p.movable_surplus() > 0);
         prop_assert!(!any_need || !any_surplus, "fixpoint has no relievable stranding");
+    }
+}
+
+proptest! {
+    /// **The §24.5 placement safety boundary, under an arbitrary learned profile (plan 07
+    /// W14).** A [`SiteProfileTable`] is fed an arbitrary stream of alloc/free/censor
+    /// observations (so the *learned* profile — hence the distilled [`PlaceHints`] — is
+    /// adversarial), then that learned hint is fed into the [`HugePageFiller`]. A placed
+    /// run is *always* exactly the requested page count, page-aligned, and in-bounds, and
+    /// the filler stays well-formed — no learned hint can change an object's geometry. This
+    /// is the randomized companion to the deterministic "fixed wall" integration tests, and
+    /// also pins the table's totality (bounded sites, total `place_hints`).
+    #[test]
+    fn learned_profile_never_breaks_placement_geometry(
+        // (op, site, val) where op selects record_alloc / record_free / record_censored.
+        obs in prop::collection::vec((0u8..3, 0u64..6, 0u64..200_000), 0..200),
+        place_pages in prop::collection::vec((1usize..=PAGES_PER_HUGEPAGE, 0u64..6, 0u8..2), 0..40),
+    ) {
+        let mut table: SiteProfileTable<16> = SiteProfileTable::new();
+        let mut now = 0u64;
+        for (op, site, val) in obs {
+            now += 1;
+            let id = StackId(site + 1);
+            match op {
+                0 => table.record_alloc(id, (val % 80) as u16, val.max(1), (val % 256) as u8, now),
+                1 => table.record_free(id, val, val.max(1), now),
+                _ => table.record_censored(id, val),
+            }
+            // Totality + bounded capacity after every observation.
+            prop_assert!(table.stats().sites_tracked <= 16);
+            let _ = table.place_hints(StackId(site)); // total on any key, even an unseen one
+        }
+
+        // Drive placements with the *learned* hints over a fresh filler.
+        let mut buf = vec![0u8; 1 << 18];
+        // SAFETY: `buf` outlives `filler` (both drop at the end of this case; filler first)
+        // and is neither moved nor aliased while borrowed.
+        let bump = unsafe { BumpArena::new(buf.as_mut_ptr(), buf.len()) };
+        let mut filler = match HugePageFiller::new(&bump, HUGEPAGE_SIZE * 32, 4) {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        let mut live = Vec::new();
+        for (pages, site, align_sel) in place_pages {
+            let hints = table.place_hints(StackId(site + 1));
+            let align = PAGE_SIZE << (align_sel as usize); // PAGE or 2*PAGE
+            if let Some(p) = filler.place(pages, align, hints) {
+                // The fixed wall (§24.5): geometry is exactly as requested, regardless of
+                // whatever (possibly wrong) hint the learned profile produced.
+                prop_assert_eq!(p.pages, pages);
+                prop_assert_eq!(p.base % align, 0);
+                let off = p.base % HUGEPAGE_SIZE;
+                prop_assert!(off + pages * PAGE_SIZE <= HUGEPAGE_SIZE);
+                filler.mark_committed(&p);
+                live.push((p.base, p.pages));
+            }
+            prop_assert!(filler.check_invariants());
+        }
+        for (base, pages) in live {
+            prop_assert!(filler.free(base, pages).valid);
+        }
+        prop_assert!(filler.check_invariants());
     }
 }

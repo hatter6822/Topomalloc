@@ -314,6 +314,16 @@ impl SpanFlags {
     /// The span's objects are in quarantine (plan 08): a pointer here classifies
     /// as `Quarantined` and a free is held, not actioned (§17.5).
     pub const QUARANTINED: u32 = 1 << 0;
+    /// The span's advisory **placement class** (§24.6–§24.8, W14), packed into bits 1–2:
+    /// the cold / hot / short-lived grouping pool it belongs to, so like-placed small
+    /// objects cluster (and whole spans empty together). Purely advisory — it never affects
+    /// object size, alignment, or validity (§24.5); it only steers which span a small
+    /// allocation is carved from. Reset to `0` (Default) on recycle and re-set by the
+    /// central path. Distinct bits from [`QUARANTINED`](Self::QUARANTINED), so the two are
+    /// orthogonal.
+    pub const PLACE_CLASS_SHIFT: u32 = 1;
+    /// Mask for the 2-bit placement class in [`flags`](crate::SpanDescriptor).
+    pub const PLACE_CLASS_MASK: u32 = 0b11 << Self::PLACE_CLASS_SHIFT;
 }
 
 /// The non-central terms of the §16.4 partition (`local_cached`, `transfer_cached`,
@@ -523,6 +533,30 @@ impl SpanDescriptor {
     #[inline]
     pub fn size_class(&self) -> SizeClassId {
         SizeClassId::new(self.sc.load(Ordering::Acquire) as usize)
+    }
+
+    /// The span's advisory placement class (§24.6–§24.8, W14) — the cold / hot / short-lived
+    /// grouping pool it belongs to, as a `0..=3` tag (see [`PlaceClass`](crate::PlaceClass)).
+    /// `0` (Default) unless the central path tagged it.
+    #[inline]
+    pub fn place_class(&self) -> u8 {
+        ((self.flags.load(Ordering::Acquire) & SpanFlags::PLACE_CLASS_MASK)
+            >> SpanFlags::PLACE_CLASS_SHIFT) as u8
+    }
+
+    /// Set the span's advisory placement class (§24.6–§24.8, W14), preserving the other flag
+    /// bits. Set by the central path when a span is created or an empty span is re-tagged for
+    /// reuse (both with no live objects, so re-tagging is safe). Advisory only — it never
+    /// changes object size/alignment/validity (§24.5).
+    #[inline]
+    pub fn set_place_class(&self, class: u8) {
+        let bits = ((class as u32) & 0b11) << SpanFlags::PLACE_CLASS_SHIFT;
+        // CAS loop so a concurrent QUARANTINED set/clear (a different bit) is preserved.
+        let _ = self
+            .flags
+            .fetch_update(Ordering::Release, Ordering::Acquire, |f| {
+                Some((f & !SpanFlags::PLACE_CLASS_MASK) | bits)
+            });
     }
 
     /// Pages backing this span.
@@ -1473,6 +1507,31 @@ mod tests {
         assert!(core::mem::size_of::<SpanDescriptor>() <= 128);
         assert!(core::mem::align_of::<SpanDescriptor>() >= 8);
         assert!(core::mem::align_of::<LargeDescriptor>() >= 8);
+    }
+
+    #[test]
+    fn place_class_round_trips_and_is_orthogonal_to_quarantine() {
+        // W14: the advisory placement class packs into spare flag bits, so it round-trips,
+        // survives a QUARANTINED set/clear (different bits), and defaults to 0.
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        assert_eq!(s.place_class(), 0, "fresh span defaults to class 0");
+        for class in [0u8, 1, 2, 3] {
+            s.set_place_class(class);
+            assert_eq!(s.place_class(), class);
+        }
+        s.set_place_class(2);
+        // Quarantining and un-quarantining must not disturb the placement class.
+        s.set_quarantined(true);
+        assert!(s.is_quarantined());
+        assert_eq!(s.place_class(), 2, "quarantine flag is orthogonal");
+        s.set_quarantined(false);
+        assert!(!s.is_quarantined());
+        assert_eq!(s.place_class(), 2);
+        // Setting the class back must not re-quarantine.
+        s.set_place_class(1);
+        assert!(!s.is_quarantined());
+        assert_eq!(s.place_class(), 1);
     }
 
     #[test]

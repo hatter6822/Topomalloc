@@ -1,7 +1,8 @@
 # Plan 07 — Observability, Placement & Control
 
 **Workstreams:** W17 (stats/telemetry/profiling), W14 (lifetime/hotness/placement), W20 (config/control plane)
-· **Status:** rev 2.1 · **Overview:** [README.md](README.md)
+· **Status:** rev 2.2 — **W14 landed (all units), with the minimal W17-3 sampling slice that feeds it
+live.** · **Overview:** [README.md](README.md)
 **SPEC anchors:** §31, §8.6, §19.7, §36.12, §24, §32, §10.5, Appendices D/E; O-001..O-007.
 **Upstream deps:** every state-owner (stats read all of them), [04](04-backend-hugepages-release.md) (coverage),
 [08](08-security-debug-testing.md)/[02](02-formal-model.md) (sampling unwind safety). **Downstream:**
@@ -32,10 +33,10 @@ placement (consumed by plan 04 filler): hot/cold + lifetime hints; allocation-si
 | W17-1a | Stats core (§31.1, O-002): all byte classes (app/cache/central/backend/metadata/quarantine/hugepage/arena). | M | | classes present; non-negative. |
 | W17-1b | Epoch/sequence + consistent-snapshot mode (§8.6): a snapshot reconciles to managed VM modulo the documented convention. | M | ∥ | reconciliation test passes. |
 | W17-2 | Snapshot/JSON/print API (§31.2) + flags (SUMMARY/BY_ARENA/BY_SIZE_CLASS/BY_CPU/BY_NUMA/BY_HUGEPAGE); additive-field rule (§35.3). | M | | JSON matches Appendix D shape. |
-| W17-3a | Sampling mechanism (§31.4): per-thread/per-CPU bytes-between-samples counter (Poisson), **no hot-path lock**. | M | | sampling decision lock-free; rate configurable. |
-| W17-3b | Stack capture on a sampled alloc **without recursive malloc** (bounded, alloc-free unwind into a fixed buffer). | M | | unwinder never re-enters the allocator (§31.4). |
-| W17-3c | Sampled-object bookkeeping: track sampled live objects, free them safely, right-censored lifetime accounting. | M | ∥ | freeing a sampled object is correct + accounted. |
-| W17-3d | Heap + lifetime profile aggregation + dump format (§31.3). | M | ∥ | profiles dumpable; low overhead. |
+| W17-3a | Sampling mechanism (§31.4): per-thread/per-CPU bytes-between-samples counter (Poisson), **no hot-path lock**. | M | | sampling decision lock-free; rate configurable. ✅ (landed early to feed W14) `topo_core::sampling::Sampler` — a per-thread Poisson "bytes-until-next-sample" counter (fixed-point exponential interval, so the core stays FP-free); the decision touches only thread-local state (no lock/syscall/alloc). Wired into `AnyAllocator::{allocate,free,realloc}`; rate set by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`. Off by default. |
+| W17-3b | Stack capture on a sampled alloc **without recursive malloc** (bounded, alloc-free unwind into a fixed buffer). | M | | unwinder never re-enters the allocator (§31.4). ✅ (early) `StackBuf` — a fixed `[usize; MAX_STACK_FRAMES]` the platform unwinder (`libc::backtrace`, warmed up once at enable) fills *in place*; folds to an opaque `StackId`. A thread-local re-entrancy guard makes the sampled slow path non-re-entrant; `sampling_lifecycle_*` pins that the sampler never re-enters the allocator. |
+| W17-3c | Sampled-object bookkeeping: track sampled live objects, free them safely, right-censored lifetime accounting. | M | ∥ | freeing a sampled object is correct + accounted. ✅ (early) `SampledObjects` — a fixed-capacity, alloc-free live set (open addressing + backward-shift deletion); a sampled free resolves the object's lifetime; `fold_censored` right-censors still-live objects at dump. The **free hot path stays lock-free** via the atomic `SampleBloom` (no false negatives), so only a maybe-positive consults the locked set (DD-1 F2). |
+| W17-3d | Heap + lifetime profile aggregation + dump format (§31.3). | M | ∥ | profiles dumpable; low overhead. ✅ (early) aggregation **is** `SiteProfileTable` (W14-2); `topomalloc_profile_dump_json` renders the §31.3 dump. (The broader W17 stats core / epoch snapshot / flags / redaction / `explain` remain for M6.) |
 | W17-4 | Fragmentation metrics (§31.5) + hugepage coverage (§19.7) wired from plan 04 W11-5. | M | ∥ | internal/external/cache/hugepage fragmentation reported. |
 | W17-5 | `topo_explain_memory()` (§31.6): a human-readable RSS attribution string. | S | ∥ | returns e.g. "RSS high because: 2.1 GiB live, 700 MiB per-CPU cache, …". |
 | W17-6 | **Label-scoped & redacted stats** (§36.12): low domains cannot infer high-domain patterns. | M | | stats-redaction test (§36.16); mirrors `stats_observation_noninterference` (plan 02 W1-12d). |
@@ -62,14 +63,45 @@ affects locality/fragmentation only — **never** validity, size, alignment, or 
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W14-1 | Hint plumbing (§24.1): hot/cold + lifetime flags from §10.4 into the filler. | M | | flags reach the filler; ignored-safely if absent. |
-| W14-2 | Lifetime classes (§24.2) + allocation-site profile record (§24.4): stack_id, size-class dist, lifetime histogram, hotness, rates, confidence. | M | ∥ | sampled profiles recorded; missing/wrong profiles never break safety (§24.5). |
-| W14-3 | Cold/short/long handling (§24.6–§24.8): grouping policy in the filler (cold spans, short-lived grouped, long-lived hot densely packed). | M | | grouping observable in stats; **safety-boundary test** (placement never changes size/align/validity). |
+| W14-1 | Hint plumbing (§24.1): hot/cold + lifetime flags from §10.4 into the filler. | M | | flags reach the filler; ignored-safely if absent. ✅ the public `TOPO_HOT`/`TOPO_COLD`/`TOPO_LIFETIME_*` flags decode to `RequestFlags` → `Hints` → `req.flags.hints_with_numa()` → `large.allocate_in_hinted()` → the filler's `PlaceHints { hotness, lifetime }`; a hint-less path (incl. the §18.6 seam) places with `PlaceHints::default()` (neutral/unspecified), so absent hints are ignored safely. |
+| W14-2 | Lifetime classes (§24.2) + allocation-site profile record (§24.4): stack_id, size-class dist, lifetime histogram, hotness, rates, confidence. | M | ∥ | sampled profiles recorded; missing/wrong profiles never break safety (§24.5). ✅ `crates/topo-core/src/placement.rs`: the six §24.2 `LifetimeClass`es; the §24.4 `AllocationSiteProfile` (all eight fields — `stack_id`, a bounded Space-Saving `SizeClassDist` with overcount bounds, the `LifetimeHistogram` incl. right-censored, a recency-weighted (EWMA) hotness with a MAD *stability* gate, EWMA alloc/free rates, `sampled_live_bytes`, per-dimension + combined `confidence_bp`); and `SiteProfileTable`, a pure/`no_std`/host-driven **16-way set-associative** learning policy (record/lookup/`place_hints`/`write_learned_hints`, least-confidence replacement). Fed **live** by the W17-3 sampler. The output is only advisory `PlaceHints`, so a missing/wrong profile can never change size/alignment/validity — the `learned_profile_*` tests + the `placement` fuzz target pin it. |
+| W14-2-loop | **Learn → place loop (live).** Confident, *consistent* per-bucket consensus is published into the engine's lock-free `LearnedHints` table; the allocation path reads it (one atomic acquire load) and a *placement-unhinted* request adopts it, an explicit hint always winning. | — | | learned profiles steer live placement; lock-free hot path; placement unchanged when nothing is learned. ✅ `SiteProfileTable::write_learned_hints` → `Allocator::{publish_learned_hints,learned_hints}`; the sampler republishes on a bounded cadence; disabling clears it. Proven end-to-end by `learned_hot_profile_steers_unhinted_large_allocations_hot` (a published hot profile sends *unhinted* large allocations to the hot-dense bin) with the `no_learned_hint_*` contrast. |
+| W14-3 | Cold/short/long handling (§24.6–§24.8): grouping policy in the filler (cold spans, short-lived grouped, long-lived hot densely packed). | M | | grouping observable in stats; **safety-boundary test** (placement never changes size/align/validity). ✅ **Two layers.** *Hugepages:* the W11 filler groups by the §24.6–§24.8 axes (cold → `ColdSparse`, same-lifetime via open-fresh-on-mismatch, long+hot → `HotDense`), observable as the §19.4 `bin_counts`. *Spans (§24.6/§24.7):* small objects are segregated into cold / hot / short-lived span pools — a `PlaceClass`-tagged span + class-preferring `CentralCache::remove_batch` (with an `ANY_PLACE_CLASS` availability fallback so grouping never causes a spurious OOM, §2.4); an all-default program keeps one pool per size class (no RSS regression). The **fixed-wall safety-boundary test** `engine_size_align_validity_free_are_invariant_under_hints` (+ pure-filler, proptest, fuzz, and `learned_profile_hints_uphold_the_wall` companions, and the §36.9 G-sim `safety_wall_holds_identically_over_sele4n_sim`): for every `(size, align)`, under *every* hint (incl. adversarial / learned), the usable size, alignment, writability, and free path are identical. |
 
 > **▸ Decomposition — W14 (placement) and its safety boundary.** The whole workstream is *policy*; the single
 > non-negotiable is W14-3's safety-boundary test, which asserts that no placement decision changes an object's
 > size, alignment, validity, or free path (§24.5). Splitting hints (W14-1), profiles (W14-2), and grouping
 > (W14-3) lets the learned-profile machinery evolve while the safety boundary stays a fixed, tested wall.
+
+> **▸ Implementation status.** W14 is **landed** (ahead of its M6 slot). W14-1 rides the existing W11 hint
+> plumbing (flags → `Hints` → filler `PlaceHints`). W14-2 is `crates/topo-core/src/placement.rs`: the §24.2
+> `LifetimeClass` taxonomy, the §24.4 `AllocationSiteProfile` record, and the `SiteProfileTable` learning
+> policy — a **pure, `no_std`, host-driven** object (the same pattern as the W12 `ReleaseController`), with a
+> bounded Space-Saving size-class summary, a right-censored lifetime histogram, per-dimension confidence, and
+> a total `place_hints` query. W14-3 is the W11 filler grouping (already live) plus the **fixed-wall**
+> safety-boundary test. To feed the policy from *real* traffic, the **minimal W17-3 sampling slice**
+> (`crates/topo-core/src/sampling.rs` + the `topo-abi` glue) landed alongside it: a lock-free per-thread
+> Poisson decision, an alloc-free `libc::backtrace` capture into a fixed buffer, a lock-free
+> `SampleBloom`-gated sampled-object lifecycle, and a re-entrancy guard — all **off by default**, enabled by
+> `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`. Because placement is **policy, not a modeled
+> transition** (§2.4 — exactly as for the W13 NUMA router), there is **no Lean obligation and no trace-grammar
+> change**; the profiler's running counters reconcile into `topo-stats` JSON (`placement` block) and the
+> `topo.placement.*` control namespace (these are *profiling* estimates, not a managed-VM byte class, so they
+> sit outside the §8.6 reconciliation). The safety boundary holds **by construction** — the policy's only
+> output is advisory `PlaceHints`, the score-only input the certified filler already tolerates.
+>
+> **Optimal-completion pass.** The loop is **closed end-to-end**: confident per-bucket consensus is published
+> into a lock-free `LearnedHints` table the allocation path reads (one atomic acquire load; explicit hints
+> override; the placement is unchanged when nothing is learned), so learned profiles steer *live*
+> placement — for medium/large through the filler, and for **small objects** through new §24.6/§24.7
+> `PlaceClass`-tagged span pools (class-preferring `CentralCache::remove_batch` with an `ANY_PLACE_CLASS`
+> availability fallback, so grouping never causes a spurious OOM). The profile quality was hardened
+> (event-driven EWMA rates, a MAD-stability-gated recency-weighted hotness, a 16-way set-associative table).
+> The W17-3 verification matches the SPEC's prescribed methods: the **`sampler_no_alloc`** test installs a
+> counting `#[global_allocator]` and proves the sampled path makes **zero** heap allocations across 50k
+> sampled allocations (§31.4 / Appendix F); a **sampling-overhead** criterion bench (off vs on) bounds the
+> hot-path cost; the membership filter auto-refreshes to cap its false-positive rate; and a **§36.9 G-sim**
+> test re-proves the §24.5 safety wall + the learn → place loop identically over `Sele4nSim`.
 
 ---
 

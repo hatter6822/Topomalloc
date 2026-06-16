@@ -77,6 +77,19 @@ impl Control {
                 Some(self.stats.numa_rebalance_released_bytes.to_string())
             }
             "topo.numa.spillovers" => Some(self.stats.numa_spillovers.to_string()),
+            // Placement / lifetime profiling (§24/§31.3, plan 07 W14 + W17-3): the learning
+            // policy's summary, read from the latest stats snapshot. All `0` until heap
+            // sampling is enabled (the default). Starting/stopping sampling is the
+            // `topomalloc_profile_set_rate` C control (`profile.heap.start`/`stop`, §10.5).
+            "topo.placement.sites_tracked" => Some(self.stats.placement.sites_tracked.to_string()),
+            "topo.placement.confident_sites" => {
+                Some(self.stats.placement.confident_sites.to_string())
+            }
+            "topo.placement.alloc_samples" => Some(self.stats.placement.alloc_samples.to_string()),
+            "topo.placement.free_samples" => Some(self.stats.placement.free_samples.to_string()),
+            "topo.placement.sampled_live_bytes" => {
+                Some(self.stats.placement.sampled_live_bytes.to_string())
+            }
             _ => None,
         }
     }
@@ -181,6 +194,41 @@ mod tests {
         // No router wired ⇒ "0".
         let d = Control::new(Profile::Performance);
         assert_eq!(d.get("topo.numa.bind_failures").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn reads_the_placement_profiler_summary() {
+        // Plan 07 W14 / W17-3: the placement learning policy's summary surfaces in the
+        // control namespace, sourced from the stats snapshot.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            placement: topo_core::PlacementStats {
+                sites_tracked: 7,
+                confident_sites: 3,
+                alloc_samples: 500,
+                free_samples: 480,
+                sampled_live_bytes: 8192,
+                ..topo_core::PlacementStats::default()
+            },
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.placement.sites_tracked").as_deref(), Some("7"));
+        assert_eq!(
+            c.get("topo.placement.confident_sites").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            c.get("topo.placement.alloc_samples").as_deref(),
+            Some("500")
+        );
+        assert_eq!(c.get("topo.placement.free_samples").as_deref(), Some("480"));
+        assert_eq!(
+            c.get("topo.placement.sampled_live_bytes").as_deref(),
+            Some("8192")
+        );
+        // No profiling enabled ⇒ "0".
+        let d = Control::new(Profile::Performance);
+        assert_eq!(d.get("topo.placement.sites_tracked").as_deref(), Some("0"));
     }
 
     #[test]

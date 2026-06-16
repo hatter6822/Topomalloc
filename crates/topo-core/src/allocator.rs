@@ -54,20 +54,22 @@ use crate::arena::{
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
 use crate::central::{CentralCache, RemoveResult};
-use crate::classify::{classify, RequestKind};
+use crate::classify::{classify, Request, RequestKind};
 use crate::error::BackendError;
 use crate::extent::{
     BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit,
     RegionCacheHook, StateBytes,
 };
-use crate::flags::RequestFlags;
+use crate::flags::{Hints, Lifetime, RequestFlags};
 use crate::generated::tables::PAGE_SIZE;
 use crate::generated::tables::SIZE_CLASSES;
 use crate::hooks::{ExtentHooks, HookProvider};
+use crate::huge::Hotness;
 use crate::ids::{ArenaId, Generation, Label, NodeId, SizeClassId, SpanId};
 use crate::large::{LargeAllocator, LargeBacking, LargeConfig};
 use crate::overflow::align_up;
 use crate::pagemap::PageMap;
+use crate::placement::{LearnedHints, PlaceClass, SizeClassDist};
 use crate::ptr_class::{
     classify_ptr, validate_free, FreeTarget, InvalidFree, MetadataRegion, PointerClass,
 };
@@ -649,6 +651,14 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// global stats total survives an arena's destroy. Live backings are summed on
     /// top in [`stats`](Self::stats).
     retired_hooks: AtomicHookFailures,
+    /// Learned per-bucket placement hints (§24, plan 07 W14): the live end of the
+    /// learn → place loop. The heap sampler publishes confident, consistent per-site
+    /// profiles into this lock-free table ([`publish_learned_hints`](Self::publish_learned_hints));
+    /// the medium/large path reads it (one atomic acquire load) to place a
+    /// *placement-unhinted* allocation by its learned profile, the explicit hint always
+    /// winning. Empty (and the read short-circuits to neutral) until a confident hint is
+    /// published, so the medium/large placement outcome is unchanged when nothing is learned.
+    learned: LearnedHints,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
@@ -784,6 +794,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             freed_bytes: AtomicU64::new(0),
             hooks: HookRegistry::new(),
             retired_hooks: AtomicHookFailures::new(),
+            learned: LearnedHints::new(),
         })
     }
 
@@ -960,7 +971,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             return ptr::null_mut();
         }
         let p = match req.kind {
-            RequestKind::Small { sc, .. } => self.alloc_small(arena, sc),
+            RequestKind::Small { sc, .. } => {
+                self.alloc_small(arena, sc, self.small_place_class(&req))
+            }
             RequestKind::Medium { .. } | RequestKind::Large { .. } => {
                 // Route to the arena's own hooked large backing if it has one (W10);
                 // otherwise the shared backend, carrying the request's placement hints
@@ -972,7 +985,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 match self.hook_backend(arena) {
                     Some(b) => b.large.allocate_in(arena, usable, req.align),
                     None => {
-                        let hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
+                        let mut hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
+                        // W14: a placement-unhinted request adopts its bucket's learned
+                        // profile (the live learn → place loop); an explicit hint wins.
+                        let bucket = match req.kind {
+                            RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
+                            _ => SizeClassDist::BUCKET_LARGE,
+                        };
+                        Self::apply_learned(&self.learned, &mut hints, bucket);
                         self.large
                             .allocate_in_hinted(arena, usable, req.align, hints)
                     }
@@ -995,19 +1015,95 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         p
     }
 
-    /// Small-object allocation: pull one object from the central list,
-    /// creating and activating a new span when none is available (§A.2's
-    /// OOM-retry loop).
+    /// The learned per-bucket placement-hint table (§24, W14). The heap sampler publishes
+    /// into it via [`publish_learned_hints`](Self::publish_learned_hints).
+    #[inline]
+    pub fn learned_hints(&self) -> &LearnedHints {
+        &self.learned
+    }
+
+    /// Publish a [`SiteProfileTable`](crate::SiteProfileTable)'s confident, consistent
+    /// per-bucket consensus into this engine's learned-hint table, so the allocation path
+    /// places by it (the live end of the W14 learn → place loop). Called by the heap sampler
+    /// from its (rare) sampled path. Lock-free for readers (§31.4).
+    #[inline]
+    pub fn publish_learned_hints<const CAP: usize>(
+        &self,
+        table: &crate::placement::SiteProfileTable<CAP>,
+    ) {
+        table.write_learned_hints(&self.learned);
+    }
+
+    /// Merge the learned hint for `bucket` into a **placement-unhinted** request's `hints`
+    /// (§24, W14): if the request carries any explicit hotness/lifetime hint, it wins
+    /// untouched; otherwise, when a confident, consistent learned hint exists for the bucket,
+    /// adopt it (encoded back into the `u8`/[`Lifetime`] hint the filler decodes). When no
+    /// hint is learned (the default / profiling-off case) the request's `hints` are left
+    /// exactly as-is, so the resulting placement is unchanged. The result is advisory —
+    /// it can only steer placement, never size/alignment/validity (§24.5).
+    #[inline]
+    fn apply_learned(learned: &LearnedHints, hints: &mut Hints, bucket: u16) {
+        // "Placement-unhinted" = no explicit hotness (0) and no explicit lifetime. (A bare
+        // `TOPO_COLD`, which is also hotness 0, is indistinguishable from unhinted here and
+        // may adopt a learned hint — documented; the hint is advisory regardless.)
+        if hints.hotness != 0 || hints.lifetime != Lifetime::Unspecified {
+            return;
+        }
+        let lh = learned.lookup(bucket);
+        if lh == crate::huge::PlaceHints::default() {
+            return; // nothing confident learned ⇒ leave the request untouched.
+        }
+        // Encode the learned `Hotness` back into the `0..=255` hint the filler's `from_hint`
+        // decodes (Cold→0, Neutral→64, Hot→200), and adopt the learned lifetime.
+        hints.hotness = match lh.hotness {
+            Hotness::Cold => 0,
+            Hotness::Neutral => 64,
+            Hotness::Hot => 200,
+        };
+        hints.lifetime = lh.lifetime;
+    }
+
+    /// The §24.6–§24.8 placement class for a **small** request: its explicit hint merged
+    /// with the bucket's learned hint (explicit wins; learned applies only to a
+    /// placement-unhinted request), distilled to a [`PlaceClass`] tag for span grouping. The
+    /// default/unhinted case maps to a single class (consistent with the filler's
+    /// `from_hint(0)`), so an all-default program keeps one span pool per size class (no
+    /// fragmentation increase); only differing hints segregate spans. Advisory (§24.5).
+    #[inline]
+    fn small_place_class(&self, req: &Request) -> u8 {
+        let mut hints = req.flags.hints();
+        let bucket = match req.kind {
+            RequestKind::Small { sc, .. } => sc.index() as u16,
+            RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
+            RequestKind::Large { .. } => SizeClassDist::BUCKET_LARGE,
+        };
+        Self::apply_learned(&self.learned, &mut hints, bucket);
+        let ph = crate::huge::PlaceHints {
+            hotness: Hotness::from_hint(hints.hotness),
+            lifetime: hints.lifetime,
+        };
+        PlaceClass::from_hints(ph).as_u8()
+    }
+
+    /// Small-object allocation: pull one object from the central list, **preferring a span
+    /// of placement class `class`** (§24.6–§24.8, W14) so cold / hot / short-lived small
+    /// objects cluster; creating and activating a new (class-tagged) span when none is
+    /// available (§A.2's OOM-retry loop).
+    ///
+    /// Class grouping is advisory and never causes a spurious OOM: if a class-tagged span
+    /// cannot be created (backend exhausted), the loop falls back to reusing *any* partial
+    /// span ([`ANY_PLACE_CLASS`](crate::ANY_PLACE_CLASS)) before failing — availability
+    /// before policy (§2.4).
     ///
     /// Termination: each iteration either returns an object or creates a new
     /// span; span creation draws from a finite region/pool, so a thread can
     /// loop only while *other* threads consume the objects it activates —
     /// i.e. only while the system as a whole makes progress.
-    fn alloc_small(&self, arena: ArenaId, sc: SizeClassId) -> *mut u8 {
+    fn alloc_small(&self, arena: ArenaId, sc: SizeClassId, class: u8) -> *mut u8 {
         loop {
             match self
                 .central
-                .remove_batch(NodeId::DEFAULT, arena, Label::PUBLIC, sc, 1)
+                .remove_batch(NodeId::DEFAULT, arena, Label::PUBLIC, sc, class, 1)
             {
                 RemoveResult::Ok(batch) => {
                     debug_assert_eq!(batch.len(), 1);
@@ -1017,8 +1113,25 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     return self.object_ptr(span, batch.index(0));
                 }
                 RemoveResult::NeedSpan => {
-                    if self.create_span(arena, sc).is_err() {
-                        return ptr::null_mut();
+                    if self.create_span(arena, sc, class).is_err() {
+                        // Backend exhausted creating a class-tagged span: as a last resort,
+                        // reuse any existing partial span regardless of class, so grouping
+                        // never turns into a spurious OOM (§2.4 availability-first).
+                        return match self.central.remove_batch(
+                            NodeId::DEFAULT,
+                            arena,
+                            Label::PUBLIC,
+                            sc,
+                            crate::central::ANY_PLACE_CLASS,
+                            1,
+                        ) {
+                            RemoveResult::Ok(batch) => {
+                                // SAFETY: as above — a live descriptor in never-freed metadata.
+                                let span = unsafe { &*batch.span() };
+                                self.object_ptr(span, batch.index(0))
+                            }
+                            RemoveResult::NeedSpan => ptr::null_mut(),
+                        };
                     }
                 }
             }
@@ -1066,7 +1179,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// Create, activate, and publish a new span for `sc` (W5-5). On any
     /// failure every partial step is rolled back: the extent is freed, the
     /// pool slot released, and `Err` returned so `malloc` fails with null.
-    fn create_span(&self, arena: ArenaId, sc: SizeClassId) -> Result<(), ExtentError> {
+    fn create_span(&self, arena: ArenaId, sc: SizeClassId, class: u8) -> Result<(), ExtentError> {
         let row = size_class::row(sc);
         let bytes = (row.slab_pages as usize)
             .checked_mul(PAGE_SIZE)
@@ -1178,6 +1291,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // SAFETY: the slot is live (acquired above) and its descriptor fully
         // initialized; descriptors live in never-freed metadata.
         let span = unsafe { &(*slot).desc };
+        // Tag the fresh/recycled span with its placement class before it joins the central
+        // partial list, so it enters the right §24.6–§24.8 grouping pool (advisory, §24.5).
+        span.set_place_class(class);
         match self.central.activate_span(span, self.pagemap, self.meta) {
             Ok(()) => Ok(()),
             Err(_) => {
@@ -3440,5 +3556,64 @@ mod tests {
             .is_null());
         assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
+    }
+
+    #[test]
+    fn small_place_class_applies_learned_hint_to_unhinted_requests() {
+        // W14 small-path learn → place loop: after a confident cold profile is published for
+        // a small bucket, an *unhinted* request of that size class is tagged with the learned
+        // class — while an explicitly-hinted request keeps its own class (explicit wins).
+        use crate::placement::{PlaceClass, SiteProfileTable};
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // Pick a real small size class and its bucket.
+        let req = classify(64, MIN_ALIGN, 0).expect("classify");
+        let sc = match req.kind {
+            RequestKind::Small { sc, .. } => sc,
+            other => panic!("expected small, got {other:?}"),
+        };
+        let bucket = sc.index() as u16;
+
+        // Baseline: nothing learned ⇒ the unhinted small request maps to one class (the
+        // default pool); record it so we can prove the learned hint *changes* it.
+        let baseline = a.small_place_class(&req);
+
+        // Teach a confident cold + short profile for that bucket and publish it.
+        let mut table: SiteProfileTable<64> = SiteProfileTable::new();
+        let mut clk = 0u64;
+        for _ in 0..crate::placement::CONFIDENT_SAMPLES {
+            table.record_alloc(crate::StackId(7), bucket, 64, 0 /* cold */, clk);
+            clk += 1;
+            table.record_free(crate::StackId(7), 5 /* short */, 64, clk);
+            clk += 1;
+        }
+        a.publish_learned_hints(&table);
+
+        // The unhinted request now adopts the learned class (Cold ⇒ class tag 1).
+        let learned = a.small_place_class(&req);
+        assert_eq!(
+            learned,
+            PlaceClass::Cold.as_u8(),
+            "unhinted small request adopts the learned cold class (was {baseline})"
+        );
+
+        // An explicit hot hint wins over the learned cold hint (explicit always overrides).
+        let hot_raw = RequestFlags::NONE.with_hotness(255).raw();
+        let hot_req = classify(64, MIN_ALIGN, hot_raw).expect("classify hot");
+        assert_eq!(
+            a.small_place_class(&hot_req),
+            PlaceClass::Hot.as_u8(),
+            "explicit hot hint overrides the learned cold hint"
+        );
+
+        // Clearing the learned hints reverts the unhinted request to its baseline class.
+        a.learned_hints().reset();
+        assert_eq!(
+            a.small_place_class(&req),
+            baseline,
+            "clear reverts to default"
+        );
     }
 }

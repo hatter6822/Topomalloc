@@ -43,6 +43,8 @@ mod extended;
 mod hooks_api;
 mod numa_api;
 mod policy;
+mod profile_api;
+pub mod sampling;
 
 pub use arena_api::{
     topo_arena_configure, topo_arena_create, topo_arena_create_ex, topo_arena_delegate,
@@ -68,6 +70,10 @@ pub use numa_api::{
     topomalloc_numa_spillovers,
 };
 pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
+pub use profile_api::{
+    topomalloc_profile_confident_sites, topomalloc_profile_dump_json, topomalloc_profile_enabled,
+    topomalloc_profile_rate, topomalloc_profile_set_rate, topomalloc_profile_sites,
+};
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
 /// virtual, lazily faulted). Sized with ample headroom over the default
@@ -113,7 +119,10 @@ impl AnyAllocator {
     /// Allocate `size` bytes with `align` under validated `flags` (§A.1).
     /// Null on OOM, overflow, or invalid alignment.
     pub fn allocate(&self, size: usize, align: usize, flags: RequestFlags) -> *mut u8 {
-        dispatch!(self, a => a.allocate(size, align, flags))
+        let p = dispatch!(self, a => a.allocate(size, align, flags));
+        // W17-3: feed live placement profiles. A single relaxed load when profiling is off.
+        crate::sampling::on_alloc(p, size, align, flags);
+        p
     }
 
     /// Allocate from an explicit arena (plan 06 W9), overriding the arena the
@@ -125,7 +134,25 @@ impl AnyAllocator {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
-        dispatch!(self, a => a.allocate_in(arena, size, align, flags))
+        let p = dispatch!(self, a => a.allocate_in(arena, size, align, flags));
+        crate::sampling::on_alloc(p, size, align, flags);
+        p
+    }
+
+    /// Publish the heap sampler's confident per-bucket placement consensus into the engine's
+    /// learned-hint table (the live W14 learn → place loop). Lock-free for the allocation
+    /// path that reads it.
+    pub fn publish_learned_hints<const CAP: usize>(
+        &self,
+        table: &topo_core::SiteProfileTable<CAP>,
+    ) {
+        dispatch!(self, a => a.publish_learned_hints(table))
+    }
+
+    /// Clear the engine's learned-hint table, so the allocation path stops applying learned
+    /// placement (called when profiling is disabled, restoring the default placement path).
+    pub fn clear_learned_hints(&self) {
+        dispatch!(self, a => a.learned_hints().reset())
     }
 
     /// Free a pointer; see [`FreeOutcome`] for the validation outcomes.
@@ -137,6 +164,9 @@ impl AnyAllocator {
     /// it (rejected harmlessly). A stale pointer aliasing a recycled live
     /// allocation would free another owner's object.
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // W17-3: resolve a sampled object's lifetime *before* the free; lock-free
+        // (a Bloom reject) for the common non-sampled pointer, and a no-op when off.
+        crate::sampling::on_free(ptr);
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.free(ptr) })
     }
@@ -153,8 +183,13 @@ impl AnyAllocator {
         min_align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        // W17-3: realloc retires the old object and (on success) creates a new one. Resolve
+        // the old lifetime first; sample the result as a fresh allocation. No-op when off.
+        crate::sampling::on_free(ptr);
         // SAFETY: the caller upholds this method's identical contract.
-        dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) })
+        let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
+        crate::sampling::on_alloc(p, new_size, min_align, flags);
+        p
     }
 
     /// The usable size of a live allocation (`None` for null/foreign/interior).
@@ -459,7 +494,15 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
             // system allocator — and only then clears the bootstrap flag.
             let _guard = BootstrapGuard::enter();
             let name = selected_backend_name();
-            new_allocator_named(&name).or_else(|| new_allocator_named("posix"))
+            let allocator = new_allocator_named(&name).or_else(|| new_allocator_named("posix"));
+            // W17-3: honour `$TOPOMALLOC_SAMPLE_RATE` (§32.1) now, under the bootstrap
+            // guard, so the sampler's one-time setup allocations are served by the system
+            // allocator and the first real sample is already armed. Only arms when the
+            // engine built — there is nothing to profile otherwise.
+            if allocator.is_some() {
+                crate::sampling::init_from_env();
+            }
+            allocator
         })
         .as_ref()
 }
