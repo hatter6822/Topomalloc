@@ -305,6 +305,36 @@ impl PageMap {
         self.publish_range(meta, (base, stop), entry)
     }
 
+    /// **Phase 1 only** of [`install_large_range`](Self::install_large_range): create
+    /// the radix leaves covering `[base, stop)` **without publishing any entry** (every
+    /// page stays whatever it was — `Empty` for the free neighbour an in-place grow is
+    /// about to absorb). This lets the grow perform its single metadata-fallible step
+    /// **before** it irreversibly absorbs that neighbour, so the matching
+    /// [`install_large_range`](Self::install_large_range) afterward publishes into
+    /// already-created nodes and **cannot fail** — it allocates nothing (phase 1 finds
+    /// every leaf present). That removes the only fallible step *after* the absorb, and
+    /// with it the best-effort rollback that could itself fail (§25.2, plan 06 W15-3a;
+    /// PR #19 review). Atomic on metadata exhaustion (nothing is published either way);
+    /// if the grow later aborts, the created nodes are simply unused — monotonic
+    /// metadata is never freed, the same bounded behavior as a lost publish race.
+    ///
+    /// `base`/`stop` must be page-aligned and lie within the descriptor's grown range.
+    ///
+    /// SPEC-transition: pagemap node reservation for large in-place grow (§17.2 P-Map-006)
+    pub fn reserve_large_range(
+        &self,
+        meta: &dyn MetadataAlloc,
+        base: usize,
+        stop: usize,
+    ) -> Result<(), PagemapError> {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "grow range base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "grow range stop must be page-aligned");
+        for p in page_range(base, stop) {
+            self.leaf_or_create(meta, p)?;
+        }
+        Ok(())
+    }
+
     /// Transition a span's pages to **released-but-retained** (P-Map-005): the
     /// entries keep pointing at the descriptor (now `state == Released`) so the
     /// pages cannot be reused without recommit. The caller MUST set the span's state
@@ -841,6 +871,48 @@ mod tests {
             assert!(
                 pm.lookup(p << PAGE_SHIFT).is_empty(),
                 "page {p:#x} left mapped after a failed install (non-atomic)"
+            );
+        }
+    }
+
+    #[test]
+    fn install_large_range_after_reserve_allocates_nothing_and_publishes() {
+        // W15-3a (PR #19 review): `reserve_large_range` pre-creates the leaves, so the
+        // matching `install_large_range` publishes into existing nodes — allocating
+        // **zero** further metadata, hence unable to fail. That is what lets the
+        // in-place grow place its only fallible (metadata) step *before* the
+        // irreversible absorb, leaving no fallible step afterward (no rollback to fail).
+        let base = 0x4000_0000usize;
+        let usable = SLOTS * PAGE_SIZE + PAGE_SIZE; // a multi-leaf range (crosses a boundary)
+        let d = LargeDescriptor::new(LargeId(7), ArenaId::DEFAULT, base, usable, PAGE_SIZE);
+        let m = meta(1 << 20);
+        let pm = PageMap::new();
+
+        // Reserve the range's leaves — nothing is published yet.
+        pm.reserve_large_range(&m, base, base + usable)
+            .expect("reserve creates the leaves");
+        for p in page_range(base, base + usable) {
+            assert!(
+                pm.lookup(p << PAGE_SHIFT).is_empty(),
+                "reserve_large_range must publish no entry"
+            );
+        }
+        let after_reserve = pm.metadata_bytes();
+
+        // Publish over the reserved range: it must allocate no further metadata and
+        // succeed — exactly the infallibility the grow relies on.
+        pm.install_large_range(&m, &d, base, base + usable)
+            .expect("publish into already-reserved leaves");
+        assert_eq!(
+            pm.metadata_bytes(),
+            after_reserve,
+            "install after reserve allocated metadata — it could then fail (the gap)"
+        );
+        for p in page_range(base, base + usable) {
+            assert_eq!(
+                pm.lookup(p << PAGE_SHIFT).large_ptr(),
+                Some(&d as *const LargeDescriptor),
+                "page {p:#x} not published to the descriptor"
             );
         }
     }

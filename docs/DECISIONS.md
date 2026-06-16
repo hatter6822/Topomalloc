@@ -1716,3 +1716,32 @@ the filler `trim_frees_the_tail_and_keeps_the_prefix_a_valid_allocation`, the AB
 all green under `cargo xtask ci` (dual-arch build, full test matrix incl. `hugepage-optimized`/`low-rss`/
 `sele4n-sim`, the eight Lean gates + the two new realloc theorems, the C/C++ ABI harness, and the
 obligation-citation lint).
+
+**PR #19 review hardening (three findings, all on the W15 surface above).** An automated review flagged
+three issues in the freshly-landed code; each was confirmed against the code and fixed:
+
+* **`TOPO_ZERO` is honored on the in-place grow (§26.2, was a leak).** A `topo_rallocx`/`topo_xallocx`
+  with `TOPO_ZERO` that grew a large allocation **in place** returned the original pointer without
+  zeroing the newly exposed suffix — so a grow that absorbed an adjacent **dirty** free extent handed
+  back its recycled bytes, violating the documented zero guarantee (the move path was always correct).
+  The shared `apply_inplace_large_resize` now zeroes `[usable, usable+grown)` on a `TOPO_ZERO` grow,
+  exactly as the move path does (the old prefix untouched). Pinned by
+  `realloc_inplace_grow_zeroes_the_exposed_tail_under_topo_zero` (grows over a 0xff dirty neighbour,
+  asserts the tail reads zero **and** that the in-place path was taken).
+* **`committed_memory_is_zeroed` is platform-gated to Linux (was an unconditional `true`).** The opt-in
+  is a *blanket* promise `alloc_z` applies to any `committed_len == 0` extent — Reserved **or** Released —
+  so it may answer `true` only where both read zero. That holds on Linux (`MAP_ANONYMOUS` reserve +
+  `MADV_DONTNEED` zero-fault) but **not** on Apple (`decommit` is `MADV_FREE_REUSABLE`, which may retain
+  contents — a recommitted Released extent is not zero) nor the non-unix fallback (reserve via
+  uninitialized `alloc` — a fresh Reserved extent is not zero). It is now `#[cfg(target_os = "linux")]`
+  `true`, conservative `false` elsewhere (always `memset`), pinned by
+  `committed_memory_is_zeroed_matches_the_platform_guarantee`.
+* **In-place grow has no fallible step after the irreversible absorb (was a best-effort rollback that
+  could itself fail).** The grow used to absorb the neighbour, then `install_large_range` (fallible on
+  metadata), then on failure split the tail back off — a rollback that could fail under slot exhaustion,
+  leaving the extent enlarged but unadvertised until free. The order is now **reserve the pagemap leaves
+  → absorb → publish**: a new `PageMap::reserve_large_range` does phase-1 node creation (the lone
+  metadata-fallible step) *before* the absorb, so the post-absorb publish allocates nothing and cannot
+  fail. No rollback exists to fail. Pinned by `install_large_range_after_reserve_allocates_nothing_and_publishes`
+  (the publish over a reserved multi-leaf range consumes zero further metadata). These are mechanism
+  reorderings, not new transitions, so no Lean obligation changes.

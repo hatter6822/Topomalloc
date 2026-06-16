@@ -870,11 +870,15 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// failure, or pagemap metadata exhaustion. In every `None` case the caller
     /// **moves** (`realloc`) or reports no-grow (`xallocx`), so the original survives.
     ///
-    /// Ordering (rollback-safe): grow the backing extent (self-rolls-back on
-    /// failure), install the new pages' pagemap entries (on metadata exhaustion,
-    /// split the just-absorbed tail back off and free it — restoring the original),
-    /// **then** publish the grown `usable_size` — so the descriptor never advertises
-    /// pages the pagemap does not yet cover.
+    /// Ordering (no fallible step after the irreversible absorb): **pre-create** the
+    /// new range's pagemap leaves (the lone metadata-fallible step), **then** grow the
+    /// backing extent (absorb the neighbour — its own trim/commit failure self-unwinds
+    /// with no extra slot), **then** publish the new pages' entries (infallible: the
+    /// leaves already exist, so it allocates nothing), **then** the grown
+    /// `usable_size`. A failure can therefore occur only *before* the absorb (nothing
+    /// mutated → no-grow), never after — so the descriptor never advertises pages the
+    /// pagemap does not cover, and there is no best-effort rollback that could itself
+    /// fail.
     ///
     /// # Safety
     ///
@@ -923,14 +927,40 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         }
         let base = ptr as usize;
 
-        // Grow the backing extent in place (absorb the adjacent free neighbour) — the
-        // primary fallible step. On any failure the manager leaves it untouched (W4-5),
-        // so the grow degrades to a move at the caller.
+        // Fail fast (no pagemap work) when the grow cannot happen — the common "no
+        // adjacent free neighbour" case — so a growing `realloc`/`xallocx` that must
+        // move pays nothing here (the reserve below is O(grow pages); this probe is
+        // O(1)). Advisory: `grow_in_place` re-checks under its own lock.
+        if !self.extents.can_grow_in_place(backing, new_usable) {
+            return None;
+        }
+
+        // Pre-create the new range's pagemap leaves **before** the irreversible absorb
+        // (phase 1 of the publish — the only metadata-fallible step). On exhaustion
+        // nothing is mutated yet, so the grow degrades to a move at the caller. Doing
+        // this first makes the publish below infallible, so there is **no fallible step
+        // after the absorb** — and thus no best-effort rollback that could itself fail
+        // (the gap a failed rollback used to leave: an enlarged-but-unadvertised extent
+        // retained until free; PR #19 review).
+        if self
+            .pagemap
+            .reserve_large_range(self.meta, base + old_usable, base + new_usable)
+            .is_err()
+        {
+            return None;
+        }
+
+        // Grow the backing extent in place (absorb the adjacent free neighbour). On any
+        // failure the manager leaves it untouched (W4-5 — its own trim/commit unwind
+        // needs no extra slot), so the grow degrades to a move; the leaves reserved
+        // above are then simply unused (monotonic metadata, never published).
         self.extents.grow_in_place(backing, new_usable).ok()?;
 
         // Map the new pages to this descriptor **before** advertising the grown usable
-        // size. On metadata exhaustion, roll the extent grow back (split the absorbed
-        // tail off and free it) and report no-grow — the allocation is fully restored.
+        // size. The leaves were reserved above, so this publishes into existing nodes
+        // and **cannot fail** (it allocates nothing) — the grow is past its last
+        // fallible step, so the descriptor never advertises pages the pagemap does not
+        // yet cover and no rollback is needed.
         // SAFETY: `desc_ptr` is our live descriptor (resolved under the lock; the realloc
         // contract excludes a concurrent free/realloc of `ptr`).
         let mapped = unsafe {
@@ -942,9 +972,11 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             )
         };
         if mapped.is_err() {
-            if let Ok(tail) = self.extents.split_tail(backing, old_usable) {
-                let _ = self.extents.free(tail);
-            }
+            // Unreachable: `reserve_large_range` created every leaf, so this publish
+            // allocates nothing and cannot fail. Guard defensively anyway — never
+            // advertise pages the pagemap does not cover: report no-grow (the extent
+            // stays grown, harmlessly reclaimed whole on the eventual free, W4-5).
+            debug_assert!(false, "install after reserve_large_range cannot fail");
             return None;
         }
 

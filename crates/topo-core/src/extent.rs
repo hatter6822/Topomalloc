@@ -1982,6 +1982,38 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         })
     }
 
+    /// Whether [`grow_in_place`](Self::grow_in_place) could currently extend `r` to
+    /// `new_len` — `r` is a live extent and its address-adjacent successor is **free**
+    /// and large enough to supply the deficit. A cheap **O(1)** feasibility probe (a
+    /// single address-list step) the large path consults to **fail fast** — falling to
+    /// a move (`realloc`) or reporting no-grow (`xallocx`) *before* any pagemap work —
+    /// so a grow that cannot happen costs nothing (the common "no adjacent free" case).
+    /// Advisory and mirrors [`grow_in_place`](Self::grow_in_place)'s precondition: the
+    /// grow re-checks under its own lock, so a neighbour that changes between this probe
+    /// and the grow is harmless (the grow simply declines).
+    pub fn can_grow_in_place(&self, r: ExtentRef, new_len: usize) -> bool {
+        let needed = match align_up(new_len, PAGE_SIZE) {
+            Some(n) => n,
+            None => return false,
+        };
+        let g = self.lock();
+        let e = match g.map.resolve(r) {
+            Some(e) => e,
+            None => return false,
+        };
+        if e.state != ExtentState::Active || needed <= e.len {
+            return false;
+        }
+        let additional = needed - e.len;
+        match g.map.addr_next(r.id) {
+            Some(next_id) => g
+                .map
+                .view(next_id)
+                .is_some_and(|nv| nv.state.is_free() && nv.len >= additional),
+            None => false,
+        }
+    }
+
     /// Grow the **live** ([`Active`](ExtentState::Active)) extent `r` in place to
     /// `new_len` page-aligned bytes by **absorbing the front of its address-adjacent
     /// free neighbour** (§18.3 grow — the dual of [`split_tail`](Self::split_tail),

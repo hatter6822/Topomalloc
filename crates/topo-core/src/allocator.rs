@@ -1713,7 +1713,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                                 // (this function's own contract); not concurrently freed.
                                 let achieved = unsafe {
                                     self.apply_inplace_large_resize(
-                                        arena, owner, ptr, usable, rounded,
+                                        arena,
+                                        owner,
+                                        ptr,
+                                        usable,
+                                        rounded,
+                                        flags.hints().zero,
                                     )
                                 };
                                 if achieved >= rounded {
@@ -1776,6 +1781,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ptr: *mut u8,
         usable: usize,
         rounded: usize,
+        zero: bool,
     ) -> usize {
         if rounded < usable {
             // SAFETY: `ptr` is the live base pointer being resized (forwarded contract).
@@ -1793,6 +1799,19 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 if let Some(grown) = unsafe { owner.grow(ptr, rounded) } {
                     self.allocated_bytes
                         .fetch_add(grown as u64, Ordering::Relaxed);
+                    // §26.2 zeroing: an in-place grow absorbs the address-adjacent free
+                    // extent, which may be a **dirty** (retained) range carrying recycled
+                    // bytes. A `TOPO_ZERO` realloc/xallocx must hand back the newly exposed
+                    // suffix `[usable, usable+grown)` zeroed — exactly as the move path does
+                    // (allocate-zeroed then copy the prefix) — never leaking those bytes
+                    // (the gap this closes; the old prefix `[0, usable)` is untouched).
+                    if zero {
+                        // SAFETY: the grow published `usable + grown` committed, writable
+                        // usable bytes at `ptr` (the extent is committed and the new pages
+                        // pagemap-mapped *before* `grow_usable`); `[usable, usable+grown)`
+                        // is in bounds and exclusively owned (the realloc/xallocx contract).
+                        unsafe { ptr::write_bytes(ptr.add(usable), 0, grown) };
+                    }
                     return usable + grown;
                 }
                 self.arenas.credit(arena, extra);
@@ -1821,7 +1840,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ptr: *mut u8,
         new_size: usize,
         min_align: usize,
-        _flags: RequestFlags,
+        flags: RequestFlags,
     ) -> Option<usize> {
         if ptr.is_null() || !min_align.is_power_of_two() {
             return None;
@@ -1856,7 +1875,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 let effective = if new_size == 0 { 1 } else { new_size };
                 let rounded = align_up(effective, PAGE_SIZE)?;
                 // SAFETY: `ptr` is the live base pointer being resized (this fn's contract).
-                Some(unsafe { self.apply_inplace_large_resize(arena, owner, ptr, usable, rounded) })
+                Some(unsafe {
+                    self.apply_inplace_large_resize(
+                        arena,
+                        owner,
+                        ptr,
+                        usable,
+                        rounded,
+                        flags.hints().zero,
+                    )
+                })
             }
             _ => None,
         }
@@ -3014,6 +3042,58 @@ mod tests {
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert_eq!(a.stats().live_bytes, 0);
         assert_eq!(a.live_large_count(), 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W15 §26.2 (PR #19 review): a `TOPO_ZERO` realloc that grows a large
+    /// allocation **in place** by absorbing an adjacent **dirty** free extent must
+    /// return the newly exposed suffix zeroed — the in-place fast path must honor
+    /// the zero hint exactly as the move path does, never handing back the
+    /// recycled neighbour's bytes.
+    #[test]
+    fn realloc_inplace_grow_zeroes_the_exposed_tail_under_topo_zero() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A: the allocation we will grow. B: carved immediately after A, filled with
+        // a non-zero pattern, then freed so it is a **dirty** (retained, committed)
+        // free extent — exactly the recycled memory the grow will absorb.
+        let pa = a.malloc(80_000);
+        let pb = a.malloc(80_000);
+        assert!(!pa.is_null() && !pb.is_null());
+        let old_usable = a.usable_size(pa).unwrap();
+        // SAFETY: each has its full usable size writable; dirty B with 0xff.
+        unsafe {
+            ptr::write_bytes(pb, 0xff, a.usable_size(pb).unwrap());
+        }
+        assert_eq!(tfree(&a, pb), FreeOutcome::Freed); // B is now dirty free, A's neighbour
+
+        // Grow A with TOPO_ZERO into B's reclaimed (dirty) pages.
+        let new = 120_000usize;
+        let new_usable = align_up(new, PAGE_SIZE).unwrap();
+        assert!(new_usable > old_usable, "must cross a page boundary upward");
+        let q = trealloc(&a, pa, new, MIN_ALIGN, RequestFlags::NONE.with_zero());
+        assert_eq!(
+            q, pa,
+            "absorbed the adjacent dirty free extent in place (no move)"
+        );
+        assert_eq!(a.usable_size(q).unwrap(), new_usable);
+
+        // The crux: the grown suffix `[old_usable, new_usable)` reads as zero — the
+        // recycled 0xff bytes were scrubbed (without the fix it would be 0xff).
+        // SAFETY: `new_usable` readable bytes at `q`.
+        unsafe {
+            for i in old_usable..new_usable {
+                assert_eq!(
+                    q.add(i).read(),
+                    0,
+                    "TOPO_ZERO grow leaked recycled byte at {i}"
+                );
+            }
+        }
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert!(a.check_invariants());
     }
 
