@@ -40,6 +40,7 @@ mod arena_api;
 mod c_api;
 mod errno_shim;
 mod extended;
+mod fork_api;
 mod hooks_api;
 mod numa_api;
 mod policy;
@@ -64,6 +65,7 @@ pub use extended::{
     TOPO_LIFETIME_MEDIUM, TOPO_LIFETIME_SHORT, TOPO_NO_HUGEPAGE, TOPO_PREFER_HUGEPAGE,
     TOPO_TCACHE_NONE, TOPO_ZERO,
 };
+pub use fork_api::topomalloc_crash_summary;
 pub use hooks_api::{topo_arena_create_hooked, topo_extent_hooks_t, topo_max_hook_backends};
 pub use numa_api::{
     topomalloc_numa_bind_failures, topomalloc_numa_nodes, topomalloc_numa_rebalance_moves,
@@ -120,6 +122,9 @@ impl AnyAllocator {
     /// Allocate `size` bytes with `align` under validated `flags` (§A.1).
     /// Null on OOM, overflow, or invalid alignment.
     pub fn allocate(&self, size: usize, align: usize, flags: RequestFlags) -> *mut u8 {
+        // W16-5: count this operation in-flight so a concurrent `fork()` quiesces
+        // it before forking (no internal lock held at fork). One `SeqCst` RMW pair.
+        let _op = topo_core::fork::operation_guard();
         let p = dispatch!(self, a => a.allocate(size, align, flags));
         // W17-3: feed live placement profiles. A single relaxed load when profiling is off.
         crate::sampling::on_alloc(p, size, align, flags);
@@ -135,6 +140,7 @@ impl AnyAllocator {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        let _op = topo_core::fork::operation_guard();
         let p = dispatch!(self, a => a.allocate_in(arena, size, align, flags));
         crate::sampling::on_alloc(p, size, align, flags);
         p
@@ -165,6 +171,7 @@ impl AnyAllocator {
     /// it (rejected harmlessly). A stale pointer aliasing a recycled live
     /// allocation would free another owner's object.
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        let _op = topo_core::fork::operation_guard();
         // W17-3: resolve a sampled object's lifetime *before* the free; lock-free
         // (a Bloom reject) for the common non-sampled pointer, and a no-op when off.
         crate::sampling::on_free(ptr);
@@ -184,6 +191,7 @@ impl AnyAllocator {
         min_align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        let _op = topo_core::fork::operation_guard();
         // W17-3: realloc retires the old object and (on success) creates a new one. Resolve
         // the old lifetime first; sample the result as a fresh allocation. No-op when off.
         crate::sampling::on_free(ptr);
@@ -209,17 +217,20 @@ impl AnyAllocator {
         min_align: usize,
         flags: RequestFlags,
     ) -> Option<usize> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.resize_in_place(ptr, new_size, min_align, flags) })
     }
 
     /// The usable size of a live allocation (`None` for null/foreign/interior).
     pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.usable_size(ptr))
     }
 
     /// Whether `ptr` is a **live** allocation of this allocator.
     pub fn owns(&self, ptr: *mut u8) -> bool {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.owns(ptr))
     }
 
@@ -228,13 +239,24 @@ impl AnyAllocator {
     /// mixed-allocator routing predicate; see
     /// [`Allocator::recognizes`](topo_core::Allocator::recognizes).
     pub fn recognizes(&self, ptr: *mut u8) -> bool {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.recognizes(ptr))
     }
 
     /// A statistics snapshot of the engine (§31.1; map into the Appendix-D
     /// JSON with `topo_stats::Stats::record_allocator`).
     pub fn stats(&self) -> AllocatorStats {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.stats())
+    }
+
+    /// A lock-free, allocation-free crash/signal-handler summary (§28.4, W16-6):
+    /// reads only cumulative-byte atomics + the process init phase / background
+    /// flag, so it is safe to call from a context where structure locks may be
+    /// held by the faulting thread. **Not** wrapped in an operation guard — it
+    /// takes no lock, so it must remain callable even mid-fork.
+    pub fn crash_summary(&self) -> topo_core::CrashSummary {
+        dispatch!(self, a => a.crash_summary())
     }
 
     /// The active backend's name (`"posix"` / `"sele4n-sim"`), proving which
@@ -247,16 +269,19 @@ impl AnyAllocator {
 
     /// Create a new explicit arena (§22.4). Returns its [`ArenaId`].
     pub fn arena_create(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_create(policy))
     }
 
     /// Delegate an attenuated child arena from `parent` (§36.4).
     pub fn arena_delegate(&self, parent: ArenaId, del: &Delegation) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_delegate(parent, del))
     }
 
     /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005).
     pub fn arena_configure(&self, arena: ArenaId, cfg: &ArenaConfig) -> Result<(), ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_configure(arena, cfg))
     }
 
@@ -268,11 +293,13 @@ impl AnyAllocator {
         hooks: &'static (dyn ExtentHooks + Send + Sync),
         cfg: AllocatorConfig,
     ) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_create_hooked(policy, hooks, cfg))
     }
 
     /// A snapshot of an arena's authority + accounting (§22.2/§36.4).
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_stats(arena))
     }
 
@@ -304,6 +331,7 @@ impl AnyAllocator {
     /// As [`topo_core::Allocator::arena_reset`]: the arena must be quiesced and
     /// the caller accepts that its outstanding pointers become invalid.
     pub unsafe fn arena_reset(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.arena_reset(arena) })
     }
@@ -314,6 +342,7 @@ impl AnyAllocator {
     ///
     /// As [`arena_reset`](Self::arena_reset).
     pub unsafe fn arena_destroy(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.arena_destroy(arena) })
     }
@@ -503,25 +532,49 @@ impl Drop for BootstrapGuard {
     }
 }
 
+/// The global allocator **only if already initialized**, without triggering the
+/// lazy init (which allocates and takes locks). Used by the crash-summary path
+/// (§28.4, W16-6), which must be safe to call from a signal/crash handler where
+/// initialization-time allocation is forbidden.
+pub(crate) fn global_if_init() -> Option<&'static AnyAllocator> {
+    GLOBAL.get().and_then(Option::as_ref)
+}
+
 /// The lazily-initialized global allocator, or `None` if the backing regions
 /// could not be reserved. The result is memoized: a process that cannot
 /// reserve them once keeps reporting OOM (a null `malloc`) rather than
 /// retrying.
 pub(crate) fn global() -> Option<&'static AnyAllocator> {
+    use topo_core::{InitPhase, INIT_PHASE};
     GLOBAL
         .get_or_init(|| {
             // `_guard` is declared first, so it drops *last* — after `name` and any
             // other init-path temporaries have been allocated and freed through the
             // system allocator — and only then clears the bootstrap flag.
             let _guard = BootstrapGuard::enter();
+            // W16-7 (§35.4): advance the observable init phases as bring-up proceeds.
+            // Phase 1: the bootstrap metadata allocator is the floor every reservation
+            // stands on (it is already live as a static, S-007).
+            INIT_PHASE.advance_to(InitPhase::BootstrapMetadata);
+            // W16-5: install the `pthread_atfork` handlers before any allocation can
+            // complete, so a `fork()` quiesces the allocator (§28.1). Idempotent.
+            crate::fork_api::register_atfork_handlers();
+            // Phase 2: OS feature discovery (backend selection; topology/hugepage probing
+            // happens inside `new_allocator_named` for the hugepage profile).
+            INIT_PHASE.advance_to(InitPhase::OsDiscovery);
             let name = selected_backend_name();
             let allocator = new_allocator_named(&name).or_else(|| new_allocator_named("posix"));
-            // W17-3: honour `$TOPOMALLOC_SAMPLE_RATE` (§32.1) now, under the bootstrap
-            // guard, so the sampler's one-time setup allocations are served by the system
-            // allocator and the first real sample is already armed. Only arms when the
-            // engine built — there is nothing to profile otherwise.
             if allocator.is_some() {
+                // Phase 3 & 4: the engine (with its arena registry + default arena, and
+                // the per-CPU/RSEQ front end) now exists.
+                INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
+                // W17-3: honour `$TOPOMALLOC_SAMPLE_RATE` (§32.1) now, under the bootstrap
+                // guard, so the sampler's one-time setup allocations are served by the
+                // system allocator and the first real sample is already armed. Only arms
+                // when the engine built — there is nothing to profile otherwise.
                 crate::sampling::init_from_env();
+                // Phase 5 & 6: background/profiling armed; open for normal operation.
+                INIT_PHASE.advance_to(InitPhase::Operational);
             }
             allocator
         })

@@ -314,6 +314,14 @@ int main(void) {
     assert(topomalloc_malloc_usable_size(pp) >= 2u * TOPOMALLOC_PAGE_SIZE);
     topomalloc_free(pp);
 
+    /* crash summary (Section 28.4, W16-6): lock-free, allocation-free, bounded.
+       Writes ASCII key=value lines into the caller buffer; NULL/0 write nothing. */
+    char summary[256];
+    size_t slen = topomalloc_crash_summary(summary, sizeof summary);
+    assert(slen > 0u && slen <= sizeof summary);
+    assert(strstr(summary, "live_bytes=") != NULL);
+    assert(topomalloc_crash_summary(NULL, 16u) == 0u);
+
     printf("C ABI smoke: OK (version=%s, backend=%s, %u size classes)\n",
            v, backend, (unsigned) TOPOMALLOC_NUM_SIZE_CLASSES);
     return 0;

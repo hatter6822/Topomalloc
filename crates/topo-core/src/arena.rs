@@ -46,9 +46,9 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-use crate::extent::BackendLock;
 use crate::flags::HugepagePolicy;
 use crate::ids::{ArenaId, Generation, Label, NodeId};
+use crate::lock::{LockRank, RankedLock};
 use crate::release::LatencyClass;
 
 /// Maximum number of arenas a single [`ArenaTable`] tracks (ids `0..MAX_ARENAS`).
@@ -958,8 +958,9 @@ struct TableInner {
 /// lock.
 pub struct ArenaTable {
     /// Lock serializing slow-path mutation (create/destroy/reset/configure) and
-    /// guarding the descriptive `meta` fields and `inner`.
-    lock: BackendLock,
+    /// guarding the descriptive `meta` fields and `inner` ([`LockRank::ARENA_REGISTRY`],
+    /// rank 1 — the outermost data-structure lock, §27.2).
+    lock: RankedLock<{ LockRank::ARENA_REGISTRY }>,
     /// Per-slot hot-path atomics (lock-free reads).
     atomics: [ArenaAtomics; MAX_ARENAS],
     /// Per-slot descriptive fields. Guarded by `lock`.
@@ -986,7 +987,7 @@ impl ArenaTable {
     /// `Active` with ambient authority (§35.4 phase 3).
     pub fn new() -> ArenaTable {
         let table = ArenaTable {
-            lock: BackendLock::new(),
+            lock: RankedLock::new(),
             atomics: [const { ArenaAtomics::empty() }; MAX_ARENAS],
             meta: core::cell::UnsafeCell::new([const { ArenaMeta::empty() }; MAX_ARENAS]),
             inner: core::cell::UnsafeCell::new(TableInner { high_water: 1 }),

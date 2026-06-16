@@ -106,27 +106,62 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 
 **Depends on:** touches all. **Enables:** **M2** (real concurrency).
 
-| WU | Description | Size | ∥ | Acceptance |
-|---|---|---|---|---|
-| W16-1a | Encode the lock ranks (table below, §27.2) as a typed/ranked lock wrapper; acquisition records its rank. | M | | every lock has a compile-time rank; refill/flush hold ≤1 middle-end lock by construction. |
-| W16-1b | Debug lock-order checker: a per-thread held-rank stack asserts monotonic acquisition; wired as the **G-conc** gate. | S | ∥ | any out-of-order acquire fails in debug CI. |
-| W16-2 | **TLS initial-exec model** (§27.6): no `malloc` re-entry on first TLS access; `dlopen` allocation-free bootstrap path. | M | | TLS-recursion test (load via dlopen) does not re-enter the allocator. |
-| W16-3 | Atomics-ordering map (§27.3): publication=release, consumption=acquire, transitions=acq-rel, stats=relaxed; documented per atomic. | M | ∥ | each atomic annotated; TSan clean. |
-| W16-4 | Global lock (M1) → fine-grained hierarchy (M2) migration without correctness regression. | M | | M1 passes with the global lock; M2 with the hierarchy. |
-| W16-5a | Pre-fork + parent-post-fork handlers (§28.1): acquire the fork lock + quiesce background threads pre-fork; release + resume in the parent. | M | | parent unaffected; no leaked held lock. |
-| W16-5b | Child-post-fork handler: reset lock states, disable background threads, flush/conservative-mode inconsistent per-CPU state. | M | | fork-in-multithread test: child allocates safely; no inherited held lock. |
-| W16-6 | Signal/reentrancy/crash (§28.2–§28.4): document non-async-signal-safety; reentrancy guard; lock-free crash summary. | S | ∥ | reentrancy during init/hooks handled; crash summary needs no lock/alloc. |
-| W16-7 | Initialization phases (§35.4) Phase 0–6, each reentrancy-safe; shutdown policy (§35.5). | M | | phased-init test; teardown available for tests, leak-by-default in prod. |
+> **▸ Implementation status.** W16 is **landed**. The ranked lock hierarchy +
+> debug lock-order checker live in [`topo-core/src/lock.rs`](../../crates/topo-core/src/lock.rs)
+> (`RankedLock<const RANK: u8>` + `LockRank`); **every** `topo-core` lock — the
+> per-CPU front-end lock, the transfer/central/span locks, the span/large
+> descriptor pools, the extent/huge backends, and the arena registries — is a
+> `RankedLock`, so the per-thread held-rank checker (debug + the `debug-checks`
+> profile) sees every acquisition and fails any out-of-order acquire (**G-conc**).
+> A static `cargo xtask lint` gate (`lock hierarchy (G-conc)`) forbids a
+> hand-rolled spinlock anywhere outside `lock.rs`. The fork coordinator
+> ([`fork.rs`](../../crates/topo-core/src/fork.rs)) is a single-word CAS read-write
+> gate that quiesces the allocator pre-fork (drains in-flight operations to zero,
+> so no internal lock is held at `fork()`) and resets in the child; the
+> `pthread_atfork` registration + the C `topomalloc_crash_summary` (§28.4) live in
+> [`topo-abi/src/fork_api.rs`](../../crates/topo-abi/src/fork_api.rs). Init phases
+> (§35.4 Phase 0–6) + a re-entrancy guard + the lock-free crash summary live in
+> [`init.rs`](../../crates/topo-core/src/init.rs). Verified four ways: the
+> **fork-in-multithread** stress test (`topo-abi/tests/fork_safety.rs`, child
+> allocates safely under 40 fork rounds racing 4 busy threads, watchdog-guarded),
+> the **TLS-via-`dlopen`** recursion test (`topo-abi/tests/tls_dlopen.rs`) + the
+> fresh-thread first-allocation path in the `global_allocator` example, the
+> **`loom`** model of the fork gate (`gate_admits_no_op_across_a_fork`, every
+> interleaving, no `SeqCst`), and **ThreadSanitizer** (`xtask test --kind tsan`,
+> the whole `topo-core` lib + RSEQ battery clean). W16 is **concurrency/operational,
+> not an abstract §33.4 transition**, so it carries **no Lean obligation** — the
+> deadlock-freedom property is pinned by the fixed-wall checker test
+> (`lock::tests::out_of_order_acquire_trips_the_checker`) and the fork-quiesce
+> property by the `loom` model, per the V-004 citation rule.
 
-### Lock hierarchy (W16-1, §27.2 — the total order)
+| WU | Description | Size | ∥ | Acceptance | Status |
+|---|---|---|---|---|---|
+| W16-1a | Encode the lock ranks (table below, §27.2) as a typed/ranked lock wrapper; acquisition records its rank. | M | | every lock has a compile-time rank; refill/flush hold ≤1 middle-end lock by construction. | **DONE** — `lock::RankedLock<RANK>` + `LockRank`; every lock routed through it |
+| W16-1b | Debug lock-order checker: a per-thread held-rank stack asserts monotonic acquisition; wired as the **G-conc** gate. | S | ∥ | any out-of-order acquire fails in debug CI. | **DONE** — per-thread held-rank checker (alloc-free const-TLS) + `xtask lint` static gate |
+| W16-2 | **TLS initial-exec model** (§27.6): no `malloc` re-entry on first TLS access; `dlopen` allocation-free bootstrap path. | M | | TLS-recursion test (load via dlopen) does not re-enter the allocator. | **DONE** — `tls_dlopen.rs` (fresh threads, watchdog) + const-init Local-Exec TLS + bootstrap guard |
+| W16-3 | Atomics-ordering map (§27.3): publication=release, consumption=acquire, transitions=acq-rel, stats=relaxed; documented per atomic. | M | ∥ | each atomic annotated; TSan clean. | **DONE** — ordering map in `lock.rs` docs; per-site annotations; TSan-clean |
+| W16-4 | Global lock (M1) → fine-grained hierarchy (M2) migration without correctness regression. | M | | M1 passes with the global lock; M2 with the hierarchy. | **DONE** — engine already per-`(node,sc)`/per-span fine-grained; the ranked hierarchy (W16-1) verifies it |
+| W16-5a | Pre-fork + parent-post-fork handlers (§28.1): acquire the fork lock + quiesce background threads pre-fork; release + resume in the parent. | M | | parent unaffected; no leaked held lock. | **DONE** — `fork::{prefork,postfork_parent}` (drain gate) + `pthread_atfork` |
+| W16-5b | Child-post-fork handler: reset lock states, disable background threads, flush/conservative-mode inconsistent per-CPU state. | M | | fork-in-multithread test: child allocates safely; no inherited held lock. | **DONE** — `fork::postfork_child` (reset gate + checker, disable background); `fork_safety.rs` |
+| W16-6 | Signal/reentrancy/crash (§28.2–§28.4): document non-async-signal-safety; reentrancy guard; lock-free crash summary. | S | ∥ | reentrancy during init/hooks handled; crash summary needs no lock/alloc. | **DONE** — `init::{ReentryGuard,CrashSummary}` + `reentry_domain!`; C `topomalloc_crash_summary` |
+| W16-7 | Initialization phases (§35.4) Phase 0–6, each reentrancy-safe; shutdown policy (§35.5). | M | | phased-init test; teardown available for tests, leak-by-default in prod. | **DONE** — `init::{InitPhase,PhaseTracker,INIT_PHASE}` advanced in the global init; leak-by-default + test teardown |
+
+### Lock hierarchy (W16-1, §27.2 — the total order, as implemented)
 
 ```text
-Global config (rank 0) → Arena registry (1) → Arena (2) → Transfer cache (3, per-LLC)
-  → NUMA central list (4, per-NUMA) → Span (5) → Backend extent (6) → Stats shard (7)
+Global config / fork (rank 0) → Arena registry (1) → Arena (2) → Front-end cache (3)
+  → Transfer cache (4) → NUMA central list (5) → Span descriptor pool (6, refinement)
+  → Span (7) → Backend extent (8) → Stats shard (9)
 ```
 
-Acquire strictly in increasing rank. The refill/flush paths (W6-3) are written hand-over-hand and hold **at
-most one** of ranks 3–6 at a time. The checker (W16-1b) enforces monotonicity at runtime in debug.
+Acquire strictly in increasing rank. The §27.2 order is **refined** into a total order over the concrete
+locks (the SPEC permits this): the *front-end* per-CPU lock is the outermost data-path lock; the *span
+descriptor pool* (rank 6) slots between central and the per-span lock because `create_span` recycles a
+descriptor — which takes the per-span lock — while holding the pool; and the three backend locks (extent
+manager / large pool / huge backend) share rank 8 because they are never held simultaneously. The
+refill/flush paths (W6-3) are written hand-over-hand and hold **at most one** middle-end lock at a time. The
+checker (W16-1b) enforces monotonicity at runtime in debug; the `xtask lint` G-conc gate enforces statically
+that every lock is a `RankedLock`.
 
 > **▸ Decomposition — W16-2 (TLS), a top risk (R3).** The allocator's own TLS **must** use the initial-exec
 > model (or a static `__thread` slot reached without dynamic TLS allocation): general-dynamic TLS can trigger

@@ -696,7 +696,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "size-class-gen"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "topo-abi"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "criterion",
  "libc",
@@ -764,11 +764,11 @@ dependencies = [
 
 [[package]]
 name = "topo-arch"
-version = "0.1.19"
+version = "0.1.20"
 
 [[package]]
 name = "topo-backend-posix"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "libc",
  "topo-core",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "topo-backend-sele4n"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "sele4n-abi",
  "sele4n-types",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "topo-control"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "topo-core",
  "topo-stats",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "topo-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "criterion",
  "loom",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "topo-stats"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "serde_json",
  "topo-core",
@@ -810,14 +810,14 @@ dependencies = [
 
 [[package]]
 name = "topo-test-support"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "topo-core",
 ]
 
 [[package]]
 name = "topo-tests"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "libc",
  "proptest",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "trace-replay"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "topo-core",
  "topo-test-support",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.19"
+version = "0.1.20"
 
 [[package]]
 name = "zerocopy"

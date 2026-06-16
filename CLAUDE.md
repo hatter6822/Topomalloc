@@ -148,7 +148,8 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 
 ## Current Development Status
 
-**Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next.
+**Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next — its
+**concurrency foundation (W16: lock hierarchy, fork, TLS, init phases) is landed** (see below).
 Reallocation, aligned allocation & calloc zeroing (W15) is **complete and optimal** (all units, no
 deferrals): the §25 realloc state machine — `realloc(NULL,n)`/`realloc(p,0)` policy, content
 preservation, failure-preserves-the-original via the always-correct move path (§25.4, arena preserved,
@@ -312,8 +313,32 @@ of W14's `engine_size_align_validity_free_are_invariant_under_hints`), and W12 b
 citations (V-004)`, `docs/CONVENTIONS.md` §8) makes a bare "no Lean obligation" claim — one without a
 cited theorem or fixed-wall test in the same comment block — fail CI, so the gap cannot recur.
 
+Concurrency, memory ordering, fork, signal & TLS (W16) completes plan 05's concurrency track ahead of
+its M2 slot. The §27.2 lock hierarchy is a **ranked-lock total order** (`crates/topo-core/src/lock.rs`):
+`RankedLock<const RANK: u8>` is the single lock primitive, and **every** `topo-core` lock — the per-CPU
+front-end lock (rank `FRONT_END`, its byte still at offset 0 for the RSEQ asm), transfer/central/per-span
+locks, the span/large descriptor pools, the extent/huge backends, and the arena registries — is one, so a
+**per-thread held-rank checker** (debug + `debug-checks`, allocation-free `const`-init TLS) asserts every
+acquisition is strictly rank-increasing and fails any out-of-order acquire (**G-conc**); a static `cargo
+xtask lint` gate (`lock hierarchy (G-conc)`) forbids a hand-rolled spinlock anywhere outside `lock.rs`.
+The §27.3 atomics-ordering map is documented in the `lock` module. `fork()` safety
+(`crates/topo-core/src/fork.rs`) is a **single-word CAS read-write gate**: every public operation runs
+inside `fork::operation_guard()`, and the §28.1 pre-fork handler **drains** the in-flight count to zero
+(no internal lock held at `fork()` — the per-span locks are dynamic, so draining beats "acquire every
+lock"), the parent resumes, and the child **resets** the gate + lock-order checker and disables
+background maintenance; the `pthread_atfork` registration + the lock-free C `topomalloc_crash_summary`
+(§28.4) live in `crates/topo-abi/src/fork_api.rs`. The §35.4 init phases (Phase 0–6), a general
+re-entrancy guard (`reentry_domain!`), and the crash summary live in `crates/topo-core/src/init.rs`,
+with `INIT_PHASE` advanced through the global initializer. It is **concurrency/operational, not an
+abstract §33.4 transition**, so there is **no Lean obligation**: deadlock-freedom is pinned by the
+fixed-wall checker test (`lock::tests::out_of_order_acquire_trips_the_checker`) and the fork-quiesce
+property by the `loom` model (`gate_admits_no_op_across_a_fork`, every interleaving, no `SeqCst`), with
+the fork-in-multithread (`fork_safety.rs`) and TLS-via-`dlopen` (`tls_dlopen.rs`) integration tests and a
+TSan pass over the whole `topo-core` lib. The per-op gate is the M2 "correct before fast" fork-safety
+cost (a single CAS); a per-thread-sharded gate is a future perf optimization, never a correctness gap.
+
 **Test counts:**
-- Rust: ~728 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~745 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)

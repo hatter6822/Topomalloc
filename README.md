@@ -50,6 +50,15 @@ seLe4n simulator (G-sim). The full reallocation surface (W15) is complete: the
 **shrink** that returns a medium/large allocation's tail pages to the backend,
 plus aligned-allocation validation and overflow-safe calloc zeroing.
 
+The **concurrency foundation (W16) is landed**: a ranked lock hierarchy (§27.2)
+with a debug lock-order checker (every lock is a `RankedLock`, any out-of-order
+acquire fails CI — the G-conc gate); `fork()` safety via a single-word
+CAS quiesce gate + `pthread_atfork` handlers (the child allocates safely with no
+inherited held lock — `loom`-verified, fork-in-multithread tested); the
+initial-exec TLS model (no `malloc` re-entry on a thread's first access, tested
+via `dlopen`); the §35.4 initialization phases; and a lock-free, allocation-free
+crash summary (`topomalloc_crash_summary`, §28.4).
+
 ## Quick start
 
 ```sh

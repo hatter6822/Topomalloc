@@ -67,10 +67,18 @@ exclude = ["fuzz", "vendor/sele4n"]
 # OS-zeroed extents (`committed_memory_is_zeroed`); cache-served hugepage tail-trim
 # (`HugePageFiller::trim` via `RegionCacheHook::try_trim`); aligned size classes (the
 # generated table records each class's natural alignment ⇒ MAX_ALIGN = page size, no Lean
-# proof change); and `valloc`/`pvalloc`. In a 0.x series new backwards-compatible
-# functionality is a patch bump (the 0.x minor is the breaking axis), keeping `^0.1.0`
-# inter-crate reqs satisfied.
-version = "0.1.19"
+# proof change); and `valloc`/`pvalloc`. 0.1.20: W16 (plan 05) — concurrency / memory
+# ordering / fork / signal / TLS: the ranked lock hierarchy + debug lock-order checker
+# (`lock::RankedLock<RANK>`/`LockRank`, every `topo-core` lock routed through it; the
+# G-conc runtime checker + an `xtask lint` static gate); the single-word CAS fork-quiesce
+# gate (`fork::{operation_guard,prefork,postfork_parent,postfork_child}`, loom-verified)
+# with `pthread_atfork` wiring; the §35.4 init phases (`init::{InitPhase,PhaseTracker}`),
+# a general re-entrancy guard, and the lock-free crash summary (`init::CrashSummary` + C
+# `topomalloc_crash_summary`, §28.4); plus the fork-in-multithread and TLS-via-dlopen
+# tests. Concurrency/operational, no Lean obligation. In a 0.x series new backwards-
+# compatible functionality is a patch bump (the 0.x minor is the breaking axis), keeping
+# `^0.1.0` inter-crate reqs satisfied.
+version = "0.1.20"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

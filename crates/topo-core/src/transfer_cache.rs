@@ -21,6 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::{ArenaId, SizeClassId};
+use crate::lock::{LockRank, RankedLock};
 use crate::size_class;
 
 /// Number of size classes in the generated table.
@@ -35,8 +36,8 @@ const DEFAULT_CAPACITY_BATCHES: usize = 4;
 /// idle size class costs only the `TransferBin` struct itself (no metadata
 /// overhead until the class is actually used).
 pub struct TransferBin {
-    /// Spinlock protecting the buffer (lock rank 3).
-    locked: AtomicBool,
+    /// Spinlock protecting the buffer ([`LockRank::TRANSFER`], rank 3).
+    lock: RankedLock<{ LockRank::TRANSFER }>,
     /// Whether the bin has been initialized (buffer allocated).
     initialized: AtomicBool,
     /// Pointer to the metadata-allocated array of `usize` addresses.
@@ -51,7 +52,7 @@ pub struct TransferBin {
 impl TransferBin {
     const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            lock: RankedLock::new(),
             initialized: AtomicBool::new(false),
             buf: AtomicUsize::new(0),
             len: AtomicU32::new(0),
@@ -59,18 +60,10 @@ impl TransferBin {
         }
     }
 
-    /// Acquire the bin's spinlock (rank 3).
+    /// Acquire the bin's spinlock (rank 3), routed through the W16-1b checker.
     #[inline]
     fn lock(&self) -> TransferGuard<'_> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
+        self.lock.acquire();
         TransferGuard { bin: self }
     }
 
@@ -137,7 +130,7 @@ struct TransferGuard<'a> {
 impl Drop for TransferGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.bin.locked.store(false, Ordering::Release);
+        self.bin.lock.release();
     }
 }
 

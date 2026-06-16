@@ -19,7 +19,7 @@
 //! `RUSTFLAGS="--cfg loom" cargo test -p topo-core --test loom_protocols`.
 #![cfg(loom)]
 
-use loom::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
@@ -352,6 +352,62 @@ fn w8_span_retirement_is_claimed_exactly_once() {
         assert_eq!(m.state.load(Ordering::Relaxed), RELEASED);
         assert_eq!(m.live.load(Ordering::Relaxed), 0);
         assert_eq!(m.bitmap.load(Ordering::Relaxed), (1 << OBJECTS) - 1);
+    });
+}
+
+/// The W16-5 fork-gate protocol (`fork.rs` `operation_guard` / `prefork`): an
+/// operation must **never** be admitted-and-in-flight at the instant `prefork`
+/// observes the in-flight count drained to zero and forks (the §28.1 quiesce
+/// guarantee — no internal lock can be held at `fork()`). The gate packs a
+/// fork-pending bit and the in-flight count into **one** word, so the reader's
+/// "enter iff no fork pending" is a single compare-exchange: a reader either wins
+/// before the forker sets the bit (and is counted by the drain) or fails its CAS
+/// after (and parks). `loom` proves this over every interleaving — and, crucially,
+/// the gate uses **no `SeqCst`** (which `loom` models only as `AcqRel`), so the
+/// model is sound. This mirrors the real `operation_guard`/`prefork` exactly
+/// (modeling the count as a single bit is exact for one operation).
+#[test]
+fn gate_admits_no_op_across_a_fork() {
+    const FORK_PENDING: usize = 1 << (usize::BITS - 1);
+    const COUNT_MASK: usize = FORK_PENDING - 1;
+    loom::model(|| {
+        let gate = Arc::new(AtomicUsize::new(0));
+        // `in_op` is true exactly while the operation thread is *inside* its
+        // guarded region (admitted, not yet left) — the window in which it could
+        // hold an internal allocator lock.
+        let in_op = Arc::new(AtomicBool::new(false));
+
+        // The operation thread: `operation_guard()` then (maybe) the op body.
+        let op = {
+            let (gate, in_op) = (gate.clone(), in_op.clone());
+            thread::spawn(move || {
+                let g = gate.load(Ordering::Acquire);
+                // If a fork is pending we would park (model it as "do not enter").
+                if g & FORK_PENDING == 0
+                    && gate
+                        .compare_exchange(g, g + 1, Ordering::Acquire, Ordering::Acquire)
+                        .is_ok()
+                {
+                    // Admitted: inside the guarded region (an internal lock could be held).
+                    in_op.store(true, Ordering::Relaxed);
+                    in_op.store(false, Ordering::Relaxed);
+                    gate.fetch_sub(1, Ordering::Release); // leave
+                }
+            })
+        };
+
+        // The forking thread: `prefork` sets the fork bit, then drains the count.
+        gate.fetch_or(FORK_PENDING, Ordering::AcqRel);
+        if gate.load(Ordering::Acquire) & COUNT_MASK == 0 {
+            // The drain observed zero in-flight operations and would now `fork()`.
+            // The non-negotiable invariant: no operation is inside its region.
+            assert!(
+                !in_op.load(Ordering::Relaxed),
+                "fork gate admitted an operation across a fork (an internal lock could be held)"
+            );
+        }
+
+        op.join().unwrap();
     });
 }
 

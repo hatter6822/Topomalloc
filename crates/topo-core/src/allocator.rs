@@ -57,8 +57,8 @@ use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, Request, RequestKind};
 use crate::error::BackendError;
 use crate::extent::{
-    BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit,
-    RegionCacheHook, StateBytes,
+    ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, RegionCacheHook,
+    StateBytes,
 };
 use crate::flags::{Hints, Lifetime, RequestFlags};
 use crate::generated::tables::PAGE_SIZE;
@@ -67,6 +67,7 @@ use crate::hooks::{ExtentHooks, HookProvider};
 use crate::huge::Hotness;
 use crate::ids::{ArenaId, Generation, Label, NodeId, SizeClassId, SpanId};
 use crate::large::{LargeAllocator, LargeBacking, LargeConfig};
+use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
 use crate::pagemap::PageMap;
 use crate::placement::{LearnedHints, PlaceClass, SizeClassDist};
@@ -544,7 +545,7 @@ impl ArenaHookBackend<'_> {
 /// lock-free `count` is the fast path: `0` ⇒ no hooked arena exists, so every
 /// allocation/free uses the shared backend with **zero** registry access.
 struct HookRegistry<'a> {
-    lock: BackendLock,
+    lock: RankedLock<{ LockRank::ARENA }>,
     slots: UnsafeCell<[Option<ArenaHookBackend<'a>>; MAX_HOOK_BACKENDS]>,
     count: AtomicUsize,
 }
@@ -552,7 +553,7 @@ struct HookRegistry<'a> {
 impl HookRegistry<'_> {
     const fn new() -> Self {
         Self {
-            lock: BackendLock::new(),
+            lock: RankedLock::new(),
             slots: UnsafeCell::new([const { None }; MAX_HOOK_BACKENDS]),
             count: AtomicUsize::new(0),
         }
@@ -633,9 +634,11 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     large: LargeAllocator<'a, P>,
     /// Recycling span-descriptor pool.
     spans: SpanPool,
-    /// Guards `spans.inner` (acquire/release; lowest lock class, §27.2 —
-    /// never held across a central-list or provider call).
-    span_lock: BackendLock,
+    /// Guards `spans.inner` ([`LockRank::SPAN_POOL`], rank 5 — a §27.2 refinement
+    /// *outer* to the per-span lock, since `create_span` recycles a descriptor
+    /// (which takes the per-span lock) while holding this; never held across a
+    /// central-list or provider call). See the [`crate::lock`] module docs.
+    span_lock: RankedLock<{ LockRank::SPAN_POOL }>,
     /// Cumulative usable bytes ever handed out (§31.1; relaxed — stats are
     /// monotone counters, not synchronization).
     allocated_bytes: AtomicU64,
@@ -789,7 +792,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_extents,
             large,
             spans,
-            span_lock: BackendLock::new(),
+            span_lock: RankedLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
             hooks: HookRegistry::new(),
@@ -2388,6 +2391,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
+        }
+    }
+
+    /// A minimal allocator summary safe for a crash/signal handler (W16-6, §28.4):
+    /// it reads **only** the process-lifetime cumulative-byte atomics (relaxed,
+    /// **no lock**), so it cannot deadlock on a structure lock held by the faulting
+    /// thread, and it allocates nothing. Object/state breakdowns (which take locks)
+    /// are deliberately omitted — "full stats may be unavailable in crash context"
+    /// (§28.4). Combine with [`crate::init::INIT_PHASE`] /
+    /// [`crate::fork::background_enabled`] for the process-wide fields.
+    pub fn crash_summary(&self) -> crate::init::CrashSummary {
+        let allocated = self.allocated_bytes.load(Ordering::Relaxed);
+        let freed = self.freed_bytes.load(Ordering::Relaxed);
+        crate::init::CrashSummary {
+            init_phase: crate::init::INIT_PHASE.current() as u8,
+            allocated_bytes: allocated,
+            freed_bytes: freed,
+            // Saturating: a torn relaxed read during concurrent ops could make
+            // `freed` transiently exceed `allocated`; never report a wrap.
+            live_bytes: allocated.saturating_sub(freed),
+            background_enabled: crate::fork::background_enabled(),
         }
     }
 }

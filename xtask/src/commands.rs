@@ -301,6 +301,10 @@ pub fn lint(root: &Path, _args: &[String]) -> Outcome {
         check_obligation_citations(root),
     );
     r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
+    r.record(
+        "lock hierarchy (G-conc, W16-1b)",
+        check_lock_hierarchy(root),
+    );
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -354,6 +358,10 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         check_obligation_citations(root),
     );
     r.record("RSEQ CS audit (W7-2d)", check_rseq_cs(root));
+    r.record(
+        "lock hierarchy (G-conc, W16-1b)",
+        check_lock_hierarchy(root),
+    );
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -1033,6 +1041,79 @@ fn check_rseq_cs(root: &Path) -> bool {
     }
 }
 
+/// The lock-hierarchy structural gate (W16-1b, the G-conc gate, DD-3 F1): every
+/// lock in `topo-core` MUST go through the ranked `RankedLock` wrapper so the
+/// debug lock-order checker sees every acquisition. A hand-rolled spinlock — the
+/// `compare_exchange(false, true, …)` test-and-set idiom — escapes the checker, so
+/// this scans `crates/topo-core/src/**/*.rs` and forbids that idiom **outside**
+/// `lock.rs` (the wrapper's sole home). The runtime half of G-conc — the
+/// per-thread held-rank assertion — fails any out-of-order acquire in debug CI;
+/// this static half guarantees the runtime checker has nothing it cannot see.
+fn lock_hierarchy_issues(content: &str) -> Vec<(usize, String)> {
+    let mut issues = Vec::new();
+    for (i, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with("//") {
+            continue; // a doc/comment mention (e.g. this gate's own description)
+        }
+        // The test-and-set spinlock construction: a CAS that flips a bool `false →
+        // true`. Matching the argument pair (not just `compare_exchange`) keeps a
+        // legitimate value CAS (e.g. the arena quota, an init flag) from tripping it.
+        let normalized: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.contains("compare_exchange_weak(false, true")
+            || normalized.contains("compare_exchange(false, true")
+        {
+            issues.push((
+                i + 1,
+                "hand-rolled spinlock (`compare_exchange(false, true, …)`) — route it through \
+                 `lock::RankedLock` so the W16-1b lock-order checker sees it (§27.2)"
+                    .to_string(),
+            ));
+        }
+    }
+    issues
+}
+
+/// Gate the lock-hierarchy discipline (W16-1b / G-conc): no hand-rolled spinlock
+/// in `topo-core` outside `lock.rs`. Scans `crates/topo-core/src/**/*.rs`.
+fn check_lock_hierarchy(root: &Path) -> bool {
+    let mut issues = Vec::new();
+    let mut scanned = 0usize;
+    visit_files(root, SKIP_DIRS, &mut |path| {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if !(s.contains("crates/topo-core/src") && s.ends_with(".rs")) {
+            return;
+        }
+        // `lock.rs` IS the ranked-lock wrapper: the one place the primitive lives.
+        if s.ends_with("/lock.rs") {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        scanned += 1;
+        for (line, reason) in lock_hierarchy_issues(&content) {
+            issues.push(format!("{}:{}: {reason}", path.display(), line));
+        }
+    });
+    if issues.is_empty() {
+        println!(
+            "  · lock hierarchy (G-conc): every `topo-core` lock is a ranked `RankedLock` \
+             ({scanned} files, §27.2/W16-1)"
+        );
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ lock hierarchy: {it}");
+        }
+        eprintln!(
+            "  → route the lock through `lock::RankedLock<{{ LockRank::… }}>` (W16-1a) so the \
+             debug checker (W16-1b) enforces the §27.2 order. See the `lock` module docs."
+        );
+        false
+    }
+}
+
 /// Run `shellcheck` over every `.sh` file, if it is installed.
 fn shellcheck_step(r: &mut Runner<'_>, root: &Path) {
     if !have("shellcheck") {
@@ -1492,5 +1573,31 @@ mod tests {
         assert_eq!(rseq_cs_issues("            \"syscall\",\n").len(), 1);
         // A comment mentioning "call" is not an asm string literal — not flagged.
         assert!(rseq_cs_issues("            // never call inside the CS\n").is_empty());
+    }
+
+    #[test]
+    fn lock_hierarchy_gate_flags_hand_rolled_spinlocks_only() {
+        // The test-and-set spinlock idiom is flagged (it escapes the checker).
+        let bad = r#"
+            self.locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        "#;
+        assert_eq!(lock_hierarchy_issues(bad).len(), 1);
+        assert_eq!(
+            lock_hierarchy_issues("    x.compare_exchange(false, true, AcqRel, Acquire)").len(),
+            1
+        );
+        // A *value* CAS (not a bool lock) is fine — e.g. the arena quota / init flag.
+        assert!(lock_hierarchy_issues(
+            "    used.compare_exchange_weak(cur, next, AcqRel, Acquire)"
+        )
+        .is_empty());
+        assert!(
+            lock_hierarchy_issues("    state.compare_exchange(0, 1, Acquire, Acquire)").is_empty()
+        );
+        // A comment describing the forbidden idiom must not trip the gate.
+        assert!(
+            lock_hierarchy_issues("    // never compare_exchange(false, true) by hand").is_empty()
+        );
     }
 }

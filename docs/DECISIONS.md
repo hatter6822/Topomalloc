@@ -1745,3 +1745,87 @@ three issues in the freshly-landed code; each was confirmed against the code and
   fail. No rollback exists to fail. Pinned by `install_large_range_after_reserve_allocates_nothing_and_publishes`
   (the publish over a reserved multi-leaf range consumes zero further metadata). These are mechanism
   reorderings, not new transitions, so no Lean obligation changes.
+
+## W16 — concurrency, memory ordering, fork, signal & TLS (plan 05)
+
+The M2 concurrency foundation. Each decision below is "correct before fast": the verified-correct mechanism
+ships first; a noted optimization is a later perf pass, never a correctness gap.
+
+* **One ranked-lock primitive; every `topo-core` lock is a `RankedLock` (W16-1a, §27.2).** The four
+  hand-rolled test-and-set spinlocks (`CentralLock`, `SpanLock`, `BackendLock`, the transfer-bin lock) and
+  the per-CPU front-end lock are replaced by a single `RankedLock<const RANK: u8>` carrying a **compile-time
+  rank**. The §27.2 hierarchy is *refined* into a total order over the concrete locks (the SPEC permits
+  refinement): a `FRONT_END` rank for the per-CPU lock (the outermost data-path lock), a `SPAN_POOL` rank
+  between `CENTRAL` and the per-span `SPAN` lock (because `create_span` recycles a descriptor — which takes
+  the per-span lock — while holding the descriptor pool), and a single shared `BACKEND` rank for the extent
+  manager / large pool / huge backend (proven never held simultaneously: the large path consults the
+  region-cache hook *before* taking the extent lock, and a span's backing extent is allocated *and released*
+  before the descriptor pool lock). The per-CPU lock keeps its `#[repr(C)]` offset-0 layout (a `RankedLock`
+  is a single `AtomicBool`), so the RSEQ assembly that peeks the lock byte is byte-for-byte unchanged.
+
+* **The lock-order checker is a per-thread held-rank set, allocation-free and debug-gated (W16-1b, the
+  G-conc gate).** Every acquire records its rank in a fixed-size, `const`-initialised thread-local array
+  (never a `Vec` — Local-Exec TLS, so recording a rank never re-enters `malloc` even when the crate backs
+  the process `#[global_allocator]`) and asserts the new rank exceeds every rank held; release removes it.
+  Active under `debug_assertions` + the `debug-checks` profile (the normal `cargo test` build and CI); a
+  no-op in `performance` and pure `no_std`. Any out-of-order acquire trips a `debug_assert!` — the deadlock
+  a lock-order cycle would cause, caught deterministically. A static `cargo xtask lint` gate
+  (`lock hierarchy (G-conc)`) forbids the `compare_exchange(false, true, …)` spinlock idiom anywhere outside
+  `lock.rs`, so a new hand-rolled lock that would escape the checker fails CI (DD-3 F1). The whole existing
+  suite (incl. the multithreaded central/arena/hugepage tests) runs green under the checker — empirical
+  proof the existing acquisition order already respects §27.2.
+
+* **`fork()` safety is a drain gate, not "acquire every lock" (W16-5, §28.1, DD-5).** jemalloc-style prefork
+  acquires every internal mutex in rank order; that is **infeasible here** because the per-span locks are
+  *dynamic* (created on demand) and are taken *outside* the central lock (`activate_span`, `recycle`), so
+  acquiring the fixed structure locks would not stop a thread from holding a per-span lock at `fork()`.
+  Instead every public operation runs inside `fork::operation_guard()`, and the pre-fork handler **drains**
+  the in-flight count to zero: no in-flight operation ⟺ no internal spinlock held ⟺ every structure is
+  consistent. The parent resumes; the child **resets** (not unlocks) the gate, clears the lock-order
+  checker's inherited bookkeeping, and disables background maintenance. This is the §28.1 "global allocator
+  fork lock + quiesce". The per-op gate is one atomic on the hot path — the M2 fork-safety cost; a
+  per-thread-sharded gate is the future perf optimization.
+
+* **The gate is a single-word CAS read-write lock — chosen over a `SeqCst` Dekker gate so `loom` can verify
+  it.** The natural "increment a count, then check a fork flag; the forker sets the flag, then waits for the
+  count" is a store-then-load (Dekker) shape that needs `SeqCst` to be correct — but `loom` models `SeqCst`
+  only as `AcqRel`, so it cannot machine-check such a gate (and indeed reports a spurious violation). The
+  gate instead packs the fork-pending bit and the in-flight count into **one** `AtomicU64`: an operation
+  enters by a compare-exchange that increments the count *iff* the fork bit is clear, so a reader that races
+  a forker either wins before the bit is set (and is drained) or fails its CAS after (and parks) — the
+  standard CAS read-write-lock shape, with **no `SeqCst`**. `gate_admits_no_op_across_a_fork`
+  (`tests/loom_protocols.rs`) proves over every interleaving that no operation is admitted-and-in-flight at
+  the instant the drain forks. The trade-off accepted: the CAS contends among concurrent entries (vs. a
+  `fetch_add`), which the future sharded gate also removes.
+
+* **TLS is initial-exec / `const`-init (W16-2, §27.6, DD-4) and tested via `dlopen`.** The allocator's own
+  thread-locals — the lock-order checker, the bootstrap/sampling re-entrancy guards — are `const`-initialised
+  `thread_local!`s, which compile to Local-Exec (a direct `%fs:…@TPOFF` load, no `__tls_get_addr`, no lazy
+  guard, no allocation) in an executable, so a thread's first allocation never re-enters the allocator while
+  establishing its TLS. The danger case is `dlopen` (where general-dynamic TLS may allocate on first access);
+  `tls_dlopen.rs` loads the freshly-built `libtopo_abi` via `dlopen` (`RTLD_LOCAL`, its own statics/TLS) and
+  drives its `malloc`/`free` from fresh threads under a watchdog — a re-entrancy regression would deadlock and
+  the watchdog aborts loudly. The `global_allocator` example additionally exercises first-allocation on many
+  fresh threads while TopoMalloc *is* the process `#[global_allocator]`.
+
+* **The crash summary is lock-free and reads only cumulative-byte atomics (W16-6, §28.4).** A signal/crash
+  handler must not take a contended lock (which the faulting thread may hold) or allocate (`malloc` is not
+  async-signal-safe). `Allocator::crash_summary()` reads only the relaxed `allocated_bytes`/`freed_bytes`
+  atomics + the process init phase / background flag and formats them into a caller buffer with an
+  allocation-free bounded cursor (`init::CrashSummary::write`); the C `topomalloc_crash_summary` never forces
+  the allocator's lazy init (it uses a non-initializing `GLOBAL.get()`). Object/state breakdowns, which take
+  locks, are deliberately omitted — "full stats may be unavailable in crash context" (§28.4).
+
+* **Init is observable as monotone §35.4 phases; shutdown leaks by default (W16-7).** `init::PhaseTracker`
+  (one `AtomicU8`, lock-free, monotone — never winds backwards) advances through Phase 0–6 as the global
+  initializer brings the allocator up (bootstrap metadata → atfork registration → OS discovery → engine →
+  profiling → operational), so a reentrant caller can ask "open for business yet?" without a lock (§35.4
+  "each phase MUST be reentrancy-safe"). Shutdown keeps the §35.5 policy: allocator metadata is process-lived
+  (the `MetaArena` is `Box::leak`-ed), with explicit `teardown()`/`Drop` available for tests.
+
+* **W16 is concurrency/operational, not an abstract §33.4 transition — no Lean obligation.** The lock
+  hierarchy, fork gate, TLS model, and init phases change *when* and *how safely* the allocator runs, never
+  the abstract ownership state the Lean model tracks. Per the V-004 citation rule, the two load-bearing
+  properties are pinned by concrete artifacts rather than a bare claim: deadlock-freedom by the fixed-wall
+  `lock::tests::out_of_order_acquire_trips_the_checker` (the checker rejects an out-of-order acquire), and
+  fork-quiesce by the `gate_admits_no_op_across_a_fork` `loom` model (no operation crosses a fork).
