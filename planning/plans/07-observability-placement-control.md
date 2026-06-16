@@ -88,7 +88,10 @@ affects locality/fragmentation only — **never** validity, size, alignment, or 
 > change**; the profiler's running counters reconcile into `topo-stats` JSON (`placement` block) and the
 > `topo.placement.*` control namespace (these are *profiling* estimates, not a managed-VM byte class, so they
 > sit outside the §8.6 reconciliation). The safety boundary holds **by construction** — the policy's only
-> output is advisory `PlaceHints`, the score-only input the certified filler already tolerates.
+> output is advisory `PlaceHints`, the score-only input the certified filler already tolerates — and is
+> **pinned, not merely asserted**, by the fixed-wall `engine_size_align_validity_free_are_invariant_under_hints`
+> (every size × align × hint leaves usable size / alignment / validity / free path identical), the
+> reference the W13 router's `placement_never_breaks_the_allocation_contract` wall mirrors.
 >
 > **Optimal-completion pass.** The loop is **closed end-to-end**: confident per-bucket consensus is published
 > into a lock-free `LearnedHints` table the allocation path reads (one atomic acquire load; explicit hints

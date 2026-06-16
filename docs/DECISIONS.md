@@ -1535,3 +1535,117 @@ Verified additionally by the new `learned_hot_profile_steers_unhinted_large_allo
 `place_class_round_trips_and_is_orthogonal_to_quarantine`, `learned_hints_publish_consensus_and_*`,
 `ewma_rate_is_recency_weighted`, the `sampler_no_alloc` proof, and the `gsim` module — all green
 under `cargo xtask ci` (dual-arch build + test + the eight Lean gates).
+
+## W15 — reallocation, aligned allocation & calloc zeroing (plan 06)
+
+W15 owns the user-facing resize/zero surface. Its semantics (W15-1), move path (W15-2), same-class
+in-place grow (W15-3a), aligned validation (W15-4), and calloc overflow/zeroing (W15-5) shipped with
+the W8 realloc core; the completion pass closed **W15-3b (in-place shrink with tail-page return)**, the
+one piece the W8 core stubbed as "keep the whole extent". Decisions:
+
+* **In-place shrink returns the tail to the backend, but only when it can do so for free.** A
+  medium/large `realloc` whose page-rounded new size is *strictly* smaller than the current usable size
+  now splits the backing extent at the new boundary and frees the tail (§25.3, DD-1 "shrink, large tail
+  → split + return tail to backend, return p"). The base pointer is unchanged, so the result is still
+  an in-place shrink — the win is RSS, not a copy. It is **best-effort under always-correct semantics
+  (§2.4):** a **cache-served** allocation (the W11 hugepage filler owns its own page geometry), a
+  **slot-pool-exhausted** split, or a **sub-page** shrink (nothing to return) all keep the allocation
+  whole. None of those fail the call — keeping the whole extent is a correct §25.3 result (SHOULD, not
+  MUST). This is the same "dumb-but-correct fallback under an optimization" discipline as the move path
+  layering.
+* **Ordering is the whole game: split → retire pagemap → shrink descriptor → free the tail.** The tail
+  is split off as a still-`Active` extent first (the sole fallible step — on slot exhaustion *nothing*
+  is mutated, W4-5, so the allocation is untouched and stays whole). Its pagemap entries are retired to
+  `Empty` **before** the tail extent is freed (`PageMap::retire_large_range`), so a later reuse of the
+  freed extent can never collide with the now-stale `Large` entries (P-Map-001 one-page-one-descriptor)
+  — exactly the retire-before-free discipline `Allocator::retire_span` already follows. Only then is
+  the owning `LargeDescriptor` shrunk in place (`shrink_usable`, under its seqlock so a concurrent
+  classifier never mixes the old/new usable size, W3-4) and the tail freed (applying the §20.5
+  retain/unmap policy). The descriptor keeps its id/base/generation — the allocation keeps its
+  identity, so outstanding base pointers stay valid; only its size moves.
+* **No lock nesting, no aliasing surprise.** `LargeAllocator::shrink` reads the descriptor + backing
+  under the pool lock, captures the **pagemap-rooted** descriptor pointer (not a slot pointer borrowed
+  from the pool `&mut`) plus plain values, then releases the lock before the extent-manager calls — the
+  pool lock and the extent lock are never held together (the alloc path's discipline). The §25 realloc
+  contract excludes a concurrent free/realloc of the same pointer, so the slot is neither recycled nor
+  mutated after the lock drops.
+* **Accounting stays exact across the shrink (§8.6/§36.17).** The freed tail is credited to the global
+  `freed_bytes` **and** the allocation's *original* arena's quota (§25.4 arena preservation), so
+  `live_bytes = allocated − freed` drops to the new usable size and `Σ arena.used == live_bytes` still
+  reconciles. The subsequent `free` credits the *current* (shrunk) usable size, so the two together
+  return exactly what was charged. The `malloc_api` fuzz target reconciles `live_bytes` against its own
+  model across every shrink, catching any drift.
+* **No new abstract transition — and the *precise* reason (not a hand-wave).** A large allocation is
+  **not** a core `Block`: clause 12 (`WfSlabLayout`) keys every block to a size class, so the §33.3
+  block state machine (malloc/free/realloc-move over `s.blocks`) models the small-object slab path only.
+  A large allocation is modeled in the **extent backend**, where the in-place shrink is exactly
+  `extent_split` (§18.3, the certified `span_split_preserves_disjointness` geometry) followed by `extent
+  free` (§20.1 `ExtentState`, pinned by the `extent state machine` `lake exe check` gate). The shrink
+  **sequences** these two certified transitions — the *same shape as the W12 release controller*
+  sequencing the certified `release_to_os_*` transition. It is **not** the W13/W14 case (placement
+  policy that is invisible to the abstract state — a different, stronger argument I originally
+  over-applied here): the shrink *does* mutate geometry, but only via already-certified extent
+  transitions. It is also explicitly **not** `reallocMove`: the move needs the old and new blocks
+  *simultaneously live and disjoint* (the copy window, `realloc_move_window_keeps_old_live`), which two
+  same-base ranges can never satisfy — the shrink instead frees the tail, so nothing overlapping is ever
+  live at once. The composition's one geometric premise — the kept prefix stays disjoint from its
+  neighbours, and the kept prefix and returned tail never overlap (so a reused tail never aliases the
+  live prefix) — is named and machine-checked by `realloc_shrink_inplace_tail_tiles_disjointly`
+  (`lean/TopoMalloc/Theorems/Realloc.lean`), discharged against `span_split_preserves_disjointness`.
+  So there is no new §33.4 obligation and no trace-grammar change — confirmed by the eight `lake exe
+  check` gates staying green and the new theorem proof-checking under `lake build`.
+
+Verified by `realloc_large_shrink_returns_the_tail_pages` and `realloc_large_shrink_credits_the_owning_arena`
+(engine: same base, usable drops, backend `active` drops by exactly the freed tail, §36.17 reconciliation,
+sub-page shrink keeps the extent, clean free), the profile-robust `free_sized_accepts_truthful_size_after_inplace_shrink`
+(C ABI cross-check across both the extent-backed and hugepage profiles), `realloc_medium_shrink_returns_the_tail_through_the_abi`
+(C ABI, extent-backed), the `realloc_preserves_content_and_survives_failure` property test, and the
+`malloc_api` fuzz target — all green under `cargo xtask ci` (dual-arch build + the full test matrix incl.
+`hugepage-optimized`/`low-rss`/`sele4n-sim` + the eight Lean gates).
+
+## W12/W13/W14 formal-obligation review (the W15-3b lesson, generalized)
+
+The W15-3b review exposed an over-broad habit: labelling a change "policy, not safety / no Lean
+obligation / sequences certified mechanisms" without a cited, auditable backing. A deliberate pass
+re-examined every such claim. The conclusion was *not* "they all cut corners" — each is sound — but
+the *backing* was tightened so the claim is verifiable, not trusted, and a guard was added so the gap
+cannot recur.
+
+* **The two patterns are distinct and must not be conflated.** *Sequences certified transitions*
+  (W12 release controller, W15-3b shrink): the change mutates abstract state, but only by composing
+  transitions the model already certifies — so it must cite the **named theorem(s)** it rests on.
+  *Pure policy, invisible to abstract state* (W13 NUMA router, W14 placement): the decision provably
+  cannot change size/alignment/validity/free (§2.4/§24.5), so the abstract state never moves — and it
+  must cite the **fixed-wall safety test** that pins that boundary. "Pure policy" is the stronger
+  claim; W15-3b was originally mislabelled with it when it is really the (weaker, geometry-mutating)
+  "sequences certified transitions" case.
+* **W12 — release controller: sound, now pinned end-to-end.** The mechanism is certified
+  (`release_to_os_preserves_live_objects`, `subrelease_preserves_live_backing`) and the controller
+  only sequences it; the mechanism *structurally* refuses live memory (`ExtentManager::decommit`
+  rejects `Active` with `NotFree`; the filler releases only empty hugepages / H-005-guarded cold-sparse
+  pages). The prior live-wiring tests released only empty supply, so a new end-to-end test
+  `controller_driven_release_preserves_live_objects` mixes live objects with releasable supply, drives
+  the controller to Emergency, and asserts every live object survives untouched — the W14-grade wall.
+* **W13 — NUMA router: genuinely pure policy, now pinned by a fixed wall.** The router only chooses
+  *which node's* (certified) `HugePageBackend` serves a request; the node never appears in the
+  abstract model. That was asserted in prose but not pinned. The new
+  `placement_never_breaks_the_allocation_contract` is the §2.4 fixed wall: for every NUMA policy
+  (Local/Bind(valid/stale)/Interleave/OsDefault/ArenaPolicy) **and** a bind failure, a routed
+  allocation has the requested size + alignment, a fully writable+readable range, and frees home —
+  the W13 analogue of W14's hint-invariance wall. `Topology::preferred_node` totality (every policy
+  yields an in-range node or `DEFAULT`) is pinned by `placement_covers_every_numa_mode`.
+* **W14 — placement policy: already the gold standard.** `engine_size_align_validity_free_are_invariant_under_hints`
+  (every size × align × hint) + a pure-filler test + proptest + fuzz + a §36.9 G-sim re-proof already
+  pin the §24.5 wall. No change needed; it is the reference the others were brought up to.
+* **The guard: an `obligation citations (V-004)` lint.** `cargo xtask lint` now scans
+  `crates/**/src/**/*.rs`: a comment block asserting "no Lean obligation" / "adds no abstract
+  transition" / "not a modeled transition" without a citation keyword (a theorem reference, or
+  `pin`/`certified`/`proven`/`discharged`/`fixed wall`) within a few lines fails the gate. It joins
+  wrapped doc-comment lines (so a phrase split across lines is still seen) and matches citation stems
+  on **word boundaries** (so an accidental substring like "map**pin**g" cannot launder a bare claim —
+  the exact false-negative found while building the lint). The pure matcher is unit-tested
+  (`obligation_citation_lint_requires_a_backing_citation`) over bare/cited/wrapped/far/substring cases.
+
+Net: every "no formal obligation" claim in the tree now cites a theorem or a fixed-wall test, and the
+lint keeps it that way. Verified green under `cargo xtask ci` (dual-arch build + full test matrix +
+the eight Lean gates + the new lint).

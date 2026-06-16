@@ -309,6 +309,28 @@ impl PageMap {
         self.overwrite_existing_range((large.base(), large.end()), TAG_EMPTY);
     }
 
+    /// Retire the page-aligned sub-range `[base, stop)` of a large allocation to
+    /// `Empty` (P-Map-002), used by an **in-place shrink** that returns the
+    /// allocation's tail pages to the backend (§25.3, plan 06 W15-3b). Like
+    /// [`retire_large`](Self::retire_large) it is allocation-free and only
+    /// overwrites pages that were mapped (the suffix the allocation still owns at
+    /// the call); after it a classifier sees `Empty` for the returned tail.
+    ///
+    /// **Ordering (load-bearing).** The caller MUST retire the tail here **before**
+    /// the underlying extent is freed (so it can be reallocated), exactly as
+    /// [`Allocator::retire_span`](crate::Allocator) clears the pagemap before
+    /// returning the extent — otherwise a reuse of the freed tail could collide
+    /// with the stale `Large` entries this clears (P-Map-001: one page → one
+    /// descriptor). `base`/`stop` must be page-aligned (the large base and both the
+    /// old and new page-rounded usable sizes are).
+    ///
+    /// SPEC-transition: pagemap clear on large in-place shrink (§17.2 P-Map-006)
+    pub fn retire_large_range(&self, base: usize, stop: usize) {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "shrink tail base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "shrink tail stop must be page-aligned");
+        self.overwrite_existing_range((base, stop), TAG_EMPTY);
+    }
+
     // --- internal radix walk + publish --------------------------------------
 
     /// Publish `entry` to every page in `[base, stop)`, creating radix nodes as

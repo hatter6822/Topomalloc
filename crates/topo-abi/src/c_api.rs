@@ -322,11 +322,15 @@ fn sized_hint_matches(a: &AnyAllocator, ptr: *mut u8, size: usize, align: usize)
             ..
         }) => class_usable == usable,
         Some(RequestKind::Medium { .. }) | Some(RequestKind::Large { .. }) => {
-            // Fit, not equality: an in-place shrink (`Allocator::realloc`)
-            // keeps the original extent, so the truthful (last-requested)
-            // size can round to *less* than the usable size. A false accept
-            // merely weakens a heuristic; a false reject would abort a
-            // correct program (found by the W8 self-audit; pinned by
+            // Fit, not equality: a medium/large allocation's usable size can
+            // *exceed* the page-rounded truthful size. A cache-served (hugepage)
+            // region rounds up to its awkward-size unit, and a best-effort
+            // in-place shrink that kept the whole extent (cache-served, or a
+            // slot-exhausted split — W15-3b) leaves a larger usable size; an
+            // extent-backed shrink returns the tail, so there usable equals the
+            // rounded size, which the `<=` also covers. A false accept merely
+            // weakens a heuristic; a false reject would abort a correct program
+            // (found by the W8 self-audit; pinned by
             // `free_sized_accepts_truthful_size_after_inplace_shrink`).
             align_up(size.max(1), PAGE_SIZE).is_some_and(|rounded| rounded <= usable)
         }
@@ -693,20 +697,34 @@ mod tests {
         }
     }
 
-    /// Regression (W8 self-audit): after an in-place medium shrink the
-    /// truthful (last-requested) size rounds to *less* than the usable size;
-    /// the debug cross-check must accept it, not abort a correct program.
+    /// After an in-place medium **shrink** the allocation stays at the same base
+    /// (W15-3a/b), and the truthful (last-requested) size is the one valid C23
+    /// `free_sized` hint the debug cross-check must accept — never aborting a
+    /// correct program (the W8 self-audit regression). Profile-robust: the
+    /// default extent-backed build **returns the tail pages**, so the usable size
+    /// drops to the page-rounded new size (W15-3b); a `hugepage-optimized` build
+    /// serves the allocation cache-side (the filler owns its page geometry) and
+    /// keeps it whole — both leave `usable >= the page-rounded new size`, which
+    /// the cross-check's fit test (not equality) accepts. The exact tail return is
+    /// pinned by the engine test `realloc_large_shrink_returns_the_tail_pages`.
     #[test]
     fn free_sized_accepts_truthful_size_after_inplace_shrink() {
         // SAFETY: pointers are test-owned; each is freed exactly once with
         // its truthful last-requested size.
         unsafe {
-            let p = topomalloc_malloc(80_000); // 5 pages: usable 81920
-            assert_eq!(topomalloc_malloc_usable_size(p), 81_920);
-            let q = topomalloc_realloc(p, 40_000); // rounds to 49152 <= 81920
-            assert_eq!(q, p, "page-rounded shrink stays in place");
-            assert_eq!(topomalloc_malloc_usable_size(q), 81_920);
-            topomalloc_free_sized(q, 40_000); // C23: the one valid hint
+            let p = topomalloc_malloc(80_000); // 5 pages (16 KiB pages)
+            let p_usable = topomalloc_malloc_usable_size(p);
+            assert!(p_usable >= 80_000);
+            let q = topomalloc_realloc(p, 40_000); // shrink: 40000 → 49152 (3 pages)
+            assert_eq!(q, p, "an in-place medium shrink keeps the same base");
+            let q_usable = topomalloc_malloc_usable_size(q);
+            assert!(
+                (49_152..=p_usable).contains(&q_usable),
+                "usable covers the page-rounded new size and never grows on a shrink \
+                 (extent-backed returns the tail to 49152; cache-served keeps it whole): \
+                 q_usable={q_usable}, p_usable={p_usable}"
+            );
+            topomalloc_free_sized(q, 40_000); // C23: the one valid hint, accepted
         }
     }
 

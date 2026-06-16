@@ -1599,8 +1599,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// * `ptr == NULL` → plain allocation.
     /// * same small class → in-place, return `ptr` (W15-3a; commits nothing,
     ///   so it cannot fail).
-    /// * medium/large whose rounded `new_size` fits the current extent and
-    ///   whose base satisfies the alignment → in-place, return `ptr`.
+    /// * medium/large grow whose rounded `new_size` still fits the current
+    ///   extent and whose base satisfies the alignment → in-place, return `ptr`
+    ///   (W15-3a).
+    /// * medium/large **shrink** across a page boundary → in-place, splitting
+    ///   off and returning the tail pages to the backend, return `ptr` (W15-3b;
+    ///   best-effort — a cache-served region or an exhausted split keeps the
+    ///   allocation whole, which is still correct).
     /// * otherwise → move: allocate, copy `min(old_usable, new_size)`, free
     ///   the original last (W15-2).
     ///
@@ -1683,12 +1688,33 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // (a small-class request moves, so the extent is returned
                     // rather than pinned under a tiny object), its page-rounded
                     // size still fits this extent, and the base satisfies the
-                    // requested alignment. Commits nothing; cannot fail.
+                    // requested alignment.
                     if let Some(req) = classify(new_size, min_align, flags.raw()) {
                         if !matches!(req.kind, RequestKind::Small { .. }) {
                             let effective = if new_size == 0 { 1 } else { new_size };
                             if let Some(rounded) = align_up(effective, PAGE_SIZE) {
                                 if rounded <= usable && (ptr as usize).is_multiple_of(min_align) {
+                                    // W15-3b in-place **shrink**: a strict page-rounded
+                                    // shrink returns the tail pages to the backend
+                                    // (§25.3, DD-1 "shrink, large tail → split + return
+                                    // tail"); an equal-size request just keeps `ptr`.
+                                    // The shrink is **best-effort** — a cache-served
+                                    // region or a slot-exhausted split keeps the
+                                    // allocation whole, still a correct realloc — so it
+                                    // never fails the call. On success the freed tail is
+                                    // accounted so `live_bytes` and the (preserved)
+                                    // arena's quota stay exact (§8.6/§36.17), mirroring
+                                    // the §25.4 arena preservation of the move path.
+                                    if rounded < usable {
+                                        // SAFETY: `ptr` is the live base pointer being
+                                        // realloc'd (this function's own contract); the
+                                        // caller does not concurrently free/realloc it.
+                                        if let Some(freed) = unsafe { owner.shrink(ptr, rounded) } {
+                                            self.freed_bytes
+                                                .fetch_add(freed as u64, Ordering::Relaxed);
+                                            self.arenas.credit(arena, freed as u64);
+                                        }
+                                    }
                                     return ptr;
                                 }
                             }
@@ -2653,6 +2679,146 @@ mod tests {
         assert!(trealloc(&a, foreign, 100, MIN_ALIGN, RequestFlags::NONE).is_null());
         // SAFETY: reclaiming the untouched foreign Box.
         drop(unsafe { Box::from_raw(foreign.cast::<u64>()) });
+    }
+
+    /// W15-3b: a medium/large in-place **shrink** across a page boundary keeps
+    /// the same base pointer but returns the tail pages to the backend (§25.3,
+    /// DD-1 "shrink, large tail → split + return tail"). The usable size drops to
+    /// the page-rounded new size, the backend's `active` bytes drop by exactly the
+    /// returned tail, the preserved prefix survives, the default arena's `used`
+    /// and the global `live_bytes` both reconcile (§8.6/§36.17), and the engine
+    /// stays well-formed. A shrink that does *not* cross a page boundary keeps the
+    /// whole extent (no tail to give back).
+    #[test]
+    fn realloc_large_shrink_returns_the_tail_pages() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A medium allocation (> SMALL_MAX) is extent-backed.
+        let old = 80_000usize;
+        let p = a.malloc(old);
+        assert!(!p.is_null());
+        let old_usable = a.usable_size(p).unwrap();
+        assert_eq!(old_usable, align_up(old, PAGE_SIZE).unwrap());
+        // Fill the whole usable size with a recognizable pattern.
+        // SAFETY: `old_usable` writable bytes.
+        unsafe {
+            for i in 0..old_usable {
+                p.add(i).write((i as u8) ^ 0x3c);
+            }
+        }
+        let active_before = a.stats().large_backend.active;
+        assert_eq!(active_before, old_usable, "the one live medium is Active");
+        assert_eq!(a.stats().live_bytes, old_usable as u64);
+
+        // Shrink to a smaller medium size that crosses a page boundary.
+        let new = 40_000usize;
+        let new_usable = align_up(new, PAGE_SIZE).unwrap();
+        assert!(
+            new_usable < old_usable,
+            "the test must cross a page boundary"
+        );
+        let q = trealloc(&a, p, new, MIN_ALIGN, RequestFlags::NONE);
+        assert_eq!(q, p, "in-place shrink keeps the base pointer");
+        assert_eq!(
+            a.usable_size(q).unwrap(),
+            new_usable,
+            "usable drops to the page-rounded new size"
+        );
+
+        // The tail pages went back to the backend: `active` dropped by exactly the
+        // returned tail; the engine is well-formed and the accounting reconciles.
+        let freed = old_usable - new_usable;
+        assert_eq!(
+            a.stats().large_backend.active,
+            active_before - freed,
+            "the tail's bytes are no longer Active (returned to the backend)"
+        );
+        assert_eq!(
+            a.stats().live_bytes,
+            new_usable as u64,
+            "global live_bytes reconciles after the shrink (§8.6)"
+        );
+        assert_eq!(
+            a.arena_stats(ArenaId::DEFAULT).unwrap().used,
+            new_usable as u64,
+            "the arena's quota is credited the freed tail (§36.17)"
+        );
+        assert_eq!(a.live_large_count(), 1, "still one live large allocation");
+        assert!(a.check_invariants());
+
+        // The preserved prefix survived the shrink (§25.4 content preservation).
+        // SAFETY: `new_usable` readable bytes.
+        unsafe {
+            for i in 0..new_usable {
+                assert_eq!(q.add(i).read(), (i as u8) ^ 0x3c, "content lost at {i}");
+            }
+        }
+
+        // A shrink that stays within the same page count keeps the whole extent
+        // (nothing to return): the base and usable size are unchanged.
+        let s = trealloc(&a, q, new_usable - 1, MIN_ALIGN, RequestFlags::NONE);
+        assert_eq!(s, q, "a sub-page shrink stays in place");
+        assert_eq!(
+            a.usable_size(s).unwrap(),
+            new_usable,
+            "a sub-page shrink keeps the extent whole"
+        );
+        assert_eq!(a.stats().live_bytes, new_usable as u64);
+
+        // Free reconciles back to zero — the descriptor now frees only the prefix.
+        assert_eq!(tfree(&a, s), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert_eq!(a.live_large_count(), 0);
+        let st = a.stats();
+        assert_eq!(
+            st.allocated_bytes_total, st.freed_bytes_total,
+            "allocated == freed after the final free"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// W15-3b under an **explicit arena** (§25.4 arena preservation + §36.17
+    /// exactness): a shrink credits the freed tail back to the allocation's
+    /// *original* arena, never the default arena the realloc flags name, and the
+    /// shrunk object can still be freed cleanly with the arena drained to zero.
+    #[test]
+    fn realloc_large_shrink_credits_the_owning_arena() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+
+        // Allocate a medium object in the explicit arena.
+        let p = a.allocate_in(id, 90_000, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null());
+        let old_usable = a.usable_size(p).unwrap();
+        assert_eq!(a.arena_stats(id).unwrap().used, old_usable as u64);
+
+        // Shrink across a page boundary (flags name NONE ⇒ the default arena; the
+        // shrink must still credit `id`, the original arena, per §25.4).
+        let q = trealloc(&a, p, 50_000, MIN_ALIGN, RequestFlags::NONE);
+        assert_eq!(q, p);
+        let new_usable = a.usable_size(q).unwrap();
+        assert!(new_usable < old_usable);
+        assert_eq!(
+            a.arena_stats(id).unwrap().used,
+            new_usable as u64,
+            "the freed tail is credited to the original arena (§25.4/§36.17)"
+        );
+        assert_eq!(
+            a.arena_stats(ArenaId::DEFAULT).unwrap().used,
+            0,
+            "the shrink did not migrate accounting to the default arena"
+        );
+        assert!(a.check_invariants());
+
+        // Free drains the arena to zero.
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert_eq!(a.arena_stats(id).unwrap().used, 0);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert!(a.check_invariants());
     }
 
     #[test]

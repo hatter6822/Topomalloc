@@ -1,9 +1,16 @@
 -- SPDX-License-Identifier: MIT
 /-
-§25.4 / §33.4 theorems for the realloc **move** path (plan 06 W8-1a, W15-2).
+§25.3/§25.4 / §33.4 theorems for the realloc **move** path (plan 06 W8-1a, W15-2)
+and the in-place **shrink** obligation (W15-3b).
 
 * `realloc_move_window_keeps_old_live`
 * `realloc_move_preserves_wellformed`
+* `realloc_shrink_inplace_tail_tiles_disjointly` — the W15-3b in-place-shrink
+  geometric obligation, discharged against the certified `extent_split` geometry
+  (`span_split_preserves_disjointness`). See its docstring for why the in-place
+  large shrink introduces no new abstract transition (it sequences the certified
+  extent split + free, the W12 pattern — not a `reallocMove`, whose copy window
+  needs two disjoint live ranges that two same-base ranges can never be).
 
 `reallocMove` is the composition `free (malloc s bNew) bOld o` — allocate
 first, free last (§25.4). The two theorems pin the properties the runtime
@@ -25,6 +32,7 @@ purely syntactic; see `Transitions.lean`.
 -/
 import TopoMalloc.Theorems.Malloc
 import TopoMalloc.Theorems.Free
+import TopoMalloc.Theorems.Span
 
 namespace TopoMalloc
 
@@ -68,5 +76,41 @@ theorem realloc_move_preserves_wellformed (s : State) (bNew bOld : BlockId) (o :
   exact free_preserves_wellformed_for_valid_pointer (malloc s bNew) bOld o
     (malloc_preserves_wellformed s bNew hwf hnonlive hcommitted)
     hne_live hne_cpu hcache hcentral
+
+/-- **`realloc_shrink_inplace_tail_tiles_disjointly` (§25.3, plan 06 W15-3b) — the
+in-place-shrink geometric obligation.** The runtime returns a medium/large
+allocation's tail pages by *splitting its backing extent* at the page-rounded new
+size `k ≤ len` and freeing the upper half (`LargeAllocator::shrink`).
+
+This adds **no new abstract transition**, and the reason is specific — not a
+hand-wave. A large allocation is **not** a core `Block`: clause 12
+(`WfSlabLayout`) keys every block to a size class, so the §33.3 block state
+machine (malloc/free/realloc-move over `s.blocks`) models only the small-object
+slab path. A large allocation is modelled in the **extent backend**, where the
+split is the certified `extent_split` (§18.3) and the tail-free is the certified
+`extent free` (§20.1 `ExtentState`, pinned by the `extent state machine` gate).
+The in-place shrink simply **sequences** those two — the same shape as the W12
+release controller sequencing the certified release transition (`release_to_os_*`),
+**not** the W13/W14 case (placement policy that is invisible to the abstract
+state). So crucially it is *not* `reallocMove`: that needs the old and new blocks
+**simultaneously live and disjoint** (the copy window), which two same-base ranges
+can never be — the shrink instead frees the tail, so nothing overlapping is ever
+live at once.
+
+The one geometric fact the sequencing rests on is discharged here against the
+certified `span_split_preserves_disjointness`: the **kept prefix** `splitLeft`
+stays disjoint from every range `x` already disjoint from the whole extent (so the
+still-live front of the allocation never aliases its neighbours), **and** the kept
+prefix and the **returned tail** `splitRight` never overlap (so a later
+reallocation of the freed tail can never alias the live prefix — the
+retire-before-free ordering's geometric premise). Naming it makes the
+"composition of certified mechanisms" claim a machine-checked artifact rather than
+a prose assertion. -/
+theorem realloc_shrink_inplace_tail_tiles_disjointly
+    (extent x : Range) (k : Nat) (hk : k ≤ extent.len) (hx : Range.Disjoint x extent) :
+    Range.Disjoint x (splitLeft extent k) ∧
+      Range.Disjoint (splitLeft extent k) (splitRight extent k) :=
+  let h := span_split_preserves_disjointness extent x k hk hx
+  ⟨h.1, h.2.2⟩
 
 end TopoMalloc

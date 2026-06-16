@@ -50,9 +50,20 @@ exclude = ["fuzz", "vendor/sele4n"]
 # LLC-domain ids too (not just NUMA nodes), so the documented no-phantom-domain invariant
 # holds for *any* builder caller (not only the sysfs reader) and `llc_count()`/stats stay
 # exact on a sparsely-numbered LLC space; dropped the now-dead `max_node`/`max_llc` builder
-# fields. In a 0.x series new backwards-compatible functionality is a patch bump
-# (the 0.x minor is the breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.16"
+# fields. 0.1.17: W15-3b (plan 06) completes in-place realloc **shrink** — a
+# medium/large shrink across a page boundary now splits off and returns the tail
+# pages to the backend (§25.3), via `ExtentManager::split_tail` +
+# `LargeAllocator::shrink` + `LargeDescriptor::shrink_usable`, with exact
+# `live_bytes`/arena-quota accounting and the in-place semantics still best-effort
+# (cache-served / exhausted-split keep the allocation whole). 0.1.18: formal-obligation
+# review (the W15-3b lesson) — pin every "policy, no Lean obligation" claim with a cited
+# artifact: the `realloc_shrink_inplace_tail_tiles_disjointly` theorem (W15-3b), the
+# `placement_never_breaks_the_allocation_contract` fixed wall (W13), and the
+# `controller_driven_release_preserves_live_objects` end-to-end test (W12); plus a new
+# `cargo xtask lint` gate (`obligation citations (V-004)`) that fails a bare claim. In a
+# 0.x series new backwards-compatible functionality is a patch bump (the 0.x minor is the
+# breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
+version = "0.1.18"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

@@ -30,6 +30,10 @@
 //!
 //! Placement is **policy, not safety** (§2.4): a misrouted or unbound allocation hurts
 //! locality but is always a sound, committed pointer — so there is no Lean obligation.
+//! That claim is not left to prose: the fixed-wall test
+//! `placement_never_breaks_the_allocation_contract` (this module's tests) pins the §2.4
+//! boundary (size / alignment / full-range validity / free-home are invariant under every
+//! NUMA policy *and* a bind failure), the W13 analogue of W14's hint-invariance wall.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -773,6 +777,86 @@ mod tests {
         assert!(r.try_cache(p1));
         assert!(r.check_invariants());
         assert_eq!(r.stats().bind_failures, 0);
+    }
+
+    /// **The §2.4 placement safety boundary, as a fixed wall** — the W13 analogue of
+    /// W14's `engine_size_align_validity_free_are_invariant_under_hints`. A routed
+    /// allocation's *size, alignment, full-range validity, and free-home* are invariant
+    /// under **every** NUMA policy **and even a bind failure**: placement steers
+    /// locality, never correctness (§2.4). W13 is pure policy, so it carries no Lean
+    /// obligation — and **this test pins the machine-checked boundary that licenses that
+    /// claim**, rather than leaving "placement is policy" a prose assertion. (`MockProvider`
+    /// backs each reservation with real `alloc`, so the writes below exercise genuine
+    /// committed memory.)
+    #[test]
+    fn placement_never_breaks_the_allocation_contract() {
+        let policies = [
+            NumaPolicy::Local,
+            NumaPolicy::Bind(NodeId(0)),
+            NumaPolicy::Bind(NodeId(1)),
+            NumaPolicy::Bind(NodeId(99)), // a stale id must clamp to a real node, never fail/escape
+            NumaPolicy::Interleave,
+            NumaPolicy::OsDefault,
+            NumaPolicy::ArenaPolicy,
+        ];
+        // Medium (sub-hugepage), exactly one hugepage, and just-over-a-hugepage (the
+        // awkward region-cache size) — the families the router serves.
+        let sizes = [
+            64 * 1024usize,
+            200 * 1024,
+            HUGEPAGE_SIZE,
+            HUGEPAGE_SIZE + PAGE_SIZE,
+        ];
+        for fail_bind in [false, true] {
+            // Ample per-node capacity so the contract sweep never spill-OOMs — capacity is
+            // W11's concern (tested there); here we isolate the placement boundary, freeing
+            // each region before the next so one hugepage per node would in fact suffice.
+            let r = router(two_node_topo(), 16, fail_bind);
+            for &policy in &policies {
+                for &size in &sizes {
+                    let region = r.try_alloc(size, PAGE_SIZE, hints(policy)).unwrap_or_else(|| {
+                        panic!("policy {policy:?} size {size} (fail_bind={fail_bind}) was not served")
+                    });
+                    // Size invariant: the served region covers the request (never under-allocates).
+                    assert!(
+                        region.len >= size,
+                        "{policy:?} size {size}: region len {} < requested",
+                        region.len
+                    );
+                    // Alignment invariant: page-aligned regardless of which node served it.
+                    assert_eq!(
+                        region.base as usize % PAGE_SIZE,
+                        0,
+                        "{policy:?} size {size}: region misaligned"
+                    );
+                    // Validity invariant: the whole region is writable and reads back — a
+                    // bind failure (locality lost) must still yield committed, usable memory.
+                    // SAFETY: `region` is a live region of `region.len` writable bytes the
+                    // router just handed out and still owns (freed below).
+                    unsafe {
+                        core::ptr::write_bytes(region.base, 0xC3, region.len);
+                        assert_eq!(
+                            *region.base, 0xC3,
+                            "{policy:?} size {size}: head unreadable"
+                        );
+                        assert_eq!(
+                            *region.base.add(region.len - 1),
+                            0xC3,
+                            "{policy:?} size {size}: tail unreadable"
+                        );
+                    }
+                    // Free-home invariant: the region returns to its owning node's backend.
+                    assert!(
+                        r.try_cache(region),
+                        "{policy:?} size {size}: free-home failed"
+                    );
+                }
+            }
+            assert!(
+                r.check_invariants(),
+                "router well-formed after the contract sweep (fail_bind={fail_bind})"
+            );
+        }
     }
 
     #[test]

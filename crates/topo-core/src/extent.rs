@@ -1842,6 +1842,53 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         Ok((region, Some(r)))
     }
 
+    /// Split the **live** ([`Active`](ExtentState::Active)) extent `r` at
+    /// `prefix_len` page-aligned bytes, keeping `[base, base + prefix_len)` in `r`
+    /// (its [`ExtentRef`] stays valid — `split` bumps only `split_generation`, not
+    /// the recycle `generation`) and returning the tail
+    /// `[base + prefix_len, base + len)` as a **fresh, still-`Active`** extent
+    /// (§18.3, plan 06 W15-3b — the large/medium in-place shrink).
+    ///
+    /// The tail is deliberately **not** freed here: the caller owns the
+    /// retire-before-free ordering (clear the tail's pagemap entries, shrink the
+    /// owning descriptor, *then* [`free`](Self::free) the returned ref), so a reuse
+    /// of the eventually-freed tail can never collide with stale pagemap entries —
+    /// the same discipline `Allocator::retire_span` follows.
+    ///
+    /// On **any** failure — `r` stale or not `Active`, `prefix_len` not a nonzero
+    /// page multiple strictly inside the extent, or the descriptor-slot pool
+    /// exhausted — **nothing is mutated** (`split_in`'s slot pop is the first and
+    /// only fallible step) and the error is returned, so the original extent stays
+    /// exactly as it was. This is the W4-5 / §25.3 safety guarantee a failed
+    /// in-place shrink relies on: it falls back to keeping the allocation whole.
+    ///
+    /// SPEC-transition: `extent_split` (§18.3 / §33.4 `span_split_preserves_disjointness`)
+    pub fn split_tail(&self, r: ExtentRef, prefix_len: usize) -> Result<ExtentRef, ExtentError> {
+        let notify = self.notifier();
+        let g = self.lock();
+        let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
+        // Only a live allocation can be shrunk in place; a free extent has no owner
+        // to keep the prefix for (M-004: never resize a range with no live object).
+        if e.state != ExtentState::Active {
+            return Err(ExtentError::NotFree);
+        }
+        // `split_in` validates `prefix_len` (a nonzero page multiple `< len`) and is
+        // the sole fallible step — a `None` leaves the back-end untouched (W4-5).
+        let tail = g
+            .map
+            .split_in(r.id, prefix_len, &notify)
+            .ok_or(ExtentError::Exhausted)?;
+        // The tail inherits the parent's `Active` state and full backing; report a
+        // generation-checked ref so the caller's subsequent `free` cannot resolve a
+        // stale slot (DD-1 F2).
+        let generation = g.map.view(tail).expect("just split").generation;
+        debug_assert!(g.map.check_invariants());
+        Ok(ExtentRef {
+            id: tail,
+            generation,
+        })
+    }
+
     /// Free extent `r`, applying the retain/unmap policy (§20.5, W4-3b): retain
     /// keeps the backing ([`Dirty`](ExtentState::Dirty)); unmap decommits it
     /// eagerly ([`Released`](ExtentState::Released)). Coalesces with free

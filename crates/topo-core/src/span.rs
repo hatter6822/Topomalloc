@@ -1349,6 +1349,39 @@ impl LargeDescriptor {
         self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Shrink this **live** descriptor's usable size to `new_usable` in place — an
+    /// in-place realloc shrink that returned the allocation's tail pages to the
+    /// backend (§25.3, plan 06 W15-3b). The id, base, alignment, arena, and
+    /// generation are all unchanged (this is the *same* allocation at the *same*
+    /// address, just smaller); only the usable size and the integrity tag move.
+    ///
+    /// Run under the seqlock so a concurrent classifier reading through
+    /// [`read_consistent`](Self::read_consistent) never composes a stale/new
+    /// `usable_size` across the update (W3-4) — the same discipline as
+    /// [`recycle`](Self::recycle), minus the generation bump (the allocation keeps
+    /// its identity, so outstanding base pointers stay valid). The caller MUST have
+    /// retired the returned tail's pagemap entries first (the
+    /// [`PageMap::retire_large_range`](crate::PageMap) ordering).
+    ///
+    /// SPEC-transition: large in-place shrink (§25.3) — sequences the certified
+    /// `extent_split` (§18.3) + `extent free` (§20.1); adds no abstract transition,
+    /// the geometric premise pinned by the `realloc_shrink_inplace_tail_tiles_disjointly`
+    /// theorem (`lean/TopoMalloc/Theorems/Realloc.lean`, plan 06 W15-3b).
+    pub fn shrink_usable(&self, new_usable: usize) {
+        debug_assert!(
+            new_usable <= self.usable_size(),
+            "shrink_usable must not grow the allocation"
+        );
+        // Open the seqlock (odd): a classifier reading through `read_consistent`
+        // retries rather than mixing the old and new usable size (W3-4).
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        self.usable_size.store(new_usable, Ordering::Release);
+        // The integrity tag (§17.3) covers `usable_size`, so recompute it.
+        self.refresh_integrity();
+        // Close the seqlock (even): publish the shrunk geometry.
+        self.seq.fetch_add(1, Ordering::AcqRel);
+    }
+
     #[inline]
     fn refresh_integrity(&self) {
         self.integrity
