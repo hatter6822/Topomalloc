@@ -149,23 +149,31 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 ## Current Development Status
 
 **Milestone:** M0 closed; M1 (central-path allocator) under way. M2 (front-end caches) is next.
-Reallocation, aligned allocation & calloc zeroing (W15) is **landed** (all units): the §25 realloc
-state machine — `realloc(NULL,n)`/`realloc(p,0)` policy, content preservation, failure-preserves-the-
-original via the always-correct move path (§25.4, arena preserved, sampled as a realloc), same-class &
-within-extent in-place grow (§25.2), and in-place **shrink** (§25.3, W15-3b) that splits off and
-returns a medium/large allocation's tail pages to the backend across a page boundary
-(`ExtentManager::split_tail` → `PageMap::retire_large_range` → `LargeDescriptor::shrink_usable` → free,
-with exact `live_bytes`/arena-quota accounting; cache-served/exhausted-split keep the allocation whole,
-best-effort under always-correct semantics §2.4) — plus aligned validation (§25.5) and calloc
-`n*size`+rounding overflow guards with full-usable zeroing (§26). A large allocation is modeled in the
-**extent backend**, not as a core `Block` (clause 12 keys every block to a size class), so the in-place
-shrink **sequences the certified extent transitions** `extent_split` (§18.3) + `extent free` (§20.1) —
-the W12 "sequence certified backend mechanisms" pattern, **not** the W13/W14 "placement policy invisible
-to abstract state" one, and **not** `reallocMove` (whose copy window needs two simultaneously-live
-disjoint ranges that two same-base ranges can never be). It therefore adds no new §33.4 obligation; the
-geometric premise (kept prefix disjoint from neighbours; prefix and returned tail never overlap) is
-pinned by `realloc_shrink_inplace_tail_tiles_disjointly`, discharged against
-`span_split_preserves_disjointness`.
+Reallocation, aligned allocation & calloc zeroing (W15) is **complete and optimal** (all units, no
+deferrals): the §25 realloc state machine — `realloc(NULL,n)`/`realloc(p,0)` policy, content
+preservation, failure-preserves-the-original via the always-correct move path (§25.4, arena preserved,
+sampled as a realloc), in-place **grow** (§25.2, W15-3a) — same-class/within-extent *and* **extent-merge
+grow** that absorbs the address-adjacent free extent (no copy; `ExtentManager::grow_in_place`), and
+in-place **shrink** (§25.3, W15-3b) that returns a medium/large allocation's tail pages to the backend:
+the extent path splits off the tail (`split_tail` → `retire_large_range` → `shrink_usable` → free), the
+**cache-served hugepage path trims the tail in the filler** (`HugePageFiller::trim` via the
+`RegionCacheHook::try_trim` seam), both with exact `live_bytes`/arena-quota accounting (§8.6/§36.17). The
+dedicated in-place-resize API `xallocx` shares this via `Allocator::resize_in_place` (shrink + grow, never
+move). calloc zeroing (§26) elides the redundant `memset` when the backing is **freshly OS-zeroed**
+(`TopoBackingProvider::committed_memory_is_zeroed`, POSIX `true`), guarded by a debug check; it re-zeroes a
+recycled extent. **Aligned classes (W15-4):** the generated size-class table records each class's
+**natural alignment** (largest power of two dividing its size, capped at the page-aligned slab base), so a
+cache-line-aligned (or any power-of-two ≤ page) small request is served from a **slab slot, not a page**
+(via the already-proven over-alignment walk; `MAX_ALIGN` is now the page size). `valloc`/`pvalloc` round
+out the §10.1 surface. A large allocation is modeled in the **extent backend**, not as a core `Block`
+(clause 12 keys every block to a size class), so the in-place grow/shrink **sequence the certified extent
+transitions** `extent_split`/`extent_merge` (§18.3) + `extent free` (§20.1) — the W12 "sequence certified
+backend mechanisms" pattern, **not** `reallocMove` (whose copy window needs two simultaneously-live
+disjoint ranges that two same-base ranges can never be). They add no new §33.4 obligation; the geometric
+premises are pinned by `realloc_shrink_inplace_tail_tiles_disjointly` (via `span_split_preserves_disjointness`)
+and `realloc_grow_inplace_absorbs_disjointly` (via `span_merge_preserves_disjointness`), and aligned
+classes need no proof change (the over-alignment walk + `maxAlign` bound were already proven, re-verified by
+the G-table/`maxAlignOkB` gates).
 Capability-backed arenas (W9) are implemented ahead of their M4 slot: the full §22/§36.4/§36.13
 lifecycle (create / delegate / reset / destroy / revocation), a live multi-arena data path with
 per-arena isolation (§22.7), quota / authority / label enforcement, and NUMA policy modes (§15.5).
@@ -305,13 +313,13 @@ citations (V-004)`, `docs/CONVENTIONS.md` §8) makes a bare "no Lean obligation"
 cited theorem or fixed-wall test in the same comment block — fail CI, so the gap cannot recur.
 
 **Test counts:**
-- Rust: ~719 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~728 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)
 
 **Lean gates (`lake exe check`):**
-- G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16)
+- G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16384 — each class records its natural alignment so over-aligned small requests are slab-served, W15-4)
 - Trace oracle OK (§33.7 replay)
 - Pagemap differential OK (W3-3d)
 - Provider state machine OK (§36.6, W4-1)

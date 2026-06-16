@@ -1298,6 +1298,79 @@ impl HugePageFiller {
         }
     }
 
+    /// **In-place tail trim (§25.3 / W15-3b cache-served shrink).** Shrink the live
+    /// allocation based at `base` from `old_pages` to `new_pages` (`1 ≤ new < old`),
+    /// freeing its tail pages `[off+new, off+old)` back to the filler so it can pack
+    /// them into this hugepage again. The kept prefix `[off, off+new)` stays live
+    /// **with its head**, so a later [`free`](Self::free)`(base, new_pages)` validates
+    /// exactly. Returns `true` on success, `false` (no change) for a bad/non-live
+    /// range — the same exact-extent validation as `free` (the run must be a single
+    /// live allocation based at `off`).
+    ///
+    /// Unlike `free`/`subrelease`, this is **not** reachable from a public, forgeable
+    /// `Region` (S-007): it is called only by the trusted realloc path, which supplies
+    /// the true `old_pages` from the live descriptor — so it cannot be tricked into a
+    /// partial free of someone else's allocation. The freed tail stays **committed**
+    /// (reusable by the filler); the W12 release controller subreleases cold pages
+    /// later, exactly as the extent shrink leaves its tail Dirty under the retain
+    /// policy.
+    ///
+    /// SPEC-transition: large in-place shrink (§25.3, W15-3b) — frees the
+    /// allocation's tail pages: the same page-bitmap free as [`free`](Self::free) /
+    /// [`subrelease`](Self::subrelease) over a sub-run, so the §19.8 H-invariants are
+    /// preserved, debug-asserted by [`check_invariants`](Self::check_invariants).
+    pub fn trim(&mut self, base: usize, old_pages: usize, new_pages: usize) -> bool {
+        if new_pages == 0 || new_pages >= old_pages {
+            return false;
+        }
+        let hp = match self.index_of(base) {
+            Some(i) => i,
+            None => return false,
+        };
+        let s0 = self.get(hp);
+        if s0.touched == 0 || !(base - self.region_base).is_multiple_of(PAGE_SIZE) {
+            return false;
+        }
+        let off = (base - self.huge_base(hp)) / PAGE_SIZE;
+        if off + old_pages > PAGES_PER_HUGEPAGE {
+            return false;
+        }
+        // Exact-extent validation (M-004/S-007), identical to `free`: `base` must be an
+        // allocation start, `old_pages` its exact live length, not part of a multi-
+        // hugepage run, with a real boundary after it — never a partial/interior range.
+        if s0.in_run != 0 || !bit_get(&s0.heads, off) {
+            return false;
+        }
+        if run_popcount(&s0.live, off, old_pages) != old_pages {
+            return false;
+        }
+        let mut e = off + 1;
+        while e < off + old_pages {
+            if bit_get(&s0.heads, e) {
+                return false; // `old_pages` spans into a later allocation
+            }
+            e += 1;
+        }
+        if off + old_pages < PAGES_PER_HUGEPAGE
+            && bit_get(&s0.live, off + old_pages)
+            && !bit_get(&s0.heads, off + old_pages)
+        {
+            return false; // `old_pages` stops short of this allocation's real end
+        }
+        // Free only the tail `[off+new, off+old)`; the head at `off` stays, so the
+        // kept prefix remains the same live allocation (just shorter).
+        let mut s = self.get(hp);
+        let mut k = off + new_pages;
+        while k < off + old_pages {
+            bit_clear(&mut s.live, k);
+            k += 1;
+        }
+        self.put(hp, s);
+        self.refile(hp);
+        debug_assert!(self.check_invariants());
+        true
+    }
+
     // --- partial subrelease (W11-4b, H-005) ----------------------------------
 
     /// **§19.6 partial subrelease (W11-4b).** Attempt to return the `pages`-page run
@@ -2329,6 +2402,40 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         ok
     }
 
+    /// **In-place tail trim** of a cache-served allocation (§25.3 / W15-3b
+    /// cache-served shrink): shrink the live sub-hugepage allocation described by
+    /// `region` (its base + current usable length) to `new_len` page-rounded bytes,
+    /// freeing its tail pages back to the filler. Returns `Some(freed_bytes)` on
+    /// success, or `None` (no change) if `region` is not ours, the request is not a
+    /// strict page-rounded shrink, the run is not a single live allocation, or it is
+    /// a **multi-hugepage run** (whose tail-hugepage release is the W12 controller's
+    /// job, not an in-place realloc trim). The freed tail stays committed (reusable
+    /// by the filler), as the extent shrink leaves its tail Dirty under the retain
+    /// policy; W12 subreleases cold pages later.
+    pub fn trim_region(&self, region: Region, new_len: usize) -> Option<usize> {
+        if self.released {
+            return None;
+        }
+        let base = region.base as usize;
+        let (rlo, rhi) = self.region.addr_range();
+        if base < rlo || base >= rhi || region.len == 0 {
+            return None; // not ours
+        }
+        let old_pages = region.len / PAGE_SIZE;
+        let new_pages = pages_for(new_len.max(1), PAGE_SIZE)?;
+        // Only a strict shrink within a single hugepage trims in place.
+        if new_pages >= old_pages || old_pages > PAGES_PER_HUGEPAGE {
+            return None;
+        }
+        let g = self.lock();
+        if g.inner.filler.trim(base, old_pages, new_pages) {
+            debug_assert!(g.inner.filler.check_invariants());
+            Some((old_pages - new_pages) * PAGE_SIZE)
+        } else {
+            None
+        }
+    }
+
     /// **Partial subrelease** of the `pages`-page run at `base` (§19.6, W11-4b): the
     /// filler decides under the §19.6 guards (H-005 etc.), and on success this
     /// **revokes the run's descendant capabilities then `decommit`s it** through the
@@ -2569,6 +2676,13 @@ impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
         }
         self.free_region(region)
     }
+
+    #[inline]
+    fn try_trim(&self, region: Region, new_len: usize) -> Option<usize> {
+        // W15-3b cache-served shrink: trim the allocation's tail pages back to the
+        // filler in place (sub-hugepage only; a run keeps whole).
+        self.trim_region(region, new_len)
+    }
 }
 
 impl<P: TopoBackingProvider> Drop for HugePageBackend<P> {
@@ -2614,6 +2728,44 @@ mod filler_tests {
         f.mark_committed(&p);
         assert!(f.check_invariants());
         p
+    }
+
+    /// W15-3b D: `trim` frees an allocation's tail pages back to the filler while the
+    /// kept prefix stays a valid single allocation; it rejects non-strict shrinks and
+    /// non-allocation-start bases (the same exact-extent guard as `free`, S-007).
+    #[test]
+    fn trim_frees_the_tail_and_keeps_the_prefix_a_valid_allocation() {
+        let mut f = filler(1);
+        let p = place_ok(&mut f, 4, PAGE_SIZE, Hotness::Neutral);
+        let base = p.base;
+        assert_eq!(p.pages, 4);
+
+        // Trim 4 → 2: the tail [2,4) returns to the filler; the prefix [0,2) stays live.
+        assert!(
+            f.trim(base, 4, 2),
+            "trim a live 4-page allocation to 2 pages"
+        );
+        assert!(f.check_invariants());
+        // The trimmed prefix is still one valid allocation — `free(base, 2)` validates
+        // exactly (head at base, exact 2-page extent, boundary after).
+        assert!(
+            f.free(base, 2).valid,
+            "the trimmed prefix frees cleanly as a 2-page run"
+        );
+        assert!(f.check_invariants());
+
+        // Rejections (no change), mirroring `free`'s exact-extent guard.
+        let q = place_ok(&mut f, 3, PAGE_SIZE, Hotness::Neutral);
+        assert!(!f.trim(q.base, 3, 3), "new == old is not a shrink");
+        assert!(!f.trim(q.base, 3, 0), "new == 0 is rejected");
+        assert!(
+            !f.trim(q.base + PAGE_SIZE, 2, 1),
+            "an interior page is not an allocation start"
+        );
+        assert!(!f.trim(q.base, 5, 2), "old beyond the live run is rejected");
+        // The intact allocation still frees normally.
+        assert!(f.free(q.base, 3).valid);
+        assert!(f.check_invariants());
     }
 
     #[test]

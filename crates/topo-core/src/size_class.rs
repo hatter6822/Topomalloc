@@ -63,9 +63,12 @@ pub fn size_class(size: usize, align: usize) -> Option<SizeClassId> {
 
 /// Table-parametric core of [`size_class`] (W2-2a/W2-3b). Extracting it lets the
 /// full granule-lookup → over-alignment-walk composition be unit-tested against
-/// synthetic tables that actually contain over-aligned classes — the shipped
-/// table is uniformly 16-aligned, so the public `size_class` never advances the
-/// walk at runtime. The parameters mirror the generated constants exactly.
+/// synthetic tables. The shipped table records each class's **natural alignment**
+/// (the largest power of two dividing its size, capped at the page-aligned slab
+/// base — W15-4), so a power-of-two-sized class self-aligns to its size and the
+/// walk genuinely advances at runtime to serve an over-aligned small request from
+/// a slab (e.g. a 64-byte/64-aligned request lands in the 64-byte class), never a
+/// whole page. The parameters mirror the generated constants exactly.
 ///
 /// `align > max_align` short-circuits the common over-aligned reject in O(1) (no
 /// class can satisfy it); the walk still returns `None` correctly for an
@@ -247,12 +250,19 @@ mod tests {
 
     #[test]
     fn oversize_and_overalign_route_out() {
-        assert_eq!(size_class(SMALL_MAX + 1, 1), None);
+        assert_eq!(size_class(SMALL_MAX + 1, 1), None); // oversize → medium/large
         assert_eq!(size_class(0, 1), None);
-        // Every class is 16-aligned in the shipped table, so a >16-byte alignment
-        // request cannot be served by a small class and routes to medium/large.
-        assert_eq!(size_class(16, 32), None);
-        assert_eq!(size_class(1024, 64), None);
+        // Over-aligned **small** requests are now served by a naturally-aligned class
+        // (a power-of-two-divisor-sized class is self-aligned in its page-aligned slab,
+        // W15-4 aligned classes) — not routed to a whole page. The over-alignment walk
+        // advances to the smallest class that is both size- and alignment-sufficient.
+        let c32 = size_class(16, 32).expect("16/32 served by the 32-aligned class");
+        assert!(row(c32).size >= 16 && row(c32).align >= 32 && row(c32).size.is_multiple_of(32));
+        let c64 = size_class(1024, 64).expect("1024/64 served by an aligned class");
+        assert!(row(c64).size >= 1024 && row(c64).align >= 64);
+        // Only an alignment beyond every class (> MAX_ALIGN) routes to medium/large.
+        assert_eq!(size_class(16, tables::MAX_ALIGN * 2), None);
+        assert_eq!(size_class(SMALL_MAX, tables::MAX_ALIGN * 2), None);
     }
 
     #[test]

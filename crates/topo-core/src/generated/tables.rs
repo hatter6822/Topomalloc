@@ -19,7 +19,7 @@ pub const SMALL_MAX: usize = 32768;
 pub const HUGE_THRESHOLD: usize = 2097152;
 /// Largest natural alignment any size class provides, in bytes. A request
 /// needing more than this can never be served by a small class.
-pub const MAX_ALIGN: usize = 16;
+pub const MAX_ALIGN: usize = 16384;
 
 /// The size-class table (index = `SizeClassId`).
 pub const SIZE_CLASSES: &[SizeClassRow] = &[
@@ -33,7 +33,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 32,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 512,
         batch: 32,
@@ -49,7 +49,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 64,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 256,
         batch: 32,
@@ -65,7 +65,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 96,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 170,
         batch: 32,
@@ -81,7 +81,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 128,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 128,
         batch: 32,
@@ -97,7 +97,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 160,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 102,
         batch: 32,
@@ -113,7 +113,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 192,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 85,
         batch: 32,
@@ -129,7 +129,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 224,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 73,
         batch: 32,
@@ -145,7 +145,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 256,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 64,
         batch: 32,
@@ -153,7 +153,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 288,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 56,
         batch: 32,
@@ -161,7 +161,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 320,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 51,
         batch: 32,
@@ -169,7 +169,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 352,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 46,
         batch: 32,
@@ -177,7 +177,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 384,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 42,
         batch: 32,
@@ -185,7 +185,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 416,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 39,
         batch: 32,
@@ -193,7 +193,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 448,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 36,
         batch: 32,
@@ -201,7 +201,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 480,
-        align: 16,
+        align: 32,
         slab_pages: 1,
         objects_per_slab: 34,
         batch: 32,
@@ -209,7 +209,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 512,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 32,
         batch: 32,
@@ -217,7 +217,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 576,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 28,
         batch: 32,
@@ -225,7 +225,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 640,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 25,
         batch: 32,
@@ -233,7 +233,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 704,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 23,
         batch: 32,
@@ -241,7 +241,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 768,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 21,
         batch: 32,
@@ -249,7 +249,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 832,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 19,
         batch: 32,
@@ -257,7 +257,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 896,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 18,
         batch: 32,
@@ -265,7 +265,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 960,
-        align: 16,
+        align: 64,
         slab_pages: 1,
         objects_per_slab: 17,
         batch: 32,
@@ -273,7 +273,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1024,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 16,
         batch: 32,
@@ -281,7 +281,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1152,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 14,
         batch: 32,
@@ -289,7 +289,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1280,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 12,
         batch: 32,
@@ -297,7 +297,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1408,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 11,
         batch: 32,
@@ -305,7 +305,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1536,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 10,
         batch: 32,
@@ -313,7 +313,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1664,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 9,
         batch: 32,
@@ -321,7 +321,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1792,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 9,
         batch: 32,
@@ -329,7 +329,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 1920,
-        align: 16,
+        align: 128,
         slab_pages: 1,
         objects_per_slab: 8,
         batch: 32,
@@ -337,7 +337,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 2048,
-        align: 16,
+        align: 2048,
         slab_pages: 1,
         objects_per_slab: 8,
         batch: 32,
@@ -345,7 +345,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 2304,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 7,
         batch: 32,
@@ -353,7 +353,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 2560,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 6,
         batch: 32,
@@ -361,7 +361,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 2816,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 5,
         batch: 32,
@@ -369,7 +369,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 3072,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 5,
         batch: 32,
@@ -377,7 +377,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 3328,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 4,
         batch: 32,
@@ -385,7 +385,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 3584,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 4,
         batch: 32,
@@ -393,7 +393,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 3840,
-        align: 16,
+        align: 256,
         slab_pages: 1,
         objects_per_slab: 4,
         batch: 32,
@@ -401,7 +401,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 4096,
-        align: 16,
+        align: 4096,
         slab_pages: 1,
         objects_per_slab: 4,
         batch: 32,
@@ -409,7 +409,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 4608,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 3,
         batch: 32,
@@ -417,7 +417,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 5120,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 3,
         batch: 32,
@@ -425,7 +425,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 5632,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -433,7 +433,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 6144,
-        align: 16,
+        align: 2048,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -441,7 +441,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 6656,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -449,7 +449,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 7168,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -457,7 +457,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 7680,
-        align: 16,
+        align: 512,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -465,7 +465,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 8192,
-        align: 16,
+        align: 8192,
         slab_pages: 1,
         objects_per_slab: 2,
         batch: 32,
@@ -473,7 +473,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 9216,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -481,7 +481,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 10240,
-        align: 16,
+        align: 2048,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -489,7 +489,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 11264,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -497,7 +497,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 12288,
-        align: 16,
+        align: 4096,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -505,7 +505,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 13312,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -513,7 +513,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 14336,
-        align: 16,
+        align: 2048,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -521,7 +521,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 15360,
-        align: 16,
+        align: 1024,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -529,7 +529,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 16384,
-        align: 16,
+        align: 16384,
         slab_pages: 1,
         objects_per_slab: 1,
         batch: 32,
@@ -537,7 +537,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 18432,
-        align: 16,
+        align: 2048,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -545,7 +545,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 20480,
-        align: 16,
+        align: 4096,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -553,7 +553,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 22528,
-        align: 16,
+        align: 2048,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -561,7 +561,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 24576,
-        align: 16,
+        align: 8192,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -569,7 +569,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 26624,
-        align: 16,
+        align: 2048,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -577,7 +577,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 28672,
-        align: 16,
+        align: 4096,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -585,7 +585,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 30720,
-        align: 16,
+        align: 2048,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,
@@ -593,7 +593,7 @@ pub const SIZE_CLASSES: &[SizeClassRow] = &[
     },
     SizeClassRow {
         size: 32768,
-        align: 16,
+        align: 16384,
         slab_pages: 2,
         objects_per_slab: 1,
         batch: 32,

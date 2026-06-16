@@ -83,6 +83,12 @@ int topomalloc_posix_memalign(void **memptr, size_t alignment, size_t size);
 /* Obsolete compatibility allocator: power-of-two `alignment`, any size. */
 void *topomalloc_memalign(size_t alignment, size_t size);
 
+/* Obsolete page-aligned allocators (§10.1 optional compatibility): `valloc`
+ * page-aligns `size` bytes; `pvalloc` page-aligns and rounds `size` up to a
+ * whole page (pvalloc(0) returns one page). Prefer posix_memalign in new code. */
+void *topomalloc_valloc(size_t size);
+void *topomalloc_pvalloc(size_t size);
+
 /* The number of usable bytes in the allocation at `ptr` (>= the requested
  * size). 0 for NULL or a pointer this allocator does not own. */
 size_t topomalloc_malloc_usable_size(void *ptr);

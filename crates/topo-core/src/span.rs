@@ -1382,6 +1382,33 @@ impl LargeDescriptor {
         self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Grow this **live** descriptor's usable size to `new_usable` in place — an
+    /// in-place realloc grow that absorbed the adjacent free extent (§25.2,
+    /// plan 06 W15-3a). The dual of [`shrink_usable`](Self::shrink_usable): the id,
+    /// base, alignment, arena, and generation are all unchanged (the *same*
+    /// allocation at the *same* address, just larger), so outstanding base pointers
+    /// stay valid; only the usable size and the integrity tag move. The caller MUST
+    /// have already grown the backing extent and installed the new pages' pagemap
+    /// entries (the [`PageMap::install_large_range`](crate::PageMap) ordering).
+    ///
+    /// SPEC-transition: large in-place grow (§25.2) — composes `extent_merge`
+    /// (§18.3); adds no abstract transition (the geometric premise is pinned by
+    /// `realloc_grow_inplace_absorbs_disjointly`, plan 06 W15-3a).
+    pub fn grow_usable(&self, new_usable: usize) {
+        debug_assert!(
+            new_usable >= self.usable_size(),
+            "grow_usable must not shrink the allocation"
+        );
+        // Open the seqlock (odd): a classifier reading through `read_consistent`
+        // retries rather than mixing the old and new usable size (W3-4).
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        self.usable_size.store(new_usable, Ordering::Release);
+        // The integrity tag (§17.3) covers `usable_size`, so recompute it.
+        self.refresh_integrity();
+        // Close the seqlock (even): publish the grown geometry.
+        self.seq.fetch_add(1, Ordering::AcqRel);
+    }
+
     #[inline]
     fn refresh_integrity(&self) {
         self.integrity

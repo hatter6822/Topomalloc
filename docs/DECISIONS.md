@@ -1649,3 +1649,69 @@ cannot recur.
 Net: every "no formal obligation" claim in the tree now cites a theorem or a fixed-wall test, and the
 lint keeps it that way. Verified green under `cargo xtask ci` (dual-arch build + full test matrix +
 the eight Lean gates + the new lint).
+
+## W15 optimal completion (the six deferred/sub-optimal items, closed)
+
+A completeness pass closed every item the W15 self-audit flagged as deferred or sub-optimal, so the
+reallocation / aligned-allocation / calloc surface is now optimal with no deferrals. Each rides an
+already-certified mechanism (no new abstract transition); the two geometry-mutating ones add a named,
+machine-checked Lean obligation.
+
+* **Extent-merge in-place grow (W15-3a).** The symmetric twin of the shrink: a medium/large `realloc`
+  that outgrows its extent now **absorbs the address-adjacent free extent** in place (no copy) instead
+  of always moving — `ExtentManager::grow_in_place` trims the free neighbour to the exact deficit,
+  commits it, and `absorb_next_in` folds it into the live extent (the dual of `split_tail`), then the
+  pagemap is extended and the descriptor grown; on no-adjacent-free / slot-or-commit exhaustion /
+  metadata it rolls back and `realloc` moves. The arena is charged the growth first (quota honored),
+  refunded on a declined grow. Pinned by `realloc_grow_inplace_absorbs_disjointly` (discharged against
+  the certified `span_merge_preserves_disjointness` + `merge_subset_left`) — `extent_merge`, not a new
+  transition, and **not** `reallocMove` (no copy: the prefix stays put).
+* **`xallocx` in-place resize (the inconsistency, fixed).** `realloc` and `xallocx` now share
+  `Allocator::resize_in_place` (extracted, so the shrink/grow accounting has one home): `xallocx`
+  genuinely shrinks (returns the tail) and grows (absorbs the neighbour) in place, reporting the achieved
+  usable size — never moving. A small object's fixed slab slot still reports its size unchanged.
+* **calloc `memset` elision (W15-5 / §26.3).** A `committed_memory_is_zeroed` provider contract (POSIX
+  `true` — the region is `mmap(MAP_ANON)` and `decommit` is `MADV_DONTNEED`, so an extent committed from
+  unbacked backing reads zero) lets a large/medium calloc over a **freshly OS-zeroed** extent skip the
+  redundant `memset`; a recycled (retained-dirty) extent is re-zeroed. The skip is debug-verified
+  (spot-checking the bytes really are zero), and the §26.2 guarantee (calloc is always zero) is the real
+  net, proven by `calloc_large_is_fully_zeroed_fresh_and_after_recycle` across the fresh/recycled paths.
+  A user backing (`HookProvider`) does not opt in, so its calloc keeps zeroing — the trust boundary is
+  explicit. Threaded as `alloc_large`'s `zeroed` flag; the shared large path self-zeroes (the engine
+  zeroes only small + hooked-arena large), so the hooked path is never silently left non-zero.
+* **Cache-served (hugepage) shrink (W15-3b D).** The filler gains `trim(base, old_pages, new_pages)` —
+  the same exact-extent validation as `free` (so it is not a forgeable partial free, S-007) but freeing
+  only the tail and keeping the head, so the kept prefix stays a valid allocation; the tail returns to
+  the filler (reusable, committed — W12 subreleases cold pages later). Reached via
+  `RegionCacheHook::try_trim` (default declines; HugePageBackend trims sub-hugepage allocations; the
+  NodeRouter routes by address) and `LargeAllocator::shrink`'s cache-served branch, which — because the
+  filler frees the tail atomically — retires the pagemap and shrinks the descriptor **first**, then
+  trims, rolling both back on a decline (multi-hugepage runs keep whole). So the tail return now works on
+  *both* the extent and hugepage profiles.
+* **Aligned size classes (W15-4).** Over-aligned **small** requests (e.g. 64-byte/cache-line-aligned) are
+  now served from a **slab slot, not a 16 KiB page**. The mechanism already existed and was proven — the
+  classifier's over-alignment **walk** (W2-3b) and the `maxAlign` bound — but the shipped table was
+  uniformly 16-aligned so the walk never advanced. The generated table now records **each class's natural
+  alignment** (the largest power of two dividing its size, capped at the page-aligned slab base), which a
+  power-of-two-divisor-sized class *already* provides with no layout change (objects at a page-aligned
+  `base + i·size` are size-aligned). `MAX_ALIGN` is derived as the widest class alignment (now the page
+  size); `> MAX_ALIGN` still routes to medium/large. **No Lean proof change** — `coversAllB` (size
+  coverage) and `maxAlignOkB` (the bound) are evaluated over the new table and the over-alignment walk is
+  generic, all re-verified by the G-table + `lake exe check` gates. A pure golden-config edit + regenerate.
+* **`valloc`/`pvalloc`.** Rounded out the §10.1 optional-compatibility surface (page-aligned; `pvalloc`
+  rounds up to a page, `pvalloc(0)` is one page), exported, declared in the C header, and exercised by the
+  C ABI harness (which the symbol↔header cross-check validates).
+* **realloc profiling (W15-2), assessed adequate.** A realloc is sampled as `on_free(old)` +
+  `on_alloc(new)`, attributing the new allocation to its realloc **call site** (distinct from malloc
+  sites in the backtrace) — which is what §25.4 "profile as realloc" means. A distinct realloc *event
+  type* is a plan-07 profiling feature, not a W15 gap.
+
+Verified by the new engine tests (`realloc_large_grow_absorbs_adjacent_free_in_place`,
+`realloc_large_grow_falls_to_move_when_blocked`, `resize_in_place_shrinks_grows_and_reports_small_unchanged`),
+the filler `trim_frees_the_tail_and_keeps_the_prefix_a_valid_allocation`, the ABI tests
+(`xallocx_resizes_a_large_allocation_in_place`, `aligned_small_allocations_use_a_slab_not_a_page`,
+`calloc_large_is_fully_zeroed_fresh_and_after_recycle`, `valloc_and_pvalloc_are_page_aligned`,
+`hugepage_realloc_shrink_trims_the_cache_served_tail`), and the updated classify/size-class coverage —
+all green under `cargo xtask ci` (dual-arch build, full test matrix incl. `hugepage-optimized`/`low-rss`/
+`sele4n-sim`, the eight Lean gates + the two new realloc theorems, the C/C++ ABI harness, and the
+obligation-citation lint).

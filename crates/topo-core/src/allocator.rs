@@ -970,6 +970,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         if self.arenas.try_charge(arena, usable as u64).is_err() {
             return ptr::null_mut();
         }
+        // The shared medium/large path honours the `TOPO_ZERO` hint **itself** (so it
+        // can elide the `memset` when its extent is freshly OS-zeroed, W15-5); the
+        // engine then zeroes only the small + hooked-arena cases below.
+        let mut large_self_zeroed = false;
         let p = match req.kind {
             RequestKind::Small { sc, .. } => {
                 self.alloc_small(arena, sc, self.small_place_class(&req))
@@ -981,7 +985,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
                 // the router need not know the arena). A hooked arena's custom backing
                 // does not place by hints (it is the user's memory source), so it takes
-                // the hint-less trait path.
+                // the hint-less trait path — and the engine zeroes it (no commit-zeroed
+                // promise from a user backing).
                 match self.hook_backend(arena) {
                     Some(b) => b.large.allocate_in(arena, usable, req.align),
                     None => {
@@ -993,6 +998,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                             _ => SizeClassDist::BUCKET_LARGE,
                         };
                         Self::apply_learned(&self.learned, &mut hints, bucket);
+                        large_self_zeroed = true;
                         self.large
                             .allocate_in_hinted(arena, usable, req.align, hints)
                     }
@@ -1007,7 +1013,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
         self.allocated_bytes
             .fetch_add(usable as u64, Ordering::Relaxed);
-        if req.flags.hints().zero {
+        // §26.2 zeroing: small objects (recycled slab memory, always dirty) and
+        // hooked-arena large allocations are zeroed here; the shared medium/large path
+        // already zeroed itself, eliding the `memset` when its extent was freshly
+        // OS-zeroed (W15-5).
+        if req.flags.hints().zero && !large_self_zeroed {
             // SAFETY: `p` is a live allocation with at least `usable` writable
             // bytes (the class's usable size, or the page-rounded extent length).
             unsafe { ptr::write_bytes(p, 0, usable) };
@@ -1684,39 +1694,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     let Some(usable) = owner.usable_size(ptr) else {
                         return ptr::null_mut();
                     };
-                    // In-place fast path: the new request is still medium/large
-                    // (a small-class request moves, so the extent is returned
-                    // rather than pinned under a tiny object), its page-rounded
-                    // size still fits this extent, and the base satisfies the
-                    // requested alignment.
+                    // In-place fast path (W15-3a grow / W15-3b shrink): the new request
+                    // is still medium/large (a small-class request moves, so the extent
+                    // is returned rather than pinned under a tiny object) and the base
+                    // satisfies the requested alignment (in-place can never re-base).
+                    // `apply_inplace_large_resize` shrinks (returns the tail), stays, or
+                    // grows (absorbs the adjacent free extent) toward `rounded`, with the
+                    // exact §8.6/§36.17 accounting and the arena preserved (§25.4); it is
+                    // best-effort, so it never fails — it returns the achieved usable size.
+                    // We keep `ptr` iff that satisfies the request; otherwise we move.
                     if let Some(req) = classify(new_size, min_align, flags.raw()) {
-                        if !matches!(req.kind, RequestKind::Small { .. }) {
+                        if !matches!(req.kind, RequestKind::Small { .. })
+                            && (ptr as usize).is_multiple_of(min_align)
+                        {
                             let effective = if new_size == 0 { 1 } else { new_size };
                             if let Some(rounded) = align_up(effective, PAGE_SIZE) {
-                                if rounded <= usable && (ptr as usize).is_multiple_of(min_align) {
-                                    // W15-3b in-place **shrink**: a strict page-rounded
-                                    // shrink returns the tail pages to the backend
-                                    // (§25.3, DD-1 "shrink, large tail → split + return
-                                    // tail"); an equal-size request just keeps `ptr`.
-                                    // The shrink is **best-effort** — a cache-served
-                                    // region or a slot-exhausted split keeps the
-                                    // allocation whole, still a correct realloc — so it
-                                    // never fails the call. On success the freed tail is
-                                    // accounted so `live_bytes` and the (preserved)
-                                    // arena's quota stay exact (§8.6/§36.17), mirroring
-                                    // the §25.4 arena preservation of the move path.
-                                    if rounded < usable {
-                                        // SAFETY: `ptr` is the live base pointer being
-                                        // realloc'd (this function's own contract); the
-                                        // caller does not concurrently free/realloc it.
-                                        if let Some(freed) = unsafe { owner.shrink(ptr, rounded) } {
-                                            self.freed_bytes
-                                                .fetch_add(freed as u64, Ordering::Relaxed);
-                                            self.arenas.credit(arena, freed as u64);
-                                        }
-                                    }
+                                // SAFETY: `ptr` is the live base pointer being realloc'd
+                                // (this function's own contract); not concurrently freed.
+                                let achieved = unsafe {
+                                    self.apply_inplace_large_resize(
+                                        arena, owner, ptr, usable, rounded,
+                                    )
+                                };
+                                if achieved >= rounded {
+                                    // Satisfied in place (shrank, stayed, or grew); the
+                                    // result holds the old prefix at the same base.
                                     return ptr;
                                 }
+                                // Could not grow in place ⇒ fall to the always-correct move.
                             }
                         }
                     }
@@ -1746,6 +1751,115 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let freed = unsafe { self.free(ptr) };
         debug_assert_eq!(freed, FreeOutcome::Freed, "realloc freed a non-live ptr");
         q
+    }
+
+    /// Apply an in-place medium/large resize of the live large allocation `ptr`
+    /// (served by `owner`, charged to `arena`) toward `rounded` page-aligned bytes,
+    /// returning the **achieved** usable size. Shared by `realloc` (which moves when
+    /// the achieved size is short of the request) and `resize_in_place`/`xallocx`
+    /// (which never moves). It performs the §8.6/§36.17 accounting for whichever path
+    /// it takes — a tail-returning **shrink** (W15-3b) credits the freed tail, an
+    /// adjacent-extent-absorbing **grow** (W15-3a) charges the growth (preserving the
+    /// arena, §25.4) — and is **best-effort**: a shrink/grow the backend declines
+    /// (cache-served, slot/commit/metadata exhaustion, or no adjacent free for a grow)
+    /// leaves the allocation whole and returns the unchanged usable size, so a grow
+    /// that could not be satisfied surfaces as `achieved < rounded`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is the live base pointer being resized (the §25 realloc / §10.3 xallocx
+    /// contract); the caller does not concurrently free or realloc it.
+    unsafe fn apply_inplace_large_resize(
+        &self,
+        arena: ArenaId,
+        owner: &dyn LargeBacking,
+        ptr: *mut u8,
+        usable: usize,
+        rounded: usize,
+    ) -> usize {
+        if rounded < usable {
+            // SAFETY: `ptr` is the live base pointer being resized (forwarded contract).
+            if let Some(freed) = unsafe { owner.shrink(ptr, rounded) } {
+                self.freed_bytes.fetch_add(freed as u64, Ordering::Relaxed);
+                self.arenas.credit(arena, freed as u64);
+                return usable - freed;
+            }
+        } else if rounded > usable {
+            // Charge the growth before absorbing (so the arena's quota is honored,
+            // §36.4); refund if the backend cannot grow in place.
+            let extra = (rounded - usable) as u64;
+            if self.arenas.try_charge(arena, extra).is_ok() {
+                // SAFETY: as above.
+                if let Some(grown) = unsafe { owner.grow(ptr, rounded) } {
+                    self.allocated_bytes
+                        .fetch_add(grown as u64, Ordering::Relaxed);
+                    return usable + grown;
+                }
+                self.arenas.credit(arena, extra);
+            }
+        }
+        usable
+    }
+
+    /// Resize `ptr` **in place only** (never move, never free) toward `new_size`
+    /// bytes at `min_align`, returning the resulting usable size — the engine behind
+    /// the extended `xallocx` (§10.3). A small object's slab slot is fixed-size, so
+    /// it cannot resize: its usable size is reported unchanged (the caller's
+    /// `result >= size` test decides success). A medium/large allocation shrinks
+    /// (returns the tail, W15-3b) or grows (absorbs the adjacent free extent, W15-3a)
+    /// toward the page-rounded `new_size`, best-effort. `None` only for a pointer
+    /// this allocator does not own, an interior pointer, a non-power-of-two
+    /// `min_align`, or a base that does not already satisfy `min_align` (in-place can
+    /// never re-base) — the deterministic `xallocx` invalid-argument cases.
+    ///
+    /// # Safety
+    ///
+    /// As [`realloc`](Self::realloc): `ptr` is null, an owned live allocation, or
+    /// never-owned memory (rejected with `None`); not concurrently freed/realloc'd.
+    pub unsafe fn resize_in_place(
+        &self,
+        ptr: *mut u8,
+        new_size: usize,
+        min_align: usize,
+        _flags: RequestFlags,
+    ) -> Option<usize> {
+        if ptr.is_null() || !min_align.is_power_of_two() {
+            return None;
+        }
+        match classify_ptr(self.pagemap, self.meta_region, ptr as usize) {
+            PointerClass::Small {
+                sc,
+                span,
+                object_index,
+                ..
+            } => {
+                // SAFETY: descriptors live in never-freed metadata.
+                let span_ref = unsafe { &*span };
+                if span_ref.is_central_free(object_index) {
+                    return None; // a freed object awaiting reuse is not a resize source
+                }
+                // In-place can never re-base, so the requested alignment must hold.
+                if !(ptr as usize).is_multiple_of(min_align) {
+                    return None;
+                }
+                // A fixed-size slab slot cannot resize in place; report its usable size.
+                size_class::checked_row(sc).map(|r| r.size as usize)
+            }
+            PointerClass::Large { desc } => {
+                // SAFETY: `desc` is a live large descriptor (never-freed metadata).
+                let arena = unsafe { (*desc).arena() };
+                let owner = self.large_owner_for(arena);
+                let usable = owner.usable_size(ptr)?;
+                if !(ptr as usize).is_multiple_of(min_align) {
+                    return None;
+                }
+                let effective = if new_size == 0 { 1 } else { new_size };
+                let rounded = align_up(effective, PAGE_SIZE)?;
+                // SAFETY: `ptr` is the live base pointer being resized (this fn's contract).
+                Some(unsafe { self.apply_inplace_large_resize(arena, owner, ptr, usable, rounded) })
+            }
+            _ => None,
+        }
     }
 
     // -- arena lifecycle & authority (plan 06 W9) ------------------------------
@@ -2818,6 +2932,216 @@ mod tests {
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert_eq!(a.arena_stats(id).unwrap().used, 0);
         assert_eq!(a.stats().live_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W15-3a: a medium/large in-place **grow** absorbs the address-adjacent free
+    /// extent (no copy) — the base pointer is unchanged, the preserved prefix
+    /// survives, the backend's `active` bytes grow by exactly the absorbed amount,
+    /// the arena's `used` and the global `live_bytes` reconcile (§8.6/§36.17), and
+    /// the grown region is writable. The symmetric counterpart to the shrink.
+    #[test]
+    fn realloc_large_grow_absorbs_adjacent_free_in_place() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A medium allocation; the rest of the large region is free right after it.
+        let old = 80_000usize;
+        let p = a.malloc(old);
+        assert!(!p.is_null());
+        let old_usable = a.usable_size(p).unwrap();
+        // SAFETY: `old_usable` writable bytes.
+        unsafe {
+            for i in 0..old_usable {
+                p.add(i).write((i as u8) ^ 0x5e);
+            }
+        }
+        let active_before = a.stats().large_backend.active;
+        assert_eq!(active_before, old_usable, "one live medium is Active");
+        assert_eq!(a.stats().live_bytes, old_usable as u64);
+
+        // Grow to a larger medium size — the adjacent free remainder is absorbed.
+        let new = 150_000usize;
+        let new_usable = align_up(new, PAGE_SIZE).unwrap();
+        assert!(
+            new_usable > old_usable,
+            "the test must cross a page boundary upward"
+        );
+        let q = trealloc(&a, p, new, MIN_ALIGN, RequestFlags::NONE);
+        assert_eq!(
+            q, p,
+            "in-place grow keeps the base pointer (absorbed adjacent free)"
+        );
+        assert_eq!(
+            a.usable_size(q).unwrap(),
+            new_usable,
+            "usable grew to the rounded new size"
+        );
+
+        // The absorbed bytes are now Active; the accounting reconciles.
+        let grown = new_usable - old_usable;
+        assert_eq!(
+            a.stats().large_backend.active,
+            active_before + grown,
+            "the absorbed free extent's bytes are now Active"
+        );
+        assert_eq!(
+            a.stats().live_bytes,
+            new_usable as u64,
+            "global live_bytes reconciles (§8.6)"
+        );
+        assert_eq!(
+            a.arena_stats(ArenaId::DEFAULT).unwrap().used,
+            new_usable as u64,
+            "the arena is charged the growth (§36.17)"
+        );
+        assert_eq!(a.live_large_count(), 1, "still one live large allocation");
+        assert!(a.check_invariants());
+
+        // The old prefix survived (no copy), and the grown region is writable.
+        // SAFETY: `new_usable` readable+writable bytes.
+        unsafe {
+            for i in 0..old_usable {
+                assert_eq!(q.add(i).read(), (i as u8) ^ 0x5e, "content lost at {i}");
+            }
+            for i in old_usable..new_usable {
+                q.add(i).write(0xcd);
+            }
+            assert_eq!(q.add(new_usable - 1).read(), 0xcd, "grown tail unwritable");
+        }
+
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert_eq!(a.live_large_count(), 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W15-3a safety: when the adjacent extent is **not** free (a second live
+    /// allocation sits right after), the in-place grow declines and `realloc`
+    /// falls to the always-correct move — content preserved, the neighbour
+    /// untouched, accounting exact.
+    #[test]
+    fn realloc_large_grow_falls_to_move_when_blocked() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let pa = a.malloc(80_000);
+        let pb = a.malloc(80_000); // carved immediately after `pa` ⇒ pa's neighbour is Active
+        assert!(!pa.is_null() && !pb.is_null());
+        // SAFETY: 200 writable bytes in each.
+        unsafe {
+            for i in 0..200u8 {
+                pa.add(i as usize).write(i ^ 0x33);
+            }
+        }
+        let live_before = a.stats().live_bytes;
+
+        // Grow `pa`: its address-adjacent neighbour is `pb` (Active), so the in-place
+        // grow declines and realloc moves.
+        let q = trealloc(&a, pa, 150_000, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        assert_ne!(q, pa, "no adjacent free ⇒ realloc moves");
+        // The prefix survived the move.
+        // SAFETY: q has ≥ 200 readable bytes carrying the pattern.
+        unsafe {
+            for i in 0..200u8 {
+                assert_eq!(
+                    q.add(i as usize).read(),
+                    i ^ 0x33,
+                    "content lost on move at {i}"
+                );
+            }
+        }
+        // Net live bytes = (new usable of q) - (old usable of pa) added to the prior total.
+        let q_usable = a.usable_size(q).unwrap() as u64;
+        assert_eq!(
+            a.stats().live_bytes,
+            live_before - align_up(80_000, PAGE_SIZE).unwrap() as u64 + q_usable
+        );
+        assert!(a.check_invariants());
+
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, pb), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W15-3a/b via the `xallocx` engine (`resize_in_place`): a medium/large
+    /// allocation shrinks (returns the tail) and grows back (absorbs the adjacent
+    /// free extent) **in place** — same base, prefix preserved, no move; a small
+    /// object's fixed slot reports its usable size unchanged; a foreign pointer is
+    /// `None`.
+    #[test]
+    fn resize_in_place_shrinks_grows_and_reports_small_unchanged() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // Large: shrink in place, then grow back into the just-returned tail.
+        let p = a.malloc(200_000);
+        assert!(!p.is_null());
+        let big = a.usable_size(p).unwrap();
+        // SAFETY: `big` writable bytes.
+        unsafe {
+            for i in 0..200u8 {
+                p.add(i as usize).write(i ^ 0x44);
+            }
+        }
+        // SAFETY: `p` is a live owned allocation; not concurrently freed.
+        let shrunk =
+            unsafe { a.resize_in_place(p, 100_000, MIN_ALIGN, RequestFlags::NONE) }.unwrap();
+        assert!(
+            shrunk >= 100_000 && shrunk < big,
+            "shrank in place to {shrunk} (was {big})"
+        );
+        assert_eq!(a.usable_size(p).unwrap(), shrunk);
+        // SAFETY: as above.
+        let grown = unsafe { a.resize_in_place(p, big, MIN_ALIGN, RequestFlags::NONE) }.unwrap();
+        assert_eq!(grown, big, "grew back in place by absorbing the freed tail");
+        assert_eq!(a.usable_size(p).unwrap(), big);
+        // The prefix survived every in-place resize (no copy).
+        // SAFETY: `big` readable bytes.
+        unsafe {
+            for i in 0..200u8 {
+                assert_eq!(p.add(i as usize).read(), i ^ 0x44, "content lost at {i}");
+            }
+        }
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+
+        // Small: a fixed slab slot cannot resize in place; report its usable size.
+        let s = a.malloc(100);
+        let su = a.usable_size(s).unwrap();
+        // SAFETY: `s` is a live owned small allocation.
+        let shrink = unsafe { a.resize_in_place(s, 50, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(
+            shrink,
+            Some(su),
+            "small shrink-request reports the unchanged slot size"
+        );
+        // SAFETY: `s` is a live owned small allocation.
+        let grow = unsafe { a.resize_in_place(s, su + 1, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(
+            grow,
+            Some(su),
+            "small grow-request cannot resize in place (fixed slot)"
+        );
+        assert_eq!(tfree(&a, s), FreeOutcome::Freed);
+
+        // A foreign pointer is not resizable: None (the xallocx deterministic invalid arg).
+        let mut local = 0u64;
+        // SAFETY: a never-owned probe pointer is the documented rejected input.
+        let foreign = unsafe {
+            a.resize_in_place(
+                (&mut local as *mut u64).cast::<u8>(),
+                8,
+                MIN_ALIGN,
+                RequestFlags::NONE,
+            )
+        };
+        assert_eq!(foreign, None);
         assert!(a.check_invariants());
     }
 

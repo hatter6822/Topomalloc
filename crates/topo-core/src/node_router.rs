@@ -477,6 +477,14 @@ impl<P: TopoBackingProvider, C: CoreProvider> RegionCacheHook for NodeRouter<P, 
         self.owner(region.base as usize)
             .is_some_and(|b| b.try_cache_revoking(region, arena))
     }
+
+    fn try_trim(&self, region: Region, new_len: usize) -> Option<usize> {
+        // Route the in-place tail trim (W15-3b cache-served shrink) to the node-backend
+        // that owns the allocation (by address) — placement never changes the address,
+        // so the owner is unchanged across the shrink.
+        self.owner(region.base as usize)
+            .and_then(|b| b.try_trim(region, new_len))
+    }
 }
 
 /// A **type-erased control surface** over a [`NodeRouter`] (W13), so a host — e.g. the C ABI,

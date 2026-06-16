@@ -296,10 +296,23 @@ int main(void) {
     assert(TOPOMALLOC_QUANTUM == 16u);
     assert(TOPOMALLOC_NUM_SIZE_CLASSES >= 1u);
     assert(topomalloc_size_classes[0].size == TOPOMALLOC_TINY_MIN);
-    /* medium/large boundary and derived max-alignment (plan 03 W2) */
+    /* medium/large boundary and derived max-alignment (plan 03 W2). MAX_ALIGN is the
+     * widest size-class alignment: with the W15-4 aligned classes (each class records
+     * its natural alignment), it is the page size, so a power-of-two-aligned small
+     * request up to a page is served from a slab. */
     assert(TOPOMALLOC_HUGE_THRESHOLD > TOPOMALLOC_SMALL_MAX);
     assert((TOPOMALLOC_HUGE_THRESHOLD % TOPOMALLOC_PAGE_SIZE) == 0u);
-    assert(TOPOMALLOC_MAX_ALIGN == 16u);
+    assert(TOPOMALLOC_MAX_ALIGN >= 16u);
+    assert((TOPOMALLOC_MAX_ALIGN & (TOPOMALLOC_MAX_ALIGN - 1u)) == 0u); /* power of two */
+
+    /* valloc / pvalloc (obsolete §10.1 compatibility): page-aligned. */
+    void *vp = topomalloc_valloc(100);
+    assert(vp != NULL && ((uintptr_t) vp % TOPOMALLOC_PAGE_SIZE) == 0u);
+    topomalloc_free(vp);
+    void *pp = topomalloc_pvalloc(TOPOMALLOC_PAGE_SIZE + 1u);
+    assert(pp != NULL && ((uintptr_t) pp % TOPOMALLOC_PAGE_SIZE) == 0u);
+    assert(topomalloc_malloc_usable_size(pp) >= 2u * TOPOMALLOC_PAGE_SIZE);
+    topomalloc_free(pp);
 
     printf("C ABI smoke: OK (version=%s, backend=%s, %u size classes)\n",
            v, backend, (unsigned) TOPOMALLOC_NUM_SIZE_CLASSES);

@@ -278,6 +278,33 @@ impl PageMap {
         self.publish_range(meta, (large.base(), large.end()), entry)
     }
 
+    /// Install the page-aligned sub-range `[base, stop)` of a large allocation,
+    /// mapping each page to `large` — used by an **in-place grow** that absorbed the
+    /// adjacent free extent and must now cover the *new* pages (§25.2, plan 06
+    /// W15-3a). Like [`install_large`](Self::install_large) it is two-phase and
+    /// **atomic on metadata exhaustion** (`publish_range` creates every node before
+    /// publishing any entry), so a failed grow leaves the new pages `Empty` and the
+    /// caller can roll the extent back without a half-mapped range.
+    ///
+    /// `base`/`stop` must be page-aligned (the large base and both the old and new
+    /// page-rounded usable sizes are) and lie within `large`'s grown range. The
+    /// caller installs this **before** publishing the grown `usable_size`, so the
+    /// descriptor never advertises pages the pagemap does not yet cover.
+    ///
+    /// SPEC-transition: pagemap publish for large in-place grow (§17.2 P-Map-006)
+    pub fn install_large_range(
+        &self,
+        meta: &dyn MetadataAlloc,
+        large: &LargeDescriptor,
+        base: usize,
+        stop: usize,
+    ) -> Result<(), PagemapError> {
+        debug_assert_eq!(base % PAGE_SIZE, 0, "grow range base must be page-aligned");
+        debug_assert_eq!(stop % PAGE_SIZE, 0, "grow range stop must be page-aligned");
+        let entry = PageEntry::Large(large as *const LargeDescriptor).encode();
+        self.publish_range(meta, (base, stop), entry)
+    }
+
     /// Transition a span's pages to **released-but-retained** (P-Map-005): the
     /// entries keep pointing at the descriptor (now `state == Released`) so the
     /// pages cannot be reused without recommit. The caller MUST set the span's state

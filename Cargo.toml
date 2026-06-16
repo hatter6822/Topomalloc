@@ -60,10 +60,17 @@ exclude = ["fuzz", "vendor/sele4n"]
 # artifact: the `realloc_shrink_inplace_tail_tiles_disjointly` theorem (W15-3b), the
 # `placement_never_breaks_the_allocation_contract` fixed wall (W13), and the
 # `controller_driven_release_preserves_live_objects` end-to-end test (W12); plus a new
-# `cargo xtask lint` gate (`obligation citations (V-004)`) that fails a bare claim. In a
-# 0.x series new backwards-compatible functionality is a patch bump (the 0.x minor is the
-# breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.18"
+# `cargo xtask lint` gate (`obligation citations (V-004)`) that fails a bare claim. 0.1.19:
+# W15 optimal completion (all units, no deferrals) — extent-merge in-place *grow*
+# (`grow_in_place`/`absorb_next_in`, pinned by `realloc_grow_inplace_absorbs_disjointly`);
+# `xallocx` in-place resize (`resize_in_place`); calloc `memset` elision over freshly-
+# OS-zeroed extents (`committed_memory_is_zeroed`); cache-served hugepage tail-trim
+# (`HugePageFiller::trim` via `RegionCacheHook::try_trim`); aligned size classes (the
+# generated table records each class's natural alignment ⇒ MAX_ALIGN = page size, no Lean
+# proof change); and `valloc`/`pvalloc`. In a 0.x series new backwards-compatible
+# functionality is a patch bump (the 0.x minor is the breaking axis), keeping `^0.1.0`
+# inter-crate reqs satisfied.
+version = "0.1.19"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

@@ -257,6 +257,16 @@ impl TopoBackingProvider for PosixBackingProvider {
     fn name(&self) -> &'static str {
         "posix"
     }
+
+    /// POSIX guarantees freshly-committed memory reads as zero (§26.2): the region
+    /// is `mmap(MAP_ANONYMOUS)` (zero-filled at reserve), and `decommit` is
+    /// `MADV_DONTNEED`/`MADV_FREE`, so a page committed from an unbacked extent
+    /// (Reserved → fresh map, or Released → discarded then zero-faulted) is zero.
+    /// This lets `calloc` skip the redundant `memset` for a freshly-extent-backed
+    /// large/medium allocation (W15-5 / §26.3).
+    fn committed_memory_is_zeroed(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for PosixBackingProvider {
