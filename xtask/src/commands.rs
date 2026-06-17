@@ -305,6 +305,7 @@ pub fn lint(root: &Path, _args: &[String]) -> Outcome {
         "lock hierarchy (G-conc, W16-1b)",
         check_lock_hierarchy(root),
     );
+    r.record("atomics ordering (W16-3)", check_atomics_ordering(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -362,6 +363,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "lock hierarchy (G-conc, W16-1b)",
         check_lock_hierarchy(root),
     );
+    r.record("atomics ordering (W16-3)", check_atomics_ordering(root));
     r.record("license boundary", check_license_boundary(root));
     markdownlint_step(&mut r);
     shellcheck_step(&mut r, root);
@@ -1043,22 +1045,32 @@ fn check_rseq_cs(root: &Path) -> bool {
 
 /// The lock-hierarchy structural gate (W16-1b, the G-conc gate, DD-3 F1): every
 /// lock in `topo-core` MUST go through the ranked `RankedLock` wrapper so the
-/// debug lock-order checker sees every acquisition. A hand-rolled spinlock — the
-/// `compare_exchange(false, true, …)` test-and-set idiom — escapes the checker, so
-/// this scans `crates/topo-core/src/**/*.rs` and forbids that idiom **outside**
-/// `lock.rs` (the wrapper's sole home). The runtime half of G-conc — the
-/// per-thread held-rank assertion — fails any out-of-order acquire in debug CI;
-/// this static half guarantees the runtime checker has nothing it cannot see.
+/// debug lock-order checker sees every acquisition. A lock that escapes the
+/// wrapper escapes the checker, so this scans the **non-test** portion of
+/// `crates/topo-core/src/**/*.rs` (everything before the first `#[cfg(test)]`)
+/// and forbids, outside `lock.rs` (the wrapper's sole home):
+///
+/// * the test-and-set spinlock idiom `compare_exchange(false, true, …)`, and
+/// * any blocking lock primitive — `std::sync::Mutex` / `RwLock` / `Condvar` or a
+///   `parking_lot` lock — which would be unranked and (in a `no_std`/hot-path
+///   crate) wrong besides.
+///
+/// Matching `false, true` (not bare `compare_exchange`) keeps a legitimate value
+/// CAS (the arena quota, the init-phase advance, a state machine) from tripping
+/// it. The runtime half of G-conc — the per-thread held-rank assertion — fails any
+/// out-of-order acquire in debug CI; this static half guarantees the runtime
+/// checker has nothing it cannot see.
 fn lock_hierarchy_issues(content: &str) -> Vec<(usize, String)> {
+    // Scan only the non-test portion: tests legitimately model spinlocks / use
+    // `std::sync::Mutex` (the loom and conservation models). Tests are conventionally
+    // a trailing `#[cfg(test)] mod tests`, so truncate at the first such attribute.
+    let end = content.find("#[cfg(test)]").unwrap_or(content.len());
     let mut issues = Vec::new();
-    for (i, raw) in content.lines().enumerate() {
+    for (i, raw) in content[..end].lines().enumerate() {
         let line = raw.trim();
-        if line.starts_with("//") {
+        if line.starts_with("//") || line.starts_with("//!") {
             continue; // a doc/comment mention (e.g. this gate's own description)
         }
-        // The test-and-set spinlock construction: a CAS that flips a bool `false →
-        // true`. Matching the argument pair (not just `compare_exchange`) keeps a
-        // legitimate value CAS (e.g. the arena quota, an init flag) from tripping it.
         let normalized: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if normalized.contains("compare_exchange_weak(false, true")
             || normalized.contains("compare_exchange(false, true")
@@ -1070,12 +1082,32 @@ fn lock_hierarchy_issues(content: &str) -> Vec<(usize, String)> {
                     .to_string(),
             ));
         }
+        // A blocking lock primitive: unranked (escapes the checker) and wrong for a
+        // `no_std`-capable hot-path crate. (`std::sync::Once`/`OnceLock`/atomics are
+        // fine — only the *locks* are forbidden.)
+        for prim in [
+            "std::sync::Mutex",
+            "std::sync::RwLock",
+            "std::sync::Condvar",
+            "parking_lot::",
+        ] {
+            if normalized.contains(prim) {
+                issues.push((
+                    i + 1,
+                    format!(
+                        "blocking lock primitive `{prim}` in non-test `topo-core` — use a \
+                         ranked `lock::RankedLock` (the single lock primitive, §27.2/W16-1)"
+                    ),
+                ));
+            }
+        }
     }
     issues
 }
 
 /// Gate the lock-hierarchy discipline (W16-1b / G-conc): no hand-rolled spinlock
-/// in `topo-core` outside `lock.rs`. Scans `crates/topo-core/src/**/*.rs`.
+/// or unranked blocking lock in non-test `topo-core` outside `lock.rs`. Scans
+/// `crates/topo-core/src/**/*.rs`.
 fn check_lock_hierarchy(root: &Path) -> bool {
     let mut issues = Vec::new();
     let mut scanned = 0usize;
@@ -1110,6 +1142,76 @@ fn check_lock_hierarchy(root: &Path) -> bool {
             "  → route the lock through `lock::RankedLock<{{ LockRank::… }}>` (W16-1a) so the \
              debug checker (W16-1b) enforces the §27.2 order. See the `lock` module docs."
         );
+        false
+    }
+}
+
+/// The §27.3 atomics-ordering-map gate (W16-3): the documented policy is
+/// publication = `Release`, consumption = `Acquire`, transitions = `AcqRel` (or a
+/// `Release`/`Acquire` pair), counters = `Relaxed` — **`SeqCst` is not in the
+/// map**. So a `SeqCst` in non-test `topo-core` production code is an undocumented
+/// deviation: it must carry an inline `SeqCst:` justification (the reason it needs
+/// the global total order), or be removed in favour of a mapped ordering. Scans
+/// the non-test portion of `crates/topo-core/src/**/*.rs` (everything before the
+/// first `#[cfg(test)]`), so the loom/conservation test models that legitimately
+/// use `SeqCst` for simplicity are exempt.
+fn atomics_ordering_issues(content: &str) -> Vec<(usize, String)> {
+    let end = content.find("#[cfg(test)]").unwrap_or(content.len());
+    let lines: Vec<&str> = content[..end].lines().collect();
+    let mut issues = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+        if line.contains("SeqCst") {
+            // Permit a justified use: an inline or adjacent `SeqCst:` rationale,
+            // mirroring the V-004 citation discipline (the map is the law; a
+            // deviation must say why it needs the global order).
+            let justified = (i.saturating_sub(1)..=i + 1)
+                .filter_map(|j| lines.get(j))
+                .any(|l| l.contains("SeqCst:"));
+            if !justified {
+                issues.push((
+                    i + 1,
+                    "`Ordering::SeqCst` is off the §27.3 ordering map — use Release/Acquire/AcqRel/\
+                     Relaxed, or justify with an inline `SeqCst: <reason>` comment (W16-3)"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    issues
+}
+
+/// Gate the §27.3 atomics-ordering map (W16-3): no unjustified `SeqCst` in
+/// non-test `topo-core`. Scans `crates/topo-core/src/**/*.rs`.
+fn check_atomics_ordering(root: &Path) -> bool {
+    let mut issues = Vec::new();
+    let mut scanned = 0usize;
+    visit_files(root, SKIP_DIRS, &mut |path| {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if !(s.contains("crates/topo-core/src") && s.ends_with(".rs")) {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        scanned += 1;
+        for (line, reason) in atomics_ordering_issues(&content) {
+            issues.push(format!("{}:{}: {reason}", path.display(), line));
+        }
+    });
+    if issues.is_empty() {
+        println!(
+            "  · atomics ordering (W16-3): no off-map `SeqCst` in non-test `topo-core` \
+             ({scanned} files, §27.3)"
+        );
+        true
+    } else {
+        for it in issues.iter().take(50) {
+            eprintln!("  ✗ atomics ordering: {it}");
+        }
         false
     }
 }
@@ -1576,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_hierarchy_gate_flags_hand_rolled_spinlocks_only() {
+    fn lock_hierarchy_gate_flags_hand_rolled_locks_only() {
         // The test-and-set spinlock idiom is flagged (it escapes the checker).
         let bad = r#"
             self.locked
@@ -1587,6 +1689,12 @@ mod tests {
             lock_hierarchy_issues("    x.compare_exchange(false, true, AcqRel, Acquire)").len(),
             1
         );
+        // A blocking lock primitive is flagged too (unranked, escapes the checker).
+        assert_eq!(
+            lock_hierarchy_issues("    let m: std::sync::Mutex<()> = todo!();").len(),
+            1
+        );
+        assert_eq!(lock_hierarchy_issues("use std::sync::RwLock;").len(), 1);
         // A *value* CAS (not a bool lock) is fine — e.g. the arena quota / init flag.
         assert!(lock_hierarchy_issues(
             "    used.compare_exchange_weak(cur, next, AcqRel, Acquire)"
@@ -1595,9 +1703,36 @@ mod tests {
         assert!(
             lock_hierarchy_issues("    state.compare_exchange(0, 1, Acquire, Acquire)").is_empty()
         );
+        // `OnceLock`/`Once`/atomics are not locks — not flagged.
+        assert!(lock_hierarchy_issues("use std::sync::OnceLock;").is_empty());
         // A comment describing the forbidden idiom must not trip the gate.
         assert!(
             lock_hierarchy_issues("    // never compare_exchange(false, true) by hand").is_empty()
         );
+        // Test code (after `#[cfg(test)]`) may model spinlocks / use Mutex freely.
+        let with_test = "fn ok() {}\n#[cfg(test)]\nmod tests {\n  use std::sync::Mutex;\n  x.compare_exchange(false, true, A, B);\n}";
+        assert!(lock_hierarchy_issues(with_test).is_empty());
+    }
+
+    #[test]
+    fn atomics_ordering_gate_flags_unjustified_seqcst() {
+        // An off-map SeqCst in production is flagged.
+        assert_eq!(
+            atomics_ordering_issues("    x.store(1, Ordering::SeqCst);").len(),
+            1
+        );
+        // A justified one (inline `SeqCst:` rationale) passes.
+        assert!(atomics_ordering_issues(
+            "    // SeqCst: a Dekker gate needs the global total order here.\n    x.store(1, Ordering::SeqCst);"
+        )
+        .is_empty());
+        // Mapped orderings are fine.
+        assert!(atomics_ordering_issues("    x.fetch_add(1, Ordering::AcqRel);").is_empty());
+        assert!(atomics_ordering_issues("    x.load(Ordering::Acquire);").is_empty());
+        // Test code (after `#[cfg(test)]`) may use SeqCst freely.
+        assert!(atomics_ordering_issues(
+            "fn ok() {}\n#[cfg(test)]\nmod t {\n  x.store(1, Ordering::SeqCst);\n}"
+        )
+        .is_empty());
     }
 }

@@ -128,10 +128,11 @@ pub use topology::{
 // W16 concurrency re-exports (plan 05): the ranked lock hierarchy + checker,
 // the fork coordinator, init phases, re-entrancy guard, and crash summary.
 pub use fork::{
-    background_enabled, in_flight_operations, operation_guard, postfork_child, postfork_parent,
-    prefork, set_background_enabled, OperationGuard,
+    background_enabled, fork_in_progress, in_flight_operations, maintenance_guard, operation_guard,
+    postfork_child, postfork_parent, prefork, probe_and_set_sharding, set_background_enabled,
+    set_sharded, OperationGuard,
 };
-pub use init::{CrashSummary, InitPhase, PhaseTracker, ReentryGuard, INIT_PHASE};
+pub use init::{CrashSummary, InitPhase, PhaseTracker, INIT_PHASE};
 pub use lock::{held_lock_count, reset_lock_checker, LockRank, RankedGuard, RankedLock};
 
 // W6 cache layer re-exports (plan 05).

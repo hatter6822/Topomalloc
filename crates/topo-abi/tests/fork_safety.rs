@@ -105,6 +105,125 @@ fn child_allocates_after_quiescent_fork() {
     wait_with_watchdog(pid, Duration::from_secs(10), 0);
 }
 
+/// The **parent** must be unaffected by a fork (W16-5a): a long-lived allocation
+/// it holds *survives* every fork intact (still mapped, still the right size, still
+/// freeable), and the parent stays fully usable. (We check survival via
+/// `usable_size`, not the process-global `live_bytes`, since libtest runs tests in
+/// parallel and other tests perturb that shared counter — DD-5 "stats consistent"
+/// from the parent's side, made robust to concurrency.)
+#[test]
+fn parent_state_is_consistent_across_fork() {
+    assert!(hammer(64));
+    let probe = topo_abi::topomalloc_malloc(4096);
+    assert!(!probe.is_null());
+    // SAFETY: `probe` has 4096 writable bytes; mark the whole block.
+    unsafe { std::ptr::write_bytes(probe.cast::<u8>(), 0xc3, 4096) };
+    let usable_before = topo_abi::topomalloc_malloc_usable_size(probe);
+    assert!(usable_before >= 4096);
+    // The crash summary (W16-6) is callable and well-formed while the process runs.
+    assert!(
+        summary_live_bytes() > 0,
+        "a live probe ⇒ nonzero live_bytes"
+    );
+
+    for _ in 0..20 {
+        // SAFETY: fork from the main thread; the child immediately `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Child: prove it can allocate, then leave without disturbing the parent.
+            let ok = hammer(50);
+            // SAFETY: terminate the child immediately.
+            unsafe { libc::_exit(if ok { 0 } else { 2 }) };
+        }
+        wait_with_watchdog(pid, Duration::from_secs(10), 0);
+        // Parent: the long-lived probe is unchanged across the fork, and the parent
+        // is still fully usable (allocate + free a fresh block).
+        assert_eq!(
+            topo_abi::topomalloc_malloc_usable_size(probe),
+            usable_before,
+            "parent's long-lived allocation must survive the fork unchanged"
+        );
+        // SAFETY: `probe`'s bytes are still mapped; the pattern must persist.
+        unsafe {
+            assert_eq!(*probe.cast::<u8>(), 0xc3);
+            assert_eq!(*probe.cast::<u8>().add(4095), 0xc3);
+        }
+        let p = topomalloc_malloc(1234);
+        assert!(!p.is_null(), "parent allocation failed after fork");
+        // SAFETY: `p` has 1234 writable bytes; freed immediately.
+        unsafe {
+            *p.cast::<u8>() = 1;
+            topomalloc_free(p);
+        }
+    }
+
+    // The probe is still a valid live allocation and frees cleanly.
+    // SAFETY: `probe` is still the live allocation from before the loop.
+    unsafe { topomalloc_free(probe) };
+}
+
+/// Two threads call `fork()` concurrently while workers hammer the allocator. The
+/// `FORK_LOCK` serializes the prepare→child/parent handlers, so neither child
+/// deadlocks (W16-5: concurrent forkers).
+#[test]
+fn concurrent_forks_from_two_threads() {
+    assert!(hammer(8));
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = hammer(16);
+                }
+            })
+        })
+        .collect();
+
+    let forker = || {
+        std::thread::spawn(|| {
+            for round in 0..15 {
+                // SAFETY: fork from this thread; the child immediately `_exit`s.
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork failed");
+                if pid == 0 {
+                    let ok = hammer(64);
+                    // SAFETY: terminate the child immediately.
+                    unsafe { libc::_exit(if ok { 0 } else { 2 }) };
+                }
+                wait_with_watchdog(pid, Duration::from_secs(10), round);
+            }
+        })
+    };
+    let a = forker();
+    let b = forker();
+    a.join().unwrap();
+    b.join().unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        w.join().unwrap();
+    }
+}
+
+/// The lock-free crash summary's `live_bytes=` field (read from the C entry point,
+/// no allocation), used by the parent-consistency check.
+fn summary_live_bytes() -> u64 {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid writable region of its length.
+    let n = unsafe {
+        topo_abi::topomalloc_crash_summary(buf.as_mut_ptr().cast::<core::ffi::c_char>(), buf.len())
+    };
+    let text = core::str::from_utf8(&buf[..n]).unwrap();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("live_bytes=") {
+            return v.parse().unwrap();
+        }
+    }
+    panic!("crash summary had no live_bytes field: {text:?}");
+}
+
 /// Wait for `pid`, failing if it does not exit 0 within `timeout` (a deadlocked
 /// child is `SIGKILL`ed and reported, so the test fails fast instead of hanging).
 fn wait_with_watchdog(pid: libc::pid_t, timeout: Duration, round: i32) {

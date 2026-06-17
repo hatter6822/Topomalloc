@@ -28,13 +28,18 @@
 //!
 //! # Re-entrancy guard (W16-6, §28.3)
 //!
-//! [`ReentryGuard`] is the general per-thread re-entrancy detector the hook,
-//! profiling-callback, and error-reporting paths use: if code inside one of
-//! those callbacks re-enters the same guarded domain on the same thread, the
-//! guard refuses (returns `None`) rather than recursing — the threading analogue
-//! of the bootstrap S-007 backstop. It is allocation-free (a `const`-initialised
-//! thread-local flag, Local-Exec TLS), so arming it never re-enters `malloc`
-//! even when this crate backs the process `#[global_allocator]`.
+//! [`reentry_flag!`](crate::reentry_flag) defines a per-thread re-entrancy domain
+//! (`scope()` + `active()`) the hook, profiling-callback, and error-reporting
+//! paths use: a guarded site marks the thread as *inside* the domain for a scope,
+//! and a *different* site (the allocator entry) queries `active()` and **fails
+//! safe** on a detected re-entry rather than recursing — the threading analogue of
+//! the bootstrap S-007 backstop. The live consumer is the extent-hook path (W10):
+//! a user hook that re-enters `malloc` is detected at the allocator entry and the
+//! re-entrant allocation is declined (null) instead of deadlocking on the
+//! non-re-entrant back-end lock (§23.3/Appendix-F). It is allocation-free (a
+//! `const`-initialised thread-local `Cell<u32>`, Local-Exec TLS), so entering a
+//! scope never re-enters `malloc` even when this crate backs the process
+//! `#[global_allocator]`.
 //!
 //! # Crash summary (W16-6, §28.4)
 //!
@@ -160,80 +165,78 @@ pub static INIT_PHASE: PhaseTracker = PhaseTracker::new();
 // `no_std` (no thread-local), like the bootstrap S-007 guard.
 // ---------------------------------------------------------------------------
 
-/// A general per-thread re-entrancy guard (W16-6). Construct one with
-/// [`enter`](ReentryGuard::enter) around a region — a hook call, a profiling
-/// callback, an error report — that must not be re-entered on the same thread; a
-/// nested `enter` returns `None`, so the caller fails safe instead of recursing
-/// into the allocator (§28.3). The guard clears the flag on drop (including on a
-/// panic-unwind).
+/// Define a per-thread **re-entrancy domain** as a module `$name` exposing
+/// `scope() -> Scope` (mark this thread as *inside* the domain for the guard's
+/// lifetime) and `active() -> bool` (is this thread inside the domain?). The
+/// guarded site enters the scope; a *different* site (e.g. the allocator entry)
+/// queries `active()` and fails safe on a detected re-entry — the §28.3 pattern
+/// the extent-hook path uses (a user hook that re-enters `malloc` is detected and
+/// declined rather than deadlocking on the non-re-entrant back-end lock).
 ///
-/// Each *domain* gets its own static flag via [`reentry_domain!`]; this type is
-/// the RAII handle. It is allocation-free: the flag is a `const`-initialised
-/// thread-local `Cell<bool>`, so arming the guard never calls `malloc`.
-#[cfg(any(test, feature = "std"))]
-pub struct ReentryGuard {
-    // The flag to clear on drop. `'static` so the guard can outlive any borrow.
-    clear: fn(),
-}
-
-#[cfg(any(test, feature = "std"))]
-impl Drop for ReentryGuard {
-    #[inline]
-    fn drop(&mut self) {
-        (self.clear)();
-    }
-}
-
-#[cfg(any(test, feature = "std"))]
-impl ReentryGuard {
-    /// Construct a guard from a domain's `(check, set, clear)` triple. Returns
-    /// `None` if the domain is already active on this thread (a re-entry).
-    /// Prefer the [`reentry_domain!`] macro, which wires the thread-local.
-    #[inline]
-    #[must_use]
-    pub fn from_parts(active: fn() -> bool, set: fn(), clear: fn()) -> Option<ReentryGuard> {
-        if active() {
-            return None;
-        }
-        set();
-        Some(ReentryGuard { clear })
-    }
-}
-
-/// Define a re-entrancy `domain`: a function `name() -> Option<ReentryGuard>` that
-/// yields a guard the first time it is called on a thread and `None` while a
-/// guard from the same domain is still alive on that thread (W16-6, §28.3). Pure
-/// `no_std` builds (no thread-local) get a no-op that always yields a guard — the
-/// guarded code is then responsible for not recursing, as for the bootstrap leaf.
+/// `scope()` nests via a depth counter, so an inner scope keeps the flag set
+/// until the outermost exits. It is **allocation-free**: a `const`-initialised
+/// thread-local `Cell<u32>` (Local-Exec TLS), so entering a scope never calls
+/// `malloc`. Pure `no_std` builds (no thread-local) get a no-op: `active()` is
+/// always `false` and the guarded leaf is responsible for not recursing.
 #[macro_export]
-macro_rules! reentry_domain {
-    ($(#[$meta:meta])* $vis:vis fn $name:ident) => {
+macro_rules! reentry_flag {
+    ($(#[$meta:meta])* $vis:vis mod $name:ident) => {
         $(#[$meta])*
-        #[cfg(any(test, feature = "std"))]
-        $vis fn $name() -> ::core::option::Option<$crate::init::ReentryGuard> {
-            ::std::thread_local! {
-                static ACTIVE: ::core::cell::Cell<bool> = const { ::core::cell::Cell::new(false) };
-            }
-            fn active() -> bool { ACTIVE.with(::core::cell::Cell::get) }
-            fn set() { ACTIVE.with(|f| f.set(true)); }
-            fn clear() { ACTIVE.with(|f| f.set(false)); }
-            $crate::init::ReentryGuard::from_parts(active, set, clear)
-        }
+        $vis mod $name {
+            // The items below are `pub` so the module's own visibility (`$vis`)
+            // governs reach; that makes them "unreachable pub" under a `pub(crate)`
+            // module, which is intended (the domain is crate-internal). A domain
+            // that only queries `active()` (not the `Scope` type by name) leaves the
+            // re-export "unused", which is fine for a generated helper.
+            #![allow(unreachable_pub, unused_imports)]
 
-        $(#[$meta])*
-        #[cfg(not(any(test, feature = "std")))]
-        $vis fn $name() -> ::core::option::Option<$crate::init::ReentryGuard> {
-            // No thread-local without `std`: the guard is a no-op marker. The
-            // `()` placeholder keeps the signature uniform; the guarded code must
-            // not recurse (the leaf contract).
-            ::core::option::Option::Some($crate::init::ReentryGuard)
+            #[cfg(any(test, feature = "std"))]
+            mod imp {
+                use ::core::cell::Cell;
+                ::std::thread_local! {
+                    static DEPTH: Cell<u32> = const { Cell::new(0) };
+                }
+                /// Whether this thread is currently inside the domain.
+                #[inline]
+                pub fn active() -> bool {
+                    DEPTH.with(|d| d.get() != 0)
+                }
+                /// RAII marker: the thread is inside the domain until dropped.
+                #[must_use = "the thread stays in the domain only while the Scope lives"]
+                pub struct Scope(());
+                /// Enter the domain for the returned guard's lifetime (nests).
+                #[inline]
+                pub fn scope() -> Scope {
+                    DEPTH.with(|d| d.set(d.get().wrapping_add(1)));
+                    Scope(())
+                }
+                impl Drop for Scope {
+                    #[inline]
+                    fn drop(&mut self) {
+                        DEPTH.with(|d| d.set(d.get().wrapping_sub(1)));
+                    }
+                }
+            }
+            #[cfg(not(any(test, feature = "std")))]
+            mod imp {
+                /// Always `false` without a thread-local (the leaf must not recurse).
+                #[inline]
+                pub fn active() -> bool {
+                    false
+                }
+                /// A no-op scope marker.
+                #[must_use]
+                pub struct Scope(());
+                /// No-op without a thread-local.
+                #[inline]
+                pub fn scope() -> Scope {
+                    Scope(())
+                }
+            }
+            pub use imp::{active, scope, Scope};
         }
     };
 }
-
-/// `no_std` placeholder for [`ReentryGuard`] (a unit marker; the macro yields it).
-#[cfg(not(any(test, feature = "std")))]
-pub struct ReentryGuard;
 
 // ---------------------------------------------------------------------------
 // Crash summary (W16-6, §28.4): lock-free, allocation-free.
@@ -243,7 +246,10 @@ pub struct ReentryGuard;
 /// produced **without any lock or allocation** (W16-6, §28.4) — for a crash or
 /// signal handler, where `malloc` is unsafe (§28.2) and the structure locks may
 /// be held by the faulting thread. Every field is read from a process-lifetime
-/// atomic; full stats (which take locks) are unavailable in that context.
+/// atomic. Per-object / per-state breakdowns need the structure locks, so they are
+/// deliberately omitted — "full stats may be unavailable in crash context" (§28.4);
+/// the cumulative **bytes** are the lock-free headline ("where is the memory") and
+/// are not taxed onto the hot path beyond the counters stats already keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrashSummary {
     /// The current [`InitPhase`] as a raw `u8` (so the struct stays `Copy`/plain).
@@ -254,6 +260,10 @@ pub struct CrashSummary {
     pub freed_bytes: u64,
     /// Live bytes (`allocated − freed`); the headline "where is the memory".
     pub live_bytes: u64,
+    /// Allocator operations in flight process-wide at the snapshot (the fork-gate
+    /// count, §28.1) — nonzero means a thread was mid-operation, useful triage for a
+    /// crash that may have interrupted the allocator. Lock-free.
+    pub in_flight_ops: u64,
     /// Whether background maintenance is currently enabled (cleared post-fork).
     pub background_enabled: bool,
 }
@@ -270,6 +280,7 @@ impl CrashSummary {
         w.kv_u64("live_bytes", self.live_bytes);
         w.kv_u64("allocated_bytes", self.allocated_bytes);
         w.kv_u64("freed_bytes", self.freed_bytes);
+        w.kv_u64("in_flight_ops", self.in_flight_ops);
         w.kv_u64("background_enabled", u64::from(self.background_enabled));
         w.len
     }
@@ -391,21 +402,31 @@ mod tests {
         assert!(t.is_operational());
     }
 
-    reentry_domain! {
-        /// Test domain for the re-entrancy guard.
-        fn test_domain
+    reentry_flag! {
+        /// Test domain for the re-entrancy flag.
+        mod test_domain
     }
 
     #[cfg(any(test, feature = "std"))]
     #[test]
-    fn reentry_guard_refuses_nested_entry() {
-        let outer = test_domain();
-        assert!(outer.is_some(), "first entry yields a guard");
-        // A nested entry on the same thread is refused.
-        assert!(test_domain().is_none(), "re-entry is refused (fails safe)");
+    fn reentry_flag_tracks_scope_and_active() {
+        assert!(!test_domain::active(), "not in the domain initially");
+        let outer = test_domain::scope();
+        assert!(test_domain::active(), "inside the domain within a scope");
+        {
+            // Nested scope keeps the flag set until the outermost exits.
+            let _inner = test_domain::scope();
+            assert!(test_domain::active());
+        }
+        assert!(
+            test_domain::active(),
+            "still active after the inner scope drops"
+        );
         drop(outer);
-        // After the outer guard drops, the domain is enterable again.
-        assert!(test_domain().is_some(), "guard released on drop");
+        assert!(
+            !test_domain::active(),
+            "flag cleared once the outermost scope drops"
+        );
     }
 
     #[test]
@@ -415,6 +436,7 @@ mod tests {
             allocated_bytes: 4096,
             freed_bytes: 1024,
             live_bytes: 3072,
+            in_flight_ops: 2,
             background_enabled: true,
         };
         let mut buf = [0u8; 256];
@@ -423,6 +445,7 @@ mod tests {
         assert!(text.contains("live_bytes=3072"));
         assert!(text.contains("init_phase=6"));
         assert!(text.contains("allocated_bytes=4096"));
+        assert!(text.contains("in_flight_ops=2"));
         assert!(text.contains("background_enabled=1"));
     }
 

@@ -971,6 +971,130 @@ fn hooked_arena_serves_from_its_own_region_and_isolates() {
     assert_eq!(st.live_bytes, 0);
 }
 
+/// A custom backing whose `commit` hook **re-enters the allocator** (the
+/// Appendix-F contract violation, §28.3 / W16-6). It delegates real memory work to
+/// a `HostHooks`, but on its first `commit` attempts a fresh allocation from the
+/// *same hooked arena* — exactly the re-entry that would deadlock on the
+/// non-re-entrant back-end lock. It records whether that re-entrant allocation was
+/// declined (null), the W16-6 fail-safe behaviour.
+struct ReentrantOnCommit {
+    inner: HostHooks,
+    /// `*const Allocator`, installed after construction (0 = not yet armed).
+    allocator: AtomicU64,
+    /// The hooked arena id to re-enter.
+    arena: AtomicU32,
+    attempted: std::sync::atomic::AtomicBool,
+    declined_null: std::sync::atomic::AtomicBool,
+}
+
+impl ReentrantOnCommit {
+    fn new() -> Self {
+        Self {
+            inner: HostHooks::new(Arc::new(HookStats::default())),
+            allocator: AtomicU64::new(0),
+            arena: AtomicU32::new(0),
+            attempted: std::sync::atomic::AtomicBool::new(false),
+            declined_null: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn contains(&self, p: *mut u8) -> bool {
+        self.inner.contains(p)
+    }
+}
+
+impl ExtentHooks for ReentrantOnCommit {
+    fn alloc(
+        &self,
+        size: usize,
+        align: usize,
+        zero: &mut bool,
+        commit: &mut bool,
+    ) -> Result<Region, BackendError> {
+        self.inner.alloc(size, align, zero, commit)
+    }
+    fn dealloc(&self, region: Region, committed: bool) -> Result<(), BackendError> {
+        self.inner.dealloc(region, committed)
+    }
+    fn commit(&self, _region: Region, _offset: usize, _len: usize) -> Result<(), BackendError> {
+        // Host memory is already committed (a no-op), but first time through,
+        // re-enter the allocator from inside the hook — the forbidden recursion.
+        let ap = self.allocator.load(Ordering::Acquire);
+        if ap != 0 && !self.attempted.swap(true, Ordering::AcqRel) {
+            let arena = ArenaId(self.arena.load(Ordering::Acquire));
+            // SAFETY: `ap` is the live test allocator pointer, valid for the test.
+            let alloc = ap as usize as *const Allocator<'static, PosixBackingProvider>;
+            // This is the re-entrant allocation. With the W16-6 guard it returns
+            // null (declined) instead of deadlocking on the back-end lock.
+            // SAFETY: `alloc` is the live test allocator (a valid `*const` for the
+            // test's duration); `allocate_in` takes `&self`.
+            let p = unsafe { (*alloc).allocate_in(arena, 64, 16, RequestFlags::NONE) };
+            self.declined_null.store(p.is_null(), Ordering::Release);
+            if !p.is_null() {
+                // Should not happen; free to avoid a leak if the guard regressed.
+                // SAFETY: `p` is a live allocation of `alloc`.
+                unsafe {
+                    (*alloc).free(p);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_hook_that_reenters_the_allocator_fails_safe_not_deadlock() {
+    // A watchdog: a regression (re-entry deadlocking on the back-end lock) would
+    // hang the outer allocation forever; abort loudly after a deadline instead.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            eprintln!(
+                "extent-hook re-entry watchdog: outer allocation did not complete in 10s — \
+                 a re-entrant hook deadlocked on the back-end lock (W16-6 regression)"
+            );
+            std::process::abort();
+        })
+    };
+
+    let a = posix_allocator();
+    let hooks: &'static ReentrantOnCommit = Box::leak(Box::new(ReentrantOnCommit::new()));
+    let arena = a
+        .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
+        .expect("create hooked arena");
+    // Arm the hook with the allocator + arena so its `commit` re-enters.
+    hooks
+        .allocator
+        .store(&a as *const _ as usize as u64, Ordering::Release);
+    hooks.arena.store(arena.0, Ordering::Release);
+
+    // An allocation from the hooked arena triggers a `commit`, whose hook re-enters
+    // the allocator. The OUTER allocation must still succeed, and the re-entrant
+    // one must have been declined (null) rather than deadlocking.
+    let p = a.allocate_in(arena, 4096, 16, RequestFlags::NONE);
+    assert!(!p.is_null(), "outer (hooked-arena) allocation must succeed");
+    assert!(hooks.contains(p), "served from the hooked region");
+    assert!(
+        hooks.attempted.load(Ordering::Acquire),
+        "the hook's commit must have run and attempted the re-entry"
+    );
+    assert!(
+        hooks.declined_null.load(Ordering::Acquire),
+        "the re-entrant allocation must be declined (null), not serviced"
+    );
+    // SAFETY: `p` is a live allocation owned by this test.
+    assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+
+    done.store(true, Ordering::Release);
+    watch.join().unwrap();
+}
+
 #[test]
 fn per_arena_hook_failures_surface_in_stats() {
     // W10 observability: a hooked arena's custom-backing failures are reachable

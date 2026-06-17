@@ -105,6 +105,7 @@ pub unsafe extern "C" fn topomalloc_crash_summary(
             allocated_bytes: 0,
             freed_bytes: 0,
             live_bytes: 0,
+            in_flight_ops: topo_core::in_flight_operations(),
             background_enabled: topo_core::background_enabled(),
         },
     };

@@ -75,10 +75,19 @@ exclude = ["fuzz", "vendor/sele4n"]
 # with `pthread_atfork` wiring; the §35.4 init phases (`init::{InitPhase,PhaseTracker}`),
 # a general re-entrancy guard, and the lock-free crash summary (`init::CrashSummary` + C
 # `topomalloc_crash_summary`, §28.4); plus the fork-in-multithread and TLS-via-dlopen
-# tests. Concurrency/operational, no Lean obligation. In a 0.x series new backwards-
-# compatible functionality is a patch bump (the 0.x minor is the breaking axis), keeping
-# `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.20"
+# tests. Concurrency/operational, no Lean obligation. 0.1.21: W16 optimal-completion
+# pass — the fork gate is now **per-CPU sharded** (per-shard fork bits ⇒ a single
+# `fetch_add`, no Dekker hazard, no `membarrier`, loom-verified by `multishard_…`),
+# quiesces background maintenance through the same drain, and is benchmarked
+# (`benches/fork_gate.rs`); the lock-order checker + S-007/hook re-entrancy guards run in
+# the real artifact (`topo-abi`/`topo-tests` enable `topo-core/std`, `no_std` kernel build
+# unaffected); the extent-hook path declines a re-entrant hook (no deadlock); the §35.4
+# phases advance through each boundary and gate maintenance; new `xtask lint` gates
+# (`atomics ordering` for off-map `SeqCst`, plus `Mutex`/`RwLock` in the lock gate); TLS
+# non-re-entrancy is depth-proven; `owns`/`recognizes` un-gated (lock-free); crash summary
+# gains `in_flight_ops`. In a 0.x series new backwards-compatible functionality is a patch
+# bump (the 0.x minor is the breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
+version = "0.1.21"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

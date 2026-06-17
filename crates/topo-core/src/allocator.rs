@@ -952,6 +952,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        // W16-6 (§28.3, Appendix-F): a user extent hook that re-enters `malloc`
+        // would deadlock on the non-re-entrant back-end lock it runs under. If a
+        // hooked arena exists *and* this thread is currently inside a hook call,
+        // decline the re-entrant allocation cleanly (null) **before** taking any
+        // lock — turning a deadlock into a safe failure. This is a *recoverable*
+        // defined-behaviour decline (like OOM), **not** a panic: we are running
+        // inside the hook's locked context, so a `debug_assert!` unwind here could
+        // strand a held lock; the null return is the §2.4 safe failure. Gated on
+        // `hooks.count` so the common (no-hooked-arena) path pays nothing.
+        if self.hooks.count.load(Ordering::Acquire) != 0 && crate::hooks::hook_reentry::active() {
+            return ptr::null_mut();
+        }
         let Some(req) = classify(size, align, flags.raw()) else {
             return ptr::null_mut();
         };
@@ -2411,6 +2423,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // Saturating: a torn relaxed read during concurrent ops could make
             // `freed` transiently exceed `allocated`; never report a wrap.
             live_bytes: allocated.saturating_sub(freed),
+            in_flight_ops: crate::fork::in_flight_operations(),
             background_enabled: crate::fork::background_enabled(),
         }
     }

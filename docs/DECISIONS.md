@@ -1829,3 +1829,71 @@ ships first; a noted optimization is a later perf pass, never a correctness gap.
   properties are pinned by concrete artifacts rather than a bare claim: deadlock-freedom by the fixed-wall
   `lock::tests::out_of_order_acquire_trips_the_checker` (the checker rejects an out-of-order acquire), and
   fork-quiesce by the `gate_admits_no_op_across_a_fork` `loom` model (no operation crosses a fork).
+
+### W16 optimal-completion pass (sharded gate, hook re-entry, load-bearing phases, ordering gate)
+
+A self-audit of the first W16 pass surfaced gaps that this pass closes — each was either a deferred
+optimization, a wired-ahead-of-consumer mechanism, or a guarantee that only held in `topo-core`'s own
+tests. All are now genuine, tested, and active in the **real** artifact.
+
+* **The fork gate is per-CPU sharded *and* loom-verifiable — no `membarrier` needed.** The first pass shipped
+  a single-word CAS gate (verifiable but a contended cacheline) and deferred sharding behind `membarrier`
+  (which `loom` cannot model). The key insight that dissolves the trade-off: put the **fork-pending bit in
+  every shard**, so an op's `fetch_add` on its CPU's shard returns the bit in its *previous value* — the
+  fork check rides on the RMW result, with **no separate load** (no Dekker hazard) and **no `membarrier`**.
+  Each shard is thus an independent, loom-checkable single-word gate; `prefork` sets the bit in all shards
+  then drains all counts. `operation_guard` is now one `fetch_add` on the running CPU's own (cache-line-
+  padded) shard — no CAS retry-storm, no shared cacheline when sharded. Sharding auto-enables when a cheap
+  per-CPU id is available (`topo_arch::rseq::current_cpu()`, the glibc/rseq area), falling back to "all ops
+  on shard 0" (exactly the single-word gate) otherwise. Verified by `gate_admits_no_op_across_a_fork` **and**
+  a new `multishard_gate_admits_no_op_across_a_fork` `loom` model, plus a `benches/fork_gate.rs` criterion
+  bench that *measures* the ~13 ns/op uncontended cost. (So the chosen answer to the verifiability-vs-
+  scalability question was "both", achieved without the membarrier complexity the question assumed.)
+
+* **`prefork` quiesces background maintenance through the *same* drain.** "Quiesce background threads"
+  (W16-5a) was a bare flag. Internal maintenance (the release pump, rebalancer) now runs inside a
+  `fork::maintenance_guard`, which counts in the same gate as public ops — so `prefork`'s single drain
+  quiesces both, and the child's `background_enabled = false` keeps maintenance off until the host re-arms
+  it. A real handshake (tested), wired ahead of its pump consumer. The fork battery additionally gained a
+  **concurrent-forker** test (two threads forking at once, serialized by `FORK_LOCK`) and a
+  **parent-consistency** test (a long-lived allocation survives 20 forks intact).
+
+* **The thread-local safety machinery is active in the *real* allocator, not just `topo-core`'s tests.**
+  Nothing enabled `topo-core/std`, so in `topo-abi` (and every downstream build) the lock-order checker, the
+  S-007 bootstrap guard, and the W16-6 hook guard were silent no-ops — the G-conc checker only ever ran in
+  `topo-core`'s own lib tests. `topo-abi` and `topo-tests` now enable `topo-core/std` (they are hosted, std
+  artifacts anyway), so the checker runs across the **integration + ABI** suites (it found zero new
+  violations) and the hook guard works in production. The `no_std` hot-path capability is preserved for the
+  kernel/seLe4n target, which builds `topo-core` *without* the feature (verified: `cargo build -p topo-core`
+  and the seLe4n `real-abi` build stay `no_std`).
+
+* **A re-entrant extent hook now fails safe instead of deadlocking (W16-6).** The per-provider `enter_hook`
+  flag could not stop the *same-arena* re-entry that deadlocks on the back-end lock (the lock is taken
+  before the flag is reached). A per-thread `hooks::hook_reentry` domain (the `reentry_flag!` macro's
+  `scope()`+`active()` shape), set for every user-hook call, lets the **allocator entry** decline a
+  re-entrant allocation with a null **before** any lock — a recoverable, defined-behaviour decline (not a
+  panic: we are inside the hook's locked context, where an unwind could strand a lock). Pinned by
+  `a_hook_that_reenters_the_allocator_fails_safe_not_deadlock` (a hook whose `commit` re-enters the same
+  arena; watchdog-guarded).
+
+* **Init phases are precise and load-bearing (W16-7).** The first pass skipped phases 3/5 and only *reported*
+  the phase. The global initializer now advances through **every** §35.4 phase at its real boundary
+  (bootstrap → atfork → OS discovery → arena registry → per-CPU/rseq → background/profiling → operational),
+  and the phase **gates behaviour**: `maintenance_guard` declines before the background/profiling phase.
+  Tested end-to-end (`global_init_reaches_operational_and_crash_summary_reflects_it`).
+
+* **`SeqCst` is off the §27.3 map, now gate-enforced (W16-3).** The ordering map's policy is
+  Release/Acquire/AcqRel/Relaxed; the redesigned gate uses no `SeqCst` at all. A new `cargo xtask lint` gate
+  (`atomics ordering (W16-3)`) forbids an unjustified `SeqCst` in non-test `topo-core` (an inline
+  `SeqCst: <reason>` permits a deliberate one, mirroring the V-004 citation discipline). The W16-1b lock
+  lint was likewise strengthened: it is test-aware (scans only the non-`#[cfg(test)]` portion) and also
+  forbids a raw `std::sync::Mutex`/`RwLock`/`Condvar`/`parking_lot` lock, not just the spinlock idiom.
+
+* **TLS non-re-entrancy is *proven by depth*, and over-gating removed.** The `global_allocator` example now
+  wraps the allocator in a depth-counting `#[global_allocator]` and asserts the steady-state path —
+  including each fresh thread's first TLS-establishing allocation — runs at depth exactly 1 (makes **no**
+  nested allocation), the precise statement of "first TLS access never re-enters" (the `dlopen` general-
+  dynamic case stays covered by `tls_dlopen.rs`). And the lock-free `owns`/`recognizes` are no longer
+  fork-gated (they hold no lock; the gate was pure overhead), while `usable_size`/`stats` (which take a
+  lock) keep it. The crash summary gained a lock-free `in_flight_ops` field (allocator activity at crash
+  time); per-object counts stay omitted by design (they need locks, §28.4) rather than taxing the hot path.

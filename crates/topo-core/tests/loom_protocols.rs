@@ -357,21 +357,21 @@ fn w8_span_retirement_is_claimed_exactly_once() {
 
 /// The W16-5 fork-gate protocol (`fork.rs` `operation_guard` / `prefork`): an
 /// operation must **never** be admitted-and-in-flight at the instant `prefork`
-/// observes the in-flight count drained to zero and forks (the §28.1 quiesce
-/// guarantee — no internal lock can be held at `fork()`). The gate packs a
-/// fork-pending bit and the in-flight count into **one** word, so the reader's
-/// "enter iff no fork pending" is a single compare-exchange: a reader either wins
-/// before the forker sets the bit (and is counted by the drain) or fails its CAS
-/// after (and parks). `loom` proves this over every interleaving — and, crucially,
-/// the gate uses **no `SeqCst`** (which `loom` models only as `AcqRel`), so the
-/// model is sound. This mirrors the real `operation_guard`/`prefork` exactly
-/// (modeling the count as a single bit is exact for one operation).
+/// observes every shard drained to zero and forks (the §28.1 quiesce guarantee —
+/// no internal lock can be held at `fork()`). Each shard packs a fork-pending bit
+/// and an in-flight count into one word, and an op enters by a **`fetch_add`** on
+/// its shard, inspecting the **returned previous value**: it is admitted iff the
+/// fork bit was clear. The fork-bit test rides on `fetch_add`'s atomic result, so
+/// there is no separate load — no store-then-load (Dekker) hazard, **no
+/// `membarrier`**, and **no `SeqCst`** (which `loom` models only as `AcqRel`), so
+/// the model is sound. This mirrors the real `operation_guard`/`prefork` exactly
+/// (one shard, one op — exact, since `fetch_add`/`fetch_sub` on a 0/1 count are the
+/// `store(1)`/`store(0)` loom captures).
 #[test]
 fn gate_admits_no_op_across_a_fork() {
     const FORK_PENDING: usize = 1 << (usize::BITS - 1);
-    const COUNT_MASK: usize = FORK_PENDING - 1;
     loom::model(|| {
-        let gate = Arc::new(AtomicUsize::new(0));
+        let shard = Arc::new(AtomicUsize::new(0));
         // `in_op` is true exactly while the operation thread is *inside* its
         // guarded region (admitted, not yet left) — the window in which it could
         // hold an internal allocator lock.
@@ -379,31 +379,83 @@ fn gate_admits_no_op_across_a_fork() {
 
         // The operation thread: `operation_guard()` then (maybe) the op body.
         let op = {
-            let (gate, in_op) = (gate.clone(), in_op.clone());
+            let (shard, in_op) = (shard.clone(), in_op.clone());
             thread::spawn(move || {
-                let g = gate.load(Ordering::Acquire);
-                // If a fork is pending we would park (model it as "do not enter").
-                if g & FORK_PENDING == 0
-                    && gate
-                        .compare_exchange(g, g + 1, Ordering::Acquire, Ordering::Acquire)
-                        .is_ok()
-                {
+                // Enter by fetch_add, reading the previous value: admitted iff the
+                // fork bit was clear when we incremented (no separate load).
+                let prev = shard.fetch_add(1, Ordering::AcqRel);
+                if prev & FORK_PENDING == 0 {
                     // Admitted: inside the guarded region (an internal lock could be held).
                     in_op.store(true, Ordering::Relaxed);
                     in_op.store(false, Ordering::Relaxed);
-                    gate.fetch_sub(1, Ordering::Release); // leave
+                    shard.fetch_sub(1, Ordering::Release); // leave
+                } else {
+                    shard.fetch_sub(1, Ordering::Release); // back out (park, modeled as no-enter)
                 }
             })
         };
 
-        // The forking thread: `prefork` sets the fork bit, then drains the count.
-        gate.fetch_or(FORK_PENDING, Ordering::AcqRel);
-        if gate.load(Ordering::Acquire) & COUNT_MASK == 0 {
+        // The forking thread: `prefork` sets the fork bit on the shard, then drains.
+        shard.fetch_or(FORK_PENDING, Ordering::AcqRel);
+        if shard.load(Ordering::Acquire) & !FORK_PENDING == 0 {
             // The drain observed zero in-flight operations and would now `fork()`.
             // The non-negotiable invariant: no operation is inside its region.
             assert!(
                 !in_op.load(Ordering::Relaxed),
                 "fork gate admitted an operation across a fork (an internal lock could be held)"
+            );
+        }
+
+        op.join().unwrap();
+    });
+}
+
+/// The multi-shard composition (`prefork` sets the fork bit in **all** shards
+/// before draining any): with the per-shard invariant above, no op on *any* shard
+/// can be admitted-and-in-flight when the all-shard drain reads zero. Modeled with
+/// two shards and one op that picks either (a migrating thread); `loom` proves the
+/// composition holds over every interleaving + shard choice.
+#[test]
+fn multishard_gate_admits_no_op_across_a_fork() {
+    const FORK_PENDING: usize = 1 << (usize::BITS - 1);
+    const COUNT_MASK: usize = FORK_PENDING - 1;
+    loom::model(|| {
+        let shards = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let in_op = Arc::new(AtomicBool::new(false));
+        // The op picks a shard (loom explores both) — standing in for "this CPU".
+        let pick = Arc::new(AtomicUsize::new(0));
+
+        let op = {
+            let (s0, s1, in_op, pick) = (
+                shards[0].clone(),
+                shards[1].clone(),
+                in_op.clone(),
+                pick.clone(),
+            );
+            thread::spawn(move || {
+                let i = pick.load(Ordering::Relaxed) & 1;
+                let s = if i == 0 { &s0 } else { &s1 };
+                let prev = s.fetch_add(1, Ordering::AcqRel);
+                if prev & FORK_PENDING == 0 {
+                    in_op.store(true, Ordering::Relaxed);
+                    in_op.store(false, Ordering::Relaxed);
+                }
+                s.fetch_sub(1, Ordering::Release);
+            })
+        };
+
+        // prefork: set the bit in ALL shards first, then sum ALL counts.
+        for s in &shards {
+            s.fetch_or(FORK_PENDING, Ordering::AcqRel);
+        }
+        let total: usize = shards
+            .iter()
+            .map(|s| s.load(Ordering::Acquire) & COUNT_MASK)
+            .sum();
+        if total == 0 {
+            assert!(
+                !in_op.load(Ordering::Relaxed),
+                "multishard fork gate admitted an operation across a fork"
             );
         }
 

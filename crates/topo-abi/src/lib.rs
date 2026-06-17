@@ -229,8 +229,11 @@ impl AnyAllocator {
     }
 
     /// Whether `ptr` is a **live** allocation of this allocator.
+    ///
+    /// **Not** fork-gated: it is lock-free (a pagemap seqlock read + atomic
+    /// bitmap bit), so it holds no internal lock at any point and a `fork()`
+    /// racing it is harmless — gating it would be pure overhead (W16-5 audit).
     pub fn owns(&self, ptr: *mut u8) -> bool {
-        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.owns(ptr))
     }
 
@@ -238,8 +241,9 @@ impl AnyAllocator {
     /// freed-awaiting-reuse, interior, retained, or metadata) — the §35.2
     /// mixed-allocator routing predicate; see
     /// [`Allocator::recognizes`](topo_core::Allocator::recognizes).
+    /// **Not** fork-gated: lock-free (a pagemap lookup + metadata-range check), so
+    /// it holds no internal lock and needs no quiesce (W16-5 audit).
     pub fn recognizes(&self, ptr: *mut u8) -> bool {
-        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.recognizes(ptr))
     }
 
@@ -552,28 +556,38 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
             // other init-path temporaries have been allocated and freed through the
             // system allocator — and only then clears the bootstrap flag.
             let _guard = BootstrapGuard::enter();
-            // W16-7 (§35.4): advance the observable init phases as bring-up proceeds.
-            // Phase 1: the bootstrap metadata allocator is the floor every reservation
-            // stands on (it is already live as a static, S-007).
+            // W16-7 (§35.4): advance the observable init phases through **each**
+            // boundary as bring-up proceeds (a reentrant caller can read the exact
+            // phase via the crash summary / control plane; behaviour is gated on it
+            // — e.g. background maintenance cannot run before phase 5).
+            //
+            // Phase 1: the bootstrap metadata allocator is the floor every
+            // reservation stands on (already live as a static, S-007).
             INIT_PHASE.advance_to(InitPhase::BootstrapMetadata);
             // W16-5: install the `pthread_atfork` handlers before any allocation can
             // complete, so a `fork()` quiesces the allocator (§28.1). Idempotent.
             crate::fork_api::register_atfork_handlers();
-            // Phase 2: OS feature discovery (backend selection; topology/hugepage probing
-            // happens inside `new_allocator_named` for the hugepage profile).
+            // Phase 2: OS feature discovery (backend selection; topology/hugepage
+            // probing happens inside `new_allocator_named` for the hugepage profile).
             INIT_PHASE.advance_to(InitPhase::OsDiscovery);
             let name = selected_backend_name();
             let allocator = new_allocator_named(&name).or_else(|| new_allocator_named("posix"));
             if allocator.is_some() {
-                // Phase 3 & 4: the engine (with its arena registry + default arena, and
-                // the per-CPU/RSEQ front end) now exists.
+                // Phase 3: the engine exists, so the arena registry + default arena
+                // (§22, §35.4 phase 3) are now live.
+                INIT_PHASE.advance_to(InitPhase::ArenaRegistry);
+                // Phase 4: per-CPU / RSEQ front-end setup. Enable the per-CPU sharded
+                // fork gate iff a cheap per-CPU id is available (the glibc/rseq area);
+                // a safe no-op otherwise (single-shard).
+                topo_core::probe_and_set_sharding();
                 INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
-                // W17-3: honour `$TOPOMALLOC_SAMPLE_RATE` (§32.1) now, under the bootstrap
-                // guard, so the sampler's one-time setup allocations are served by the
-                // system allocator and the first real sample is already armed. Only arms
-                // when the engine built — there is nothing to profile otherwise.
+                // Phase 5: background threads + profiling. Honour `$TOPOMALLOC_SAMPLE_RATE`
+                // (§32.1) now, under the bootstrap guard, so the sampler's one-time setup
+                // allocations are served by the system allocator and the first real sample
+                // is already armed. Only arms when the engine built.
                 crate::sampling::init_from_env();
-                // Phase 5 & 6: background/profiling armed; open for normal operation.
+                INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
+                // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);
             }
             allocator
@@ -916,5 +930,41 @@ mod tests {
         // SAFETY: `p` was just returned by `a` and is owned by this test.
         assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
         assert!(new_allocator_named("nope").is_none());
+    }
+
+    /// W16-7 (§35.4): the lazy global initializer drives the init phases all the
+    /// way to `Operational`, and the lock-free crash summary reflects that phase.
+    /// (Triggering `global()` here also covers the phased bring-up end to end.)
+    #[test]
+    fn global_init_reaches_operational_and_crash_summary_reflects_it() {
+        use topo_core::{InitPhase, INIT_PHASE};
+        // Force the lazy init (allocate one block through the process allocator).
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(96, 16).unwrap();
+        // SAFETY: valid non-zero layout; freed below.
+        let p = unsafe { g.alloc(layout) };
+        assert!(!p.is_null());
+        // SAFETY: `p` is a live 96-byte allocation from `g`.
+        unsafe { g.dealloc(p, layout) };
+
+        // The phased bring-up reached normal operation.
+        assert_eq!(INIT_PHASE.current(), InitPhase::Operational);
+        assert!(INIT_PHASE.is_operational());
+
+        // The lock-free crash summary (W16-6) reports the phase + nonzero allocation
+        // history, with no lock taken and no allocation.
+        let mut buf = [0i8; 256];
+        // SAFETY: `buf` is a valid 256-byte writable region.
+        let n = unsafe { topomalloc_crash_summary(buf.as_mut_ptr(), buf.len()) };
+        // SAFETY: `n <= buf.len()`; the written bytes are ASCII.
+        let text = core::str::from_utf8(unsafe {
+            core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n)
+        })
+        .unwrap();
+        assert!(
+            text.contains(&format!("init_phase={}", InitPhase::Operational as u8)),
+            "crash summary must report the operational phase: {text:?}"
+        );
+        assert!(text.contains("allocated_bytes="));
     }
 }

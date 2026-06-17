@@ -377,11 +377,11 @@ size_t topomalloc_profile_dump_json(char *buf, size_t cap);
 
 /* Write a minimal, lock-free, allocation-free allocator summary into buf as
  * ASCII "key=value" lines (init phase, cumulative allocated/freed/live bytes,
- * background-maintenance flag), returning the number of bytes written (never
- * exceeding len). Safe to call from a crash or signal handler: it takes no lock,
- * allocates nothing, and never forces allocator initialization. A NULL buf or
- * len==0 writes nothing and returns 0. Full stats may be unavailable in a crash
- * context; this is the always-available summary. */
+ * in-flight operation count, background-maintenance flag), returning the number
+ * of bytes written (never exceeding len). Safe to call from a crash or signal
+ * handler: it takes no lock, allocates nothing, and never forces allocator
+ * initialization. A NULL buf or len==0 writes nothing and returns 0. Full stats
+ * may be unavailable in a crash context; this is the always-available summary. */
 size_t topomalloc_crash_summary(char *buf, size_t len);
 
 /* ------------------------------------------------------------------------

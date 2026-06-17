@@ -57,9 +57,13 @@
 //! not call TopoMalloc recursively unless documented reentrant-safe") is inherited
 //! from the seam: every hook runs while the back-end extent lock is held (as the
 //! existing `commit`/`decommit` provider calls do), so a re-entrant allocator call
-//! from inside a hook would deadlock on that non-re-entrant lock — the documented,
-//! enforced boundary (explicit recursion detection is a hardened-profile concern,
-//! plan 08).
+//! from inside a hook would otherwise deadlock on that non-re-entrant lock.
+//! Two guards turn that into a **graceful, detected** failure (W16-6, §28.3): the
+//! per-provider [`enter_hook`](HookProvider) flag rejects a re-entry that reaches
+//! the same provider, and the per-thread `hook_reentry` domain (set by
+//! `HookGuard`) lets the allocator entry decline a re-entrant allocation with a
+//! null *before* it can take the lock. (Full hardened-profile recursion diagnostics
+//! — quarantine, stack capture — remain a plan-08 concern.)
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -343,16 +347,31 @@ impl ReservationSet {
     }
 }
 
+crate::reentry_flag! {
+    /// Per-thread "inside an extent-hook call" domain (W16-6, §28.3). Set by
+    /// [`HookGuard`] for the duration of every user-hook call; queried at the
+    /// allocator entry ([`Allocator`](crate::Allocator)), which **fails safe**
+    /// (returns null) if a hook re-enters `malloc` — turning the same-arena
+    /// re-entry that would otherwise deadlock on the non-re-entrant back-end lock
+    /// into a clean failure (Appendix-F). Allocation-free, Local-Exec TLS.
+    pub(crate) mod hook_reentry
+}
+
 /// RAII reentrancy guard: clears the provider's `in_hook` flag on drop — including
 /// an unwinding hook in `std` tests — so the flag never sticks (§23.3 reentrancy).
+/// Also marks the **per-thread** `hook_reentry` domain (W16-6) for the call's
+/// duration, so the allocator entry can decline a re-entrant hook allocation
+/// *before* it reaches (and deadlocks on) the back-end lock.
 struct HookGuard<'a> {
     flag: &'a AtomicBool,
+    _thread_scope: hook_reentry::Scope,
 }
 
 impl Drop for HookGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         self.flag.store(false, Ordering::Release);
+        // `_thread_scope` drops here too, leaving the per-thread domain.
     }
 }
 
@@ -449,6 +468,9 @@ impl<H: ExtentHooks> HookProvider<H> {
         }
         Ok(HookGuard {
             flag: &self.in_hook,
+            // Mark the per-thread domain so the allocator entry declines a
+            // re-entrant hook allocation before it can deadlock (W16-6).
+            _thread_scope: hook_reentry::scope(),
         })
     }
 
