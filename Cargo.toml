@@ -67,10 +67,32 @@ exclude = ["fuzz", "vendor/sele4n"]
 # OS-zeroed extents (`committed_memory_is_zeroed`); cache-served hugepage tail-trim
 # (`HugePageFiller::trim` via `RegionCacheHook::try_trim`); aligned size classes (the
 # generated table records each class's natural alignment ⇒ MAX_ALIGN = page size, no Lean
-# proof change); and `valloc`/`pvalloc`. In a 0.x series new backwards-compatible
-# functionality is a patch bump (the 0.x minor is the breaking axis), keeping `^0.1.0`
-# inter-crate reqs satisfied.
-version = "0.1.19"
+# proof change); and `valloc`/`pvalloc`. 0.1.20: W16 (plan 05) — concurrency / memory
+# ordering / fork / signal / TLS: the ranked lock hierarchy + debug lock-order checker
+# (`lock::RankedLock<RANK>`/`LockRank`, every `topo-core` lock routed through it; the
+# G-conc runtime checker + an `xtask lint` static gate); the single-word CAS fork-quiesce
+# gate (`fork::{operation_guard,prefork,postfork_parent,postfork_child}`, loom-verified)
+# with `pthread_atfork` wiring; the §35.4 init phases (`init::{InitPhase,PhaseTracker}`),
+# a general re-entrancy guard, and the lock-free crash summary (`init::CrashSummary` + C
+# `topomalloc_crash_summary`, §28.4); plus the fork-in-multithread and TLS-via-dlopen
+# tests. Concurrency/operational, no Lean obligation. 0.1.21: W16 optimal-completion
+# pass — the fork gate is now **per-CPU sharded** (per-shard fork bits ⇒ a single
+# `fetch_add`, no Dekker hazard, no `membarrier`, loom-verified by `multishard_…`),
+# quiesces background maintenance through the same drain, and is benchmarked
+# (`benches/fork_gate.rs`); the lock-order checker + S-007/hook re-entrancy guards run in
+# the real artifact (`topo-abi`/`topo-tests` enable `topo-core/std`, `no_std` kernel build
+# unaffected); the extent-hook path declines a re-entrant hook (no deadlock); the §35.4
+# phases advance through each boundary and gate maintenance; new `xtask lint` gates
+# (`atomics ordering` for off-map `SeqCst`, plus `Mutex`/`RwLock` in the lock gate); TLS
+# non-re-entrancy is depth-proven; `owns`/`recognizes` un-gated (lock-free); crash summary
+# gains `in_flight_ops`. 0.1.22: W16 deep-audit pass — the fork gate is now genuinely
+# **re-entrancy-aware** (a nested entry nests on a per-thread depth instead of parking on the
+# fork bit, closing a latent drain deadlock), the `topomalloc_numa_*` control surface is
+# fork-gated (it takes backend locks), and the hook re-entrancy fail-safe now declines
+# `free`/`realloc`/in-place-resize too (not just `malloc`); regression tests pin each. In a 0.x
+# series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
+# axis), keeping `^0.1.0` inter-crate reqs satisfied.
+version = "0.1.22"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

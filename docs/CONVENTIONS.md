@@ -132,3 +132,32 @@ obligation claim without a citation keyword (a theorem reference, or `pin`/
 `certified`/`proven`/`discharged`/`fixed wall`) within `LINE_WINDOW` lines fails
 the gate. The matcher joins wrapped doc-comment lines and matches citation stems
 on word boundaries (so "map**pin**g" is not mistaken for a `pin` citation).
+
+## 9. Locks, lock order & atomics (W16, §27)
+
+* **Every lock in `topo-core` is a `lock::RankedLock<const RANK: u8>`** — the single
+  lock primitive — so the debug lock-order checker (W16-1b) sees every acquisition.
+  A hand-rolled spinlock (the `compare_exchange(false, true, …)` test-and-set idiom)
+  anywhere outside `lock.rs` fails the `cargo xtask lint` **G-conc** gate
+  (`lock hierarchy`). Pick the rank from the §27.2 total order in the `lock` module
+  docs; acquisitions must be **strictly rank-increasing** (the checker `debug_assert!`s
+  it, active in debug + `debug-checks`). Refill/flush stay hand-over-hand — at most one
+  middle-end lock held at a time.
+* **Every atomic carries a documented memory order** (§27.3): publication = `Release`,
+  consumption = `Acquire`, a transition visible to concurrent free/classify = `AcqRel`
+  (or a `Release`/`Acquire` pair), approximate counters/stats = `Relaxed`. The map is
+  in the `lock` module docs; the `loom` models in `tests/loom_protocols.rs` machine-check
+  the ordering-protocol invariants, and `cargo xtask test --kind tsan` must stay clean.
+* **A thread-local on (or reachable from) an allocation path must be allocation-free**
+  (W16-2 / S-007): use a `const`-initialised `thread_local!` (Local-Exec TLS, no lazy
+  alloc) — never one whose initializer allocates — so a thread's first allocation cannot
+  re-enter the allocator. The `reentry_flag!` macro and the lock-order checker follow
+  this.
+* **Public process-allocator entry points run inside `fork::operation_guard()`** so a
+  `fork()` quiesces them (W16-5); a new entry point that takes internal locks must be
+  gated too — including control surfaces like `topomalloc_numa_*` that take backend
+  locks. The gate is **re-entrancy-aware** (a nested entry nests on a per-thread depth
+  instead of parking on the fork bit), so gating an entry point that itself re-enters
+  `malloc` is safe and never deadlocks the pre-fork drain. `pthread_atfork` registration
+  is `topo-abi`'s job (it has `libc`); the core exposes the mechanism
+  (`fork::{prefork,postfork_parent,postfork_child}`).

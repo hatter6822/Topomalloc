@@ -1745,3 +1745,256 @@ three issues in the freshly-landed code; each was confirmed against the code and
   fail. No rollback exists to fail. Pinned by `install_large_range_after_reserve_allocates_nothing_and_publishes`
   (the publish over a reserved multi-leaf range consumes zero further metadata). These are mechanism
   reorderings, not new transitions, so no Lean obligation changes.
+
+## W16 — concurrency, memory ordering, fork, signal & TLS (plan 05)
+
+The M2 concurrency foundation. Each decision below is "correct before fast": the verified-correct mechanism
+ships first; a noted optimization is a later perf pass, never a correctness gap.
+
+* **One ranked-lock primitive; every `topo-core` lock is a `RankedLock` (W16-1a, §27.2).** The four
+  hand-rolled test-and-set spinlocks (`CentralLock`, `SpanLock`, `BackendLock`, the transfer-bin lock) and
+  the per-CPU front-end lock are replaced by a single `RankedLock<const RANK: u8>` carrying a **compile-time
+  rank**. The §27.2 hierarchy is *refined* into a total order over the concrete locks (the SPEC permits
+  refinement): a `FRONT_END` rank for the per-CPU lock (the outermost data-path lock), a `SPAN_POOL` rank
+  between `CENTRAL` and the per-span `SPAN` lock (because `create_span` recycles a descriptor — which takes
+  the per-span lock — while holding the descriptor pool), and a single shared `BACKEND` rank for the extent
+  manager / large pool / huge backend (proven never held simultaneously: the large path consults the
+  region-cache hook *before* taking the extent lock, and a span's backing extent is allocated *and released*
+  before the descriptor pool lock). The per-CPU lock keeps its `#[repr(C)]` offset-0 layout (a `RankedLock`
+  is a single `AtomicBool`), so the RSEQ assembly that peeks the lock byte is byte-for-byte unchanged.
+
+* **The lock-order checker is a per-thread held-rank set, allocation-free and debug-gated (W16-1b, the
+  G-conc gate).** Every acquire records its rank in a fixed-size, `const`-initialised thread-local array
+  (never a `Vec` — Local-Exec TLS, so recording a rank never re-enters `malloc` even when the crate backs
+  the process `#[global_allocator]`) and asserts the new rank exceeds every rank held; release removes it.
+  Active under `debug_assertions` + the `debug-checks` profile (the normal `cargo test` build and CI); a
+  no-op in `performance` and pure `no_std`. Any out-of-order acquire trips a `debug_assert!` — the deadlock
+  a lock-order cycle would cause, caught deterministically. A static `cargo xtask lint` gate
+  (`lock hierarchy (G-conc)`) forbids the `compare_exchange(false, true, …)` spinlock idiom anywhere outside
+  `lock.rs`, so a new hand-rolled lock that would escape the checker fails CI (DD-3 F1). The whole existing
+  suite (incl. the multithreaded central/arena/hugepage tests) runs green under the checker — empirical
+  proof the existing acquisition order already respects §27.2.
+
+* **`fork()` safety is a drain gate, not "acquire every lock" (W16-5, §28.1, DD-5).** jemalloc-style prefork
+  acquires every internal mutex in rank order; that is **infeasible here** because the per-span locks are
+  *dynamic* (created on demand) and are taken *outside* the central lock (`activate_span`, `recycle`), so
+  acquiring the fixed structure locks would not stop a thread from holding a per-span lock at `fork()`.
+  Instead every public operation runs inside `fork::operation_guard()`, and the pre-fork handler **drains**
+  the in-flight count to zero: no in-flight operation ⟺ no internal spinlock held ⟺ every structure is
+  consistent. The parent resumes; the child **resets** (not unlocks) the gate, clears the lock-order
+  checker's inherited bookkeeping, and disables background maintenance. This is the §28.1 "global allocator
+  fork lock + quiesce". The per-op gate is one atomic on the hot path — the M2 fork-safety cost; a
+  per-thread-sharded gate is the future perf optimization.
+
+* **The gate is a single-word CAS read-write lock — chosen over a `SeqCst` Dekker gate so `loom` can verify
+  it.** The natural "increment a count, then check a fork flag; the forker sets the flag, then waits for the
+  count" is a store-then-load (Dekker) shape that needs `SeqCst` to be correct — but `loom` models `SeqCst`
+  only as `AcqRel`, so it cannot machine-check such a gate (and indeed reports a spurious violation). The
+  gate instead packs the fork-pending bit and the in-flight count into **one** `AtomicU64`: an operation
+  enters by a compare-exchange that increments the count *iff* the fork bit is clear, so a reader that races
+  a forker either wins before the bit is set (and is drained) or fails its CAS after (and parks) — the
+  standard CAS read-write-lock shape, with **no `SeqCst`**. `gate_admits_no_op_across_a_fork`
+  (`tests/loom_protocols.rs`) proves over every interleaving that no operation is admitted-and-in-flight at
+  the instant the drain forks. The trade-off accepted: the CAS contends among concurrent entries (vs. a
+  `fetch_add`), which the future sharded gate also removes.
+
+* **TLS is initial-exec / `const`-init (W16-2, §27.6, DD-4) and tested via `dlopen`.** The allocator's own
+  thread-locals — the lock-order checker, the bootstrap/sampling re-entrancy guards — are `const`-initialised
+  `thread_local!`s, which compile to Local-Exec (a direct `%fs:…@TPOFF` load, no `__tls_get_addr`, no lazy
+  guard, no allocation) in an executable, so a thread's first allocation never re-enters the allocator while
+  establishing its TLS. The danger case is `dlopen` (where general-dynamic TLS may allocate on first access);
+  `tls_dlopen.rs` loads the freshly-built `libtopo_abi` via `dlopen` (`RTLD_LOCAL`, its own statics/TLS) and
+  drives its `malloc`/`free` from fresh threads under a watchdog — a re-entrancy regression would deadlock and
+  the watchdog aborts loudly. The `global_allocator` example additionally exercises first-allocation on many
+  fresh threads while TopoMalloc *is* the process `#[global_allocator]`.
+
+* **The crash summary is lock-free and reads only cumulative-byte atomics (W16-6, §28.4).** A signal/crash
+  handler must not take a contended lock (which the faulting thread may hold) or allocate (`malloc` is not
+  async-signal-safe). `Allocator::crash_summary()` reads only the relaxed `allocated_bytes`/`freed_bytes`
+  atomics + the process init phase / background flag and formats them into a caller buffer with an
+  allocation-free bounded cursor (`init::CrashSummary::write`); the C `topomalloc_crash_summary` never forces
+  the allocator's lazy init (it uses a non-initializing `GLOBAL.get()`). Object/state breakdowns, which take
+  locks, are deliberately omitted — "full stats may be unavailable in crash context" (§28.4).
+
+* **Init is observable as monotone §35.4 phases; shutdown leaks by default (W16-7).** `init::PhaseTracker`
+  (one `AtomicU8`, lock-free, monotone — never winds backwards) advances through Phase 0–6 as the global
+  initializer brings the allocator up (bootstrap metadata → atfork registration → OS discovery → engine →
+  profiling → operational), so a reentrant caller can ask "open for business yet?" without a lock (§35.4
+  "each phase MUST be reentrancy-safe"). Shutdown keeps the §35.5 policy: allocator metadata is process-lived
+  (the `MetaArena` is `Box::leak`-ed), with explicit `teardown()`/`Drop` available for tests.
+
+* **W16 is concurrency/operational, not an abstract §33.4 transition — no Lean obligation.** The lock
+  hierarchy, fork gate, TLS model, and init phases change *when* and *how safely* the allocator runs, never
+  the abstract ownership state the Lean model tracks. Per the V-004 citation rule, the two load-bearing
+  properties are pinned by concrete artifacts rather than a bare claim: deadlock-freedom by the fixed-wall
+  `lock::tests::out_of_order_acquire_trips_the_checker` (the checker rejects an out-of-order acquire), and
+  fork-quiesce by the `gate_admits_no_op_across_a_fork` `loom` model (no operation crosses a fork).
+
+### W16 optimal-completion pass (sharded gate, hook re-entry, load-bearing phases, ordering gate)
+
+A self-audit of the first W16 pass surfaced gaps that this pass closes — each was either a deferred
+optimization, a wired-ahead-of-consumer mechanism, or a guarantee that only held in `topo-core`'s own
+tests. All are now genuine, tested, and active in the **real** artifact.
+
+* **The fork gate is per-CPU sharded *and* loom-verifiable — no `membarrier` needed.** The first pass shipped
+  a single-word CAS gate (verifiable but a contended cacheline) and deferred sharding behind `membarrier`
+  (which `loom` cannot model). The key insight that dissolves the trade-off: put the **fork-pending bit in
+  every shard**, so an op's `fetch_add` on its CPU's shard returns the bit in its *previous value* — the
+  fork check rides on the RMW result, with **no separate load** (no Dekker hazard) and **no `membarrier`**.
+  Each shard is thus an independent, loom-checkable single-word gate; `prefork` sets the bit in all shards
+  then drains all counts. `operation_guard` is now one `fetch_add` on the running CPU's own (cache-line-
+  padded) shard — no CAS retry-storm, no shared cacheline when sharded. Sharding auto-enables when a cheap
+  per-CPU id is available (`topo_arch::rseq::current_cpu()`, the glibc/rseq area), falling back to "all ops
+  on shard 0" (exactly the single-word gate) otherwise. Verified by `gate_admits_no_op_across_a_fork` **and**
+  a new `multishard_gate_admits_no_op_across_a_fork` `loom` model, plus a `benches/fork_gate.rs` criterion
+  bench that *measures* the ~13 ns/op uncontended cost. (So the chosen answer to the verifiability-vs-
+  scalability question was "both", achieved without the membarrier complexity the question assumed.)
+
+* **`prefork` quiesces background maintenance through the *same* drain.** "Quiesce background threads"
+  (W16-5a) was a bare flag. Internal maintenance (the release pump, rebalancer) now runs inside a
+  `fork::maintenance_guard`, which counts in the same gate as public ops — so `prefork`'s single drain
+  quiesces both, and the child's `background_enabled = false` keeps maintenance off until the host re-arms
+  it. A real handshake (tested), wired ahead of its pump consumer. The fork battery additionally gained a
+  **concurrent-forker** test (two threads forking at once, serialized by `FORK_LOCK`) and a
+  **parent-consistency** test (a long-lived allocation survives 20 forks intact).
+
+* **The thread-local safety machinery is active in the *real* allocator, not just `topo-core`'s tests.**
+  Nothing enabled `topo-core/std`, so in `topo-abi` (and every downstream build) the lock-order checker, the
+  S-007 bootstrap guard, and the W16-6 hook guard were silent no-ops — the G-conc checker only ever ran in
+  `topo-core`'s own lib tests. `topo-abi` and `topo-tests` now enable `topo-core/std` (they are hosted, std
+  artifacts anyway), so the checker runs across the **integration + ABI** suites (it found zero new
+  violations) and the hook guard works in production. The `no_std` hot-path capability is preserved for the
+  kernel/seLe4n target, which builds `topo-core` *without* the feature (verified: `cargo build -p topo-core`
+  and the seLe4n `real-abi` build stay `no_std`).
+
+* **A re-entrant extent hook now fails safe instead of deadlocking (W16-6).** The per-provider `enter_hook`
+  flag could not stop the *same-arena* re-entry that deadlocks on the back-end lock (the lock is taken
+  before the flag is reached). A per-thread `hooks::hook_reentry` domain (the `reentry_flag!` macro's
+  `scope()`+`active()` shape), set for every user-hook call, lets the **allocator entry** decline a
+  re-entrant allocation with a null **before** any lock — a recoverable, defined-behaviour decline (not a
+  panic: we are inside the hook's locked context, where an unwind could strand a lock). Pinned by
+  `a_hook_that_reenters_the_allocator_fails_safe_not_deadlock` (a hook whose `commit` re-enters the same
+  arena; watchdog-guarded).
+
+* **Init phases are precise and load-bearing (W16-7).** The first pass skipped phases 3/5 and only *reported*
+  the phase. The global initializer now advances through **every** §35.4 phase at its real boundary
+  (bootstrap → atfork → OS discovery → arena registry → per-CPU/rseq → background/profiling → operational),
+  and the phase **gates behaviour**: `maintenance_guard` declines before the background/profiling phase.
+  Tested end-to-end (`global_init_reaches_operational_and_crash_summary_reflects_it`).
+
+* **`SeqCst` is off the §27.3 map, now gate-enforced (W16-3).** The ordering map's policy is
+  Release/Acquire/AcqRel/Relaxed; the redesigned gate uses no `SeqCst` at all. A new `cargo xtask lint` gate
+  (`atomics ordering (W16-3)`) forbids an unjustified `SeqCst` in non-test `topo-core` (an inline
+  `SeqCst: <reason>` permits a deliberate one, mirroring the V-004 citation discipline). The W16-1b lock
+  lint was likewise strengthened: it is test-aware (scans only the non-`#[cfg(test)]` portion) and also
+  forbids a raw `std::sync::Mutex`/`RwLock`/`Condvar`/`parking_lot` lock, not just the spinlock idiom.
+
+* **TLS non-re-entrancy is *proven by depth*, and over-gating removed.** The `global_allocator` example now
+  wraps the allocator in a depth-counting `#[global_allocator]` and asserts the steady-state path —
+  including each fresh thread's first TLS-establishing allocation — runs at depth exactly 1 (makes **no**
+  nested allocation), the precise statement of "first TLS access never re-enters" (the `dlopen` general-
+  dynamic case stays covered by `tls_dlopen.rs`). And the lock-free `owns`/`recognizes` are no longer
+  fork-gated (they hold no lock; the gate was pure overhead), while `usable_size`/`stats` (which take a
+  lock) keep it. The crash summary gained a lock-free `in_flight_ops` field (allocator activity at crash
+  time); per-object counts stay omitted by design (they need locks, §28.4) rather than taxing the hot path.
+
+### W16 deep-audit pass (re-entrancy deadlock, numa fork hole, hook free/realloc)
+
+A code-first audit ("do not trust the docs") of the W16 changes found three real defects — two of
+them latent deadlocks — and fixed each with a regression test.
+
+* **The fork gate had a latent re-entrancy deadlock; the gate is now genuinely re-entrancy-aware.** The
+  module doc claimed "a re-entrant operation simply nests the count", but the code did not: a *nested*
+  `operation_guard` re-checked the fork bit and, during a fork window, **parked** — while the *outer*
+  guard's count was still held. `prefork`'s drain waits for that count, so it would hang forever. The
+  current gated methods happen not to re-enter (the sampled path is allocation-free, verified), so it was
+  latent — but gating the `numa` control ops (below), which *do* allocate, would have triggered it. Fixed
+  by tracking a **per-thread nesting depth** (a `const`-init, allocation-free thread-local, Local-Exec,
+  ~1 cycle): only the *first-level* guard takes a shard slot and does the fork check; a nested guard nests
+  the depth and runs to completion (the fork is, by definition, draining the outer op). Pinned by
+  `nested_guard_during_fork_window_does_not_deadlock` (a thread takes a nested guard *inside* an open fork
+  window; a regression deadlocks and a watchdog aborts).
+
+* **The NUMA control surface was not fork-gated (a `hugepage-optimized` deadlock).** Every
+  `topomalloc_numa_*` entry point takes the router lock (rank `BACKEND`) and/or per-node backend locks,
+  but none ran inside the fork gate — so a `fork()` during a `rebalance_tick` / `release` / `refresh` /
+  stats read could leave a backend lock held in the child, deadlocking the child's large path. All seven
+  are now wrapped in `operation_guard` (safe now that the gate is re-entrancy-aware: `refresh`'s
+  `discover_topology` allocation nests rather than parks). Pinned by
+  `child_is_safe_with_concurrent_numa_control_calls` (workers hammer the control surface while the main
+  thread forks; the child both allocates and calls the surface — watchdog-guarded, `hugepage-optimized`).
+
+* **The hook re-entrancy fail-safe covered only `malloc`; it now covers `free`/`realloc` too.** A
+  re-entrant hook calling `free` would take a central/span lock while holding the hook's back-end lock — a
+  lock-order inversion that, with the now-artifact-active checker, **panics inside the locked hook
+  context** (stranding the lock); a same-arena large `free` would deadlock outright. The
+  `hook_reentry_declines()` guard now gates `free` (declines as a `Null` no-op — the contract-violating
+  object leaks, the §2.4 safe degradation) and `realloc`/`resize_in_place` (decline to null/`None`, the
+  original preserved). The re-entrancy test now drives all three (malloc, free, realloc) and asserts the
+  scratch survives the declined free/realloc.
+
+* **A regression guard confirms the checker is genuinely live in the artifact.**
+  `lock_order_checker_is_active_in_this_artifact` (in `topo-abi`) trips an out-of-order acquire and
+  requires the panic — so if `topo-core/std` is ever dropped (silently disabling the checker + the S-007 /
+  hook guards everywhere but `topo-core`'s own tests), CI fails. (An incidental fix from the audit: the
+  helper insertion had orphaned `allocate_in`'s doc + `SPEC-transition` tag — an M-001 violation — now
+  restored.)
+
+### PR #20 review pass (Codex automated review of the W16 fork/concurrency work)
+
+An automated review (Codex) of the W16 changes raised five findings; each was checked **against the
+code** (not taken at face value) and four were confirmed and fixed, with the fifth (a narrow
+lazy-init/fork race) deferred to a decision because its complete fix is architecturally significant.
+
+* **P1 — the hook re-entry decline missed a *direct* `HookProvider` backend.** `hook_reentry_declines()`
+  pre-gated on `self.hooks.count` (the per-arena hook-registry count), but `HookGuard` sets the per-thread
+  `hook_reentry` domain for **every** `HookProvider` hook — including an allocator built directly over a
+  `HookProvider` (`Allocator::new`, a documented custom-backing path), where `count` is 0 yet a hook is
+  live. A re-entrant `malloc`/`free` from such a hook would slip past the decline and reach (deadlock on /
+  invert the lock order of) the back-end lock. Fixed by keying the decline on the `hook_reentry` domain
+  **alone** (one Local-Exec TLS read — it replaces, not adds to, the former atomic load, so the no-hook hot
+  path is unchanged). Pinned by `direct_hook_backend_declines_reentrant_malloc_and_free` (a direct-backend
+  allocator whose `commit` re-enters; the re-entrant malloc/free must be declined, not deadlock/trip the
+  checker).
+
+* **P2 — the lock-order checker was compiled out of a hardened *release* artifact (doc-vs-code).** Plan 05
+  states the held-rank checker runs in "debug + the `debug-checks` profile", and the §17.3/Appendix-B
+  checks follow the "profiles are features, not forks" principle (feature-gated, so they survive into a
+  `--release --features hardened` build). But the checker was gated on `debug_assertions` alone, so a
+  hardened release silently omitted it — and its violation check was a `debug_assert!`, elided in release
+  even where the module compiled. Fixed both: the `checker` module (and its no-op stub) now gate on
+  `any(debug_assertions, feature = "debug-checks")`, and the trip uses `assert!` (the module exists only
+  when the checker is active, so the check must fire whenever it exists). A new CI step
+  (`test hardened-release lock checker (G-conc)`, `--release --features debug-checks`) proves the checker
+  is active **and** trips there; a plain release still compiles the zero-cost stub.
+
+* **P2 — the C `topomalloc_numa_*` analogue for arenas: `arena_handle`/`arena_resolve_handle` were not
+  fork-gated.** Both resolve through `ArenaRegistry::stats`, which takes the arena-registry lock, and they
+  back the public C `topo_arena_handle`/`topo_arena_id`/`topo_mallocx_arena` entry points — so a `fork()`
+  during one could strand that lock in the child, exactly the gap the W16 audit closed for the `numa`
+  surface. Both now take `operation_guard` (the lock-free `arena_is_active`/`arena_has_hook_backend` stay
+  ungated, like `owns`/`recognizes`).
+
+* **P2 — the C smoke test read a non-NUL-terminated buffer.** `topomalloc_crash_summary` returns a byte
+  count and does not terminate, but `abi_smoke.c` passed an *uninitialized* `char[256]` straight to
+  `strstr`, which could read past the written region. Now caps the write at `sizeof-1` and terminates at
+  the returned length before the C string call.
+
+* **P2 — fork racing the very first lazy allocation (fixed; chosen approach: full fork-safe lazy init).**
+  The `pthread_atfork` handlers were registered *inside* the first `GLOBAL.get_or_init`, and that init was
+  not counted by the fork gate, so a `fork()` from another thread during the first-ever allocation could
+  leave the child blocked on a half-initialized `OnceLock` (the initializer thread does not exist in the
+  child). Real but extremely narrow (almost every process allocates — via the runtime — before it
+  threads/forks). Closed by **both** halves the issue requires: (1) the handlers are now installed
+  **eagerly at library load** by an ELF `.init_array` constructor (`fork_api::REGISTER_ATFORK_CTOR`),
+  before any allocation, so a concurrent fork is intercepted — with the first-`global()` call kept as a
+  fallback for a build where the ctor is elided (an rlib in a test binary); and (2) `global()`'s slow path
+  now takes `fork::operation_guard()` around the lazy init, so the now-registered `prefork` **drains-and-
+  waits** for an in-progress construction instead of forking mid-flight. Registration was switched from a
+  blocking `Once` to a **CAS guard** (claims the flag *before* `pthread_atfork`) so it is re-entrancy-safe:
+  if `pthread_atfork` itself allocates through this allocator during the ctor, the nested registration
+  returns at once rather than dead-locking. Lazy init is preserved (the ctor does only the lightweight
+  registration; the allocator is still built on first use), and the steady-state path is unchanged — the
+  `global()` fast path returns the cached allocator with no gate cost, so the bootstrap depth-1 proof still
+  holds. Pinned by `register_atfork_is_idempotent_and_reentrancy_safe` (concurrent + repeated registration:
+  no panic/deadlock/double-register) and the existing fork battery (no regression).

@@ -14,7 +14,13 @@ license = "MIT"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.1.0" }
+# `std` is enabled because `topo-abi` is the hosted (std) artifact: it activates
+# topo-core's thread-local safety machinery — the W16-1b lock-order checker (debug
+# only), the S-007 bootstrap re-entrancy guard, and the W16-6 extent-hook
+# re-entrancy guard — in the real allocator, not just in topo-core's own tests.
+# The `no_std` hot-path capability is preserved for the kernel/seLe4n target,
+# which builds topo-core *without* this feature.
+topo-core = { path = "../topo-core", version = "0.1.0", features = ["std"] }
 topo-backend-posix = { path = "../topo-backend-posix", version = "0.1.0" }
 # GPL backend is optional and OFF by default; enabling `sele4n-sim` produces a
 # GPL-3.0-or-later artifact (libtopomalloc-sele4n, §36.3.2). See NOTICE.

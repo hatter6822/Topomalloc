@@ -66,5 +66,9 @@ harness = false
 name = "huge"
 harness = false
 
+[[bench]]
+name = "fork_gate"
+harness = false
+
 [lints]
 workspace = true

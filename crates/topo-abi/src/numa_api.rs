@@ -38,6 +38,11 @@ pub(crate) fn publish_router(router: &'static dyn RouterControl) {
 /// stranded, or no router). The host calls it on its own cadence.
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_rebalance_tick() -> c_int {
+    // W16-5: the router's control ops take the router lock + per-node backend
+    // locks (rank `BACKEND`), so they run inside the fork gate — a `fork()` then
+    // quiesces them (no router/backend lock is held at fork). Rare host-driven
+    // calls, so the gate cost is irrelevant.
+    let _op = topo_core::fork::operation_guard();
     NUMA_ROUTER
         .get()
         .map_or(0, |r| c_int::from(r.rebalance_tick().is_some()))
@@ -49,6 +54,7 @@ pub extern "C" fn topomalloc_numa_rebalance_tick() -> c_int {
 /// placement map; the per-node backend set is fixed at construction.
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_refresh() -> c_int {
+    let _op = topo_core::fork::operation_guard(); // W16-5: takes the router lock
     match NUMA_ROUTER.get() {
         Some(r) => {
             r.refresh(topo_backend_posix::discover_topology());
@@ -64,6 +70,7 @@ pub extern "C" fn topomalloc_numa_refresh() -> c_int {
 /// `reserve_per_node` keeps that many empty hugepages warm per backend for burst reuse.
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_release(reserve_per_node: usize) -> usize {
+    let _op = topo_core::fork::operation_guard(); // W16-5: takes per-node backend locks
     NUMA_ROUTER
         .get()
         .map_or(0, |r| r.release_idle(reserve_per_node))
@@ -74,6 +81,7 @@ pub extern "C" fn topomalloc_numa_release(reserve_per_node: usize) -> usize {
 /// placement is active), `1` on a single-node host, `n` on a multi-node host.
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_nodes() -> usize {
+    let _op = topo_core::fork::operation_guard(); // W16-5: `stats()` takes the router lock
     NUMA_ROUTER.get().map_or(0, |r| r.stats().nodes as usize)
 }
 
@@ -81,6 +89,7 @@ pub extern "C" fn topomalloc_numa_nodes() -> usize {
 /// the cumulative count of per-node `mbind` failures (locality lost, never correctness).
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_bind_failures() -> u64 {
+    let _op = topo_core::fork::operation_guard(); // W16-5: `stats()` takes the router lock
     NUMA_ROUTER.get().map_or(0, |r| r.stats().bind_failures)
 }
 
@@ -88,6 +97,7 @@ pub extern "C" fn topomalloc_numa_bind_failures() -> u64 {
 /// executed across all `topomalloc_numa_rebalance_tick` calls.
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_rebalance_moves() -> u64 {
+    let _op = topo_core::fork::operation_guard(); // W16-5: `stats()` takes the router lock
     NUMA_ROUTER.get().map_or(0, |r| r.stats().rebalance_moves)
 }
 
@@ -95,6 +105,7 @@ pub extern "C" fn topomalloc_numa_rebalance_moves() -> u64 {
 /// (served off the preferred node because it was full — remote reuse under pressure).
 #[no_mangle]
 pub extern "C" fn topomalloc_numa_spillovers() -> u64 {
+    let _op = topo_core::fork::operation_guard(); // W16-5: `stats()` takes the router lock
     NUMA_ROUTER.get().map_or(0, |r| r.stats().spillovers)
 }
 

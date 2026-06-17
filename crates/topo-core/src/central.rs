@@ -40,11 +40,12 @@
 //! transitions the pagemap, and signals the caller. Neither returns a non-empty span
 //! (C-005 acceptance).
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::{ArenaId, Label, NodeId, SizeClassId};
+use crate::lock::{LockRank, RankedGuard, RankedLock};
 use crate::pagemap::{PageMap, PagemapError};
 use crate::slab::SlabLayout;
 use crate::span::{NonCentralResidency, SpanDescriptor, SpanState};
@@ -199,45 +200,15 @@ pub struct InsertResult {
 }
 
 // ---------------------------------------------------------------------------
-// CentralLock — per-bin spinlock (§27.2)
+// CentralLock — per-bin spinlock (§27.2, rank `CENTRAL`)
 // ---------------------------------------------------------------------------
 
-struct CentralLock {
-    locked: AtomicBool,
-}
-
-impl CentralLock {
-    const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    #[inline]
-    fn acquire(&self) -> CentralGuard<'_> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
-        CentralGuard { lock: self }
-    }
-}
-
-struct CentralGuard<'a> {
-    lock: &'a CentralLock,
-}
-
-impl Drop for CentralGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
-    }
-}
+/// The per-bin central lock is rank [`LockRank::CENTRAL`] in the §27.2 hierarchy:
+/// outer to the per-span lock (this bin's batch ops take a span's lock while
+/// holding it), inner to transfer (hand-over-hand) and the arena locks. Routed
+/// through [`RankedLock`] so the W16-1b checker sees every acquisition.
+type CentralLock = RankedLock<{ LockRank::CENTRAL }>;
+type CentralGuard<'a> = RankedGuard<'a, { LockRank::CENTRAL }>;
 
 // ---------------------------------------------------------------------------
 // CentralBin — per-sc structure (W5-4a)
@@ -287,7 +258,7 @@ impl CentralBin {
     /// Acquire the bin's lock.
     #[inline]
     fn lock(&self) -> CentralGuard<'_> {
-        self.lock.acquire()
+        self.lock.lock()
     }
 
     // --- partial-list operations (all under the bin lock) --------------------

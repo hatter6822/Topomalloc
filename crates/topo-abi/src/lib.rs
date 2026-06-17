@@ -40,6 +40,7 @@ mod arena_api;
 mod c_api;
 mod errno_shim;
 mod extended;
+mod fork_api;
 mod hooks_api;
 mod numa_api;
 mod policy;
@@ -64,6 +65,7 @@ pub use extended::{
     TOPO_LIFETIME_MEDIUM, TOPO_LIFETIME_SHORT, TOPO_NO_HUGEPAGE, TOPO_PREFER_HUGEPAGE,
     TOPO_TCACHE_NONE, TOPO_ZERO,
 };
+pub use fork_api::topomalloc_crash_summary;
 pub use hooks_api::{topo_arena_create_hooked, topo_extent_hooks_t, topo_max_hook_backends};
 pub use numa_api::{
     topomalloc_numa_bind_failures, topomalloc_numa_nodes, topomalloc_numa_rebalance_moves,
@@ -120,6 +122,9 @@ impl AnyAllocator {
     /// Allocate `size` bytes with `align` under validated `flags` (§A.1).
     /// Null on OOM, overflow, or invalid alignment.
     pub fn allocate(&self, size: usize, align: usize, flags: RequestFlags) -> *mut u8 {
+        // W16-5: count this operation in-flight so a concurrent `fork()` quiesces
+        // it before forking (no internal lock held at fork). One `SeqCst` RMW pair.
+        let _op = topo_core::fork::operation_guard();
         let p = dispatch!(self, a => a.allocate(size, align, flags));
         // W17-3: feed live placement profiles. A single relaxed load when profiling is off.
         crate::sampling::on_alloc(p, size, align, flags);
@@ -135,6 +140,7 @@ impl AnyAllocator {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        let _op = topo_core::fork::operation_guard();
         let p = dispatch!(self, a => a.allocate_in(arena, size, align, flags));
         crate::sampling::on_alloc(p, size, align, flags);
         p
@@ -165,6 +171,7 @@ impl AnyAllocator {
     /// it (rejected harmlessly). A stale pointer aliasing a recycled live
     /// allocation would free another owner's object.
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        let _op = topo_core::fork::operation_guard();
         // W17-3: resolve a sampled object's lifetime *before* the free; lock-free
         // (a Bloom reject) for the common non-sampled pointer, and a no-op when off.
         crate::sampling::on_free(ptr);
@@ -184,6 +191,7 @@ impl AnyAllocator {
         min_align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        let _op = topo_core::fork::operation_guard();
         // W17-3: realloc retires the old object and (on success) creates a new one. Resolve
         // the old lifetime first; sample the result as a fresh allocation. No-op when off.
         crate::sampling::on_free(ptr);
@@ -209,16 +217,22 @@ impl AnyAllocator {
         min_align: usize,
         flags: RequestFlags,
     ) -> Option<usize> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.resize_in_place(ptr, new_size, min_align, flags) })
     }
 
     /// The usable size of a live allocation (`None` for null/foreign/interior).
     pub fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.usable_size(ptr))
     }
 
     /// Whether `ptr` is a **live** allocation of this allocator.
+    ///
+    /// **Not** fork-gated: it is lock-free (a pagemap seqlock read + atomic
+    /// bitmap bit), so it holds no internal lock at any point and a `fork()`
+    /// racing it is harmless — gating it would be pure overhead (W16-5 audit).
     pub fn owns(&self, ptr: *mut u8) -> bool {
         dispatch!(self, a => a.owns(ptr))
     }
@@ -227,6 +241,8 @@ impl AnyAllocator {
     /// freed-awaiting-reuse, interior, retained, or metadata) — the §35.2
     /// mixed-allocator routing predicate; see
     /// [`Allocator::recognizes`](topo_core::Allocator::recognizes).
+    /// **Not** fork-gated: lock-free (a pagemap lookup + metadata-range check), so
+    /// it holds no internal lock and needs no quiesce (W16-5 audit).
     pub fn recognizes(&self, ptr: *mut u8) -> bool {
         dispatch!(self, a => a.recognizes(ptr))
     }
@@ -234,7 +250,17 @@ impl AnyAllocator {
     /// A statistics snapshot of the engine (§31.1; map into the Appendix-D
     /// JSON with `topo_stats::Stats::record_allocator`).
     pub fn stats(&self) -> AllocatorStats {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.stats())
+    }
+
+    /// A lock-free, allocation-free crash/signal-handler summary (§28.4, W16-6):
+    /// reads only cumulative-byte atomics + the process init phase / background
+    /// flag, so it is safe to call from a context where structure locks may be
+    /// held by the faulting thread. **Not** wrapped in an operation guard — it
+    /// takes no lock, so it must remain callable even mid-fork.
+    pub fn crash_summary(&self) -> topo_core::CrashSummary {
+        dispatch!(self, a => a.crash_summary())
     }
 
     /// The active backend's name (`"posix"` / `"sele4n-sim"`), proving which
@@ -247,16 +273,19 @@ impl AnyAllocator {
 
     /// Create a new explicit arena (§22.4). Returns its [`ArenaId`].
     pub fn arena_create(&self, policy: &ArenaPolicy) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_create(policy))
     }
 
     /// Delegate an attenuated child arena from `parent` (§36.4).
     pub fn arena_delegate(&self, parent: ArenaId, del: &Delegation) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_delegate(parent, del))
     }
 
     /// Reconfigure an arena's non-authority policy (§22.4 *configure*, F-005).
     pub fn arena_configure(&self, arena: ArenaId, cfg: &ArenaConfig) -> Result<(), ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_configure(arena, cfg))
     }
 
@@ -268,11 +297,13 @@ impl AnyAllocator {
         hooks: &'static (dyn ExtentHooks + Send + Sync),
         cfg: AllocatorConfig,
     ) -> Result<ArenaId, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_create_hooked(policy, hooks, cfg))
     }
 
     /// A snapshot of an arena's authority + accounting (§22.2/§36.4).
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arena_stats(arena))
     }
 
@@ -289,11 +320,17 @@ impl AnyAllocator {
     /// A generation-checked handle for `arena`'s current incarnation (§36.13),
     /// or `None` if unregistered.
     pub fn arena_handle(&self, arena: ArenaId) -> Option<u64> {
+        // W16-5: `handle` resolves through `ArenaRegistry::stats`, which takes the
+        // arena-registry lock (rank `ARENA_REGISTRY`), so a `fork()` during it must
+        // quiesce it — gate like the sibling `arena_stats`.
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arenas().handle(arena))
     }
 
     /// Resolve a handle to its [`ArenaId`], or `None` if it is stale (§36.13).
     pub fn arena_resolve_handle(&self, handle: u64) -> Option<ArenaId> {
+        // W16-5: `resolve_handle` also reads through the lock-taking `stats` path.
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arenas().resolve_handle(handle))
     }
 
@@ -304,6 +341,7 @@ impl AnyAllocator {
     /// As [`topo_core::Allocator::arena_reset`]: the arena must be quiesced and
     /// the caller accepts that its outstanding pointers become invalid.
     pub unsafe fn arena_reset(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.arena_reset(arena) })
     }
@@ -314,6 +352,7 @@ impl AnyAllocator {
     ///
     /// As [`arena_reset`](Self::arena_reset).
     pub unsafe fn arena_destroy(&self, arena: ArenaId) -> Result<Generation, ArenaError> {
+        let _op = topo_core::fork::operation_guard();
         // SAFETY: the caller upholds this method's identical contract.
         dispatch!(self, a => unsafe { a.arena_destroy(arena) })
     }
@@ -503,25 +542,78 @@ impl Drop for BootstrapGuard {
     }
 }
 
+/// The global allocator **only if already initialized**, without triggering the
+/// lazy init (which allocates and takes locks). Used by the crash-summary path
+/// (§28.4, W16-6), which must be safe to call from a signal/crash handler where
+/// initialization-time allocation is forbidden.
+pub(crate) fn global_if_init() -> Option<&'static AnyAllocator> {
+    GLOBAL.get().and_then(Option::as_ref)
+}
+
 /// The lazily-initialized global allocator, or `None` if the backing regions
 /// could not be reserved. The result is memoized: a process that cannot
 /// reserve them once keeps reporting OOM (a null `malloc`) rather than
 /// retrying.
 pub(crate) fn global() -> Option<&'static AnyAllocator> {
+    use topo_core::{InitPhase, INIT_PHASE};
+    // Fast path: already initialized. The steady-state allocation path pays no
+    // fork-gate cost here — the per-operation gate lives in the allocator methods.
+    if let Some(inner) = GLOBAL.get() {
+        return inner.as_ref();
+    }
+    // Slow path: the first allocation builds the global allocator. Two #4
+    // precautions wrap the lazy init so a `fork()` racing it cannot strand the child
+    // on a half-constructed `OnceLock` (the forking thread vanishes in the child):
+    //
+    //  1. Ensure the `pthread_atfork` handlers are installed *before* the gated init
+    //     below, so a concurrent `fork()` is intercepted. The ELF `.init_array` ctor
+    //     installs them at load already; this idempotent, re-entrancy-safe call is
+    //     the fallback for a build where the ctor was elided (e.g. an rlib linked
+    //     into a test binary).
+    //  2. Count the init itself in the fork gate, so the now-registered `prefork`
+    //     drains-and-waits for it to finish instead of forking mid-construction.
+    //
+    // The fast path above means neither cost is paid once initialization completes.
+    crate::fork_api::register_atfork_handlers();
+    let _op = topo_core::fork::operation_guard();
     GLOBAL
         .get_or_init(|| {
             // `_guard` is declared first, so it drops *last* — after `name` and any
             // other init-path temporaries have been allocated and freed through the
             // system allocator — and only then clears the bootstrap flag.
             let _guard = BootstrapGuard::enter();
+            // W16-7 (§35.4): advance the observable init phases through **each**
+            // boundary as bring-up proceeds (a reentrant caller can read the exact
+            // phase via the crash summary / control plane; behaviour is gated on it
+            // — e.g. background maintenance cannot run before phase 5).
+            //
+            // Phase 1: the bootstrap metadata allocator is the floor every
+            // reservation stands on (already live as a static, S-007). The
+            // `pthread_atfork` handlers are already installed (at load by the ctor,
+            // or just above on the fallback path), so a fork mid-init is quiesced.
+            INIT_PHASE.advance_to(InitPhase::BootstrapMetadata);
+            // Phase 2: OS feature discovery (backend selection; topology/hugepage
+            // probing happens inside `new_allocator_named` for the hugepage profile).
+            INIT_PHASE.advance_to(InitPhase::OsDiscovery);
             let name = selected_backend_name();
             let allocator = new_allocator_named(&name).or_else(|| new_allocator_named("posix"));
-            // W17-3: honour `$TOPOMALLOC_SAMPLE_RATE` (§32.1) now, under the bootstrap
-            // guard, so the sampler's one-time setup allocations are served by the system
-            // allocator and the first real sample is already armed. Only arms when the
-            // engine built — there is nothing to profile otherwise.
             if allocator.is_some() {
+                // Phase 3: the engine exists, so the arena registry + default arena
+                // (§22, §35.4 phase 3) are now live.
+                INIT_PHASE.advance_to(InitPhase::ArenaRegistry);
+                // Phase 4: per-CPU / RSEQ front-end setup. Enable the per-CPU sharded
+                // fork gate iff a cheap per-CPU id is available (the glibc/rseq area);
+                // a safe no-op otherwise (single-shard).
+                topo_core::probe_and_set_sharding();
+                INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
+                // Phase 5: background threads + profiling. Honour `$TOPOMALLOC_SAMPLE_RATE`
+                // (§32.1) now, under the bootstrap guard, so the sampler's one-time setup
+                // allocations are served by the system allocator and the first real sample
+                // is already armed. Only arms when the engine built.
                 crate::sampling::init_from_env();
+                INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
+                // Phase 6: every subsystem is up — open for normal operation.
+                INIT_PHASE.advance_to(InitPhase::Operational);
             }
             allocator
         })
@@ -863,5 +955,72 @@ mod tests {
         // SAFETY: `p` was just returned by `a` and is owned by this test.
         assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
         assert!(new_allocator_named("nope").is_none());
+    }
+
+    /// W16-7 (§35.4): the lazy global initializer drives the init phases all the
+    /// way to `Operational`, and the lock-free crash summary reflects that phase.
+    /// (Triggering `global()` here also covers the phased bring-up end to end.)
+    #[test]
+    fn global_init_reaches_operational_and_crash_summary_reflects_it() {
+        use topo_core::{InitPhase, INIT_PHASE};
+        // Force the lazy init (allocate one block through the process allocator).
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(96, 16).unwrap();
+        // SAFETY: valid non-zero layout; freed below.
+        let p = unsafe { g.alloc(layout) };
+        assert!(!p.is_null());
+        // SAFETY: `p` is a live 96-byte allocation from `g`.
+        unsafe { g.dealloc(p, layout) };
+
+        // The phased bring-up reached normal operation.
+        assert_eq!(INIT_PHASE.current(), InitPhase::Operational);
+        assert!(INIT_PHASE.is_operational());
+
+        // The lock-free crash summary (W16-6) reports the phase + nonzero allocation
+        // history, with no lock taken and no allocation.
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid 256-byte writable region. `c_char` is `i8` on
+        // some targets and `u8` on others (AArch64), so cast the byte pointer to
+        // `c_char` rather than assuming the buffer's element type matches.
+        let n = unsafe {
+            topomalloc_crash_summary(buf.as_mut_ptr().cast::<core::ffi::c_char>(), buf.len())
+        };
+        // SAFETY: `n <= buf.len()`; the written bytes are ASCII.
+        let text =
+            core::str::from_utf8(unsafe { core::slice::from_raw_parts(buf.as_ptr(), n) }).unwrap();
+        assert!(
+            text.contains(&format!("init_phase={}", InitPhase::Operational as u8)),
+            "crash summary must report the operational phase: {text:?}"
+        );
+        assert!(text.contains("allocated_bytes="));
+    }
+
+    /// W16-1b regression guard: the lock-order checker must be **genuinely active**
+    /// in the real `topo-abi` artifact (debug), not a silent no-op. This is the
+    /// whole point of enabling `topo-core/std` here — without it the checker (and
+    /// the S-007 / hook re-entrancy guards) compile out everywhere except
+    /// `topo-core`'s own tests. We confirm by tripping it: acquiring a lower rank
+    /// while holding a higher one must panic (debug only). If this test ever passes
+    /// *without* a panic, the checker has been silently disabled in the artifact.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn lock_order_checker_is_active_in_this_artifact() {
+        use topo_core::{LockRank, RankedLock};
+        let high: RankedLock<{ LockRank::BACKEND }> = RankedLock::new();
+        let low: RankedLock<{ LockRank::CENTRAL }> = RankedLock::new();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            high.acquire();
+            low.acquire(); // backend(8) held, acquiring central(5) — a violation
+        }));
+        std::panic::set_hook(prev);
+        assert!(
+            caught.is_err(),
+            "the lock-order checker is NOT active in topo-abi — `topo-core/std` must be enabled"
+        );
+        // We panicked mid-`low.acquire`, so `high` is still recorded as held; clear
+        // this thread's bookkeeping for the rest of the test binary.
+        topo_core::reset_lock_checker();
     }
 }

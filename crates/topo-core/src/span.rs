@@ -44,12 +44,13 @@
 
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 
 use crate::bootstrap::MetadataAlloc;
 use crate::generated::tables::{PAGE_SIZE, SIZE_CLASSES};
 use crate::ids::{ArenaId, Generation, LargeId, SizeClassId, SpanId};
+use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
 use crate::size_class;
 
@@ -244,41 +245,13 @@ impl FreeBitmap {
     }
 }
 
-/// A lightweight per-span spinlock (§27.2 "Span lock"). The critical section is a
-/// couple of atomic edits, and there is no contention before the caches/central
-/// list exist (M1), so a test-and-test-and-set spinlock is the right tool; W5
-/// adopts it as the span lock in the lock hierarchy.
-struct SpanLock {
-    locked: AtomicBool,
-}
-
-impl SpanLock {
-    const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    #[inline]
-    fn acquire(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // Spin on a relaxed load (test-and-test-and-set) to avoid hammering the
-            // cache line with CAS while another holder runs.
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    #[inline]
-    fn release(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
+/// The per-span spinlock (§27.2 "Span lock", rank [`LockRank::SPAN`]). The
+/// critical section is a couple of atomic edits; it is the innermost lock in the
+/// central data path (a central bin and the span descriptor pool both take it
+/// while they are held), so a ranked test-and-test-and-set spinlock — the single
+/// [`RankedLock`] primitive, routed through the W16-1b lock-order checker — is
+/// the right tool.
+type SpanLock = RankedLock<{ LockRank::SPAN }>;
 
 /// Lifecycle state of a span (§7.3, what classification needs). Stored as a `u8`
 /// so concurrent classifiers read it atomically (W3-3c).

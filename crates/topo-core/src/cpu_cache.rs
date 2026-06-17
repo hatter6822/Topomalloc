@@ -29,6 +29,7 @@ use crate::bootstrap::MetadataAlloc;
 use crate::fe::{CoreId, FeOutcome};
 use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::{ArenaId, SizeClassId};
+use crate::lock::{LockRank, RankedLock};
 use crate::size_class;
 
 /// Number of size classes in the generated table.
@@ -201,11 +202,16 @@ impl CpuSlot {
 /// `#[repr(C)]` with `locked` first (offset 0): the RSEQ sequence reads the lock
 /// byte at `&cpus[cpu]` to divert to the locked path when a non-owner holds it
 /// (W7-4), and indexes `slots` by the kernel-reported CPU. The offsets and the
-/// `size_of::<PerCpu>()` stride are fed to the assembly via `offset_of!`.
+/// `size_of::<PerCpu>()` stride are fed to the assembly via `offset_of!`. The lock
+/// is a [`RankedLock`] at rank [`LockRank::FRONT_END`] (the outermost data-path
+/// lock, §27.2), routed through the W16-1b checker; it is a single-`AtomicBool`
+/// struct, so the lock byte stays at offset 0 exactly as the assembly requires.
+/// The RSEQ fast path peeks that byte directly (no checker); only the locked
+/// baseline / non-owner drain take it through the per-CPU `lock()`.
 #[repr(C)]
 pub struct PerCpu {
     /// Spinlock protecting all slots for this CPU. Offset 0 (the RSEQ lock byte).
-    locked: AtomicBool,
+    locked: RankedLock<{ LockRank::FRONT_END }>,
     /// Per-size-class slots.
     slots: [CpuSlot; NUM_SIZE_CLASSES],
 }
@@ -213,23 +219,15 @@ pub struct PerCpu {
 impl PerCpu {
     const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            locked: RankedLock::new(),
             slots: [const { CpuSlot::new() }; NUM_SIZE_CLASSES],
         }
     }
 
-    /// Acquire the per-CPU lock.
+    /// Acquire the per-CPU lock (rank `FRONT_END`, routed through the checker).
     #[inline]
     fn lock(&self) -> CpuGuard<'_> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
+        self.locked.acquire();
         CpuGuard { cpu: self }
     }
 
@@ -248,7 +246,7 @@ struct CpuGuard<'a> {
 impl Drop for CpuGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.cpu.locked.store(false, Ordering::Release);
+        self.cpu.locked.release();
     }
 }
 

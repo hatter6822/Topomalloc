@@ -57,8 +57,8 @@ use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, Request, RequestKind};
 use crate::error::BackendError;
 use crate::extent::{
-    BackendLock, ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit,
-    RegionCacheHook, StateBytes,
+    ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, RegionCacheHook,
+    StateBytes,
 };
 use crate::flags::{Hints, Lifetime, RequestFlags};
 use crate::generated::tables::PAGE_SIZE;
@@ -67,6 +67,7 @@ use crate::hooks::{ExtentHooks, HookProvider};
 use crate::huge::Hotness;
 use crate::ids::{ArenaId, Generation, Label, NodeId, SizeClassId, SpanId};
 use crate::large::{LargeAllocator, LargeBacking, LargeConfig};
+use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
 use crate::pagemap::PageMap;
 use crate::placement::{LearnedHints, PlaceClass, SizeClassDist};
@@ -544,7 +545,7 @@ impl ArenaHookBackend<'_> {
 /// lock-free `count` is the fast path: `0` ⇒ no hooked arena exists, so every
 /// allocation/free uses the shared backend with **zero** registry access.
 struct HookRegistry<'a> {
-    lock: BackendLock,
+    lock: RankedLock<{ LockRank::ARENA }>,
     slots: UnsafeCell<[Option<ArenaHookBackend<'a>>; MAX_HOOK_BACKENDS]>,
     count: AtomicUsize,
 }
@@ -552,7 +553,7 @@ struct HookRegistry<'a> {
 impl HookRegistry<'_> {
     const fn new() -> Self {
         Self {
-            lock: BackendLock::new(),
+            lock: RankedLock::new(),
             slots: UnsafeCell::new([const { None }; MAX_HOOK_BACKENDS]),
             count: AtomicUsize::new(0),
         }
@@ -633,9 +634,11 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     large: LargeAllocator<'a, P>,
     /// Recycling span-descriptor pool.
     spans: SpanPool,
-    /// Guards `spans.inner` (acquire/release; lowest lock class, §27.2 —
-    /// never held across a central-list or provider call).
-    span_lock: BackendLock,
+    /// Guards `spans.inner` ([`LockRank::SPAN_POOL`], rank 5 — a §27.2 refinement
+    /// *outer* to the per-span lock, since `create_span` recycles a descriptor
+    /// (which takes the per-span lock) while holding this; never held across a
+    /// central-list or provider call). See the [`crate::lock`] module docs.
+    span_lock: RankedLock<{ LockRank::SPAN_POOL }>,
     /// Cumulative usable bytes ever handed out (§31.1; relaxed — stats are
     /// monotone counters, not synchronization).
     allocated_bytes: AtomicU64,
@@ -789,7 +792,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_extents,
             large,
             spans,
-            span_lock: BackendLock::new(),
+            span_lock: RankedLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
             hooks: HookRegistry::new(),
@@ -936,6 +939,29 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.allocate_in(flags.arena(), size, align, flags)
     }
 
+    /// W16-6 (§28.3, Appendix-F): whether this thread is currently inside an
+    /// extent-hook call, so a re-entrant allocator operation must be **declined
+    /// before any lock**. The hook runs under the non-re-entrant back-end lock;
+    /// re-entering would deadlock on it (a large op) or trip the lock-order checker
+    /// / take locks out of order (a small op). Declining is a *recoverable*
+    /// defined-behaviour failure (like OOM) — **never** a panic, since we are inside
+    /// the hook's locked context where an unwind could strand a held lock.
+    ///
+    /// The signal is the per-thread `hook_reentry` domain **alone** (a single
+    /// Local-Exec TLS read): `HookGuard` sets it for *every* [`HookProvider`] hook
+    /// call — whether the hooks back a per-arena region (W10 `arena_create_hooked`)
+    /// **or the whole allocator** ([`Allocator::new`](Self::new) directly over a
+    /// `HookProvider`, a documented custom-backing path). It deliberately does **not**
+    /// pre-gate on `self.hooks.count` (per-arena registrations only): that count is 0
+    /// for a direct-`HookProvider` backend even while its hook is live, so the
+    /// re-entrant op would slip through to the back-end lock. `active()` is false on
+    /// the common (no-hook) path, so the hot path still pays only one always-false
+    /// TLS read.
+    #[inline]
+    fn hook_reentry_declines(&self) -> bool {
+        crate::hooks::hook_reentry::active()
+    }
+
     /// Allocate from an **explicit** arena (plan 06 W9), overriding the arena the
     /// `flags` encode. [`allocate`](Self::allocate) is `allocate_in(flags.arena(),
     /// …)`; `realloc` uses this to preserve the original allocation's arena across
@@ -949,6 +975,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        // A re-entrant hook allocation is declined cleanly (null) before any lock.
+        if self.hook_reentry_declines() {
+            return ptr::null_mut();
+        }
         let Some(req) = classify(size, align, flags.raw()) else {
             return ptr::null_mut();
         };
@@ -1344,6 +1374,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         if ptr.is_null() {
             return FreeOutcome::Null;
         }
+        // W16-6 (Appendix-F): a hook that re-enters `free` would take a central/span
+        // lock while holding the hook's back-end lock — a lock-order inversion (and
+        // a same-arena large free deadlocks). Decline as a no-op *before* any lock;
+        // the object leaks (the hook's contract violation), which is the §2.4 safe
+        // degradation versus a deadlock or a checker-panic in the locked context.
+        if self.hook_reentry_declines() {
+            return FreeOutcome::Null;
+        }
         match validate_free(self.pagemap, self.meta_region, ptr as usize) {
             Ok(FreeTarget::Noop) => FreeOutcome::Null,
             Ok(FreeTarget::Small { span, object_index }) => {
@@ -1638,6 +1676,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         min_align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        // W16-6 (Appendix-F): decline a re-entrant hook `realloc` cleanly (null);
+        // the §25.1 contract is "failure preserves the original", so nothing leaks.
+        if self.hook_reentry_declines() {
+            return ptr::null_mut();
+        }
         if ptr.is_null() {
             return self.allocate(new_size, min_align, flags);
         }
@@ -1842,6 +1885,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         min_align: usize,
         flags: RequestFlags,
     ) -> Option<usize> {
+        // W16-6 (Appendix-F): decline a re-entrant hook in-place resize (`None`,
+        // no resize) before any lock — the allocation is unchanged.
+        if self.hook_reentry_declines() {
+            return None;
+        }
         if ptr.is_null() || !min_align.is_power_of_two() {
             return None;
         }
@@ -2388,6 +2436,28 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
+        }
+    }
+
+    /// A minimal allocator summary safe for a crash/signal handler (W16-6, §28.4):
+    /// it reads **only** the process-lifetime cumulative-byte atomics (relaxed,
+    /// **no lock**), so it cannot deadlock on a structure lock held by the faulting
+    /// thread, and it allocates nothing. Object/state breakdowns (which take locks)
+    /// are deliberately omitted — "full stats may be unavailable in crash context"
+    /// (§28.4). Combine with [`crate::init::INIT_PHASE`] /
+    /// [`crate::fork::background_enabled`] for the process-wide fields.
+    pub fn crash_summary(&self) -> crate::init::CrashSummary {
+        let allocated = self.allocated_bytes.load(Ordering::Relaxed);
+        let freed = self.freed_bytes.load(Ordering::Relaxed);
+        crate::init::CrashSummary {
+            init_phase: crate::init::INIT_PHASE.current() as u8,
+            allocated_bytes: allocated,
+            freed_bytes: freed,
+            // Saturating: a torn relaxed read during concurrent ops could make
+            // `freed` transiently exceed `allocated`; never report a wrap.
+            live_bytes: allocated.saturating_sub(freed),
+            in_flight_ops: crate::fork::in_flight_operations(),
+            background_enabled: crate::fork::background_enabled(),
         }
     }
 }

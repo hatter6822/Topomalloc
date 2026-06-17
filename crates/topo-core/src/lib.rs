@@ -27,11 +27,14 @@ pub mod error;
 pub mod extent;
 pub mod fe;
 pub mod flags;
+pub mod fork;
 pub mod generated;
 pub mod hooks;
 pub mod huge;
 pub mod ids;
+pub mod init;
 pub mod large;
+pub mod lock;
 pub mod node_router;
 pub mod overflow;
 pub mod pagemap;
@@ -121,6 +124,16 @@ pub use topology::{
     NodePressure, RebalanceMove, RebalanceTier, Rebalancer, Topology, TopologyBuilder,
     DISTANCE_LOCAL, DISTANCE_REMOTE, MAX_NODES,
 };
+
+// W16 concurrency re-exports (plan 05): the ranked lock hierarchy + checker,
+// the fork coordinator, init phases, re-entrancy guard, and crash summary.
+pub use fork::{
+    background_enabled, fork_in_progress, in_flight_operations, maintenance_guard, operation_guard,
+    postfork_child, postfork_parent, prefork, probe_and_set_sharding, set_background_enabled,
+    set_sharded, OperationGuard,
+};
+pub use init::{CrashSummary, InitPhase, PhaseTracker, INIT_PHASE};
+pub use lock::{held_lock_count, reset_lock_checker, LockRank, RankedGuard, RankedLock};
 
 // W6 cache layer re-exports (plan 05).
 pub use budget::{CacheBudget, SlotStats};

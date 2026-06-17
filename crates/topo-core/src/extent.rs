@@ -49,7 +49,6 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
@@ -57,6 +56,7 @@ use crate::error::BackendError;
 use crate::flags::Hints;
 use crate::generated::tables::PAGE_SIZE;
 use crate::ids::ArenaId;
+use crate::lock::{LockRank, RankedLock};
 use crate::overflow::{align_up, pages_for};
 
 /// A sentinel "no slot" index for the intrusive links (`u32::MAX`).
@@ -1410,41 +1410,16 @@ impl ExtentMap {
 // The lock-guarded, provider-driving back-end (§27.2 backend lock, W4-2d/3/4/5).
 // ===========================================================================
 
-/// The §27.2 *Backend extent lock* — a test-and-test-and-set spinlock, the same
-/// lightweight primitive the span lock uses. The backend's critical sections are a
+/// The §27.2 *Backend extent lock* (rank [`LockRank::BACKEND`]) — a ranked
+/// test-and-test-and-set spinlock (the single [`RankedLock`] primitive, routed
+/// through the W16-1b lock-order checker). The backend's critical sections are a
 /// handful of slot edits plus one provider call; it is the lowest data-structure
 /// lock in the hierarchy, so holding it across a provider call cannot invert the
-/// §27.2 order. `pub(crate)` so the large-allocation path ([`crate::large`]) reuses
-/// it for its descriptor-pool critical section.
-pub(crate) struct BackendLock {
-    locked: AtomicBool,
-}
-
-impl BackendLock {
-    pub(crate) const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn acquire(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn release(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
+/// §27.2 order. `pub(crate)` so the large-allocation path ([`crate::large`]) and
+/// the hugepage backend ([`crate::huge`]) reuse it for their descriptor-pool
+/// critical sections (all rank `BACKEND`; they are never held simultaneously, so
+/// the shared rank is correct — see the [`crate::lock`] module docs).
+pub(crate) type BackendLock = RankedLock<{ LockRank::BACKEND }>;
 
 /// Retain-versus-unmap policy for freed extents (§20.5, W4-3b). Retaining virtual
 /// address space improves reuse and metadata stability; unmapping (here:
