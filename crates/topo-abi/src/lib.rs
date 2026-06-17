@@ -556,6 +556,26 @@ pub(crate) fn global_if_init() -> Option<&'static AnyAllocator> {
 /// retrying.
 pub(crate) fn global() -> Option<&'static AnyAllocator> {
     use topo_core::{InitPhase, INIT_PHASE};
+    // Fast path: already initialized. The steady-state allocation path pays no
+    // fork-gate cost here — the per-operation gate lives in the allocator methods.
+    if let Some(inner) = GLOBAL.get() {
+        return inner.as_ref();
+    }
+    // Slow path: the first allocation builds the global allocator. Two #4
+    // precautions wrap the lazy init so a `fork()` racing it cannot strand the child
+    // on a half-constructed `OnceLock` (the forking thread vanishes in the child):
+    //
+    //  1. Ensure the `pthread_atfork` handlers are installed *before* the gated init
+    //     below, so a concurrent `fork()` is intercepted. The ELF `.init_array` ctor
+    //     installs them at load already; this idempotent, re-entrancy-safe call is
+    //     the fallback for a build where the ctor was elided (e.g. an rlib linked
+    //     into a test binary).
+    //  2. Count the init itself in the fork gate, so the now-registered `prefork`
+    //     drains-and-waits for it to finish instead of forking mid-construction.
+    //
+    // The fast path above means neither cost is paid once initialization completes.
+    crate::fork_api::register_atfork_handlers();
+    let _op = topo_core::fork::operation_guard();
     GLOBAL
         .get_or_init(|| {
             // `_guard` is declared first, so it drops *last* — after `name` and any
@@ -568,11 +588,10 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
             // — e.g. background maintenance cannot run before phase 5).
             //
             // Phase 1: the bootstrap metadata allocator is the floor every
-            // reservation stands on (already live as a static, S-007).
+            // reservation stands on (already live as a static, S-007). The
+            // `pthread_atfork` handlers are already installed (at load by the ctor,
+            // or just above on the fallback path), so a fork mid-init is quiesced.
             INIT_PHASE.advance_to(InitPhase::BootstrapMetadata);
-            // W16-5: install the `pthread_atfork` handlers before any allocation can
-            // complete, so a `fork()` quiesces the allocator (§28.1). Idempotent.
-            crate::fork_api::register_atfork_handlers();
             // Phase 2: OS feature discovery (backend selection; topology/hugepage
             // probing happens inside `new_allocator_named` for the hugepage profile).
             INIT_PHASE.advance_to(InitPhase::OsDiscovery);

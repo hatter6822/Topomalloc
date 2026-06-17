@@ -338,7 +338,10 @@ allocates) takes **no** shard slot and skips the fork check, nesting instead on 
 so a nested op can never park-and-deadlock the drain (the fork is by definition draining the outer op).
 The whole `topomalloc_numa_*` control surface (router + per-node backend locks, rank `BACKEND`) runs
 inside the gate, so a `fork()` quiesces it too. The
-`pthread_atfork` registration + the lock-free C `topomalloc_crash_summary` (§28.4, with an `in_flight_ops`
+`pthread_atfork` registration (installed **eagerly at load** by an ELF `.init_array` ctor — re-entrancy-safe
+via a CAS guard, not a blocking `Once` — so a `fork()` racing the very first allocation is intercepted; the
+lazy `global()` init is itself fork-gated so `prefork` drains-and-waits for it rather than forking a child
+onto a half-built `OnceLock`) + the lock-free C `topomalloc_crash_summary` (§28.4, with an `in_flight_ops`
 field) live in `crates/topo-abi/src/fork_api.rs`. The §35.4 init phases (Phase 0–6, advanced through
 **each** boundary and load-bearing — maintenance declines before its phase), the `reentry_flag!` domain
 (wired into the extent-hook path so a re-entrant hook's `malloc`/`free`/`realloc`/in-place-resize is

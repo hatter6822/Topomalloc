@@ -1980,10 +1980,21 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   `strstr`, which could read past the written region. Now caps the write at `sizeof-1` and terminates at
   the returned length before the C string call.
 
-* **Deferred (P2) — fork racing the very first lazy allocation.** The `pthread_atfork` handlers are
-  registered *inside* the first `GLOBAL.get_or_init`, and that init is not counted by the fork gate, so a
-  `fork()` from another thread during the first-ever allocation can leave the child blocked on a
-  half-initialized `OnceLock`. Real but extremely narrow (almost every process allocates — via the runtime
-  — before it threads/forks). The complete fix (eager ctor-time atfork registration **and** counting init
-  in the fork gate) changes the init/fork model, so it is raised for a decision rather than pushed
-  unilaterally.
+* **P2 — fork racing the very first lazy allocation (fixed; chosen approach: full fork-safe lazy init).**
+  The `pthread_atfork` handlers were registered *inside* the first `GLOBAL.get_or_init`, and that init was
+  not counted by the fork gate, so a `fork()` from another thread during the first-ever allocation could
+  leave the child blocked on a half-initialized `OnceLock` (the initializer thread does not exist in the
+  child). Real but extremely narrow (almost every process allocates — via the runtime — before it
+  threads/forks). Closed by **both** halves the issue requires: (1) the handlers are now installed
+  **eagerly at library load** by an ELF `.init_array` constructor (`fork_api::REGISTER_ATFORK_CTOR`),
+  before any allocation, so a concurrent fork is intercepted — with the first-`global()` call kept as a
+  fallback for a build where the ctor is elided (an rlib in a test binary); and (2) `global()`'s slow path
+  now takes `fork::operation_guard()` around the lazy init, so the now-registered `prefork` **drains-and-
+  waits** for an in-progress construction instead of forking mid-flight. Registration was switched from a
+  blocking `Once` to a **CAS guard** (claims the flag *before* `pthread_atfork`) so it is re-entrancy-safe:
+  if `pthread_atfork` itself allocates through this allocator during the ctor, the nested registration
+  returns at once rather than dead-locking. Lazy init is preserved (the ctor does only the lightweight
+  registration; the allocator is still built on first use), and the steady-state path is unchanged — the
+  `global()` fast path returns the cached allocator with no gate cost, so the bootstrap depth-1 proof still
+  holds. Pinned by `register_atfork_is_idempotent_and_reentrancy_safe` (concurrent + repeated registration:
+  no panic/deadlock/double-register) and the existing fork battery (no regression).

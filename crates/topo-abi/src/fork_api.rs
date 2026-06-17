@@ -20,12 +20,15 @@
 //!   maintenance. Because the parent quiesced first, the child inherits consistent,
 //!   unlocked structures and can allocate safely.
 //!
-//! Registration is **idempotent** and happens once, from the global allocator's
-//! lazy initializer (before any allocation can complete), so a `fork()` before the
-//! first allocation has nothing to quiesce and a later one is fully protected.
+//! Registration is **idempotent**, **re-entrancy-safe**, and happens **eagerly at
+//! library load** via an ELF `.init_array` constructor, with the first-`global()`
+//! call as a fallback. Installing the handlers before any allocation means even a
+//! `fork()` racing the very first allocation is intercepted, and (because the lazy
+//! init is itself fork-gated) `prefork` drains-and-waits for it rather than forking
+//! a child that inherits a half-constructed `OnceLock` (W16-5 / #4).
 
 #[cfg(unix)]
-use std::sync::Once;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// `pthread_atfork` prepare handler (parent context, pre-fork): quiesce the
 /// allocator so `fork()` happens with no internal lock held (§28.1).
@@ -49,14 +52,22 @@ extern "C" fn atfork_child() {
 }
 
 #[cfg(unix)]
-static ATFORK_ONCE: Once = Once::new();
+static ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// Install the `pthread_atfork` handlers exactly once (W16-5). Called from the
-/// global allocator's initializer, under the bootstrap re-entrancy guard, before
-/// any allocation can complete. A no-op on non-unix hosts (no `fork`).
+/// Install the `pthread_atfork` handlers exactly once (W16-5). Idempotent and
+/// **re-entrancy-safe**: the guard flag is claimed *before* `pthread_atfork` is
+/// called, so if that call itself allocates — re-entering this function through the
+/// global allocator during the load-time ctor — the nested call observes the flag
+/// and returns without a second registration. (A blocking `Once` would instead
+/// dead-lock on such re-entry.) Installed eagerly at load by [`REGISTER_ATFORK_CTOR`]
+/// and, as a fallback, on the first `global()` call. A no-op on non-unix hosts (no
+/// `fork`).
 pub(crate) fn register_atfork_handlers() {
     #[cfg(unix)]
-    ATFORK_ONCE.call_once(|| {
+    if ATFORK_REGISTERED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         // SAFETY: the three handlers are `extern "C"` functions with no captured
         // state that only call the allocation-free `topo_core::fork::*` routines;
         // `pthread_atfork` simply records them. A non-zero return (out of memory
@@ -69,8 +80,25 @@ pub(crate) fn register_atfork_handlers() {
                 Some(atfork_child),
             );
         }
-    });
+    }
 }
+
+/// Install the `pthread_atfork` handlers **at library load** (before `main` and
+/// before any allocation), via an ELF `.init_array` constructor, so a `fork()`
+/// racing the very first lazy allocation is intercepted (#4). Without it the
+/// handlers would first be installed *inside* the initial `global()` init, leaving
+/// a window in which a concurrent fork is not quiesced and the child inherits a
+/// half-constructed `OnceLock`. Non-Linux/non-ELF targets fall back to the
+/// idempotent registration on the first `global()` call.
+#[cfg(all(unix, target_os = "linux"))]
+#[used]
+#[link_section = ".init_array"]
+static REGISTER_ATFORK_CTOR: extern "C" fn() = {
+    extern "C" fn ctor() {
+        register_atfork_handlers();
+    }
+    ctor
+};
 
 /// Write a minimal, **lock-free, allocation-free** allocator summary into `buf`
 /// for a crash or signal handler (§28.4, W16-6): init phase, cumulative
@@ -121,10 +149,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_atfork_is_idempotent() {
-        // Calling twice must not panic or double-register (the `Once` gate).
+    fn register_atfork_is_idempotent_and_reentrancy_safe() {
+        // Calling it repeatedly — including concurrently — must not panic, dead-lock,
+        // or double-register. The CAS guard claims registration *before* calling
+        // `pthread_atfork`, so a re-entrant call (were `pthread_atfork` itself to
+        // allocate through this allocator during the load-time ctor) observes the
+        // flag and returns at once, where a blocking `Once` would dead-lock (#4).
         register_atfork_handlers();
         register_atfork_handlers();
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(register_atfork_handlers))
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // By now (the test binary has long since allocated, and the `.init_array`
+        // ctor ran at load), the handlers are registered.
+        #[cfg(unix)]
+        assert!(ATFORK_REGISTERED.load(Ordering::Acquire));
     }
 
     #[test]
