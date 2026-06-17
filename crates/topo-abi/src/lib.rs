@@ -953,14 +953,16 @@ mod tests {
 
         // The lock-free crash summary (W16-6) reports the phase + nonzero allocation
         // history, with no lock taken and no allocation.
-        let mut buf = [0i8; 256];
-        // SAFETY: `buf` is a valid 256-byte writable region.
-        let n = unsafe { topomalloc_crash_summary(buf.as_mut_ptr(), buf.len()) };
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid 256-byte writable region. `c_char` is `i8` on
+        // some targets and `u8` on others (AArch64), so cast the byte pointer to
+        // `c_char` rather than assuming the buffer's element type matches.
+        let n = unsafe {
+            topomalloc_crash_summary(buf.as_mut_ptr().cast::<core::ffi::c_char>(), buf.len())
+        };
         // SAFETY: `n <= buf.len()`; the written bytes are ASCII.
-        let text = core::str::from_utf8(unsafe {
-            core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n)
-        })
-        .unwrap();
+        let text =
+            core::str::from_utf8(unsafe { core::slice::from_raw_parts(buf.as_ptr(), n) }).unwrap();
         assert!(
             text.contains(&format!("init_phase={}", InitPhase::Operational as u8)),
             "crash summary must report the operational phase: {text:?}"

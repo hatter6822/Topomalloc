@@ -129,12 +129,16 @@ mod tests {
 
     #[test]
     fn crash_summary_c_api_writes_bounded() {
-        let mut buf = [0i8; 256];
-        // SAFETY: `buf` is a valid 256-byte writable region.
-        let n = unsafe { topomalloc_crash_summary(buf.as_mut_ptr(), buf.len()) };
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid 256-byte writable region. `c_char` is `i8` on
+        // some targets and `u8` on others (AArch64), so cast the byte pointer to
+        // `c_char` rather than assuming the buffer's element type matches.
+        let n = unsafe {
+            topomalloc_crash_summary(buf.as_mut_ptr().cast::<core::ffi::c_char>(), buf.len())
+        };
         assert!(n > 0 && n <= buf.len());
         // SAFETY: `n <= buf.len()`; the written bytes are ASCII.
-        let bytes: &[u8] = unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+        let bytes: &[u8] = unsafe { core::slice::from_raw_parts(buf.as_ptr(), n) };
         let text = core::str::from_utf8(bytes).unwrap();
         assert!(text.contains("init_phase="));
         assert!(text.contains("live_bytes="));
@@ -145,9 +149,11 @@ mod tests {
         // SAFETY: a null buffer is explicitly handled (returns 0, writes nothing).
         let n_null = unsafe { topomalloc_crash_summary(core::ptr::null_mut(), 16) };
         assert_eq!(n_null, 0);
-        let mut buf = [0i8; 8];
+        let mut buf = [0u8; 8];
         // SAFETY: zero length writes nothing, regardless of the (valid) buffer.
-        let n_zero = unsafe { topomalloc_crash_summary(buf.as_mut_ptr(), 0) };
+        // (`c_char` signedness varies by target — cast the byte pointer to it.)
+        let n_zero =
+            unsafe { topomalloc_crash_summary(buf.as_mut_ptr().cast::<core::ffi::c_char>(), 0) };
         assert_eq!(n_zero, 0);
     }
 }
