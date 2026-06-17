@@ -1939,3 +1939,51 @@ them latent deadlocks — and fixed each with a regression test.
   hook guards everywhere but `topo-core`'s own tests), CI fails. (An incidental fix from the audit: the
   helper insertion had orphaned `allocate_in`'s doc + `SPEC-transition` tag — an M-001 violation — now
   restored.)
+
+### PR #20 review pass (Codex automated review of the W16 fork/concurrency work)
+
+An automated review (Codex) of the W16 changes raised five findings; each was checked **against the
+code** (not taken at face value) and four were confirmed and fixed, with the fifth (a narrow
+lazy-init/fork race) deferred to a decision because its complete fix is architecturally significant.
+
+* **P1 — the hook re-entry decline missed a *direct* `HookProvider` backend.** `hook_reentry_declines()`
+  pre-gated on `self.hooks.count` (the per-arena hook-registry count), but `HookGuard` sets the per-thread
+  `hook_reentry` domain for **every** `HookProvider` hook — including an allocator built directly over a
+  `HookProvider` (`Allocator::new`, a documented custom-backing path), where `count` is 0 yet a hook is
+  live. A re-entrant `malloc`/`free` from such a hook would slip past the decline and reach (deadlock on /
+  invert the lock order of) the back-end lock. Fixed by keying the decline on the `hook_reentry` domain
+  **alone** (one Local-Exec TLS read — it replaces, not adds to, the former atomic load, so the no-hook hot
+  path is unchanged). Pinned by `direct_hook_backend_declines_reentrant_malloc_and_free` (a direct-backend
+  allocator whose `commit` re-enters; the re-entrant malloc/free must be declined, not deadlock/trip the
+  checker).
+
+* **P2 — the lock-order checker was compiled out of a hardened *release* artifact (doc-vs-code).** Plan 05
+  states the held-rank checker runs in "debug + the `debug-checks` profile", and the §17.3/Appendix-B
+  checks follow the "profiles are features, not forks" principle (feature-gated, so they survive into a
+  `--release --features hardened` build). But the checker was gated on `debug_assertions` alone, so a
+  hardened release silently omitted it — and its violation check was a `debug_assert!`, elided in release
+  even where the module compiled. Fixed both: the `checker` module (and its no-op stub) now gate on
+  `any(debug_assertions, feature = "debug-checks")`, and the trip uses `assert!` (the module exists only
+  when the checker is active, so the check must fire whenever it exists). A new CI step
+  (`test hardened-release lock checker (G-conc)`, `--release --features debug-checks`) proves the checker
+  is active **and** trips there; a plain release still compiles the zero-cost stub.
+
+* **P2 — the C `topomalloc_numa_*` analogue for arenas: `arena_handle`/`arena_resolve_handle` were not
+  fork-gated.** Both resolve through `ArenaRegistry::stats`, which takes the arena-registry lock, and they
+  back the public C `topo_arena_handle`/`topo_arena_id`/`topo_mallocx_arena` entry points — so a `fork()`
+  during one could strand that lock in the child, exactly the gap the W16 audit closed for the `numa`
+  surface. Both now take `operation_guard` (the lock-free `arena_is_active`/`arena_has_hook_backend` stay
+  ungated, like `owns`/`recognizes`).
+
+* **P2 — the C smoke test read a non-NUL-terminated buffer.** `topomalloc_crash_summary` returns a byte
+  count and does not terminate, but `abi_smoke.c` passed an *uninitialized* `char[256]` straight to
+  `strstr`, which could read past the written region. Now caps the write at `sizeof-1` and terminates at
+  the returned length before the C string call.
+
+* **Deferred (P2) — fork racing the very first lazy allocation.** The `pthread_atfork` handlers are
+  registered *inside* the first `GLOBAL.get_or_init`, and that init is not counted by the fork gate, so a
+  `fork()` from another thread during the first-ever allocation can leave the child blocked on a
+  half-initialized `OnceLock`. Real but extremely narrow (almost every process allocates — via the runtime
+  — before it threads/forks). The complete fix (eager ctor-time atfork registration **and** counting init
+  in the fork gate) changes the init/fork model, so it is raised for a decision rather than pushed
+  unilaterally.

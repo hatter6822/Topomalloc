@@ -432,6 +432,25 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "debug-checks"],
     );
+    // Hardened **release** pass (W16-1b / G-conc): in a `--release --features
+    // debug-checks` artifact `debug_assertions` is off, so this proves the
+    // lock-order checker (and its `assert!`-based trip) is still compiled in and
+    // active under the `debug-checks` feature — not silently elided with the
+    // `debug_assert!`s. Scoped to `lock::` to stay fast.
+    r.run(
+        "test hardened-release lock checker (G-conc)",
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "topo-core",
+            "--release",
+            "--features",
+            "debug-checks",
+            "--lib",
+            "lock::",
+        ],
+    );
     r.run(
         "test dual-backend (G-sim)",
         "cargo",

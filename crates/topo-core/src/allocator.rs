@@ -939,18 +939,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.allocate_in(flags.arena(), size, align, flags)
     }
 
-    /// W16-6 (§28.3, Appendix-F): whether this thread is inside an extent-hook call
-    /// while a hooked arena exists, so a re-entrant allocator operation must be
-    /// **declined before any lock**. The hook runs under the non-re-entrant
-    /// back-end lock; re-entering would deadlock on it (a large op in the same
-    /// arena) or trip the lock-order checker / take locks out of order (a small
-    /// op). Declining is a *recoverable* defined-behaviour failure (like OOM) —
-    /// **never** a panic, since we are inside the hook's locked context where an
-    /// unwind could strand a held lock. Gated on `hooks.count` so the common
-    /// (no-hooked-arena) path pays nothing.
+    /// W16-6 (§28.3, Appendix-F): whether this thread is currently inside an
+    /// extent-hook call, so a re-entrant allocator operation must be **declined
+    /// before any lock**. The hook runs under the non-re-entrant back-end lock;
+    /// re-entering would deadlock on it (a large op) or trip the lock-order checker
+    /// / take locks out of order (a small op). Declining is a *recoverable*
+    /// defined-behaviour failure (like OOM) — **never** a panic, since we are inside
+    /// the hook's locked context where an unwind could strand a held lock.
+    ///
+    /// The signal is the per-thread `hook_reentry` domain **alone** (a single
+    /// Local-Exec TLS read): `HookGuard` sets it for *every* [`HookProvider`] hook
+    /// call — whether the hooks back a per-arena region (W10 `arena_create_hooked`)
+    /// **or the whole allocator** ([`Allocator::new`](Self::new) directly over a
+    /// `HookProvider`, a documented custom-backing path). It deliberately does **not**
+    /// pre-gate on `self.hooks.count` (per-arena registrations only): that count is 0
+    /// for a direct-`HookProvider` backend even while its hook is live, so the
+    /// re-entrant op would slip through to the back-end lock. `active()` is false on
+    /// the common (no-hook) path, so the hot path still pays only one always-false
+    /// TLS read.
     #[inline]
     fn hook_reentry_declines(&self) -> bool {
-        self.hooks.count.load(Ordering::Acquire) != 0 && crate::hooks::hook_reentry::active()
+        crate::hooks::hook_reentry::active()
     }
 
     /// Allocate from an **explicit** arena (plan 06 W9), overriding the arena the

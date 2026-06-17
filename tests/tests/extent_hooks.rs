@@ -854,6 +854,140 @@ fn hook_backing_is_behaviourally_coequal_with_posix() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// W16-6 (#2 regression): re-entry decline for a **direct** `HookProvider` backend.
+// ---------------------------------------------------------------------------
+
+/// Shared, `Arc`-observable state for [`DirectReentry`] (the hook is *moved* into
+/// the allocator, so its results are read back through this).
+#[derive(Default)]
+struct DirectProbe {
+    /// `*const Allocator<'static, HookProvider<DirectReentry>>` (as `usize`), or 0.
+    allocator: AtomicU64,
+    /// A live default-arena allocation, for the re-entrant free attempt.
+    scratch: AtomicU64,
+    /// Set once the hook has actually re-entered (so the assertions are meaningful).
+    fired: std::sync::atomic::AtomicBool,
+    /// The re-entrant `malloc` was declined (returned null) — the property under test.
+    malloc_declined: std::sync::atomic::AtomicBool,
+    /// The re-entrant `free` was declined (a `Null` no-op, leaving `scratch` live).
+    free_declined: std::sync::atomic::AtomicBool,
+}
+
+/// A backing hook (delegating its physical ops to an inner [`HostHooks`]) whose
+/// `commit` **re-enters** the allocator it backs. Used to build an allocator
+/// **directly** over a `HookProvider` — the path where the arena `HookRegistry`
+/// count is 0 yet a hook is live, which the original `count`-pre-gated decline
+/// missed (#2).
+struct DirectReentry {
+    inner: HostHooks,
+    probe: Arc<DirectProbe>,
+}
+
+impl ExtentHooks for DirectReentry {
+    fn alloc(
+        &self,
+        size: usize,
+        align: usize,
+        zero: &mut bool,
+        commit: &mut bool,
+    ) -> Result<Region, BackendError> {
+        self.inner.alloc(size, align, zero, commit)
+    }
+    fn dealloc(&self, region: Region, committed: bool) -> Result<(), BackendError> {
+        self.inner.dealloc(region, committed)
+    }
+    fn commit(&self, region: Region, offset: usize, length: usize) -> Result<(), BackendError> {
+        // Re-enter exactly once, while this hook runs under the back-end lock.
+        if !self.probe.fired.swap(true, Ordering::AcqRel) {
+            let a = self.probe.allocator.load(Ordering::Acquire) as usize
+                as *const Allocator<'static, HookProvider<DirectReentry>>;
+            if !a.is_null() {
+                // SAFETY: `a` is the live allocator currently running this hook; its
+                // methods take `&self` over interior-mutable state (sound to alias).
+                let p = unsafe { (*a).malloc(64) };
+                self.probe
+                    .malloc_declined
+                    .store(p.is_null(), Ordering::Release);
+                let scratch = self.probe.scratch.load(Ordering::Acquire) as usize as *mut u8;
+                if !scratch.is_null() {
+                    // SAFETY: the decline runs before `free` validates/derefs `scratch`,
+                    // so a declined free never touches it (and it stays live).
+                    let fo = unsafe { (*a).free(scratch) };
+                    self.probe
+                        .free_declined
+                        .store(fo == FreeOutcome::Null, Ordering::Release);
+                }
+            }
+        }
+        self.inner.commit(region, offset, length)
+    }
+}
+
+/// An allocator built directly over a `HookProvider` (no `arena_create_hooked`, so
+/// the arena hook count stays 0) must STILL decline a re-entrant `malloc`/`free`
+/// issued from inside one of its hooks — otherwise the re-entry reaches the
+/// non-re-entrant back-end lock and deadlocks (release) or trips the lock-order
+/// checker (debug). Regression guard for the `hooks.count`-pre-gated decline (#2).
+#[test]
+fn direct_hook_backend_declines_reentrant_malloc_and_free() {
+    let probe = Arc::new(DirectProbe::default());
+    let arena = meta(8 * 1024 * 1024);
+    let pm: &'static PageMap = Box::leak(Box::new(PageMap::new()));
+    let mk = || DirectReentry {
+        inner: HostHooks::new(Arc::new(HookStats::default())),
+        probe: probe.clone(),
+    };
+    let a: Allocator<'static, HookProvider<DirectReentry>> = Allocator::new(
+        HookProvider::new(mk()),
+        HookProvider::new(mk()),
+        arena,
+        arena,
+        pm,
+        ArenaId::DEFAULT,
+        hook_cfg(),
+    )
+    .expect("allocator directly over a hook backing");
+
+    // A live scratch allocation. Its commit fires before the probe is armed (so it
+    // does not re-enter); then arm the probe and re-open the one-shot re-entry.
+    let scratch = a.malloc(48);
+    assert!(!scratch.is_null());
+    probe
+        .scratch
+        .store(scratch as usize as u64, Ordering::Release);
+    probe
+        .allocator
+        .store(&a as *const _ as usize as u64, Ordering::Release);
+    probe.fired.store(false, Ordering::Release);
+
+    // A fresh allocation whose commit re-enters the allocator. The OUTER allocation
+    // must still succeed; the re-entrant malloc/free must be declined — not deadlock
+    // or trip the checker (which a regression would, failing this test loudly).
+    let p = a.malloc(4096);
+    assert!(
+        !p.is_null(),
+        "outer allocation over the direct hook backing must succeed"
+    );
+    assert!(
+        probe.fired.load(Ordering::Acquire),
+        "the hook must have re-entered the allocator"
+    );
+    assert!(
+        probe.malloc_declined.load(Ordering::Acquire),
+        "re-entrant malloc must be declined even though the arena hook count is 0"
+    );
+    assert!(
+        probe.free_declined.load(Ordering::Acquire),
+        "re-entrant free must be declined (a Null no-op)"
+    );
+    // `scratch` survived the declined free — still a live, valid allocation.
+    // SAFETY: `scratch` is a live allocation owned by this test.
+    assert_eq!(unsafe { a.free(scratch) }, FreeOutcome::Freed);
+    // SAFETY: `p` is the live outer allocation owned by this test.
+    assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+}
+
 // ===========================================================================
 // W10 / §22.2–§22.4: per-arena hooked backing regions.
 // ===========================================================================

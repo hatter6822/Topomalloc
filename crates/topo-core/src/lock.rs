@@ -230,13 +230,22 @@ impl<const RANK: u8> Drop for RankedGuard<'_, RANK> {
 }
 
 // ---------------------------------------------------------------------------
-// The per-thread held-rank checker (W16-1b). Active only in debug builds with a
-// thread-local available; a no-op otherwise. Allocation-free and reentrancy-safe
-// (a fixed array in a `const`-initialised thread-local), so it never re-enters
-// `malloc` even when this crate backs the process `#[global_allocator]`.
+// The per-thread held-rank checker (W16-1b). Active in **debug builds and the
+// `debug-checks` / hardened profile** (plan 05: "the held-rank checker (debug +
+// the `debug-checks` profile)"), whenever a thread-local is available (`std` or a
+// test build); a no-op otherwise. Gating on the `debug-checks` feature — not on
+// `debug_assertions` alone — is the "profiles are features, not forks" principle:
+// a hardened **release** artifact compiles the §17.3/Appendix-B checks in, and the
+// G-conc lock-order check must travel with them. Allocation-free and
+// reentrancy-safe (a fixed array in a `const`-initialised thread-local), so it
+// never re-enters `malloc` even when this crate backs the process
+// `#[global_allocator]`.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(debug_assertions, any(test, feature = "std")))]
+#[cfg(all(
+    any(debug_assertions, feature = "debug-checks"),
+    any(test, feature = "std")
+))]
 mod checker {
     use core::cell::Cell;
 
@@ -275,15 +284,24 @@ mod checker {
             let mut held = cell.get();
             // Strict-increasing: a new acquisition must out-rank everything held,
             // so the global order can never form a cycle (W16-1b / DD-3).
+            //
+            // These are `assert!`, not `debug_assert!`: this module is compiled
+            // **only** when the checker is active (debug, or the `debug-checks` /
+            // hardened profile — see the module cfg), so the check must fire whenever
+            // it exists. A `debug_assert!` would be elided in a `debug-checks`
+            // *release* artifact, leaving a checker that silently tracks ranks but
+            // never trips — defeating the hardened-build guarantee (#3). In a plain
+            // `performance` build the no-op `checker` stub is compiled instead, so
+            // there is no release hot-path cost outside the opt-in hardened profile.
             for i in 0..held.len {
-                debug_assert!(
+                assert!(
                     held.ranks[i] < rank,
                     "lock-order violation (G-conc): acquiring rank {rank} while holding rank {} \
                      — acquisitions MUST be strictly rank-increasing (§27.2)",
                     held.ranks[i]
                 );
             }
-            debug_assert!(
+            assert!(
                 held.len < MAX_HELD,
                 "lock-order checker: held-rank stack overflow (>{MAX_HELD} nested locks)"
             );
@@ -336,11 +354,15 @@ mod checker {
     }
 }
 
-#[cfg(not(all(debug_assertions, any(test, feature = "std"))))]
+#[cfg(not(all(
+    any(debug_assertions, feature = "debug-checks"),
+    any(test, feature = "std")
+)))]
 mod checker {
-    /// No-op in `performance` builds and pure `no_std` (no thread-local): the
-    /// rank stays a compile-time constant (W16-1a), only the runtime check is
-    /// elided. Mirrors the bootstrap re-entrancy guard's `no_std` no-op.
+    /// No-op in plain `performance` builds (release, no `debug-checks`) and pure
+    /// `no_std` (no thread-local): the rank stays a compile-time constant (W16-1a),
+    /// only the runtime check is elided. Mirrors the bootstrap re-entrancy guard's
+    /// `no_std` no-op.
     #[inline(always)]
     pub(super) fn enter(_rank: u8) {}
     #[inline(always)]
@@ -409,7 +431,13 @@ mod tests {
         l.acquire();
         assert_eq!(
             held_lock_count(),
-            if cfg!(debug_assertions) { 1 } else { 0 }
+            // The checker is active under debug_assertions **or** the `debug-checks`
+            // feature (in a test build `any(test, …)` always holds) — #3 fix.
+            if cfg!(any(debug_assertions, feature = "debug-checks")) {
+                1
+            } else {
+                0
+            }
         );
         l.release();
         assert_eq!(held_lock_count(), 0);
@@ -422,7 +450,11 @@ mod tests {
             let _g = l.lock();
             assert_eq!(
                 held_lock_count(),
-                if cfg!(debug_assertions) { 1 } else { 0 }
+                if cfg!(any(debug_assertions, feature = "debug-checks")) {
+                    1
+                } else {
+                    0
+                }
             );
         }
         assert_eq!(held_lock_count(), 0);
@@ -443,7 +475,11 @@ mod tests {
         let _gb = b.lock();
         assert_eq!(
             held_lock_count(),
-            if cfg!(debug_assertions) { 4 } else { 0 }
+            if cfg!(any(debug_assertions, feature = "debug-checks")) {
+                4
+            } else {
+                0
+            }
         );
     }
 
@@ -459,7 +495,10 @@ mod tests {
         assert_eq!(held_lock_count(), 0);
     }
 
-    #[cfg(all(debug_assertions, any(test, feature = "std")))]
+    #[cfg(all(
+        any(debug_assertions, feature = "debug-checks"),
+        any(test, feature = "std")
+    ))]
     #[test]
     fn out_of_order_acquire_trips_the_checker() {
         // Acquiring a lower rank while holding a higher one is the deadlock the

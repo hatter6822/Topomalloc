@@ -320,11 +320,17 @@ impl AnyAllocator {
     /// A generation-checked handle for `arena`'s current incarnation (§36.13),
     /// or `None` if unregistered.
     pub fn arena_handle(&self, arena: ArenaId) -> Option<u64> {
+        // W16-5: `handle` resolves through `ArenaRegistry::stats`, which takes the
+        // arena-registry lock (rank `ARENA_REGISTRY`), so a `fork()` during it must
+        // quiesce it — gate like the sibling `arena_stats`.
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arenas().handle(arena))
     }
 
     /// Resolve a handle to its [`ArenaId`], or `None` if it is stale (§36.13).
     pub fn arena_resolve_handle(&self, handle: u64) -> Option<ArenaId> {
+        // W16-5: `resolve_handle` also reads through the lock-taking `stats` path.
+        let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.arenas().resolve_handle(handle))
     }
 

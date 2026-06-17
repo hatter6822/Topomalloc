@@ -317,8 +317,13 @@ int main(void) {
     /* crash summary (Section 28.4, W16-6): lock-free, allocation-free, bounded.
        Writes ASCII key=value lines into the caller buffer; NULL/0 write nothing. */
     char summary[256];
-    size_t slen = topomalloc_crash_summary(summary, sizeof summary);
-    assert(slen > 0u && slen <= sizeof summary);
+    /* The summary returns a byte count and is NOT NUL-terminated. Cap the write at
+       sizeof-1 and terminate at the returned length before handing the buffer to a
+       C string routine, or `strstr` reads past the written region into the
+       uninitialized stack tail (undefined / flaky). */
+    size_t slen = topomalloc_crash_summary(summary, sizeof summary - 1u);
+    assert(slen > 0u && slen < sizeof summary);
+    summary[slen] = '\0';
     assert(strstr(summary, "live_bytes=") != NULL);
     assert(topomalloc_crash_summary(NULL, 16u) == 0u);
 
