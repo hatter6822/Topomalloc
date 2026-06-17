@@ -1897,3 +1897,45 @@ tests. All are now genuine, tested, and active in the **real** artifact.
   fork-gated (they hold no lock; the gate was pure overhead), while `usable_size`/`stats` (which take a
   lock) keep it. The crash summary gained a lock-free `in_flight_ops` field (allocator activity at crash
   time); per-object counts stay omitted by design (they need locks, §28.4) rather than taxing the hot path.
+
+### W16 deep-audit pass (re-entrancy deadlock, numa fork hole, hook free/realloc)
+
+A code-first audit ("do not trust the docs") of the W16 changes found three real defects — two of
+them latent deadlocks — and fixed each with a regression test.
+
+* **The fork gate had a latent re-entrancy deadlock; the gate is now genuinely re-entrancy-aware.** The
+  module doc claimed "a re-entrant operation simply nests the count", but the code did not: a *nested*
+  `operation_guard` re-checked the fork bit and, during a fork window, **parked** — while the *outer*
+  guard's count was still held. `prefork`'s drain waits for that count, so it would hang forever. The
+  current gated methods happen not to re-enter (the sampled path is allocation-free, verified), so it was
+  latent — but gating the `numa` control ops (below), which *do* allocate, would have triggered it. Fixed
+  by tracking a **per-thread nesting depth** (a `const`-init, allocation-free thread-local, Local-Exec,
+  ~1 cycle): only the *first-level* guard takes a shard slot and does the fork check; a nested guard nests
+  the depth and runs to completion (the fork is, by definition, draining the outer op). Pinned by
+  `nested_guard_during_fork_window_does_not_deadlock` (a thread takes a nested guard *inside* an open fork
+  window; a regression deadlocks and a watchdog aborts).
+
+* **The NUMA control surface was not fork-gated (a `hugepage-optimized` deadlock).** Every
+  `topomalloc_numa_*` entry point takes the router lock (rank `BACKEND`) and/or per-node backend locks,
+  but none ran inside the fork gate — so a `fork()` during a `rebalance_tick` / `release` / `refresh` /
+  stats read could leave a backend lock held in the child, deadlocking the child's large path. All seven
+  are now wrapped in `operation_guard` (safe now that the gate is re-entrancy-aware: `refresh`'s
+  `discover_topology` allocation nests rather than parks). Pinned by
+  `child_is_safe_with_concurrent_numa_control_calls` (workers hammer the control surface while the main
+  thread forks; the child both allocates and calls the surface — watchdog-guarded, `hugepage-optimized`).
+
+* **The hook re-entrancy fail-safe covered only `malloc`; it now covers `free`/`realloc` too.** A
+  re-entrant hook calling `free` would take a central/span lock while holding the hook's back-end lock — a
+  lock-order inversion that, with the now-artifact-active checker, **panics inside the locked hook
+  context** (stranding the lock); a same-arena large `free` would deadlock outright. The
+  `hook_reentry_declines()` guard now gates `free` (declines as a `Null` no-op — the contract-violating
+  object leaks, the §2.4 safe degradation) and `realloc`/`resize_in_place` (decline to null/`None`, the
+  original preserved). The re-entrancy test now drives all three (malloc, free, realloc) and asserts the
+  scratch survives the declined free/realloc.
+
+* **A regression guard confirms the checker is genuinely live in the artifact.**
+  `lock_order_checker_is_active_in_this_artifact` (in `topo-abi`) trips an out-of-order acquire and
+  requires the panic — so if `topo-core/std` is ever dropped (silently disabling the checker + the S-007 /
+  hook guards everywhere but `topo-core`'s own tests), CI fails. (An incidental fix from the audit: the
+  helper insertion had orphaned `allocate_in`'s doc + `SPEC-transition` tag — an M-001 violation — now
+  restored.)

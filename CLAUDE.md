@@ -331,23 +331,35 @@ single `fetch_add` on its CPU's shard (the fork check rides on the returned valu
 `membarrier`**, loom-verifiable), the §28.1 pre-fork handler sets the bit in all shards then **drains**
 them to zero (no internal lock held at `fork()` — the per-span locks are dynamic, so draining beats
 "acquire every lock"), the parent resumes, and the child **resets** every shard + the lock-order checker
-and disables background maintenance (the same gate quiesces it via `maintenance_guard`). The
+and disables background maintenance (the same gate quiesces it via `maintenance_guard`). The gate is
+**genuinely re-entrancy-aware**: a nested entry (an arena or C `topomalloc_numa_*` control op that itself
+allocates) takes **no** shard slot and skips the fork check, nesting instead on a per-thread depth (a
+`const`-init Local-Exec TLS, ~1 cycle) — only the *first-level* guard the drain waits for is fork-checked,
+so a nested op can never park-and-deadlock the drain (the fork is by definition draining the outer op).
+The whole `topomalloc_numa_*` control surface (router + per-node backend locks, rank `BACKEND`) runs
+inside the gate, so a `fork()` quiesces it too. The
 `pthread_atfork` registration + the lock-free C `topomalloc_crash_summary` (§28.4, with an `in_flight_ops`
 field) live in `crates/topo-abi/src/fork_api.rs`. The §35.4 init phases (Phase 0–6, advanced through
 **each** boundary and load-bearing — maintenance declines before its phase), the `reentry_flag!` domain
-(wired into the extent-hook path so a re-entrant hook is declined, not deadlocked), and the crash summary
+(wired into the extent-hook path so a re-entrant hook's `malloc`/`free`/`realloc`/in-place-resize is
+declined before any lock — not deadlocked, and never tripping the now-artifact-active checker), and the
+crash summary
 live in `crates/topo-core/src/init.rs`, with `INIT_PHASE` advanced through the global initializer. It is
 **concurrency/operational, not an abstract §33.4 transition**, so there is **no Lean obligation**:
 deadlock-freedom is pinned by the fixed-wall checker test
-(`lock::tests::out_of_order_acquire_trips_the_checker`) and fork-quiesce by the `loom` models
+(`lock::tests::out_of_order_acquire_trips_the_checker`, plus `lock_order_checker_is_active_in_this_artifact`
+in `topo-abi` proving the checker is live — not a silent no-op — in the real artifact), re-entrancy
+deadlock-freedom by `nested_guard_during_fork_window_does_not_deadlock` (a nested guard inside an open fork
+window must nest, not park; a regression hangs and a watchdog aborts), and fork-quiesce by the `loom` models
 (`gate_admits_no_op_across_a_fork` + `multishard_…`, no `SeqCst`), with the fork-in-multithread battery
-(`fork_safety.rs`: concurrent forkers, parent consistency), the TLS **depth proof** (the `global_allocator`
+(`fork_safety.rs`: concurrent forkers, parent consistency, the gated `numa` control surface under
+`hugepage-optimized`), the TLS **depth proof** (the `global_allocator`
 example asserts the steady-state path runs at depth 1) + TLS-via-`dlopen` (`tls_dlopen.rs`), the
 hook-re-entry fail-safe test, and a TSan pass over the whole `topo-core` lib. The per-op gate (~13 ns,
 `benches/fork_gate.rs`) is the M2 fork-safety cost; per-CPU sharding removes the contended cacheline.
 
 **Test counts:**
-- Rust: ~775 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~766 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)

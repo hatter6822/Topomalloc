@@ -56,15 +56,23 @@
 //!
 //! # Re-entrancy, background threads, and maintenance
 //!
-//! The gate is a **counter**, so a re-entrant operation (e.g. `realloc` calling
-//! `allocate`) simply nests — `prefork` waits for the count, which a balanced
-//! pair always returns to zero. Internal background maintenance (the release pump,
-//! rebalancer — host-driven today) runs inside a [`maintenance_guard`], which
-//! counts in the **same** gate, so `prefork`'s one drain quiesces public ops *and*
-//! maintenance together (§28.1 "quiesce background threads"); [`background_enabled`]
-//! is the on/off switch the child clears so maintenance stays off until the host
-//! re-arms it. The handshake is wired ahead of the pump consumer but is a real
-//! mechanism (tested), not a bare flag.
+//! A gated operation may **re-enter** the allocator (an arena op, or a `numa`
+//! control call, that itself allocates). A naive nested entry that re-checked the
+//! fork bit would *park* during a fork window while the outer guard's count was
+//! still held — deadlocking `prefork`'s drain. So the gate tracks a **per-thread
+//! nesting depth** (a `const`-init, allocation-free thread-local): only the
+//! *first-level* guard takes a shard slot and does the fork check; a nested guard
+//! merely nests the depth and runs to completion (the fork is, by definition,
+//! draining the outer op). This makes re-entrancy genuinely deadlock-free, not
+//! just "nests the count".
+//!
+//! Internal background maintenance (the release pump, rebalancer — host-driven
+//! today) runs inside a [`maintenance_guard`], which counts in the **same** gate,
+//! so `prefork`'s one drain quiesces public ops *and* maintenance together (§28.1
+//! "quiesce background threads"); [`background_enabled`] is the on/off switch the
+//! child clears so maintenance stays off until the host re-arms it. The handshake
+//! is wired ahead of the pump consumer but is a real mechanism (tested), not a
+//! bare flag.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -150,14 +158,21 @@ fn shard_index() -> usize {
     0
 }
 
+/// Sentinel shard for a **nested** guard: it owns no shard slot (the *outer*
+/// first-level guard does), so its drop only unwinds the re-entrancy depth. `u32`
+/// because a real shard index is `< NUM_SHARDS` (≤ 64), never `u32::MAX`.
+const NESTED: u32 = u32::MAX;
+
 /// RAII guard for one in-flight allocator operation: decrements its shard's count
-/// on drop. Held for the dynamic extent of a public `allocate`/`free`/`realloc`/
-/// arena operation, so `prefork`'s drain proves no internal lock is held. Carries
-/// the shard it incremented, so a thread that **migrates** mid-operation still
-/// decrements the shard it entered (the count balances per shard).
+/// on drop (and always unwinds the per-thread re-entrancy depth). Held for the
+/// dynamic extent of a public `allocate`/`free`/`realloc`/arena operation, so
+/// `prefork`'s drain proves no internal lock is held. Carries the shard it
+/// incremented, so a thread that **migrates** mid-operation still decrements the
+/// shard it entered (the count balances per shard).
 #[must_use = "the operation is counted as in-flight until the guard is dropped"]
 pub struct OperationGuard {
-    /// The shard this operation incremented (decremented on drop).
+    /// The shard this operation incremented, or [`NESTED`] for a nested guard
+    /// (which holds no shard slot — only the outer first-level guard does).
     shard: u32,
     /// The `*const ()` makes the guard `!Send`/`!Sync`: an operation enters and
     /// leaves on one thread, so the guard is never transferred across threads.
@@ -167,27 +182,48 @@ pub struct OperationGuard {
 impl Drop for OperationGuard {
     #[inline]
     fn drop(&mut self) {
-        // Release the slot on the shard we entered (even if we have since migrated
-        // CPUs). `Release` so a draining `prefork` (which `Acquire`-loads the shard)
-        // that observes the count reach zero has also observed every write this
-        // operation made under the internal locks (they are unlocked now).
-        SHARDS[self.shard as usize]
-            .0
-            .fetch_sub(1, Ordering::Release);
+        // Unwind this thread's nesting depth first (the inverse of the `enter` that
+        // built this guard), then — only for the *first-level* guard — release the
+        // shard slot. `Release` so a draining `prefork` (which `Acquire`-loads the
+        // shard) that observes the count reach zero has also observed every write
+        // this operation made under the internal locks (they are unlocked now).
+        reentry::leave();
+        if self.shard != NESTED {
+            SHARDS[self.shard as usize]
+                .0
+                .fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
 /// Enter a public allocator operation, returning a guard that keeps it counted as
 /// in-flight until dropped (W16-5). If a `fork()` is in progress this **parks**
 /// until it completes, so the operation never races a fork — the §28.1 quiesce
-/// seen from the operation side. Re-entrant: a nested operation simply nests the
-/// count (on possibly different shards — each balances independently).
+/// seen from the operation side.
 ///
-/// This is the single hot-path cost of fork safety: a (cheap) CPU-id read + one
-/// `fetch_add` on the running CPU's own shard, plus the matching decrement on the
-/// guard's drop.
+/// **Re-entrancy is genuinely safe.** If this thread is *already* inside an
+/// admitted operation (e.g. an arena op or a `numa` control call that re-enters
+/// `malloc`), the nested guard takes **no** shard slot and does **not** re-check
+/// the fork bit — it simply nests the per-thread depth. This is essential: a
+/// nested guard that parked on the fork bit while the *outer* guard's count was
+/// still held would deadlock `prefork`'s drain (which waits for that count). The
+/// outer (first-level) guard is the one the drain waits for; the fork is, by
+/// definition, draining the outer op, so the nested work must be allowed to run to
+/// completion.
+///
+/// Hot-path cost: a per-thread depth read (Local-Exec TLS, ~1 cycle) + on the
+/// first level a CPU-id read and one `fetch_add` on the running CPU's own shard,
+/// plus the matching unwind on drop.
 #[inline]
 pub fn operation_guard() -> OperationGuard {
+    // Re-entrant: already inside an admitted operation on this thread → nest.
+    if reentry::enter() {
+        return OperationGuard {
+            shard: NESTED,
+            _not_send: core::marker::PhantomData,
+        };
+    }
+    // First level: the fork-checked shard entry.
     loop {
         let idx = shard_index();
         // Increment this shard's count and read its previous value atomically: the
@@ -221,14 +257,22 @@ pub fn operation_guard() -> OperationGuard {
 #[inline]
 #[must_use]
 pub fn maintenance_guard() -> Option<OperationGuard> {
-    // Load-bearing §35.4 phase gate (W16-7): background maintenance must not run
-    // before the allocator reaches the background/profiling phase (and is cleared
-    // back below it never — the phase is monotone), nor while it is disabled
-    // (the post-fork state). Both conditions are checked before counting an op.
+    // Load-bearing §35.4 phase gate (W16-7), checked at **every** level (before
+    // touching the depth): background maintenance must not run before the allocator
+    // reaches the background/profiling phase (the phase is monotone), nor while it
+    // is disabled (the post-fork state).
     if crate::init::INIT_PHASE.current() < crate::init::InitPhase::BackgroundAndProfiling
         || !BACKGROUND_ENABLED.load(Ordering::Acquire)
     {
         return None;
+    }
+    // A nested maintenance call (already inside an admitted operation) just nests,
+    // like `operation_guard` — the outer op governs admission.
+    if reentry::enter() {
+        return Some(OperationGuard {
+            shard: NESTED,
+            _not_send: core::marker::PhantomData,
+        });
     }
     let idx = shard_index();
     let prev = SHARDS[idx].0.fetch_add(1, Ordering::AcqRel);
@@ -238,9 +282,10 @@ pub fn maintenance_guard() -> Option<OperationGuard> {
             _not_send: core::marker::PhantomData,
         });
     }
-    // A fork is starting: do not run maintenance during the window. Back out and
-    // decline (the pump retries on its next tick).
+    // A fork is starting: do not run maintenance during the window. Back out the
+    // shard slot and the depth, and decline (the pump retries on its next tick).
     SHARDS[idx].0.fetch_sub(1, Ordering::Release);
+    reentry::leave();
     None
 }
 
@@ -322,6 +367,9 @@ pub fn postfork_child() {
     // The forking thread held the fork lock (rank 0) at fork; clear the inherited
     // held-rank snapshot so the checker starts clean in the child.
     reset_lock_checker();
+    // Clear the inherited operation-nesting depth (the forking thread was not in an
+    // operation, so this is normally already 0 — defensive).
+    reentry::reset();
     // Disable background maintenance until the host re-arms it (§28.1).
     BACKGROUND_ENABLED.store(false, Ordering::Release);
 }
@@ -341,6 +389,64 @@ pub fn background_enabled() -> bool {
 #[inline]
 pub fn set_background_enabled(on: bool) {
     BACKGROUND_ENABLED.store(on, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread operation-nesting depth (W16-5 re-entrancy). A `const`-initialised
+// thread-local `Cell<u32>` (Local-Exec TLS, allocation-free, so it never re-enters
+// `malloc` even when this crate backs the process `#[global_allocator]`). It is
+// what lets a *nested* `operation_guard` nest instead of parking on the fork bit
+// (which would deadlock `prefork`'s drain). A no-op in pure `no_std` (no
+// thread-local): there, every guard is treated as first-level — fine, because a
+// `no_std` host drives its own fork strategy and the seLe4n kernel does not fork.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "std"))]
+mod reentry {
+    use core::cell::Cell;
+    std::thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+    /// Bump the depth; return `true` iff this thread was **already** inside an
+    /// operation (i.e. this is a nested entry).
+    #[inline]
+    pub(super) fn enter() -> bool {
+        DEPTH.with(|d| {
+            let was = d.get();
+            d.set(was.wrapping_add(1));
+            was != 0
+        })
+    }
+    /// Unwind one level of depth.
+    #[inline]
+    pub(super) fn leave() {
+        DEPTH.with(|d| d.set(d.get().wrapping_sub(1)));
+    }
+    /// Reset the depth to zero (the fork-child reset).
+    #[inline]
+    pub(super) fn reset() {
+        DEPTH.with(|d| d.set(0));
+    }
+    /// The current nesting depth (test-only diagnostic hook).
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn depth() -> u32 {
+        DEPTH.with(Cell::get)
+    }
+}
+
+#[cfg(not(any(test, feature = "std")))]
+mod reentry {
+    /// No thread-local without `std`: every guard is treated as first-level (no
+    /// nesting detection). A `no_std` host owns its fork strategy.
+    #[inline(always)]
+    pub(super) fn enter() -> bool {
+        false
+    }
+    #[inline(always)]
+    pub(super) fn leave() {}
+    #[inline(always)]
+    pub(super) fn reset() {}
 }
 
 /// The number of allocator operations currently in flight, process-wide
@@ -377,18 +483,108 @@ mod tests {
         GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The re-entrancy-safety property (the deadlock this gate's depth tracking
+    /// exists to prevent): a thread holding a first-level guard takes a **nested**
+    /// guard *while a fork window is open*. The nested guard MUST nest (not park),
+    /// so the thread can finish and drop its outer guard — letting `prefork`'s
+    /// drain complete. A regression (the nested guard parking) deadlocks: the
+    /// watchdog aborts so the test fails loudly instead of hanging.
     #[test]
-    fn operation_guard_counts_in_flight() {
+    fn nested_guard_during_fork_window_does_not_deadlock() {
+        let _serialize = serialize();
+        let holding = Arc::new(StdAtomicBool::new(false));
+        let nested_ok = Arc::new(StdAtomicBool::new(false));
+        let done = Arc::new(StdAtomicBool::new(false));
+
+        // Watchdog: a deadlock would hang both threads; abort after a deadline.
+        let watch = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if done.load(StdOrdering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                eprintln!(
+                    "fork-gate re-entrancy watchdog: a nested guard parked during a fork window \
+                     and deadlocked prefork's drain (W16-5 regression)"
+                );
+                std::process::abort();
+            })
+        };
+
+        let t = {
+            let (holding, nested_ok) = (holding.clone(), nested_ok.clone());
+            std::thread::spawn(move || {
+                let outer = operation_guard(); // first-level, admitted
+                holding.store(true, StdOrdering::Release);
+                // Wait until the forker has opened the window.
+                while !fork_in_progress() {
+                    std::hint::spin_loop();
+                }
+                // The critical step: a nested guard during the fork window. It must
+                // nest (return immediately), NOT park. If it parks, we never reach
+                // the next line and the outer guard is never dropped → deadlock.
+                let inner = operation_guard();
+                nested_ok.store(true, StdOrdering::Release);
+                drop(inner);
+                drop(outer); // releasing the outer lets prefork's drain finish
+            })
+        };
+
+        while !holding.load(StdOrdering::Acquire) {
+            std::hint::spin_loop();
+        }
+        // prefork sets the fork bit (the thread `t` observes it), then drains — it
+        // returns only once `t` drops its outer guard, which `t` can only do after
+        // its nested guard did NOT park.
+        prefork();
+        assert!(
+            nested_ok.load(StdOrdering::Acquire),
+            "the nested guard must have nested (not parked) during the fork window"
+        );
+        assert_eq!(in_flight_operations(), 0);
+        postfork_parent();
+
+        t.join().unwrap();
+        done.store(true, StdOrdering::Release);
+        watch.join().unwrap();
+    }
+
+    #[test]
+    fn operation_guard_counts_in_flight_and_nests() {
         let _serialize = serialize();
         assert_eq!(in_flight_operations(), 0);
+        assert_eq!(reentry::depth(), 0);
+
+        // First-level guard: one shard slot, depth 1.
         let g1 = operation_guard();
         assert!(in_flight_operations() >= 1);
+        assert_eq!(reentry::depth(), 1);
+        let base = in_flight_operations();
+
+        // A NESTED guard (taken while `g1` is held) must take **no** new shard slot
+        // — it only nests the depth. This is the re-entrancy-safety property: a
+        // nested op never re-checks the fork bit, so it cannot park-and-deadlock.
         let g2 = operation_guard();
-        assert!(in_flight_operations() >= 2);
-        drop(g1);
+        assert_eq!(reentry::depth(), 2);
+        assert_eq!(
+            in_flight_operations(),
+            base,
+            "a nested guard must not add an in-flight slot"
+        );
         drop(g2);
-        // Other threads may transiently bump the global count, so we only assert
-        // that *our* two slots were returned (the count did not leak upward).
+        assert_eq!(reentry::depth(), 1);
+        drop(g1);
+        assert_eq!(reentry::depth(), 0);
+
+        // Two **sequential** (non-nested) ops each take a first-level slot.
+        {
+            let _a = operation_guard();
+            assert_eq!(reentry::depth(), 1);
+        }
+        assert_eq!(reentry::depth(), 0);
     }
 
     #[test]

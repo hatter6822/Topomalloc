@@ -967,4 +967,33 @@ mod tests {
         );
         assert!(text.contains("allocated_bytes="));
     }
+
+    /// W16-1b regression guard: the lock-order checker must be **genuinely active**
+    /// in the real `topo-abi` artifact (debug), not a silent no-op. This is the
+    /// whole point of enabling `topo-core/std` here — without it the checker (and
+    /// the S-007 / hook re-entrancy guards) compile out everywhere except
+    /// `topo-core`'s own tests. We confirm by tripping it: acquiring a lower rank
+    /// while holding a higher one must panic (debug only). If this test ever passes
+    /// *without* a panic, the checker has been silently disabled in the artifact.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn lock_order_checker_is_active_in_this_artifact() {
+        use topo_core::{LockRank, RankedLock};
+        let high: RankedLock<{ LockRank::BACKEND }> = RankedLock::new();
+        let low: RankedLock<{ LockRank::CENTRAL }> = RankedLock::new();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            high.acquire();
+            low.acquire(); // backend(8) held, acquiring central(5) — a violation
+        }));
+        std::panic::set_hook(prev);
+        assert!(
+            caught.is_err(),
+            "the lock-order checker is NOT active in topo-abi — `topo-core/std` must be enabled"
+        );
+        // We panicked mid-`low.acquire`, so `high` is still recorded as held; clear
+        // this thread's bookkeeping for the rest of the test binary.
+        topo_core::reset_lock_checker();
+    }
 }

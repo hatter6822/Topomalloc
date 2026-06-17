@@ -983,8 +983,12 @@ struct ReentrantOnCommit {
     allocator: AtomicU64,
     /// The hooked arena id to re-enter.
     arena: AtomicU32,
+    /// A live default-arena scratch allocation for the re-entrant free/realloc.
+    scratch: AtomicU64,
     attempted: std::sync::atomic::AtomicBool,
     declined_null: std::sync::atomic::AtomicBool,
+    free_declined: std::sync::atomic::AtomicBool,
+    realloc_declined: std::sync::atomic::AtomicBool,
 }
 
 impl ReentrantOnCommit {
@@ -993,8 +997,11 @@ impl ReentrantOnCommit {
             inner: HostHooks::new(Arc::new(HookStats::default())),
             allocator: AtomicU64::new(0),
             arena: AtomicU32::new(0),
+            scratch: AtomicU64::new(0),
             attempted: std::sync::atomic::AtomicBool::new(false),
             declined_null: std::sync::atomic::AtomicBool::new(false),
+            free_declined: std::sync::atomic::AtomicBool::new(false),
+            realloc_declined: std::sync::atomic::AtomicBool::new(false),
         }
     }
     fn contains(&self, p: *mut u8) -> bool {
@@ -1036,6 +1043,26 @@ impl ExtentHooks for ReentrantOnCommit {
                     (*alloc).free(p);
                 }
             }
+
+            // A re-entrant FREE and REALLOC must ALSO be declined (Appendix-F):
+            // otherwise a small free takes central/span locks while the hook holds
+            // the back-end lock — a lock-order inversion (checker-panic in debug)
+            // or a same-arena large deadlock. The scratch ptr is a live default-
+            // arena allocation; a *declined* free is a no-op (`Null`), leaving it
+            // live (the test frees it), and a *declined* realloc returns null
+            // (original preserved). A regression frees it (`Freed`) / moves it.
+            let scratch = self.scratch.load(Ordering::Acquire) as usize as *mut u8;
+            if !scratch.is_null() {
+                // SAFETY: the decline check runs before `free` dereferences/validates
+                // `scratch`, so a live (or even declined) pointer is never misused.
+                let fo = unsafe { (*alloc).free(scratch) };
+                self.free_declined
+                    .store(fo == FreeOutcome::Null, Ordering::Release);
+                // SAFETY: `scratch` is still live (the free was declined); the
+                // realloc decline likewise runs before any dereference.
+                let rp = unsafe { (*alloc).realloc(scratch, 256, 16, RequestFlags::NONE) };
+                self.realloc_declined.store(rp.is_null(), Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -1068,15 +1095,22 @@ fn a_hook_that_reenters_the_allocator_fails_safe_not_deadlock() {
     let arena = a
         .arena_create_hooked(&ArenaPolicy::explicit(), hooks, hook_cfg())
         .expect("create hooked arena");
-    // Arm the hook with the allocator + arena so its `commit` re-enters.
+    // A live default-arena scratch allocation for the re-entrant free/realloc test.
+    let scratch = a.allocate(48, 16, RequestFlags::NONE);
+    assert!(!scratch.is_null());
+    // Arm the hook with the allocator + arena + scratch so its `commit` re-enters.
     hooks
         .allocator
         .store(&a as *const _ as usize as u64, Ordering::Release);
     hooks.arena.store(arena.0, Ordering::Release);
+    hooks
+        .scratch
+        .store(scratch as usize as u64, Ordering::Release);
 
     // An allocation from the hooked arena triggers a `commit`, whose hook re-enters
-    // the allocator. The OUTER allocation must still succeed, and the re-entrant
-    // one must have been declined (null) rather than deadlocking.
+    // the allocator (malloc, free, realloc). The OUTER allocation must still
+    // succeed, and every re-entrant call must have been declined rather than
+    // deadlocking or tripping the lock-order checker.
     let p = a.allocate_in(arena, 4096, 16, RequestFlags::NONE);
     assert!(!p.is_null(), "outer (hooked-arena) allocation must succeed");
     assert!(hooks.contains(p), "served from the hooked region");
@@ -1088,6 +1122,18 @@ fn a_hook_that_reenters_the_allocator_fails_safe_not_deadlock() {
         hooks.declined_null.load(Ordering::Acquire),
         "the re-entrant allocation must be declined (null), not serviced"
     );
+    assert!(
+        hooks.free_declined.load(Ordering::Acquire),
+        "the re-entrant free must be declined (no-op), not freed/deadlocked"
+    );
+    assert!(
+        hooks.realloc_declined.load(Ordering::Acquire),
+        "the re-entrant realloc must be declined (null), original preserved"
+    );
+    // The scratch survived the declined free/realloc and is still a live, valid
+    // allocation — frees cleanly now (proving the declines were true no-ops).
+    // SAFETY: `scratch` is the live allocation this test owns.
+    assert_eq!(unsafe { a.free(scratch) }, FreeOutcome::Freed);
     // SAFETY: `p` is a live allocation owned by this test.
     assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
 

@@ -939,6 +939,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.allocate_in(flags.arena(), size, align, flags)
     }
 
+    /// W16-6 (§28.3, Appendix-F): whether this thread is inside an extent-hook call
+    /// while a hooked arena exists, so a re-entrant allocator operation must be
+    /// **declined before any lock**. The hook runs under the non-re-entrant
+    /// back-end lock; re-entering would deadlock on it (a large op in the same
+    /// arena) or trip the lock-order checker / take locks out of order (a small
+    /// op). Declining is a *recoverable* defined-behaviour failure (like OOM) —
+    /// **never** a panic, since we are inside the hook's locked context where an
+    /// unwind could strand a held lock. Gated on `hooks.count` so the common
+    /// (no-hooked-arena) path pays nothing.
+    #[inline]
+    fn hook_reentry_declines(&self) -> bool {
+        self.hooks.count.load(Ordering::Acquire) != 0 && crate::hooks::hook_reentry::active()
+    }
+
     /// Allocate from an **explicit** arena (plan 06 W9), overriding the arena the
     /// `flags` encode. [`allocate`](Self::allocate) is `allocate_in(flags.arena(),
     /// …)`; `realloc` uses this to preserve the original allocation's arena across
@@ -952,16 +966,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
-        // W16-6 (§28.3, Appendix-F): a user extent hook that re-enters `malloc`
-        // would deadlock on the non-re-entrant back-end lock it runs under. If a
-        // hooked arena exists *and* this thread is currently inside a hook call,
-        // decline the re-entrant allocation cleanly (null) **before** taking any
-        // lock — turning a deadlock into a safe failure. This is a *recoverable*
-        // defined-behaviour decline (like OOM), **not** a panic: we are running
-        // inside the hook's locked context, so a `debug_assert!` unwind here could
-        // strand a held lock; the null return is the §2.4 safe failure. Gated on
-        // `hooks.count` so the common (no-hooked-arena) path pays nothing.
-        if self.hooks.count.load(Ordering::Acquire) != 0 && crate::hooks::hook_reentry::active() {
+        // A re-entrant hook allocation is declined cleanly (null) before any lock.
+        if self.hook_reentry_declines() {
             return ptr::null_mut();
         }
         let Some(req) = classify(size, align, flags.raw()) else {
@@ -1359,6 +1365,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         if ptr.is_null() {
             return FreeOutcome::Null;
         }
+        // W16-6 (Appendix-F): a hook that re-enters `free` would take a central/span
+        // lock while holding the hook's back-end lock — a lock-order inversion (and
+        // a same-arena large free deadlocks). Decline as a no-op *before* any lock;
+        // the object leaks (the hook's contract violation), which is the §2.4 safe
+        // degradation versus a deadlock or a checker-panic in the locked context.
+        if self.hook_reentry_declines() {
+            return FreeOutcome::Null;
+        }
         match validate_free(self.pagemap, self.meta_region, ptr as usize) {
             Ok(FreeTarget::Noop) => FreeOutcome::Null,
             Ok(FreeTarget::Small { span, object_index }) => {
@@ -1653,6 +1667,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         min_align: usize,
         flags: RequestFlags,
     ) -> *mut u8 {
+        // W16-6 (Appendix-F): decline a re-entrant hook `realloc` cleanly (null);
+        // the §25.1 contract is "failure preserves the original", so nothing leaks.
+        if self.hook_reentry_declines() {
+            return ptr::null_mut();
+        }
         if ptr.is_null() {
             return self.allocate(new_size, min_align, flags);
         }
@@ -1857,6 +1876,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         min_align: usize,
         flags: RequestFlags,
     ) -> Option<usize> {
+        // W16-6 (Appendix-F): decline a re-entrant hook in-place resize (`None`,
+        // no resize) before any lock — the allocation is unchanged.
+        if self.hook_reentry_declines() {
+            return None;
+        }
         if ptr.is_null() || !min_align.is_power_of_two() {
             return None;
         }

@@ -125,8 +125,13 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 > `fetch_add` on its CPU's shard (the fork check rides on the returned value — no
 > Dekker hazard, **no `membarrier`**, loom-verifiable), and `prefork` sets the bit
 > in all shards then drains them (so no internal lock is held at `fork()`); the
-> child resets every shard. The same gate quiesces background maintenance
-> (`maintenance_guard`). The `pthread_atfork` registration + the C
+> child resets every shard. The gate is **re-entrancy-aware**: a nested entry (an
+> arena or `topomalloc_numa_*` control op that itself allocates) nests on a
+> per-thread depth (a `const`-init Local-Exec TLS) and skips the fork check, so it
+> can never park-and-deadlock the drain (only the first-level guard the drain waits
+> for is fork-checked). The same gate quiesces background maintenance
+> (`maintenance_guard`) and the whole `topomalloc_numa_*` control surface (router +
+> per-node backend locks). The `pthread_atfork` registration + the C
 > `topomalloc_crash_summary` (§28.4) live in
 > [`topo-abi/src/fork_api.rs`](../../crates/topo-abi/src/fork_api.rs). Init phases
 > (§35.4 Phase 0–6, advanced through **each** boundary and load-bearing — maintenance
@@ -138,12 +143,16 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 > example asserts the steady-state path — incl. a fresh thread's first TLS access —
 > runs at depth 1) + the **TLS-via-`dlopen`** test, the **`loom`** models
 > (`gate_admits_no_op_across_a_fork` + `multishard_…`, no `SeqCst`), the
-> **hook-re-entry fail-safe** test (a re-entrant hook is declined, not deadlocked),
-> and **ThreadSanitizer** (the whole `topo-core` lib + RSEQ battery clean). A
-> `benches/fork_gate.rs` criterion bench measures the ~13 ns/op gate cost. W16 is
-> **concurrency/operational, not an abstract §33.4 transition**, so it carries **no
-> Lean obligation** — deadlock-freedom is pinned by the fixed-wall checker test
-> (`lock::tests::out_of_order_acquire_trips_the_checker`) and fork-quiesce by the
+> **hook-re-entry fail-safe** test (a re-entrant hook's `malloc`/`free`/`realloc` is
+> declined before any lock, not deadlocked), and **ThreadSanitizer** (the whole
+> `topo-core` lib + RSEQ battery clean). A `benches/fork_gate.rs` criterion bench
+> measures the ~13 ns/op gate cost. W16 is **concurrency/operational, not an
+> abstract §33.4 transition**, so it carries **no Lean obligation** —
+> deadlock-freedom is pinned by the fixed-wall checker test
+> (`lock::tests::out_of_order_acquire_trips_the_checker`, plus
+> `lock_order_checker_is_active_in_this_artifact` proving the checker is live in the
+> real `topo-abi` artifact), re-entrancy deadlock-freedom by
+> `nested_guard_during_fork_window_does_not_deadlock`, and fork-quiesce by the
 > `loom` models, per the V-004 citation rule.
 
 | WU | Description | Size | ∥ | Acceptance | Status |
@@ -153,9 +162,9 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 | W16-2 | **TLS initial-exec model** (§27.6): no `malloc` re-entry on first TLS access; `dlopen` allocation-free bootstrap path. | M | | TLS-recursion test (load via dlopen) does not re-enter the allocator. | **DONE** — depth-proof (`global_allocator`: steady-state path at depth 1) + `tls_dlopen.rs` + const-init Local-Exec TLS |
 | W16-3 | Atomics-ordering map (§27.3): publication=release, consumption=acquire, transitions=acq-rel, stats=relaxed; documented per atomic. | M | ∥ | each atomic annotated; TSan clean. | **DONE** — ordering map in `lock.rs` docs; `xtask lint` `atomics ordering` gate (no off-map `SeqCst`); TSan-clean |
 | W16-4 | Global lock (M1) → fine-grained hierarchy (M2) migration without correctness regression. | M | | M1 passes with the global lock; M2 with the hierarchy. | **DONE** — engine already per-`(node,sc)`/per-span fine-grained; the ranked hierarchy + active checker (W16-1) verify it under the concurrency suites |
-| W16-5a | Pre-fork + parent-post-fork handlers (§28.1): acquire the fork lock + quiesce background threads pre-fork; release + resume in the parent. | M | | parent unaffected; no leaked held lock. | **DONE** — `fork::{prefork,postfork_parent}` (per-CPU sharded drain gate; `maintenance_guard` quiesce) + `pthread_atfork`; parent-consistency + concurrent-forker tests |
+| W16-5a | Pre-fork + parent-post-fork handlers (§28.1): acquire the fork lock + quiesce background threads pre-fork; release + resume in the parent. | M | | parent unaffected; no leaked held lock. | **DONE** — `fork::{prefork,postfork_parent}` (per-CPU sharded, **re-entrancy-aware** drain gate — nested entries nest on a per-thread depth, never park; `maintenance_guard` quiesce; the `topomalloc_numa_*` control surface gated too) + `pthread_atfork`; parent-consistency, concurrent-forker, nested-guard-no-deadlock, and gated-numa tests |
 | W16-5b | Child-post-fork handler: reset lock states, disable background threads, flush/conservative-mode inconsistent per-CPU state. | M | | fork-in-multithread test: child allocates safely; no inherited held lock. | **DONE** — `fork::postfork_child` (reset all shards + checker, disable maintenance); `fork_safety.rs` battery |
-| W16-6 | Signal/reentrancy/crash (§28.2–§28.4): document non-async-signal-safety; reentrancy guard; lock-free crash summary. | S | ∥ | reentrancy during init/hooks handled; crash summary needs no lock/alloc. | **DONE** — `reentry_flag!` wired into the extent-hook path (re-entrant hook declined, not deadlocked) + `init::CrashSummary` (lock-free, `in_flight_ops`) + C `topomalloc_crash_summary` |
+| W16-6 | Signal/reentrancy/crash (§28.2–§28.4): document non-async-signal-safety; reentrancy guard; lock-free crash summary. | S | ∥ | reentrancy during init/hooks handled; crash summary needs no lock/alloc. | **DONE** — `reentry_flag!` wired into the extent-hook path (a re-entrant hook's `malloc`/`free`/`realloc`/in-place-resize declined before any lock, not deadlocked nor tripping the active checker) + `init::CrashSummary` (lock-free, `in_flight_ops`) + C `topomalloc_crash_summary` |
 | W16-7 | Initialization phases (§35.4) Phase 0–6, each reentrancy-safe; shutdown policy (§35.5). | M | | phased-init test; teardown available for tests, leak-by-default in prod. | **DONE** — `init::{InitPhase,PhaseTracker,INIT_PHASE}` advanced in the global init; leak-by-default + test teardown |
 
 ### Lock hierarchy (W16-1, §27.2 — the total order, as implemented)

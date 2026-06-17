@@ -85,9 +85,14 @@ exclude = ["fuzz", "vendor/sele4n"]
 # phases advance through each boundary and gate maintenance; new `xtask lint` gates
 # (`atomics ordering` for off-map `SeqCst`, plus `Mutex`/`RwLock` in the lock gate); TLS
 # non-re-entrancy is depth-proven; `owns`/`recognizes` un-gated (lock-free); crash summary
-# gains `in_flight_ops`. In a 0.x series new backwards-compatible functionality is a patch
-# bump (the 0.x minor is the breaking axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.21"
+# gains `in_flight_ops`. 0.1.22: W16 deep-audit pass — the fork gate is now genuinely
+# **re-entrancy-aware** (a nested entry nests on a per-thread depth instead of parking on the
+# fork bit, closing a latent drain deadlock), the `topomalloc_numa_*` control surface is
+# fork-gated (it takes backend locks), and the hook re-entrancy fail-safe now declines
+# `free`/`realloc`/in-place-resize too (not just `malloc`); regression tests pin each. In a 0.x
+# series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
+# axis), keeping `^0.1.0` inter-crate reqs satisfied.
+version = "0.1.22"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

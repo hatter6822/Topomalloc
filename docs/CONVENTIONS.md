@@ -151,9 +151,13 @@ on word boundaries (so "map**pin**g" is not mistaken for a `pin` citation).
 * **A thread-local on (or reachable from) an allocation path must be allocation-free**
   (W16-2 / S-007): use a `const`-initialised `thread_local!` (Local-Exec TLS, no lazy
   alloc) — never one whose initializer allocates — so a thread's first allocation cannot
-  re-enter the allocator. The `reentry_domain!` macro and the lock-order checker follow
+  re-enter the allocator. The `reentry_flag!` macro and the lock-order checker follow
   this.
 * **Public process-allocator entry points run inside `fork::operation_guard()`** so a
   `fork()` quiesces them (W16-5); a new entry point that takes internal locks must be
-  gated too. `pthread_atfork` registration is `topo-abi`'s job (it has `libc`); the core
-  exposes the mechanism (`fork::{prefork,postfork_parent,postfork_child}`).
+  gated too — including control surfaces like `topomalloc_numa_*` that take backend
+  locks. The gate is **re-entrancy-aware** (a nested entry nests on a per-thread depth
+  instead of parking on the fork bit), so gating an entry point that itself re-enters
+  `malloc` is safe and never deadlocks the pre-fork drain. `pthread_atfork` registration
+  is `topo-abi`'s job (it has `libc`); the core exposes the mechanism
+  (`fork::{prefork,postfork_parent,postfork_child}`).

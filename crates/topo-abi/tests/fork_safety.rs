@@ -207,8 +207,63 @@ fn concurrent_forks_from_two_threads() {
     }
 }
 
+/// The NUMA control surface takes the router lock + per-node backend locks; under
+/// `hugepage-optimized` it must therefore be fork-gated too (W16-5), or a fork
+/// during a control call could leave a backend lock held in the child. Workers
+/// hammer the control surface while the main thread forks; the child then both
+/// allocates *and* calls the control surface — a held router/backend lock would
+/// deadlock it (watchdog-caught).
+#[test]
+#[cfg(feature = "hugepage-optimized")]
+fn child_is_safe_with_concurrent_numa_control_calls() {
+    use topo_abi::{
+        topomalloc_numa_nodes, topomalloc_numa_rebalance_tick, topomalloc_numa_refresh,
+        topomalloc_numa_release,
+    };
+    assert!(hammer(8));
+    // Ensure the router is wired (nonzero under hugepage-optimized).
+    assert!(topomalloc_numa_nodes() >= 1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = topomalloc_numa_rebalance_tick();
+                    let _ = topomalloc_numa_release(1);
+                    let _ = topomalloc_numa_nodes();
+                    let _ = hammer(8);
+                }
+            })
+        })
+        .collect();
+
+    for round in 0..30 {
+        // SAFETY: fork from the main thread; the child immediately `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Child: both the allocator and the (re-gated) control surface must be
+            // usable — a router/backend lock inherited-held would deadlock here.
+            let _ = topomalloc_numa_refresh();
+            let _ = topomalloc_numa_release(0);
+            let ok = hammer(100);
+            // SAFETY: terminate the child immediately.
+            unsafe { libc::_exit(if ok { 0 } else { 2 }) };
+        }
+        wait_with_watchdog(pid, Duration::from_secs(10), round);
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        w.join().unwrap();
+    }
+}
+
 /// The lock-free crash summary's `live_bytes=` field (read from the C entry point,
 /// no allocation), used by the parent-consistency check.
+#[allow(dead_code)] // used only by `parent_state_is_consistent_across_fork`
 fn summary_live_bytes() -> u64 {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is a valid writable region of its length.
