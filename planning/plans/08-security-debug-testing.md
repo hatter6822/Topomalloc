@@ -17,6 +17,23 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 
 **Depends on:** plan 03 (W3,W5), plan 06 W8. **Enables:** M7. **Threat model:** §3.3.
 
+> **Status — landed (ahead of its M7 slot).** All six units are implemented behind
+> granular, profile-composed Cargo features (`crate::harden`; `performance` pays
+> nothing): **W18-1a/b** out-of-line large metadata + generation/integrity tags
+> (always-on; the freelist is an out-of-line bitmap, §16.4, so no critical metadata
+> is in user-writable memory — the encoded-freelist requirement is met *structurally*;
+> optional metadata guard pages remain a deferred refinement). **W18-2** double/invalid-
+> free detection (always-on: bitmap double-free, interior/foreign/metadata, sized-delete
+> mismatch, quarantine-hit; flush-time detection arrives with the M2 caches). **W18-3**
+> quarantine (`quarantine` feature; accounted as `quarantine.bytes`, budgets + random-
+> evict + sampling + drain, `topomalloc_quarantine_*` control, off by default).
+> **W18-4** guarded allocations (`guard-pages` feature; the new `TopoBackingProvider::protect`
+> seam + `LargeAllocator::allocate_guarded` + `GuardSampler`; a real `mprotect` SIGSEGV
+> trap, proven by a POSIX death test). **W18-5** junk filling (`junk-fill` feature).
+> **W18-6** scrub-before-downgrade (`secure-scrub` feature; the non-PUBLIC scrub is
+> unconditional, the runtime image of the Lean `scrub_before_downgrade` theorem; a
+> POSIX/Sim co-equality test is the §36.16 label test).
+
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W18-1a | Out-of-line metadata for large allocations + generation tags (§29.2/§17.3). | M | | large headers separated from user data. |

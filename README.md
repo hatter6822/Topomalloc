@@ -80,6 +80,23 @@ released`) are a fixed-wall test, live and under concurrency. The minimal
 heap-sampling slice (W17-3, off by default) feeds the lifetime/hotness placement
 policy (W14) from real traffic.
 
+**Security & hardening (W18) is landed**: each §29 protection is its own opt-in,
+profile-composed Cargo feature (`crate::harden`), so `performance` pays nothing and
+`hardened`/`debug` compose them. **Junk filling** (§29.6 `junk-fill`): fill-on-alloc
+/ fill-on-free + a sound use-after-free **verify-on-reuse canary** (the bitmap design
+stores no metadata in user bytes, §16.4). **Quarantine** (§29.4 `quarantine`):
+delayed reuse of freed objects, accounted separately as `quarantine.bytes`, with
+byte/object/per-arena budgets, random-evict + sampling, a drain protocol, and the
+`topomalloc_quarantine_*` control surface — off by default. **Guarded allocations**
+(§29.5 `guard-pages`): sampled (or `TOPO_GUARDED`) objects bracketed by inaccessible
+guard pages — a real `mprotect(PROT_NONE)` trap (the new `TopoBackingProvider::protect`
+seam), proven by a POSIX overrun/underrun **SIGSEGV death test**. **Scrub-before-
+downgrade** (§36.12 `secure-scrub`): a non-PUBLIC arena's backing is scrubbed before
+recycle (the §36.12 MUST, feature-independent), the runtime image of the Lean
+`scrub_before_downgrade` theorem, co-equal over POSIX and the seLe4n simulator.
+Out-of-line large metadata + generation/integrity tags (W18-1) and double/invalid-free
+detection (W18-2) are always-on.
+
 ## Quick start
 
 ```sh
