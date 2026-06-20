@@ -273,6 +273,54 @@ fn realloc_in_place_keeps_exact_fragmentation_current() {
 const PAGE_TAIL_SLACK: u64 = 64 * 1024;
 
 #[test]
+fn exact_fragmentation_tracks_a_same_page_request_change() {
+    // W17-4 exactness regression: a resize that changes the request but lands in the **same**
+    // page count (`rounded == usable`, so the backend neither shrinks nor grows) must still
+    // update the recorded request — else `usable − requested` reads the *stale* pre-resize
+    // request and mis-states the exact fragmentation (over-count when the request grew within
+    // the page, under-count when it shrank). The allocation is the only live large, so the
+    // engine's exact frag equals this descriptor's waste.
+    let eng = engine();
+    let req0 = HUGE_THRESHOLD + 100; // 513 pages; the request tail-wastes within the last page
+    let p = eng.allocate(req0, 16, RequestFlags::NONE);
+    assert!(!p.is_null());
+    let usable = eng.usable_size(p).expect("live large");
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        (usable - req0) as u64
+    );
+    // Grow the request within the same page (+200 still rounds to 513 pages): `rounded ==
+    // usable`, no backend move — frag must DROP to reflect the larger request, not stay stale.
+    let req_up = HUGE_THRESHOLD + 200;
+    // SAFETY: `p` is the live base pointer we own and do not concurrently free/realloc.
+    let kept = unsafe { eng.resize_in_place(p, req_up, 16, RequestFlags::NONE) };
+    assert_eq!(
+        kept,
+        Some(usable),
+        "same page count ⇒ kept whole at the same usable"
+    );
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        (usable - req_up) as u64,
+        "frag reflects the grown (same-page) request, not the stale original"
+    );
+    // Shrink the request within the same page (+50): frag must RISE to reflect the smaller
+    // request — the under-count direction the stale-request bug would hide.
+    let req_down = HUGE_THRESHOLD + 50;
+    // SAFETY: live pointer we own.
+    let kept2 = unsafe { eng.resize_in_place(p, req_down, 16, RequestFlags::NONE) };
+    assert_eq!(kept2, Some(usable), "still the same page count");
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        (usable - req_down) as u64,
+        "frag reflects the shrunk (same-page) request"
+    );
+    // SAFETY: live pointer we own.
+    unsafe { eng.free(p) };
+    assert_eq!(eng.stats().live_internal_fragmentation_bytes, 0);
+}
+
+#[test]
 fn destroyed_arena_count_reconciles_through_stats() {
     let eng = engine();
     assert_eq!(snapshot(eng).arenas_destroyed, 0);

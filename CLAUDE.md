@@ -405,8 +405,10 @@ non-interfering — fuzzed (`stats_render`) and pinned by `summary_redaction_is_
 `peak_live_bytes` high-water (maintained at the allocation charge point), `BY_NUMA`/`BY_HUGEPAGE` render genuine
 per-node (`NodeRouter::node_coverage`) / per-bin detail, an unknown flag bit is strictly rejected (§10.4), and
 `topomalloc_stats_t` is the full 27-field snapshot. **W17-4** internal fragmentation is now *exact* for
-medium/large (the large descriptor records each request; a free-path-agnostic walk sums the live waste,
-robust to single / arena-bulk / realloc frees) alongside the sampled small estimate. **W17-5** `explain_memory`
+medium/large (the large descriptor records each request — refreshed on every in-place resize, including a
+*same-page-count* shrink/grow that moves no backing, so the figure never goes stale; a free-path-agnostic
+walk sums the live waste, robust to single / arena-bulk / realloc frees) alongside the sampled small
+estimate. **W17-5** `explain_memory`
 reads the **real RSS** (`/proc/self/statm`), leads with it, and attributes the non-heap remainder. The only
 deferrals left are narrow: true stats epoch *snapshot-isolation* (a seqlock; the read-twice loop + §8.6
 bounded-skew convention cover operational debugging today) and the seLe4n resource-server-enforced per-label

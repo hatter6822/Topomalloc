@@ -1065,8 +1065,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             .allocated_bytes
             .fetch_add(usable as u64, Ordering::Relaxed)
             .wrapping_add(usable as u64);
-        // §31.2/§31.3 peak heap (W17-2): bump the live high-water mark. A torn read of
-        // `freed` can only *under*-state live, so the peak is never over-stated.
+        // §31.2/§31.3 peak heap (W17-2): bump the live high-water mark. `live_now <=
+        // new_allocated <= allocated_bytes_total`, so the gauge is bounded by the cumulative
+        // allocated bytes and can never exceed them. A concurrent free not yet visible in the
+        // relaxed `freed` load can transiently inflate `live_now` toward `new_allocated`, within
+        // the §8.6 bytes-in-flight skew — it is a best-effort diagnostic gauge, not a
+        // load-bearing value (RESET_PEAKS re-anchors it).
         let live_now = new_allocated.saturating_sub(self.freed_bytes.load(Ordering::Relaxed));
         self.peak_live_bytes.fetch_max(live_now, Ordering::Relaxed);
         // §31.5 exact medium/large internal fragmentation (W17-4): record the *requested*
@@ -1903,6 +1907,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 self.arenas.credit(arena, extra);
             }
         }
+        // §31.5 (W17-4) exactness: the allocation is kept whole at its current `usable` — a
+        // same-page-count request change (`rounded == usable`) or a shrink the backend declined
+        // (cache-served / exhausted-split) — so record the new request; `usable − requested`
+        // would otherwise read the *stale* pre-realloc request and mis-state the exact
+        // fragmentation. `note_requested` clamps to the descriptor's usable, so a grow that
+        // fell through here (the caller will move, freeing this ptr) records harmlessly. A
+        // no-op for a foreign / non-large ptr.
+        owner.note_requested(ptr, requested);
         usable
     }
 
