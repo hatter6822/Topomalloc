@@ -265,6 +265,16 @@ pub struct AllocatorStats {
     /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may later
     /// be recycled (§36.13), so this is an event count, not `created − live`.
     pub arenas_destroyed: u64,
+    /// The high-water mark of `live_bytes` since the last reset (§31.2/§31.3 sampled peak
+    /// heap, plan 07 W17-2). A true high-water mark maintained on the allocation charge
+    /// path (`fetch_max` of live after each charge), reset by `topomalloc_stats` `RESET_PEAKS`.
+    pub peak_live_bytes: u64,
+    /// **Exact** internal fragmentation of the live medium/large (extent-backed) allocations
+    /// (§31.5, plan 07 W17-4): `Σ(usable − requested)` over every live large allocation. The
+    /// large path records each allocation's requested size, so this is exact and always-on —
+    /// page-rounding is where internal waste dominates. Small-object internal fragmentation is
+    /// the *sampled* estimate in the placement profiler (§31.5 "MAY sample in performance mode").
+    pub live_internal_fragmentation_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +659,11 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Cumulative usable bytes ever returned. `live = allocated - freed` by
     /// construction, so the §8.6 application-side identity cannot drift.
     freed_bytes: AtomicU64,
+    /// High-water mark of live bytes since the last reset (§31.2/§31.3 peak heap, W17-2):
+    /// `fetch_max`'d with `live` after each allocation charge. Relaxed (a stats gauge). The
+    /// exact medium/large internal fragmentation (§31.5) is tracked by the large allocator
+    /// itself ([`LargeAllocator::internal_fragmentation_bytes`]), which owns the descriptors.
+    peak_live_bytes: AtomicU64,
     /// Per-arena hooked backing regions (plan 06 W10, §22.2): an arena created with
     /// [`arena_create_hooked`](Self::arena_create_hooked) serves its span/large
     /// allocations from its own [`ExtentHooks`] instead of the shared backend.
@@ -799,6 +814,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_lock: RankedLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
+            peak_live_bytes: AtomicU64::new(0),
             hooks: HookRegistry::new(),
             retired_hooks: AtomicHookFailures::new(),
             learned: LearnedHints::new(),
@@ -1045,8 +1061,24 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             self.arenas.credit(arena, usable as u64);
             return ptr::null_mut();
         }
-        self.allocated_bytes
-            .fetch_add(usable as u64, Ordering::Relaxed);
+        let new_allocated = self
+            .allocated_bytes
+            .fetch_add(usable as u64, Ordering::Relaxed)
+            .wrapping_add(usable as u64);
+        // §31.2/§31.3 peak heap (W17-2): bump the live high-water mark. A torn read of
+        // `freed` can only *under*-state live, so the peak is never over-stated.
+        let live_now = new_allocated.saturating_sub(self.freed_bytes.load(Ordering::Relaxed));
+        self.peak_live_bytes.fetch_max(live_now, Ordering::Relaxed);
+        // §31.5 exact medium/large internal fragmentation (W17-4): record the *requested*
+        // size on the large descriptor so `usable − requested` is exact. Routed to the same
+        // backend the allocation came from (hooked arena's own, or the shared large path); a
+        // no-op for small objects (sampled instead).
+        if !matches!(req.kind, RequestKind::Small { .. }) {
+            match self.hook_backend(arena) {
+                Some(b) => b.large.note_requested(p, size),
+                None => self.large.note_requested(p, size),
+            }
+        }
         // §26.2 zeroing: small objects (recycled slab memory, always dirty) and
         // hooked-arena large allocations are zeroed here; the shared medium/large path
         // already zeroed itself, eliding the `memset` when its extent was freshly
@@ -1765,6 +1797,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                                         ptr,
                                         usable,
                                         rounded,
+                                        new_size,
                                         flags.hints().zero,
                                     )
                                 };
@@ -1821,6 +1854,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     ///
     /// `ptr` is the live base pointer being resized (the §25 realloc / §10.3 xallocx
     /// contract); the caller does not concurrently free or realloc it.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn apply_inplace_large_resize(
         &self,
         arena: ArenaId,
@@ -1828,6 +1862,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ptr: *mut u8,
         usable: usize,
         rounded: usize,
+        requested: usize,
         zero: bool,
     ) -> usize {
         if rounded < usable {
@@ -1835,6 +1870,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             if let Some(freed) = unsafe { owner.shrink(ptr, rounded) } {
                 self.freed_bytes.fetch_add(freed as u64, Ordering::Relaxed);
                 self.arenas.credit(arena, freed as u64);
+                // §31.5: the allocation now holds `requested` of `usable − freed` usable bytes.
+                owner.note_requested(ptr, requested);
                 return usable - freed;
             }
         } else if rounded > usable {
@@ -1859,6 +1896,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                         // is in bounds and exclusively owned (the realloc/xallocx contract).
                         unsafe { ptr::write_bytes(ptr.add(usable), 0, grown) };
                     }
+                    // §31.5: the grown allocation now holds `requested` of its larger usable.
+                    owner.note_requested(ptr, requested);
                     return usable + grown;
                 }
                 self.arenas.credit(arena, extra);
@@ -1934,6 +1973,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                         ptr,
                         usable,
                         rounded,
+                        new_size,
                         flags.hints().zero,
                     )
                 })
@@ -2420,6 +2460,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let mut span_backend = self.span_extents.state_bytes();
         let mut large_backend = self.large.state_bytes();
         let mut live_large = self.large.live_count() as u64;
+        // §31.5 exact medium/large internal fragmentation (W17-4), summed over the shared
+        // backend and every hooked region (so a hooked arena's large waste counts too).
+        let mut live_internal_frag = self.large.internal_fragmentation_bytes() as u64;
         // Cumulative hook failures: the persistent total from torn-down backings
         // plus every live backing's current counts (W10 observability).
         let mut hf = self.retired_hooks.snapshot();
@@ -2431,6 +2474,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     span_backend = span_backend.add(b.span_extents.state_bytes());
                     large_backend = large_backend.add(b.large.state_bytes());
                     live_large += b.large.live_count() as u64;
+                    live_internal_frag += b.large.internal_fragmentation_bytes() as u64;
                     let s = b.hook_failure_stats();
                     hf.commit += s.commit;
                     hf.release += s.release;
@@ -2444,6 +2488,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // Saturating: `freed` can transiently exceed `allocated` only in
             // a torn relaxed read during concurrent ops; never report a wrap.
             live_bytes: allocated.saturating_sub(freed),
+            // The high-water mark, never below the live bytes we just computed (§31.3).
+            peak_live_bytes: self
+                .peak_live_bytes
+                .load(Ordering::Relaxed)
+                .max(allocated.saturating_sub(freed)),
             allocated_bytes_total: allocated,
             freed_bytes_total: freed,
             central_free_bytes,
@@ -2452,11 +2501,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
             live_spans: self.live_span_count() as u64,
             live_large,
+            live_internal_fragmentation_bytes: live_internal_frag,
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
             arenas_destroyed: self.arenas.destroyed_count(),
         }
+    }
+
+    /// Reset the §31.3 peak-live high-water mark to the **current** live bytes (the
+    /// `RESET_PEAKS` control, W17-2). After this, the peak re-accumulates from now.
+    pub fn reset_peak_live(&self) {
+        let live = self
+            .allocated_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.freed_bytes.load(Ordering::Relaxed));
+        self.peak_live_bytes.store(live, Ordering::Relaxed);
     }
 
     /// A minimal allocator summary safe for a crash/signal handler (W16-6, §28.4):

@@ -328,13 +328,15 @@ int main(void) {
     assert(topomalloc_crash_summary(NULL, 16u) == 0u);
 
     /* statistics & observability (Section 31, plan 07 W17). */
-    /* ABI: the snapshot struct layout is frozen (20 uint64_t fields, key offsets). */
-    _Static_assert(sizeof(topomalloc_stats_t) == 20u * sizeof(uint64_t),
+    /* ABI: the snapshot struct layout is frozen (27 uint64_t fields, key offsets). */
+    _Static_assert(sizeof(topomalloc_stats_t) == 27u * sizeof(uint64_t),
                    "topomalloc_stats_t layout changed");
     _Static_assert(offsetof(topomalloc_stats_t, epoch) == 0, "epoch moved");
     _Static_assert(offsetof(topomalloc_stats_t, live_bytes) == 8u, "live_bytes moved");
     _Static_assert(offsetof(topomalloc_stats_t, virtual_bytes) == 12u * 8u, "virtual_bytes moved");
     _Static_assert(offsetof(topomalloc_stats_t, arena_destroyed) == 19u * 8u, "arena_destroyed moved");
+    _Static_assert(offsetof(topomalloc_stats_t, peak_live_bytes) == 20u * 8u, "peak_live moved");
+    _Static_assert(offsetof(topomalloc_stats_t, numa_nodes) == 26u * 8u, "numa_nodes moved");
     /* flag bits mirror the Rust topo_stats::StatsFlags exactly. */
     _Static_assert(TOPOMALLOC_STATS_BY_ARENA == 1u, "BY_ARENA bit");
     _Static_assert(TOPOMALLOC_STATS_BY_HUGEPAGE == 16u, "BY_HUGEPAGE bit");
@@ -347,20 +349,34 @@ int main(void) {
     assert(st.pageheap_free_bytes ==
            st.retained_bytes + st.dirty_bytes + st.muzzy_bytes + st.released_bytes);
     assert(st.virtual_bytes == st.active_bytes + st.pageheap_free_bytes);
+    assert(st.total_managed_vm_bytes == st.virtual_bytes + st.metadata_bytes);
+    assert(st.peak_live_bytes >= st.live_bytes); /* high-water >= current live */
     assert(st.arena_count >= 1u); /* the default arena is always present */
     /* the epoch advances on the next snapshot (Section 8.6 sequence number). */
     topomalloc_stats_t st2;
     assert(topomalloc_stats_snapshot(&st2, 0) == 0 && st2.epoch > st.epoch);
     assert(topomalloc_stats_snapshot(NULL, 0) == -1); /* NULL out is a clean error */
+    /* Section 10.4 strict validation: an unknown flag bit is rejected, never ignored. */
+    assert(topomalloc_stats_snapshot(&st, (uint64_t) 1 << 40) == -1);
+    assert(topomalloc_stats_json(NULL, 0, (uint64_t) 1 << 40) == 0u);
+
+    /* CONSISTENT_SNAPSHOT yields a coherent snapshot (this thread is the only mutator). */
+    topomalloc_stats_t cs;
+    assert(topomalloc_stats_snapshot(&cs, TOPOMALLOC_STATS_CONSISTENT_SNAPSHOT) == 0);
+    assert(cs.live_bytes == cs.allocated_bytes_total - cs.freed_bytes_total);
 
     /* JSON: a single consistent snapshot into a fixed buffer (no length-query race). */
     char json[8192];
-    size_t got = topomalloc_stats_json(json, sizeof json, TOPOMALLOC_STATS_BY_ARENA);
+    size_t got = topomalloc_stats_json(json, sizeof json,
+                                       TOPOMALLOC_STATS_BY_ARENA | TOPOMALLOC_STATS_BY_NUMA);
     assert(got > 0u && got < sizeof json);
     assert(strstr(json, "\"epoch\":") != NULL);
     assert(strstr(json, "\"by_arena\":") != NULL);
+    assert(strstr(json, "\"by_numa_node\":") != NULL); /* BY_NUMA detail present */
     assert(strstr(json, "\"quarantine\":") != NULL);
     assert(strstr(json, "\"fragmentation\":") != NULL);
+    assert(strstr(json, "\"peak_live_bytes\":") != NULL);
+    assert(strstr(json, "\"total_managed_vm_bytes\":") != NULL);
     /* a length query (NULL buffer) returns a positive length without writing. */
     assert(topomalloc_stats_json(NULL, 0, 0) > 0u);
 
@@ -370,11 +386,12 @@ int main(void) {
     assert(lgot > 0u && lgot < sizeof ljson);
     assert(strstr(ljson, "\"by_arena\":") != NULL);
 
-    /* explain_memory: a human-readable RSS attribution (Section 31.6). */
+    /* explain_memory: a human-readable RSS attribution (Section 31.6). On Linux the real RSS
+     * is read, so it leads with "RSS is <size>:"; the "RSS is " prefix is always present. */
     char explain[512];
     size_t elen = topomalloc_explain_memory(explain, sizeof explain);
     assert(elen > 0u);
-    assert(strstr(explain, "RSS is attributed to") != NULL);
+    assert(strstr(explain, "RSS is ") != NULL);
 
     /* print to /dev/null (Section 31.2). */
     FILE *devnull = fopen("/dev/null", "w");

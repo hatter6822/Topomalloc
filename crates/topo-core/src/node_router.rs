@@ -355,6 +355,20 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
         total
     }
 
+    /// Per-node §19.7 hugepage coverage (the §31.2 `BY_NUMA` detail, plan 07 W17-2): entry `i`
+    /// is bound node `i`'s coverage for `i < node_count`, default for the rest. A fixed array
+    /// (no allocation, `no_std`); the unbound default (first-touch) backend's coverage is not
+    /// attributed to a node, so it is excluded here (it is in [`coverage`](Self::coverage)).
+    pub fn node_coverage(&self) -> [HugeStats; MAX_NODES] {
+        let mut out = [HugeStats::default(); MAX_NODES];
+        for (i, slot) in out.iter_mut().enumerate().take(self.n_nodes.min(MAX_NODES)) {
+            if let Some(b) = self.backend(i) {
+                *slot = b.coverage();
+            }
+        }
+        out
+    }
+
     /// Whether every backend is well-formed — the per-node backends and the unbound default
     /// (delegates to each filler's §19.8 invariant check) — for debug assertions and tests.
     pub fn check_invariants(&self) -> bool {
@@ -526,6 +540,9 @@ pub trait RouterControl: Send + Sync {
     /// Aggregate §19.7 hugepage coverage across every backend (plan 07 W17-4). See
     /// [`NodeRouter::coverage`].
     fn coverage(&self) -> HugeStats;
+    /// Per-node §19.7 hugepage coverage (the §31.2 `BY_NUMA` detail, plan 07 W17-2). See
+    /// [`NodeRouter::node_coverage`].
+    fn node_coverage(&self) -> [HugeStats; MAX_NODES];
 }
 
 impl<P: TopoBackingProvider + Send + Sync, C: CoreProvider + Send + Sync> RouterControl
@@ -550,6 +567,10 @@ impl<P: TopoBackingProvider + Send + Sync, C: CoreProvider + Send + Sync> Router
     #[inline]
     fn coverage(&self) -> HugeStats {
         NodeRouter::coverage(self)
+    }
+    #[inline]
+    fn node_coverage(&self) -> [HugeStats; MAX_NODES] {
+        NodeRouter::node_coverage(self)
     }
 }
 

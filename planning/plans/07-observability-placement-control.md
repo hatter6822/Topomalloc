@@ -69,9 +69,27 @@ placement (consumed by plan 04 filler): hot/cold + lifetime hints; allocation-si
 > fixed-wall `tests/tests/stats.rs` battery, and the W17-6 redaction is the Rust analogue of the proved Lean
 > `stats_observation_noninterference` theorem (pinned by `redaction_is_label_noninterference`). The control
 > namespace (W20) and the C header gain the matching keys/symbols; the ABI struct/flags are frozen by the
-> two-sided ABI smoke tests. The broader **stats epoch *snapshot-isolation*** (a true seqlock over the fast
-> path) and the **seLe4n resource-server-enforced** per-label aggregate scoping remain the deferred pieces
-> (the §8.6 bounded-skew convention + the per-arena redaction cover the POSIX profile today).
+> two-sided ABI smoke tests.
+>
+> **Optimal-completion pass.** A self-audit found several pieces "present but inert" or hollow-by-default;
+> they are now genuinely complete: **(W17-6)** redaction is no longer detail-only — `redact_summary` scopes
+> the *whole* summary a low observer receives (cross-domain aggregates zeroed; `live_bytes` recomputed from
+> the visible arenas via `Σ arena.used == live_bytes`), so the JSON is genuinely non-interfering (the
+> property is fuzzed in `fuzz/fuzz_targets/stats_render.rs` and unit-pinned by
+> `summary_redaction_is_noninterference_for_the_whole_view`). **(W17-1b)** `CONSISTENT_SNAPSHOT` now *does
+> something*: a read-twice-until-stable loop over the cumulative counters yields a coherent snapshot.
+> **(W17-2)** `RESET_PEAKS` is real — a true `peak_live_bytes` high-water is maintained at the allocation
+> charge point and cleared by the flag; `BY_NUMA` renders a genuine per-node array (`NodeRouter::node_coverage`)
+> and `BY_HUGEPAGE` a labeled per-bin array; an unknown flag bit is **strictly rejected** (§10.4), and the
+> `topomalloc_stats_t` struct grew to the full 27-field snapshot. **(W17-4)** internal fragmentation is now
+> *exact* for medium/large (the large descriptor records each request; the live waste is summed by a
+> free-path-agnostic walk, robust to single/arena-bulk/realloc frees) alongside the sampled small-object
+> estimate. **(W17-5)** `explain_memory` reads the **real RSS** (`/proc/self/statm`), leads with it, partitions
+> the resident footprint, and attributes the non-heap remainder. The remaining deferrals are narrow: true stats
+> epoch **snapshot-isolation** (a seqlock over the fast path; the read-twice loop + §8.6 bounded-skew convention
+> cover operational debugging today) and the **seLe4n resource-server-enforced** per-label backend/cache
+> partitioning (the per-arena + whole-summary redaction is the complete Rust-side mechanism for the POSIX
+> profile, and the analogue the seLe4n server will enforce at its IPC boundary, plan 09).
 
 ---
 

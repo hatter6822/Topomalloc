@@ -267,6 +267,13 @@ impl AnyAllocator {
         dispatch!(self, a => a.for_each_size_class_central_free(f))
     }
 
+    /// Reset the §31.3 peak-live high-water mark to the current live bytes (the §31.2
+    /// `RESET_PEAKS` control, plan 07 W17-2).
+    pub fn reset_peak_live(&self) {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.reset_peak_live())
+    }
+
     /// A lock-free, allocation-free crash/signal-handler summary (§28.4, W16-6):
     /// reads only cumulative-byte atomics + the process init phase / background
     /// flag, so it is safe to call from a context where structure locks may be

@@ -25,10 +25,18 @@ pub struct Stats {
     pub profile: Profile,
     /// Bytes currently live in the application.
     pub live_bytes: u64,
+    /// The high-water mark of `live_bytes` since the last `RESET_PEAKS` (§31.2/§31.3
+    /// sampled peak heap, W17-2): the maximum live bytes the allocator has charged.
+    /// A true high-water mark maintained on the allocation path, not a poll-time sample.
+    pub peak_live_bytes: u64,
     /// Cumulative bytes ever allocated.
     pub allocated_bytes_total: u64,
     /// Cumulative bytes ever freed.
     pub freed_bytes_total: u64,
+    /// The process resident-set size in bytes (§31.6), read from the OS (`/proc/self/statm`
+    /// on Linux) at snapshot time; `0` when unavailable. This is the *actual* RSS the
+    /// `explain` endpoint attributes (W17-5) — distinct from `virtual_bytes` (managed VM).
+    pub rss_bytes: u64,
     /// Bytes held in per-CPU caches.
     pub per_cpu_bytes: u64,
     /// Bytes held in thread caches.
@@ -120,11 +128,17 @@ pub struct Stats {
     /// [`record_placement`](Self::record_placement). These are *profiling* estimates, not a
     /// managed-memory byte class, so they do not enter the §8.6 VM reconciliation.
     pub placement: topo_core::PlacementStats,
-    /// The §31.5 **sampled internal fragmentation**: the sum of `usable − requested` over
-    /// the live sampled objects (W17-4). A profiling estimate (`0` unless sampling is on),
-    /// so — like `placement` — it sits outside the §8.6 byte reconciliation. Set via
-    /// [`record_fragmentation`](Self::record_fragmentation).
+    /// The §31.5 **sampled internal fragmentation** for *small* objects: the sum of
+    /// `usable − requested` over the live sampled small objects (W17-4). A profiling estimate
+    /// (`0` unless sampling is on), so — like `placement` — it sits outside the §8.6 byte
+    /// reconciliation. Set via [`record_fragmentation`](Self::record_fragmentation).
     pub sampled_internal_fragmentation_bytes: u64,
+    /// The §31.5 **exact internal fragmentation** for *medium/large* allocations: the sum of
+    /// `usable − requested` over every live extent-backed allocation (W17-4). Tracked exactly
+    /// and always-on (the large path records its requested size), since page-rounding is where
+    /// internal waste dominates and is cheap to track there. `0` when no medium/large
+    /// allocations are live. Set via [`record_fragmentation`](Self::record_fragmentation).
+    pub exact_internal_fragmentation_bytes: u64,
 }
 
 /// Stats selection flags (§31.2) — which views a snapshot / JSON / print renders. The
@@ -260,11 +274,19 @@ impl Stats {
         self.virtual_bytes = sb.total() as u64;
     }
 
-    /// Record the §31.5 sampled internal-fragmentation estimate (W17-4): the sum of
-    /// `usable − requested` over the live sampled objects. A profiling estimate (`0` unless
-    /// heap sampling is on), recorded alongside [`record_placement`](Self::record_placement).
+    /// Record the §31.5 **sampled** small-object internal-fragmentation estimate (W17-4):
+    /// `Σ(usable − requested)` over the live sampled small objects. A profiling estimate
+    /// (`0` unless heap sampling is on), recorded alongside
+    /// [`record_placement`](Self::record_placement). The medium/large exact figure arrives
+    /// through [`record_allocator`](Self::record_allocator).
     pub fn record_fragmentation(&mut self, sampled_internal_bytes: u64) {
         self.sampled_internal_fragmentation_bytes = sampled_internal_bytes;
+    }
+
+    /// Record the process resident-set size (§31.6, W17-5) read from the OS at snapshot
+    /// time. `0` leaves it unknown (the `explain` endpoint then omits the RSS figure).
+    pub fn record_rss(&mut self, rss_bytes: u64) {
+        self.rss_bytes = rss_bytes;
     }
 
     /// Record an [`Allocator`](topo_core::Allocator) snapshot (plan 06 W8 —
@@ -275,10 +297,12 @@ impl Stats {
     /// nodes are the metadata overhead measured so far.
     pub fn record_allocator(&mut self, a: &topo_core::AllocatorStats) {
         self.live_bytes = a.live_bytes;
+        self.peak_live_bytes = a.peak_live_bytes;
         self.allocated_bytes_total = a.allocated_bytes_total;
         self.freed_bytes_total = a.freed_bytes_total;
         self.central_free_bytes = a.central_free_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
+        self.exact_internal_fragmentation_bytes = a.live_internal_fragmentation_bytes;
         self.live_arenas = a.live_arenas;
         self.arenas_destroyed = a.arenas_destroyed;
         self.numa_bind_failures = a.numa_bind_failures;
@@ -390,8 +414,10 @@ impl Stats {
                 "  \"profile\": \"{profile}\",\n",
                 "  \"application\": {{\n",
                 "    \"live_bytes\": {live},\n",
+                "    \"peak_live_bytes\": {peak_live},\n",
                 "    \"allocated_bytes_total\": {alloc_total},\n",
-                "    \"freed_bytes_total\": {freed_total}\n",
+                "    \"freed_bytes_total\": {freed_total},\n",
+                "    \"rss_bytes\": {rss}\n",
                 "  }},\n",
                 "  \"cache\": {{\n",
                 "    \"per_cpu_bytes\": {per_cpu},\n",
@@ -419,7 +445,8 @@ impl Stats {
                 "    \"muzzy_bytes\": {muzzy},\n",
                 "    \"released_bytes\": {released},\n",
                 "    \"pageheap_free_bytes\": {pageheap},\n",
-                "    \"virtual_bytes\": {virtual_b}\n",
+                "    \"virtual_bytes\": {virtual_b},\n",
+                "    \"total_managed_vm_bytes\": {total_vm}\n",
                 "  }},\n",
                 "  \"quarantine\": {{\n",
                 "    \"bytes\": {quarantine}\n",
@@ -463,7 +490,8 @@ impl Stats {
                 "    \"sampled_live_bytes\": {pl_live}\n",
                 "  }},\n",
                 "  \"fragmentation\": {{\n",
-                "    \"internal_sampled_bytes\": {frag_internal},\n",
+                "    \"internal_exact_bytes\": {frag_internal_exact},\n",
+                "    \"internal_sampled_bytes\": {frag_internal_sampled},\n",
                 "    \"external_bytes\": {frag_external},\n",
                 "    \"cache_bytes\": {frag_cache},\n",
                 "    \"hugepage_bytes\": {hp_fragmentation},\n",
@@ -477,8 +505,10 @@ impl Stats {
             epoch = self.epoch,
             profile = self.profile.as_str(),
             live = self.live_bytes,
+            peak_live = self.peak_live_bytes,
             alloc_total = self.allocated_bytes_total,
             freed_total = self.freed_bytes_total,
+            rss = self.rss_bytes,
             per_cpu = self.per_cpu_bytes,
             thread = self.thread_cache_bytes,
             transfer = self.transfer_bytes,
@@ -497,6 +527,7 @@ impl Stats {
             released = self.released_bytes,
             pageheap = self.pageheap_free_bytes,
             virtual_b = self.virtual_bytes,
+            total_vm = self.virtual_bytes.saturating_add(self.metadata_bytes),
             quarantine = self.quarantine_bytes,
             hp_coverage = self.hugepage.coverage_bytes,
             hp_intact = self.hugepage.live_bytes_on_intact,
@@ -528,7 +559,8 @@ impl Stats {
             pl_censored = self.placement.censored_samples,
             pl_evict = self.placement.evictions,
             pl_live = self.placement.sampled_live_bytes,
-            frag_internal = self.sampled_internal_fragmentation_bytes,
+            frag_internal_exact = self.exact_internal_fragmentation_bytes,
+            frag_internal_sampled = self.sampled_internal_fragmentation_bytes,
             frag_external = frag_external,
             frag_cache = frag_cache,
             metadata = self.metadata_bytes,
@@ -576,25 +608,80 @@ impl Stats {
             // then (the flag resolves to a defined, additive shape, never a missing key).
             out.push_str(",\n  \"by_cpu\": []");
         }
+        if flags.contains(StatsFlags::BY_NUMA) {
+            // Per-node §19.7 hugepage coverage (empty in the default build / single-node host;
+            // populated under the live NUMA router). The aggregate is always in `topology`.
+            out.push_str(",\n  \"by_numa_node\": [");
+            for (i, n) in detail.numa_nodes.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"node\": {}, \"coverage_bytes\": {}, \"empty_backed_bytes\": {}, \"live_bytes\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    n.node,
+                    n.coverage_bytes,
+                    n.empty_backed_bytes,
+                    n.live_bytes,
+                );
+            }
+            out.push_str(if detail.numa_nodes.is_empty() {
+                "]"
+            } else {
+                "\n  ]"
+            });
+        }
+        if flags.contains(StatsFlags::BY_HUGEPAGE) {
+            // The §19.4 occupancy-bin distribution, as a labeled {bin, count} array. (The same
+            // counts are the always-present `hugepage.bin_counts`; this is the labeled detail.)
+            out.push_str(",\n  \"by_hugepage_bin\": [");
+            for (i, count) in self.hugepage.bins.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"bin\": {}, \"count\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    i,
+                    count,
+                );
+            }
+            out.push_str("\n  ]");
+        }
         out.push_str("\n}");
         out
     }
 
     /// A human-readable, single-paragraph RSS attribution string (§31.6 `topo_explain_memory`,
-    /// W17-5): "RSS is attributed to: …", naming the largest contributors to resident memory
-    /// in descending order. Adoption often hinges on RSS being *explainable*, not just
-    /// measurable; this renders the same byte classes [`to_json`](Self::to_json) reports into
-    /// prose. Sizes are rendered in binary units (KiB/MiB/GiB).
+    /// W17-5): "RSS is 2.5 GiB: 1.8 GiB live, 700.0 MiB per-CPU cache, …", leading with the
+    /// **actual** resident-set size (read from the OS, [`record_rss`](Self::record_rss)) and
+    /// naming the largest contributors to resident memory in descending order. Adoption hinges
+    /// on RSS being *explainable*, not just measurable. The contributors form a complete
+    /// partition of the allocator's *physically-backed* footprint — `live + caches + central +
+    /// quarantine + slab/page overhead` (= the §20.1 *active* backing) `+ dirty + muzzy +
+    /// empty hugepages + metadata` — so they reconcile; decommitted (`released`) bytes are
+    /// noted apart as managed-VM-not-resident (§8.6), and any RSS beyond the allocator's
+    /// footprint is attributed to non-heap mappings (code, stacks, …). Integer-only binary
+    /// units (§6).
     pub fn explain(&self) -> String {
         use core::fmt::Write as _;
-        // (label, bytes) for every contributor worth naming; sorted descending, the
-        // nonzero ones joined into the explanation. A fixed small set, so a tiny `Vec`.
+        let caches = self
+            .per_cpu_bytes
+            .saturating_add(self.thread_cache_bytes)
+            .saturating_add(self.transfer_bytes);
+        // Slab/page overhead = the §20.1 active backing not accounted by app-visible objects:
+        // partially-filled slab pages, per-slab metadata. Completes the partition of `active`.
+        let slab_overhead = self.active_bytes.saturating_sub(
+            self.live_bytes
+                .saturating_add(self.central_free_bytes)
+                .saturating_add(caches)
+                .saturating_add(self.quarantine_bytes),
+        );
+        // (label, bytes) for every resident contributor, sorted descending; their sum is the
+        // allocator's physically-backed footprint. A fixed small set, so a tiny `Vec`.
         let mut parts: alloc::vec::Vec<(&'static str, u64)> = alloc::vec![
             ("live", self.live_bytes),
             ("per-CPU cache", self.per_cpu_bytes),
             ("thread cache", self.thread_cache_bytes),
             ("transfer cache", self.transfer_bytes),
             ("central free lists", self.central_free_bytes),
+            ("slab/page overhead", slab_overhead),
             ("dirty retained", self.dirty_bytes),
             ("muzzy (lazily purged)", self.muzzy_bytes),
             ("empty hugepages retained", self.hugepage.empty_backed_bytes),
@@ -603,7 +690,14 @@ impl Stats {
         ];
         // Stable, deterministic order: bytes descending, then first-listed wins ties.
         parts.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut out = String::from("RSS is attributed to: ");
+        let allocator_resident: u64 = parts.iter().map(|&(_, b)| b).sum();
+
+        let mut out = String::new();
+        if self.rss_bytes > 0 {
+            let _ = write!(out, "RSS is {}: ", human_bytes(self.rss_bytes));
+        } else {
+            out.push_str("RSS is attributed to: ");
+        }
         let mut first = true;
         for (label, bytes) in parts {
             if bytes == 0 {
@@ -616,7 +710,7 @@ impl Stats {
             let _ = write!(out, "{} {}", human_bytes(bytes), label);
         }
         if first {
-            // Nothing live anywhere — be explicit rather than emit a dangling colon.
+            // Nothing resident anywhere — be explicit rather than emit a dangling colon.
             out.push_str("no resident allocator memory (idle)");
         }
         out.push('.');
@@ -628,6 +722,17 @@ impl Stats {
                 " Additionally {} is decommitted (retained in the address space, not resident).",
                 human_bytes(self.released_bytes)
             );
+        }
+        // If the OS RSS exceeds the allocator's resident footprint, the remainder is non-heap
+        // (code, stacks, thread-local storage, other mappings) — the gap operators ask about.
+        if let Some(outside) = self.rss_bytes.checked_sub(allocator_resident) {
+            if outside > 0 && self.rss_bytes > 0 {
+                let _ = write!(
+                    out,
+                    " {} of RSS is outside the allocator (code, stacks, other mappings).",
+                    human_bytes(outside)
+                );
+            }
         }
         out
     }
@@ -680,6 +785,21 @@ pub struct SizeClassLine {
     pub free_bytes: u64,
 }
 
+/// One line of the §31.2 `BY_NUMA` per-node breakdown (W17-2): a NUMA node's §19.7 hugepage
+/// coverage. Empty (all backends absent) in the default build; populated under the live NUMA
+/// router (`hugepage-optimized`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NumaNodeLine {
+    /// The dense NUMA node id.
+    pub node: u32,
+    /// §19.7 hugepage coverage bytes placed on this node.
+    pub coverage_bytes: u64,
+    /// Empty-but-backed hugepage bytes retained on this node.
+    pub empty_backed_bytes: u64,
+    /// Live bytes on this node's hugepages.
+    pub live_bytes: u64,
+}
+
 /// The per-entity detail the `BY_*` flags render (§31.2). `topo-stats` is a pure renderer:
 /// the live composer (`topo-abi`) fills these from the running allocator/registry and passes
 /// them to [`Stats::to_json_with`]. Borrowed slices so the renderer allocates nothing extra.
@@ -689,6 +809,8 @@ pub struct StatsDetail<'a> {
     pub arenas: &'a [ArenaLine],
     /// `BY_SIZE_CLASS` lines.
     pub size_classes: &'a [SizeClassLine],
+    /// `BY_NUMA` per-node lines.
+    pub numa_nodes: &'a [NumaNodeLine],
 }
 
 impl StatsDetail<'_> {
@@ -696,6 +818,7 @@ impl StatsDetail<'_> {
     pub const EMPTY: StatsDetail<'static> = StatsDetail {
         arenas: &[],
         size_classes: &[],
+        numa_nodes: &[],
     };
 }
 
@@ -716,6 +839,43 @@ pub fn redact_arenas(arenas: &[ArenaLine], observer_label: u32) -> alloc::vec::V
         .copied()
         .filter(|a| a.label <= observer_label)
         .collect()
+}
+
+/// **Summary-level label redaction (§36.12, W17-6).** Produce the stats *summary* a low
+/// observer is authorized to see — the piece `redact_arenas` (which only filters the
+/// per-arena detail) leaves open. When `all_visible` is true (the observer dominates every
+/// arena — always the POSIX single-`PUBLIC`-label case), the full summary is returned
+/// unchanged (a `PUBLIC` observer legitimately sees everything). Otherwise every **cross-domain
+/// aggregate** — the global cumulative counters, the *shared* backend / cache / central /
+/// hugepage / release / placement / fragmentation state, the metadata, the peak — is redacted
+/// to zero (it mixes all domains' activity, so a low observer must not see it), and the
+/// observer-visible `live_bytes` is recomputed from the visible arenas' `used` (sound because
+/// `Σ arena.used == live_bytes`, §8.6/§36.17).
+///
+/// The result is a **pure function of `(full.epoch, full.profile, visible_arenas)`**, so —
+/// modulo the non-sensitive snapshot sequence number `epoch` — any higher-domain activity is
+/// invisible to a low observer: the summary analogue of `redact_arenas`. Together they make
+/// the JSON a low observer receives the Rust-side analogue of the proved Lean
+/// `stats_observation_noninterference`. Pure and total.
+pub fn redact_summary(full: &Stats, visible_arenas: &[ArenaLine], all_visible: bool) -> Stats {
+    if all_visible {
+        return *full;
+    }
+    let visible_live: u64 = visible_arenas.iter().map(|a| a.used).sum();
+    Stats {
+        // Non-sensitive identity (a snapshot sequence number + the build profile).
+        epoch: full.epoch,
+        profile: full.profile,
+        // The only disclosed figure: this domain's live bytes, with a consistent
+        // application identity (`live == allocated − freed`).
+        live_bytes: visible_live,
+        allocated_bytes_total: visible_live,
+        freed_bytes_total: 0,
+        // The visible arena count (the per-arena lines are redacted by `redact_arenas`).
+        live_arenas: visible_arenas.len() as u64,
+        // Every other field is a cross-domain aggregate ⇒ redacted to zero.
+        ..Stats::default()
+    }
 }
 
 #[cfg(test)]
@@ -962,6 +1122,8 @@ mod tests {
                 merge: 15,
             },
             arenas_destroyed: 4,
+            peak_live_bytes: 2000,
+            live_internal_fragmentation_bytes: 512,
         };
         let mut s = Stats::default();
         s.record_allocator(&snap);
@@ -1012,6 +1174,16 @@ mod tests {
         assert_eq!(v["arenas"]["hook_failures"]["merge"], 15);
         assert_eq!(v["backend"]["active_bytes"], 22);
         assert_eq!(v["backend"]["retained_bytes"], 11);
+        // W17-2/3/4: the peak high-water, exact medium/large fragmentation, and total managed
+        // VM (= virtual + metadata) all map through and render.
+        assert_eq!(s.peak_live_bytes, 2000);
+        assert_eq!(s.exact_internal_fragmentation_bytes, 512);
+        assert_eq!(v["application"]["peak_live_bytes"], 2000);
+        assert_eq!(v["fragmentation"]["internal_exact_bytes"], 512);
+        assert_eq!(
+            v["backend"]["total_managed_vm_bytes"],
+            s.virtual_bytes + s.metadata_bytes
+        );
     }
 
     #[test]
@@ -1078,6 +1250,7 @@ mod tests {
         let detail = StatsDetail {
             arenas: &arenas,
             size_classes: &[],
+            numa_nodes: &[],
         };
         // Without the flag: no by_arena key.
         let summary: serde_json::Value =
@@ -1165,9 +1338,110 @@ mod tests {
             &StatsDetail {
                 arenas: &redacted,
                 size_classes: &[],
+                numa_nodes: &[],
             },
         );
         assert!(!json.contains("1048576")); // the high arena's bytes never appear
+    }
+
+    #[test]
+    fn summary_redaction_is_noninterference_for_the_whole_view() {
+        // W17-6 correctness fix: the *summary* (not just the per-arena detail) a low observer
+        // receives is a pure function of the visible arenas + epoch/profile — so ALL
+        // cross-domain aggregate activity (global live/backend/placement, a high arena's bytes)
+        // is invisible. Two states that differ only in high-domain activity redact identically.
+        let low = ArenaLine {
+            id: 1,
+            label: 0,
+            used: 4096,
+            reserved: 0,
+        };
+        let high = ArenaLine {
+            id: 2,
+            label: 7,
+            used: 64 << 20,
+            reserved: 0,
+        };
+        // State A: modest globals. State B: very different globals + a much bigger high arena.
+        let full_a = Stats {
+            epoch: 9,
+            profile: Profile::Performance,
+            live_bytes: 4096 + (64 << 20),
+            allocated_bytes_total: 10 << 20,
+            freed_bytes_total: 1 << 20,
+            dirty_bytes: 5 << 20,
+            active_bytes: 80 << 20,
+            metadata_bytes: 1 << 20,
+            sampled_internal_fragmentation_bytes: 12345,
+            ..Stats::default()
+        };
+        let high_b = ArenaLine {
+            used: 900 << 20,
+            ..high
+        };
+        let full_b = Stats {
+            live_bytes: 4096 + (900 << 20),
+            allocated_bytes_total: 999 << 20,
+            freed_bytes_total: 7 << 20,
+            dirty_bytes: 123 << 20,
+            active_bytes: 950 << 20,
+            metadata_bytes: 9 << 20,
+            sampled_internal_fragmentation_bytes: 6_7890,
+            ..full_a // same epoch + profile
+        };
+        // The visible (low) set is identical in both; redacting summaries must match exactly.
+        let vis_a = redact_arenas(&[low, high], 0);
+        let vis_b = redact_arenas(&[low, high_b], 0);
+        let red_a = redact_summary(&full_a, &vis_a, false);
+        let red_b = redact_summary(&full_b, &vis_b, false);
+        assert_eq!(red_a, red_b, "the redacted low-domain summary is invariant");
+        // It discloses only the visible domain's live bytes, with a consistent identity.
+        assert_eq!(red_a.live_bytes, 4096);
+        assert_eq!(red_a.allocated_bytes_total, 4096);
+        assert_eq!(red_a.freed_bytes_total, 0);
+        assert_eq!(red_a.dirty_bytes, 0, "shared backend state is redacted");
+        assert_eq!(red_a.sampled_internal_fragmentation_bytes, 0);
+        assert_eq!(red_a.live_arenas, 1);
+        // The rendered JSON differs nowhere a high domain could be inferred.
+        let json_a = red_a.to_json();
+        let json_b = red_b.to_json();
+        assert_eq!(json_a, json_b);
+        // `all_visible` (a top observer / the POSIX PUBLIC case) is the identity: full stats.
+        assert_eq!(redact_summary(&full_a, &[low, high], true), full_a);
+    }
+
+    #[test]
+    fn explain_is_rss_aware() {
+        // W17-5: with a real RSS, the explanation leads with it and attributes the resident
+        // footprint, calling out the non-heap remainder (code/stacks) and decommitted bytes.
+        let s = Stats {
+            rss_bytes: 3 * (1 << 30),  // 3.0 GiB resident
+            live_bytes: 1 << 30,       // 1.0 GiB live
+            active_bytes: 1 << 30,     // (no slab overhead beyond live here)
+            dirty_bytes: 512 << 20,    // 512 MiB dirty retained
+            metadata_bytes: 64 << 20,  // 64 MiB metadata
+            released_bytes: 256 << 20, // 256 MiB decommitted
+            ..Stats::default()
+        };
+        let e = s.explain();
+        assert!(
+            e.starts_with("RSS is 3.0 GiB: "),
+            "leads with the real RSS: {e}"
+        );
+        assert!(e.contains("1.0 GiB live"));
+        assert!(e.contains("512.0 MiB dirty retained"));
+        // allocator resident ≈ 1 GiB live + 512 MiB dirty + 64 MiB metadata ≈ 1.56 GiB; the
+        // remaining ~1.44 GiB of the 3 GiB RSS is outside the allocator.
+        assert!(e.contains("outside the allocator"));
+        assert!(e.contains("decommitted"));
+        // Without an RSS reading, it falls back to the attribution phrasing (no "outside").
+        let no_rss = Stats {
+            live_bytes: 1 << 20,
+            ..Stats::default()
+        };
+        let e2 = no_rss.explain();
+        assert!(e2.starts_with("RSS is attributed to: "));
+        assert!(!e2.contains("outside the allocator"));
     }
 
     #[test]

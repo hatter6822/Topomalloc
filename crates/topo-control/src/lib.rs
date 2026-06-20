@@ -50,15 +50,27 @@ impl Control {
             // (plan 07 W17-5/1b), read from the latest snapshot.
             "topo.stats.explain" => Some(self.stats.explain()),
             "topo.stats.epoch" => Some(self.stats.epoch.to_string()),
+            // §31.3 peak heap high-water + §31.6 RSS (W17-2/5), read from the latest snapshot.
+            "topo.stats.peak_live_bytes" => Some(self.stats.peak_live_bytes.to_string()),
+            "topo.stats.rss_bytes" => Some(self.stats.rss_bytes.to_string()),
             // §31.1 byte classes added by W17-1a (retained/active distinction,
-            // quarantine, destroyed-arena count) and the §31.5 sampled internal
-            // fragmentation (W17-4), read from the latest snapshot.
+            // quarantine, destroyed-arena count) and the §31.5 internal fragmentation
+            // (sampled small + exact medium/large, W17-4), read from the latest snapshot.
             "topo.backend.active_bytes" => Some(self.stats.active_bytes.to_string()),
             "topo.backend.retained_bytes" => Some(self.stats.retained_bytes.to_string()),
+            "topo.backend.total_managed_vm_bytes" => Some(
+                self.stats
+                    .virtual_bytes
+                    .saturating_add(self.stats.metadata_bytes)
+                    .to_string(),
+            ),
             "topo.quarantine.bytes" => Some(self.stats.quarantine_bytes.to_string()),
             "topo.arena.destroyed" => Some(self.stats.arenas_destroyed.to_string()),
             "topo.fragmentation.internal_sampled_bytes" => {
                 Some(self.stats.sampled_internal_fragmentation_bytes.to_string())
+            }
+            "topo.fragmentation.internal_exact_bytes" => {
+                Some(self.stats.exact_internal_fragmentation_bytes.to_string())
             }
             // The W8-4 zero-size policy (§9.6, Appendix E `compat.*`): read
             // from the core's process-wide knob, so this agrees with what the
@@ -149,14 +161,35 @@ mod tests {
             quarantine_bytes: 0,
             arenas_destroyed: 3,
             sampled_internal_fragmentation_bytes: 128,
+            exact_internal_fragmentation_bytes: 4000,
+            peak_live_bytes: 2 << 20,
+            rss_bytes: 5 << 20,
+            virtual_bytes: 10000,
+            metadata_bytes: 2000,
             live_bytes: 1 << 20,
             ..Stats::default()
         });
         assert_eq!(c.get("topo.stats.epoch").as_deref(), Some("7"));
+        assert_eq!(
+            c.get("topo.stats.peak_live_bytes").as_deref(),
+            Some((2 << 20).to_string().as_str())
+        );
+        assert_eq!(
+            c.get("topo.stats.rss_bytes").as_deref(),
+            Some((5 << 20).to_string().as_str())
+        );
         assert_eq!(c.get("topo.backend.active_bytes").as_deref(), Some("4096"));
         assert_eq!(
             c.get("topo.backend.retained_bytes").as_deref(),
             Some("2048")
+        );
+        assert_eq!(
+            c.get("topo.backend.total_managed_vm_bytes").as_deref(),
+            Some("12000")
+        );
+        assert_eq!(
+            c.get("topo.fragmentation.internal_exact_bytes").as_deref(),
+            Some("4000")
         );
         assert_eq!(c.get("topo.quarantine.bytes").as_deref(), Some("0"));
         assert_eq!(c.get("topo.arena.destroyed").as_deref(), Some("3"));
@@ -165,9 +198,13 @@ mod tests {
                 .as_deref(),
             Some("128")
         );
-        // The §31.6 explanation names the live contributor.
+        // The §31.6 explanation leads with the real RSS (we set one) and names the live
+        // contributor.
         let explain = c.get("topo.stats.explain").expect("explain present");
-        assert!(explain.starts_with("RSS is attributed to: "));
+        assert!(
+            explain.starts_with("RSS is 5.0 MiB: "),
+            "explain: {explain}"
+        );
         assert!(explain.contains("live"));
     }
 

@@ -64,18 +64,21 @@ hook's `malloc`/`free`/`realloc` is declined before any lock, never deadlocked);
 and a lock-free, allocation-free crash summary (`topomalloc_crash_summary`, §28.4).
 
 **Observability (W17) is landed**: an epoch-stamped, machine-readable snapshot
-that answers "where is the memory?" (§31.1) — every byte class (app, caches,
-central, the §20.1 backend split active/retained/dirty/muzzy/released, metadata,
-quarantine, hugepage coverage, per-arena, destroyed-arena count) plus §31.5
-fragmentation metrics — over the C `topomalloc_stats_json` / `_print` / `_snapshot`
-API with the §31.2 selection flags (`SUMMARY`/`BY_ARENA`/`BY_SIZE_CLASS`/…),
-additive JSON (§35.3), a human-readable `topomalloc_explain_memory()` RSS
-attribution (§31.6), and §36.12 label-scoped redaction (a low domain cannot infer
-a high domain's pattern — the Rust analogue of the proved `stats_observation_noninterference`).
-The §8.6 reconciliation identities (`virtual == active + pageheap_free`,
-`pageheap_free == retained + dirty + muzzy + released`) are a fixed-wall test, live
-and under concurrency. The minimal heap-sampling slice (W17-3, off by default)
-feeds the lifetime/hotness placement policy (W14) from real traffic.
+that answers "where is the memory?" (§31.1) — every byte class (app live + **peak**
+high-water, caches, central, the §20.1 backend split active/retained/dirty/muzzy/
+released, metadata, quarantine, hugepage coverage, per-arena, destroyed-arena count)
+plus §31.5 fragmentation (**exact** for medium/large, sampled for small) — over the
+C `topomalloc_stats_json` / `_print` / `_snapshot` API with the §31.2 selection
+flags (a real `CONSISTENT_SNAPSHOT` read-twice-coherent mode, `RESET_PEAKS`,
+`BY_ARENA`/`BY_SIZE_CLASS`/`BY_NUMA`/…; unknown bits strictly rejected), additive
+JSON (§35.3), a `topomalloc_explain_memory()` that reads the **real RSS** and
+attributes it (§31.6), and §36.12 label-scoped redaction that scopes the *whole*
+view a low domain receives (the Rust analogue of the proved
+`stats_observation_noninterference`). The §8.6 reconciliation identities
+(`virtual == active + pageheap_free`, `pageheap_free == retained + dirty + muzzy +
+released`) are a fixed-wall test, live and under concurrency. The minimal
+heap-sampling slice (W17-3, off by default) feeds the lifetime/hotness placement
+policy (W14) from real traffic.
 
 ## Quick start
 

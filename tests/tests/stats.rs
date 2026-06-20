@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use topo_backend_posix::PosixBackingProvider;
+use topo_core::generated::tables::HUGE_THRESHOLD;
 use topo_core::ids::ArenaId;
 use topo_core::{Allocator, AllocatorConfig, ArenaPolicy, MetaArena, PageMap, RequestFlags};
 use topo_stats::{redact_arenas, ArenaLine, Stats, StatsDetail, StatsFlags};
@@ -142,11 +143,15 @@ fn reconciliation_holds_for_a_sequential_live_allocator() {
 #[test]
 fn reconciliation_holds_under_concurrent_load_then_quiesces() {
     let eng = engine();
-    let done = Arc::new(AtomicUsize::new(0));
+    const WORKERS: usize = 4;
+    // Deterministic completion signal (no timing hack): each worker bumps `finished` when it
+    // returns; the reader spins until all `WORKERS` are done.
+    let finished = Arc::new(AtomicUsize::new(0));
     std::thread::scope(|scope| {
         // Workers churn allocations while a reader repeatedly snapshots — the algebraic
         // identities must never be violated mid-flight (W17-1b).
-        for t in 0..4 {
+        for t in 0..WORKERS {
+            let finished = Arc::clone(&finished);
             scope.spawn(move || {
                 let mut live: Vec<*mut u8> = Vec::new();
                 for i in 0..2000 {
@@ -165,29 +170,107 @@ fn reconciliation_holds_under_concurrent_load_then_quiesces() {
                     // SAFETY: a live pointer this thread owns.
                     unsafe { eng.free(p) };
                 }
+                finished.fetch_add(1, Ordering::Release);
             });
         }
-        // Reader thread: snapshot under load; the algebraic identities hold even torn.
-        let done_r = Arc::clone(&done);
+        // Reader thread: snapshot under load; the algebraic identities hold even torn. Runs
+        // until every worker has finished (then a few more, to catch the post-quiesce tail).
+        let finished_r = Arc::clone(&finished);
         scope.spawn(move || {
-            while done_r.load(Ordering::Relaxed) == 0 {
+            while finished_r.load(Ordering::Acquire) < WORKERS {
                 assert_reconciles(&snapshot(eng), false);
             }
-            // A few more after the flag flips, to catch the tail.
             for _ in 0..64 {
                 assert_reconciles(&snapshot(eng), false);
             }
         });
-        // The workers above finish; signal the reader once the scope's worker closures return
-        // is not directly observable, so just let the reader run a bounded burst.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        done.store(1, Ordering::Relaxed);
     });
     // All threads joined ⇒ quiescent: the full reconciliation is exact, and everything freed.
     let s = snapshot(eng);
     assert_reconciles(&s, true);
     assert_eq!(s.live_bytes, 0, "every thread freed its allocations");
 }
+
+#[test]
+fn exact_large_fragmentation_and_peak_track_the_engine() {
+    // W17-4: exact medium/large internal fragmentation = usable − requested, live-set accurate.
+    // W17-2/3: the peak high-water tracks the maximum live, and RESET_PEAKS clears it.
+    let eng = engine();
+    let req = HUGE_THRESHOLD + 100; // large, not a page multiple ⇒ genuine waste
+    let p = eng.allocate(req, 16, RequestFlags::NONE);
+    assert!(!p.is_null());
+    let usable = eng.usable_size(p).expect("live large");
+    assert!(usable > req, "page-rounding wastes the tail");
+    let s = eng.stats();
+    assert_eq!(
+        s.live_internal_fragmentation_bytes,
+        (usable - req) as u64,
+        "exact frag = usable − requested"
+    );
+    assert!(s.peak_live_bytes >= s.live_bytes, "peak ≥ live");
+    assert!(
+        s.peak_live_bytes >= usable as u64,
+        "peak captured the large alloc"
+    );
+
+    // A second, larger request grows the exact frag by its own waste (live-set additive).
+    let req2 = 2 * HUGE_THRESHOLD + 7;
+    let q = eng.allocate(req2, 16, RequestFlags::NONE);
+    assert!(!q.is_null());
+    let usable2 = eng.usable_size(q).expect("live large 2");
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        (usable - req) as u64 + (usable2 - req2) as u64
+    );
+
+    // Freeing returns the waste to the live set exactly (robust to the free path).
+    // SAFETY: live pointers we own.
+    unsafe {
+        eng.free(p);
+        eng.free(q);
+    }
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        0,
+        "no live large ⇒ no internal fragmentation"
+    );
+    // The peak persists above the now-zero live until reset, then collapses.
+    assert!(eng.stats().peak_live_bytes >= usable2 as u64);
+    eng.reset_peak_live();
+    assert_eq!(
+        eng.stats().peak_live_bytes,
+        0,
+        "RESET_PEAKS clears the high-water"
+    );
+}
+
+#[test]
+fn realloc_in_place_keeps_exact_fragmentation_current() {
+    // W17-4: an in-place large grow/shrink updates the recorded request, so the exact frag
+    // never goes stale (the over-/under-count the naïve approach would leave).
+    let eng = engine();
+    let p = eng.allocate(HUGE_THRESHOLD + 100, 16, RequestFlags::NONE);
+    assert!(!p.is_null());
+    // Grow in place toward a much larger request: frag must reflect the NEW request, not the
+    // old tiny one (else it would over-report by ~the growth).
+    // SAFETY: `p` is the live base pointer we own and do not concurrently free/realloc.
+    let grown = unsafe { eng.resize_in_place(p, 4 * HUGE_THRESHOLD, 16, RequestFlags::NONE) };
+    if let Some(new_usable) = grown {
+        if new_usable >= 4 * HUGE_THRESHOLD {
+            let frag = eng.stats().live_internal_fragmentation_bytes;
+            assert!(
+                frag <= (new_usable - 4 * HUGE_THRESHOLD) as u64 + PAGE_TAIL_SLACK,
+                "frag {frag} reflects the grown request, not the original"
+            );
+        }
+    }
+    // SAFETY: live pointer we own.
+    unsafe { eng.free(p) };
+    assert_eq!(eng.stats().live_internal_fragmentation_bytes, 0);
+}
+
+/// A page of slack to keep the in-place-grow assertion robust to page rounding.
+const PAGE_TAIL_SLACK: u64 = 64 * 1024;
 
 #[test]
 fn destroyed_arena_count_reconciles_through_stats() {
@@ -206,6 +289,31 @@ fn destroyed_arena_count_reconciles_through_stats() {
     assert_eq!(s.arenas_destroyed, 2, "two destroys counted (§31.1)");
     let v: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
     assert_eq!(v["arenas"]["destroyed"], 2);
+}
+
+#[test]
+fn exact_fragmentation_is_robust_to_the_arena_bulk_free_path() {
+    // W17-4: the exact-frag walk reads the live set, so it is correct across the *bulk* free
+    // path too — a large allocation in an arena contributes waste, and destroying the arena
+    // (which frees it via `free_arena`, not `free`) returns the waste to zero.
+    let eng = engine();
+    let arena = eng.arena_create(&ArenaPolicy::explicit()).expect("arena");
+    let req = HUGE_THRESHOLD + 100;
+    let p = eng.allocate_in(arena, req, 16, RequestFlags::NONE);
+    assert!(!p.is_null());
+    let usable = eng.usable_size(p).expect("live large");
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        (usable - req) as u64
+    );
+    // Destroy the arena (bulk-frees its large allocation via the free_arena chokepoint).
+    // SAFETY: the arena is quiesced — we hold no other live pointer into it.
+    unsafe { eng.arena_destroy(arena).expect("destroy") };
+    assert_eq!(
+        eng.stats().live_internal_fragmentation_bytes,
+        0,
+        "arena bulk-free returns the large waste to the live set"
+    );
 }
 
 #[test]
@@ -264,6 +372,7 @@ fn explanation_and_full_report_render_for_a_live_snapshot() {
     let detail = StatsDetail {
         arenas: &arenas,
         size_classes: &[],
+        numa_nodes: &[],
     };
     let json = s.to_json_with(StatsFlags::BY_ARENA | StatsFlags::BY_CPU, &detail);
     let v: serde_json::Value = serde_json::from_str(&json).expect("valid detailed JSON");
@@ -317,6 +426,7 @@ fn redaction_is_label_noninterference_end_to_end() {
         &StatsDetail {
             arenas: &view_a,
             size_classes: &[],
+            numa_nodes: &[],
         },
     );
     let json_b = s.to_json_with(
@@ -324,6 +434,7 @@ fn redaction_is_label_noninterference_end_to_end() {
         &StatsDetail {
             arenas: &view_b,
             size_classes: &[],
+            numa_nodes: &[],
         },
     );
     assert_eq!(json_a, json_b, "the redacted low-domain JSON is identical");

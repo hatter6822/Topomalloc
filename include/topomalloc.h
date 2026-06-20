@@ -422,21 +422,32 @@ typedef struct topomalloc_stats_s {
   uint64_t fragmentation_external_bytes;          /* Section 31.5 (dirty+muzzy) */
   uint64_t arena_count;           /* arenas.count */
   uint64_t arena_destroyed;       /* arenas.destroyed (cumulative) */
+  /* appended in the W17 completion pass (additive, Section 35.3) */
+  uint64_t peak_live_bytes;       /* application.peak_live_bytes (Section 31.3) */
+  uint64_t rss_bytes;             /* application.rss_bytes (Section 31.6; 0 if n/a) */
+  uint64_t total_managed_vm_bytes;            /* virtual_bytes + metadata_bytes */
+  uint64_t fragmentation_internal_exact_bytes; /* Section 31.5, exact medium/large */
+  uint64_t hugepage_coverage_ratio_bp;        /* Section 19.7 (0..10000 bp) */
+  uint64_t sampled_live_bytes;    /* placement.sampled_live_bytes (0 unless sampling) */
+  uint64_t numa_nodes;            /* topology.numa_nodes (0 when no router) */
 } topomalloc_stats_t;
 
 /* Fill the fixed core byte-class struct from a fresh live snapshot. Returns 0 on
- * success, -1 on a NULL out. `flags` selects the read mode (Section 8.6). */
+ * success, -1 on a NULL out OR an unknown flag bit (Section 10.4 strict
+ * validation). `flags` selects the read mode (Section 8.6). */
 int topomalloc_stats_snapshot(topomalloc_stats_t *out, uint64_t flags);
 
 /* Render the live snapshot as JSON (Appendix-D shape) into buf (NUL-terminated,
  * truncated to cap), returning the full length in bytes (excl. NUL). Pass
- * buf=NULL/cap=0 to query the length only. `flags` selects detail. */
+ * buf=NULL/cap=0 to query the length only. `flags` selects detail; an unknown
+ * flag bit is rejected (writes nothing, returns 0 — Section 10.4). */
 size_t topomalloc_stats_json(char *buf, size_t cap, uint64_t flags);
 
-/* Like topomalloc_stats_json, but the BY_ARENA per-arena detail is REDACTED to
- * only the arenas an observer at `observer_label` is authorized to see (Section
- * 36.12): a low domain cannot observe a higher domain's arenas. On POSIX every
- * arena is PUBLIC (0), so a PUBLIC observer sees everything (the identity case). */
+/* Like topomalloc_stats_json, but the BY_ARENA per-arena detail (and, for a
+ * redacted low observer, ALL cross-domain summary aggregates) are REDACTED to
+ * only what an observer at `observer_label` is authorized to see (Section 36.12):
+ * a low domain cannot observe a higher domain's activity. On POSIX every arena is
+ * PUBLIC (0), so a PUBLIC observer sees everything (the identity case). */
 size_t topomalloc_stats_json_for_label(char *buf, size_t cap, uint64_t flags,
                                        uint32_t observer_label);
 

@@ -1169,6 +1169,13 @@ pub struct LargeDescriptor {
     base: AtomicUsize,
     /// Usable size in bytes (`>=` the request).
     usable_size: AtomicUsize,
+    /// The **requested** byte size (`<= usable_size`), for the §31.5 exact internal-
+    /// fragmentation metric (W17-4): `usable_size − requested` is this allocation's waste.
+    /// Stats-only and deliberately **outside** the [`integrity`](Self::integrity) tag — a
+    /// torn read or corruption only blurs a fragmentation stat, never a safety decision
+    /// (free/realloc/usable_size never consult it). Defaults to `usable_size` (zero waste)
+    /// until the engine records the real request via [`set_requested`](Self::set_requested).
+    requested: AtomicUsize,
     /// Required alignment (a power of two).
     align: AtomicUsize,
     /// Integrity tag over the header fields (§17.3), recomputed on new/recycle.
@@ -1202,6 +1209,7 @@ impl LargeDescriptor {
         let desc = Self {
             base: AtomicUsize::new(base),
             usable_size: AtomicUsize::new(usable_size),
+            requested: AtomicUsize::new(usable_size),
             align: AtomicUsize::new(align),
             integrity: AtomicU64::new(0),
             id,
@@ -1262,6 +1270,23 @@ impl LargeDescriptor {
         self.usable_size.load(Ordering::Acquire)
     }
 
+    /// The requested size in bytes (`<= usable_size`), for the §31.5 exact internal-
+    /// fragmentation metric (W17-4). Defaults to the usable size (zero waste) until
+    /// [`set_requested`](Self::set_requested) records the real request.
+    #[inline]
+    pub fn requested(&self) -> usize {
+        self.requested.load(Ordering::Relaxed)
+    }
+
+    /// Record the requested size (W17-4 stats only; relaxed — never a safety input). Clamped
+    /// to `usable_size` so the fragmentation `usable − requested` can never underflow.
+    #[inline]
+    pub fn set_requested(&self, requested: usize) {
+        let usable = self.usable_size.load(Ordering::Relaxed);
+        self.requested
+            .store(requested.min(usable), Ordering::Relaxed);
+    }
+
     /// Required alignment.
     #[inline]
     pub fn align(&self) -> usize {
@@ -1314,6 +1339,9 @@ impl LargeDescriptor {
         self.arena.store(arena.0, Ordering::Release);
         self.base.store(base, Ordering::Release);
         self.usable_size.store(usable_size, Ordering::Release);
+        // Reset the requested size to the usable size (zero waste) until the engine records
+        // the real request for this incarnation (W17-4 stats only).
+        self.requested.store(usable_size, Ordering::Relaxed);
         self.align.store(align, Ordering::Release);
         self.state
             .store(LargeState::Active as u8, Ordering::Release);

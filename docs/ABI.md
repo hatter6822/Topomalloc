@@ -141,22 +141,24 @@ returns its region to the backing via `dealloc`.
 
 | Symbol | Semantics |
 |--------|-----------|
-| `topomalloc_stats_t` | the fixed core byte-class snapshot struct — 20 `uint64_t` fields (epoch, application, cache, central, the §20.1 backend split, metadata, quarantine, hugepage coverage, fragmentation, arena counts). Additive across the 0.x series (fields append, never reorder); the layout is pinned by the ABI smoke tests. |
-| `topomalloc_stats_snapshot(out, flags)` | fill `*out` from a fresh live snapshot; `0` on success, `-1` on a NULL `out`. |
-| `topomalloc_stats_json(buf, cap, flags)` | render the snapshot as Appendix-D JSON into `buf` (NUL-terminated, truncated to `cap`); returns the full length (excl. NUL). `buf=NULL`/`cap=0` queries the length. |
-| `topomalloc_stats_json_for_label(buf, cap, flags, observer_label)` | as above, but the `BY_ARENA` detail is **redacted** to the arenas the `observer_label` domain may see (§36.12); a low domain cannot observe a higher domain's arenas. |
-| `topomalloc_stats_print(out, flags)` | write a human-readable dump (the §31.6 explanation + the JSON) to the `FILE* out`; `0` on success, `-1` on a NULL stream / short write. |
-| `topomalloc_explain_memory(buf, cap)` | render a one-line RSS attribution (§31.6, "RSS is attributed to: …") into `buf`; returns the full length. |
+| `topomalloc_stats_t` | the fixed core byte-class snapshot struct — 27 `uint64_t` fields (epoch, application incl. `peak_live`/`rss`, cache, central, the §20.1 backend split + `total_managed_vm`, metadata, quarantine, hugepage coverage + ratio, fragmentation [sampled + exact], arena counts, numa nodes). Additive across the 0.x series (fields append, never reorder); the layout is pinned by the ABI smoke tests. |
+| `topomalloc_stats_snapshot(out, flags)` | fill `*out` from a fresh live snapshot; `0` on success, `-1` on a NULL `out` **or an unknown flag bit** (§10.4). |
+| `topomalloc_stats_json(buf, cap, flags)` | render the snapshot as Appendix-D JSON into `buf` (NUL-terminated, truncated to `cap`); returns the full length (excl. NUL). `buf=NULL`/`cap=0` queries the length; an unknown flag bit returns `0` (writes nothing). |
+| `topomalloc_stats_json_for_label(buf, cap, flags, observer_label)` | as above, but **redacted** for the `observer_label` domain (§36.12): the `BY_ARENA` detail is filtered to the arenas it may see, **and** when a higher-labelled arena is hidden the cross-domain summary aggregates are zeroed (`live_bytes` recomputed from the visible arenas) — a low domain cannot infer a higher domain's activity. |
+| `topomalloc_stats_print(out, flags)` | write a human-readable dump (a header + the §31.6 explanation + the JSON) to the `FILE* out`; `0` on success, `-1` on a NULL stream / unknown flag / short write. |
+| `topomalloc_explain_memory(buf, cap)` | render a one-line RSS attribution (§31.6, "RSS is 2.5 GiB: 1.8 GiB live, …") into `buf`; returns the full length. |
 
 `flags` is a `uint64_t` of `TOPOMALLOC_STATS_*` bits (§31.2): `SUMMARY` (0, always
 rendered) plus the additive `BY_ARENA` / `BY_SIZE_CLASS` / `BY_CPU` / `BY_NUMA` /
-`BY_HUGEPAGE` detail selectors and the `CONSISTENT_SNAPSHOT` / `RESET_PEAKS` read
-modes. Unknown bits are ignored (forward-compatible). Every snapshot carries a
+`BY_HUGEPAGE` detail selectors and the `CONSISTENT_SNAPSHOT` (read-twice-coherent,
+§8.6) / `RESET_PEAKS` (clear the peak high-water) read modes. An **unknown bit is
+rejected** (§10.4 strict validation), not ignored. Every snapshot carries a
 monotonic `epoch` (§8.6); the reconciliation identities `virtual == active +
 pageheap_free` and `pageheap_free == retained + dirty + muzzy + released` hold by
-construction. Sampling-derived fields (`fragmentation.internal_sampled`,
-`placement.*`) are `0` unless heap sampling is enabled
-(`topomalloc_profile_set_rate`).
+construction. `explain_memory` reads the real RSS (`/proc/self/statm` on Linux).
+Sampling-derived fields (`fragmentation.internal_sampled`, `placement.*`) are `0`
+unless heap sampling is enabled (`topomalloc_profile_set_rate`); the exact
+medium/large `fragmentation.internal_exact` is always tracked.
 
 ### Behavior contracts
 

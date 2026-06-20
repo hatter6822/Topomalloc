@@ -395,15 +395,29 @@ low view bit-for-bit identical) — the Rust analogue of the proved Lean `stats_
 Stats are **derived observability, not an abstract §33.4 transition**, so there is **no Lean obligation**
 (the reconciliation is the fixed-wall test above, the redaction the cited non-interference theorem). The new
 keys reconcile into the `topo.stats.*` / `topo.backend.*` / `topo.quarantine.*` / `topo.fragmentation.*`
-control namespace (W20). The broader stats epoch *snapshot-isolation* (a seqlock over the fast path) and the
-seLe4n resource-server-enforced per-label aggregate scoping remain deferred (the §8.6 bounded-skew convention
-+ the per-arena redaction cover the POSIX profile today).
+control namespace (W20).
+
+**Optimal-completion pass (W17).** A self-audit hardened every "present-but-inert" piece: **W17-6** redaction
+now scopes the *whole* summary a low observer receives (`redact_summary` zeroes cross-domain aggregates and
+recomputes `live_bytes` from the visible arenas via `Σ arena.used == live_bytes`), so the JSON is genuinely
+non-interfering — fuzzed (`stats_render`) and pinned by `summary_redaction_is_noninterference_for_the_whole_view`.
+**W17-1b** `CONSISTENT_SNAPSHOT` is a real read-twice-until-stable loop; **W17-2** `RESET_PEAKS` clears a true
+`peak_live_bytes` high-water (maintained at the allocation charge point), `BY_NUMA`/`BY_HUGEPAGE` render genuine
+per-node (`NodeRouter::node_coverage`) / per-bin detail, an unknown flag bit is strictly rejected (§10.4), and
+`topomalloc_stats_t` is the full 27-field snapshot. **W17-4** internal fragmentation is now *exact* for
+medium/large (the large descriptor records each request; a free-path-agnostic walk sums the live waste,
+robust to single / arena-bulk / realloc frees) alongside the sampled small estimate. **W17-5** `explain_memory`
+reads the **real RSS** (`/proc/self/statm`), leads with it, and attributes the non-heap remainder. The only
+deferrals left are narrow: true stats epoch *snapshot-isolation* (a seqlock; the read-twice loop + §8.6
+bounded-skew convention cover operational debugging today) and the seLe4n resource-server-enforced per-label
+backend/cache *partitioning* (the per-arena + whole-summary redaction is the complete Rust-side mechanism for
+the POSIX profile).
 
 **Test counts:**
-- Rust: ~790 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~805 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)
+- Fuzzing: 10 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, `placement`, and `stats_render`)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16384 — each class records its natural alignment so over-aligned small requests are slab-served, W15-4)
