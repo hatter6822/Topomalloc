@@ -29,6 +29,7 @@ pub mod fe;
 pub mod flags;
 pub mod fork;
 pub mod generated;
+pub mod harden;
 pub mod hooks;
 pub mod huge;
 pub mod ids;
@@ -85,6 +86,10 @@ pub use extent::{
     RetainPolicy, StateBytes,
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
+pub use harden::{
+    guard_pages_enabled, junk_fill_enabled, quarantine_enabled, secure_scrub_enabled,
+    ALLOC_PATTERN, FREE_PATTERN,
+};
 pub use hooks::{ExtentHooks, HookProvider};
 pub use huge::{
     classify_bin, FreeReport, Hotness, HugeBin, HugeConfig, HugeError, HugePageBackend,

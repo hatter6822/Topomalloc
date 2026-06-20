@@ -646,11 +646,61 @@ impl CentralCache {
     /// returned.
     ///
     /// Lock order: `central_lock → span_lock` (W5-4d).
+    ///
+    /// This is the no-scrub form (no backing writes), used by the rollback paths
+    /// and the synthetic-address unit tests; the live free path uses
+    /// [`insert_batch_scrubbing`](Self::insert_batch_scrubbing).
     pub fn insert_batch(
         &self,
         span: &SpanDescriptor,
         indices: &[u16],
         count: usize,
+    ) -> InsertResult {
+        self.insert_batch_inner(span, indices, count, None)
+    }
+
+    /// Like [`insert_batch`](Self::insert_batch) but, in `junk-fill` builds, scrubs
+    /// each object that *genuinely* transitions live→central-free to the
+    /// [`FREE_PATTERN`](crate::harden::FREE_PATTERN) **under the span lock** (§29.6,
+    /// W18-5) — the unique race-free point, since a concurrent `remove_batch` reuse
+    /// and the span's retirement take this same lock. Scrubbing under the lock and
+    /// only on the real 0→1 bit flip is what makes it sound: a double/UAF free never
+    /// scrubs a *different* owner's live object, and a concurrent retire cannot
+    /// decommit the slab out from under the scrub (W18-2: detection/scrub never
+    /// corrupts unrelated state; never faults on a clean double free). The scrub
+    /// also re-arms the use-after-free canary the next hand-out verifies.
+    ///
+    /// The span geometry is read from `span` itself (its base was exposed from the
+    /// provider mapping), so this MUST be called only with a span over real backing
+    /// (the live allocator path); the geometry-only unit tests use
+    /// [`insert_batch`](Self::insert_batch). A true no-op (identical to
+    /// `insert_batch`) unless `junk-fill` is compiled in.
+    pub fn insert_batch_scrubbing(
+        &self,
+        span: &SpanDescriptor,
+        indices: &[u16],
+        count: usize,
+    ) -> InsertResult {
+        let scrub = if crate::harden::junk_fill_enabled() {
+            let sc = span.size_class();
+            SlabLayout::compute(sc, span.base(), span.slab_header() as usize)
+                .map(|layout| (layout, crate::size_class::usable_size(sc)))
+        } else {
+            None
+        };
+        self.insert_batch_inner(span, indices, count, scrub)
+    }
+
+    /// Shared body of [`insert_batch`](Self::insert_batch) /
+    /// [`insert_batch_scrubbing`](Self::insert_batch_scrubbing). `scrub`, when
+    /// `Some((layout, obj_size))`, scrubs each genuinely-inserted object's
+    /// `obj_size` usable bytes under the span lock (§29.6, W18-5).
+    fn insert_batch_inner(
+        &self,
+        span: &SpanDescriptor,
+        indices: &[u16],
+        count: usize,
+        scrub: Option<(SlabLayout, usize)>,
     ) -> InsertResult {
         let sc = span.size_class();
         let bin = match self.bins.get(sc.index()) {
@@ -691,6 +741,21 @@ impl CentralCache {
             let idx = obj_idx as usize;
             if sg.central_insert(idx) {
                 inserted += 1;
+                // W18-5 (§29.6): scrub this object now that its bit has flipped
+                // live→free under the span lock (no-op unless `junk-fill` + a real
+                // span geometry were supplied by `insert_batch_scrubbing`).
+                if let Some((layout, obj_size)) = scrub {
+                    if let Some(addr) = layout.object_addr(idx) {
+                        // SAFETY: `addr` is the exposed-provenance address of object
+                        // `idx`'s `obj_size` usable bytes in this span's committed slab
+                        // (the arithmetic `object_ptr` uses). The span lock is held and
+                        // the object just flipped live→free, so no concurrent reuse or
+                        // retire can observe a torn scrub or decommit it underneath us.
+                        unsafe {
+                            crate::harden::fill_on_free(addr as *mut u8, obj_size);
+                        }
+                    }
+                }
             } else {
                 // central_insert returns false for two reasons:
                 //   (a) idx >= object_count (out-of-range index), or

@@ -499,7 +499,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// its large allocations) — the §22.5/§36.13 reset/destroy precondition. Each
     /// freed pointer is a live base pointer this allocator handed out, so the
     /// per-free [`free`](Self::free) contract is met.
-    pub unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+    pub unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool) {
         let mut count = 0usize;
         let mut bytes = 0usize;
         let mut all_revoked = true;
@@ -535,8 +535,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                     // SAFETY: `base` is the current base pointer of a live large
                     // allocation of this allocator (the pagemap confirmed it under
                     // the lock); freeing it meets the `free` contract. Revoke the
-                    // backing's descendants before recycling (§36.6/§36.13).
-                    let (retired, revoked) = unsafe { self.free_revoking(base as *mut u8, arena) };
+                    // backing's descendants before recycling (§36.6/§36.13), zeroing
+                    // first when the arena may be reused at a lower label (W18-6).
+                    let (retired, revoked) =
+                        unsafe { self.free_revoking(base as *mut u8, arena, scrub_zero) };
                     if retired {
                         // The object is gone regardless of revoke; count its bytes.
                         count += 1;
@@ -571,8 +573,24 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large free` (pagemap clear §17.2 + extent free §18.3)
     pub unsafe fn free_with(&self, ptr: *mut u8, hook: &dyn RegionCacheHook) -> bool {
-        // SAFETY: identical contract, forwarded; `None` = no capability revoke.
-        unsafe { self.free_inner(ptr, hook, None) }.0
+        // SAFETY: identical contract, forwarded; `None` = no capability revoke, and
+        // no zero-scrub (junk-fill, if compiled, still scrubs the freed bytes).
+        unsafe { self.free_inner(ptr, hook, None, false) }.0
+    }
+
+    /// As [`free`](Self::free) but with the **scrub-before-downgrade** decision
+    /// passed in (W18-6, §36.12): `scrub_zero` zeroes the freed bytes before the
+    /// backing returns to the shared pool, where a lower-label arena may reuse it.
+    /// The engine computes it from the source arena's label (it owns the registry);
+    /// `false` here behaves exactly like [`free`](Self::free).
+    ///
+    /// # Safety
+    ///
+    /// As [`free_with`](Self::free_with).
+    pub unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool {
+        // SAFETY: identical contract, forwarded; the installed region cache routes a
+        // cache-served free back to it (W11).
+        unsafe { self.free_inner(ptr, self.region_cache, None, scrub_zero) }.0
     }
 
     /// Free a live large of `arena`, **revoking its backing's descendants before
@@ -586,11 +604,18 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// # Safety
     ///
     /// As [`free_with`](Self::free_with).
-    pub unsafe fn free_revoking(&self, ptr: *mut u8, arena: ArenaId) -> (bool, bool) {
+    pub unsafe fn free_revoking(
+        &self,
+        ptr: *mut u8,
+        arena: ArenaId,
+        scrub_zero: bool,
+    ) -> (bool, bool) {
         // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first. The
         // installed region cache (the hugepage backend when wired, W11) routes a
         // cache-served arena-drain free back to it rather than dropping it.
-        unsafe { self.free_inner(ptr, self.region_cache, Some(arena)) }
+        // `scrub_zero` zeroes the freed bytes first when the arena may be reused at a
+        // lower label (W18-6, §36.12).
+        unsafe { self.free_inner(ptr, self.region_cache, Some(arena), scrub_zero) }
     }
 
     /// The shared body of the large-free paths. `revoke` selects whether the
@@ -606,6 +631,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         ptr: *mut u8,
         hook: &dyn RegionCacheHook,
         revoke: Option<ArenaId>,
+        scrub_zero: bool,
     ) -> (bool, bool) {
         if ptr.is_null() {
             return (false, false);
@@ -668,6 +694,26 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         };
         pool.release(idx);
         self.lock.release();
+
+        // Scrub the freed allocation's user bytes before the backing is returned
+        // (and possibly decommitted). Race-free and fault-free here: the pagemap
+        // entry is already retired and the slot released, so a concurrent double free
+        // re-reads `None` and never reaches this point, yet `return_backing` has not
+        // decommitted the region — it is committed and exclusively ours. A **zero**
+        // scrub (W18-6, §36.12) when `scrub_zero` is set — the caller's source arena
+        // is non-PUBLIC (reusable at a lower label) or `secure-scrub` is on; otherwise
+        // the junk-fill FREE pattern (W18-5, §29.6, no-op without that feature). Both
+        // destroy the freed contents; a large allocation has no verify-on-reuse, so
+        // zeroing it loses no canary. In both branches `region` is this allocation's
+        // committed user range (`base .. base + usable_size`); after retire + release
+        // we are its sole accessor.
+        if scrub_zero {
+            // SAFETY: see above — sole accessor of the committed user range.
+            unsafe { crate::harden::scrub(region.base, region.len) };
+        } else {
+            // SAFETY: see above — sole accessor of the committed user range.
+            unsafe { crate::harden::fill_on_free(region.base, region.len) };
+        }
 
         // Return the backing outside the pool lock (the provider call is the slow,
         // §27.2-lowest step). A failed extent free still leaves us well-formed;
@@ -1131,12 +1177,19 @@ pub trait LargeBacking {
     /// # Safety
     /// As [`shrink`](Self::shrink).
     unsafe fn grow(&self, ptr: *mut u8, new_usable: usize) -> Option<usize>;
+    /// Free a large allocation with the scrub-before-downgrade decision passed in
+    /// (W18-6, §36.12); see [`LargeAllocator::free_scrubbing`].
+    ///
+    /// # Safety
+    /// As [`free`](Self::free).
+    unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool;
     /// Free every live large of `arena` (reset/destroy); see
-    /// [`LargeAllocator::free_arena`].
+    /// [`LargeAllocator::free_arena`]. `scrub_zero` zeroes each freed allocation
+    /// before recycling when the arena may be reused at a lower label (W18-6).
     ///
     /// # Safety
     /// `arena` is quiesced (the §22.5/§36.13 precondition).
-    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool);
+    unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool);
     /// Number of large allocations currently live in this backend.
     fn live_count(&self) -> usize;
     /// The §20.1 physical-state byte breakdown of this backend's large region.
@@ -1178,9 +1231,14 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
         unsafe { LargeAllocator::grow(self, ptr, new_usable) }
     }
     #[inline]
-    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+    unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool {
+        // SAFETY: forwarded unchanged from the trait's `free_scrubbing` contract.
+        unsafe { LargeAllocator::free_scrubbing(self, ptr, scrub_zero) }
+    }
+    #[inline]
+    unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool) {
         // SAFETY: forwarded unchanged from the trait's `free_arena` contract.
-        unsafe { LargeAllocator::free_arena(self, arena) }
+        unsafe { LargeAllocator::free_arena(self, arena, scrub_zero) }
     }
     #[inline]
     fn live_count(&self) -> usize {
@@ -1706,7 +1764,7 @@ mod tests {
         assert_eq!(la.live_count(), 1);
         // Drain the arena: the cache-served region returns via `try_cache_revoking`.
         // SAFETY: `p` is a live large of `ArenaId::DEFAULT` from this allocator.
-        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT) };
+        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT, false) };
         assert!(retired, "the cache-served large is retired on drain");
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(

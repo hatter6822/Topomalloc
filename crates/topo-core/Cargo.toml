@@ -17,11 +17,23 @@ default = []
 std = ["topo-arch/std"]
 # Debug/hardened invariant checks (Appendix B) compiled in.
 debug-checks = []
+# --- W18 security & hardening units (plan 08, §29/§17.3/§36.12). Each protection
+# is its **own opt-in, profile-gated unit** so the `performance` profile pays for
+# none of them (every entry point compiles to a no-op without its feature) and the
+# `hardened`/`debug` profiles *compose* the ones they want. See `crate::harden`. ---
+# W18-5: junk filling — fill-on-alloc / fill-on-free / verify-on-reuse (§29.6).
+junk-fill = []
+# W18-3: delayed-reuse quarantine for freed objects (§29.4).
+quarantine = []
+# W18-4: sampled guarded allocations — inaccessible guard pages (§29.5).
+guard-pages = []
+# W18-6: scrub dirty memory before it is reused across a security label (§36.12).
+secure-scrub = []
 # Profiles are features, not forks (overview principle 8; §30.1). Each selects a
 # feature set; their behaviour is filled in as subsystems land (plans 04/05/08).
 # See profiles/README.md for the full mapping.
-hardened = ["debug-checks"]
-debug = ["debug-checks"]
+hardened = ["debug-checks", "junk-fill", "quarantine", "guard-pages", "secure-scrub"]
+debug = ["debug-checks", "junk-fill"]
 deterministic-test = []
 low-rss = []
 hugepage-optimized = []

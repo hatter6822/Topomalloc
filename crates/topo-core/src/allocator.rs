@@ -1081,10 +1081,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // hooked-arena large allocations are zeroed here; the shared medium/large path
         // already zeroed itself, eliding the `memset` when its extent was freshly
         // OS-zeroed (W15-5).
-        if req.flags.hints().zero && !large_self_zeroed {
-            // SAFETY: `p` is a live allocation with at least `usable` writable
-            // bytes (the class's usable size, or the page-rounded extent length).
-            unsafe { ptr::write_bytes(p, 0, usable) };
+        if req.flags.hints().zero {
+            if !large_self_zeroed {
+                // SAFETY: `p` is a live allocation with at least `usable` writable
+                // bytes (the class's usable size, or the page-rounded extent length).
+                unsafe { ptr::write_bytes(p, 0, usable) };
+            }
+        } else {
+            // W18-5 (§29.6): junk-fill the freshly handed-out object with the ALLOC
+            // pattern so an uninitialised read is conspicuous. Mutually exclusive with
+            // zeroing (which the caller asked for) and a true no-op unless `junk-fill`
+            // is compiled in. For small objects this also overwrites the FREE canary
+            // that `hand_out_object` already verified.
+            // SAFETY: `p` is a live allocation with at least `usable` writable bytes.
+            unsafe { crate::harden::fill_on_alloc(p, usable) };
         }
         p
     }
@@ -1184,7 +1194,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // SAFETY: the batch's span pointer was installed from a
                     // valid descriptor in never-freed metadata (§27.5).
                     let span = unsafe { &*batch.span() };
-                    return self.object_ptr(span, batch.index(0));
+                    return self.hand_out_object(span, batch.index(0));
                 }
                 RemoveResult::NeedSpan => {
                     if self.create_span(arena, sc, class).is_err() {
@@ -1202,7 +1212,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                             RemoveResult::Ok(batch) => {
                                 // SAFETY: as above — a live descriptor in never-freed metadata.
                                 let span = unsafe { &*batch.span() };
-                                self.object_ptr(span, batch.index(0))
+                                self.hand_out_object(span, batch.index(0))
                             }
                             RemoveResult::NeedSpan => ptr::null_mut(),
                         };
@@ -1210,6 +1220,32 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
             }
         }
+    }
+
+    /// Hand object `index` out of `span`: resolve its pointer ([`object_ptr`](Self::object_ptr))
+    /// and, in `junk-fill` builds, **verify-on-reuse** (§29.6, W18-5) that the slot
+    /// still reads as the use-after-free canary before the caller overwrites it
+    /// (fills with the alloc pattern, or zeroes). The check is read-only — it never
+    /// mutates allocator state — and a true no-op (always returns `true`) unless
+    /// `junk-fill` is compiled in, so the `performance` build pays nothing. A
+    /// mismatch is a write-after-free and aborts loudly (allocation-free message,
+    /// Appendix F); aborting is the §2.4-safe response to detected corruption.
+    /// Returns null exactly when [`object_ptr`](Self::object_ptr) does.
+    #[inline]
+    fn hand_out_object(&self, span: &SpanDescriptor, index: u16) -> *mut u8 {
+        let p = self.object_ptr(span, index);
+        if !p.is_null() {
+            let usable = size_class::usable_size(span.size_class());
+            // SAFETY: `p` points at `usable` readable bytes of the just-removed
+            // object (its class object size); it is exclusively ours until returned.
+            let intact = unsafe { crate::harden::verify_free_pattern(p, usable) };
+            assert!(
+                intact,
+                "use-after-free: a freed object was written before reuse \
+                 (junk-fill verify-on-reuse canary, §29.6)"
+            );
+        }
+        p
     }
 
     /// Convert an object index in `span` into a provenance-correct pointer.
@@ -1269,6 +1305,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         };
         let base_ptr = region.base;
         let base = base_ptr as usize;
+        // W18-5 (§29.6): fill the freshly carved slab with the FREE pattern so
+        // *every* central-free object — fresh now or recycled later — reads as the
+        // use-after-free canary, making `verify_free_pattern` sound on the first
+        // reuse of each slot. A true no-op unless `junk-fill` is compiled in. The
+        // whole slab is committed, writable backing (the provider mapped it RW at
+        // `reserve`), so this never touches an unbacked page.
+        // SAFETY: `base_ptr` is the provider mapping for `[base, base + bytes)`, a
+        // freshly allocated, committed, exclusively-owned slab no object has been
+        // carved from yet.
+        unsafe { crate::harden::fill_fresh_slab(base_ptr, bytes) };
         let Some(layout) = SlabLayout::compute(sc, base, 0) else {
             let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
@@ -1432,7 +1478,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // and recycle under a racing thread, and its class/arena with it.
                 let usable = size_class::usable_size(span.size_class());
                 let arena = span.arena();
-                let r = self.central.insert_batch(span, &[idx], 1);
+                // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the
+                // use-after-free canary under the span lock; a true no-op otherwise.
+                let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
                 if r.inserted == 0 {
                     // Already central-free (double free) or the span raced
                     // its teardown; nothing was mutated (W8 hardening).
@@ -1461,9 +1509,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // usable size is captured first: after the free the descriptor may
                 // recycle.
                 let usable = owner.usable_size(ptr).unwrap_or(0);
+                // W18-6 (§36.12): zero the freed bytes before the backing returns to
+                // the shared pool when this arena could be reused at a lower label
+                // (decided lock-free); the scrub itself happens race-free under the
+                // large pool lock inside `free_inner`.
+                let scrub_zero = self.scrub_on_release(arena);
                 // SAFETY: this method's own contract is the large path's
                 // contract, forwarded unchanged.
-                if unsafe { owner.free(ptr) } {
+                if unsafe { owner.free_scrubbing(ptr, scrub_zero) } {
                     self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
                     // Credit the owning arena's quota (§36.17 exact accounting).
                     self.arenas.credit(arena, usable as u64);
@@ -1564,6 +1617,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// caller turns that into a §36.13 quarantine (drain) or a safe leak (normal
     /// retirement). (No per-arena pool exists yet — were one added for
     /// same-domain reuse, M3+, this revoke could be elided for that path.)
+    /// Whether memory released from `arena` must be **scrubbed before downgrade**
+    /// (W18-6, §36.12): zeroed before its backing can be recycled to a possibly
+    /// lower-labelled arena. True when the arena is non-PUBLIC (a downgrade is then
+    /// possible — the §36.12 MUST, feature-independent) or, as hardened
+    /// defence-in-depth, whenever `secure-scrub` is compiled in. One lock-free label
+    /// load; `false` (no scrub) for the PUBLIC POSIX common case with the feature off.
+    #[inline]
+    fn scrub_on_release(&self, arena: ArenaId) -> bool {
+        crate::harden::secure_scrub_enabled()
+            || crate::harden::must_scrub_for_relabel(self.arenas.label_of(arena), Label::PUBLIC)
+    }
+
     fn reclaim_span_slot(&self, span: &SpanDescriptor, arena: ArenaId) -> bool {
         self.pagemap.retire_span(span);
 
@@ -1590,11 +1655,31 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             ext
         };
         self.span_lock.release();
+        let backing = self.span_backing(arena);
+        // W18-6 (§36.12): scrub the slab before the backing crosses to the shared
+        // span pool, where a *different*-label arena may reuse it — high-domain
+        // dirty memory MUST NOT be observable at a lower label. Required whenever the
+        // owning arena is non-PUBLIC (a downgrade is then possible — the §36.12 MUST,
+        // independent of any feature), and, as hardened defence-in-depth, whenever
+        // `secure-scrub` is compiled in. A true no-op for the PUBLIC (POSIX) common
+        // case with the feature off — one lock-free label load, no scrub. This is the
+        // runtime image of the Lean `scrub_before_downgrade` protocol: the frame is
+        // scrubbed before the revoke-and-recycle that makes it reusable elsewhere.
+        // It also covers the *forced* retire of an arena reset/destroy, where live
+        // objects (never individually freed/scrubbed) are discarded with the span.
+        if self.scrub_on_release(arena) {
+            if let Some(region) = backing.region_of(ext) {
+                // SAFETY: `region` is this span's committed slab; the span is retired
+                // (no live objects, unlinked, pagemap cleared) and `free_revoking` has
+                // not yet revoked/recycled/decommitted it, so we are its sole accessor.
+                unsafe { crate::harden::scrub(region.base, region.len) };
+            }
+        }
         // Revoke-before-recycle; a revoke failure leaves the extent allocated
         // (well-formed) and is reported so a drain quarantines (§36.13). Route to
         // the arena's own hooked backing if it has one (W10) — the same backing the
         // extent was carved from in `create_span`.
-        self.span_backing(arena).free_revoking(ext, arena).is_ok()
+        backing.free_revoking(ext, arena).is_ok()
     }
 
     // -- introspection --------------------------------------------------------
@@ -2381,9 +2466,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // arena's own `used` is zeroed by the reset/destroy completion.
         // SAFETY: the arena is quiesced (its objects are not concurrently freed),
         // the reset/destroy precondition. Route to the arena's own hooked large
-        // backing if it has one (W10).
+        // backing if it has one (W10). `scrub_zero` (W18-6) zeroes each freed large
+        // before recycle when the arena may be reused at a lower label.
+        let scrub_zero = self.scrub_on_release(arena);
+        // SAFETY: the arena is quiesced (its objects are not concurrently freed).
         let (_, large_bytes, large_revoked) =
-            unsafe { self.large_backing(arena).free_arena(arena) };
+            unsafe { self.large_backing(arena).free_arena(arena, scrub_zero) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
@@ -2760,6 +2848,68 @@ mod tests {
         let q = a.malloc(64);
         assert_eq!(p, q, "freed object must be reused (no leak)");
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-5 (§29.6): in `junk-fill` builds a non-zeroed allocation is filled with
+    /// [`ALLOC_PATTERN`](crate::harden::ALLOC_PATTERN), a freed object is scrubbed to
+    /// [`FREE_PATTERN`](crate::harden::FREE_PATTERN), and reusing the slot succeeds
+    /// (the canary verifies). Two live objects keep the span from retiring, so the
+    /// freed slot's backing stays mapped for the white-box read.
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn junk_fill_brackets_an_objects_life_with_patterns() {
+        use crate::harden::{ALLOC_PATTERN, FREE_PATTERN};
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        let q = a.malloc(64); // keeps the span live after p is freed
+        assert!(!p.is_null() && !q.is_null());
+        // Fresh allocation is filled with the alloc pattern (not zero).
+        // SAFETY: `p` has at least 64 writable/readable usable bytes.
+        let pbytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(pbytes.iter().all(|&b| b == ALLOC_PATTERN), "fill-on-alloc");
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Freed memory is scrubbed to the free pattern (the span did not retire — `q`
+        // is still live — so the slot's backing is still mapped).
+        // SAFETY: `p`'s slab is still mapped (the span has a live object `q`).
+        let freed = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(freed.iter().all(|&b| b == FREE_PATTERN), "fill-on-free");
+
+        // Reuse the slot: verify-on-reuse passes (the canary is intact) and the
+        // object is re-filled with the alloc pattern.
+        let r = a.malloc(64);
+        assert_eq!(r, p, "freed slot reused");
+        // SAFETY: `r == p` is live again with 64 usable bytes.
+        let rbytes = unsafe { core::slice::from_raw_parts(r, 64) };
+        assert!(rbytes.iter().all(|&b| b == ALLOC_PATTERN), "re-fill on reuse");
+
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, r), FreeOutcome::Freed);
+    }
+
+    /// W18-5 (§29.6): a write-after-free corrupts the canary, and the next time the
+    /// slot is handed out `verify_free_pattern` (verify-on-reuse) detects it and
+    /// aborts — proving the check is live, not decorative. `should_panic` because
+    /// the detection is a loud, allocation-free abort (the §2.4-safe response).
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    #[should_panic(expected = "use-after-free")]
+    fn junk_fill_verify_on_reuse_catches_a_write_after_free() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        let _q = a.malloc(64); // keep the span live so `p`'s backing stays mapped
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // A stray write after free — the bug the canary exists to catch.
+        // SAFETY: `p`'s slab is still mapped (the span has the live `_q`).
+        unsafe { p.write(0x00) };
+        // Reusing the slot must trip verify-on-reuse and abort.
+        let _ = a.malloc(64);
     }
 
     #[test]
@@ -3962,6 +4112,81 @@ mod tests {
         assert!(!q.is_null());
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert_eq!(tfree(&a, keep), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-6 (§36.12 scrub-before-downgrade / §36.16 label test): a **non-PUBLIC**
+    /// arena's dirty backing is scrubbed before it is recycled, so its bytes cannot
+    /// later be reused by a lower-label arena while still carrying the high-domain
+    /// secret. This is the §36.12 information-flow MUST and runs in **every** build —
+    /// it keys on the label, not a feature. The runtime image of the Lean
+    /// `scrub_before_downgrade` theorem (a frame is scrubbed before it can be reused
+    /// at a lower label). Covers the *forced* retire (the object is never individually
+    /// freed, so only the teardown scrub can clear it).
+    #[test]
+    fn scrub_before_downgrade_zeroes_a_non_public_arena_on_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let high = a
+            .arena_create(&ArenaPolicy::explicit().with_label(crate::ids::Label(7)))
+            .unwrap();
+        // A small object and a large one — both backings must be scrubbed.
+        let p = a.allocate_in(high, 64, MIN_ALIGN, RequestFlags::NONE);
+        let big = a.allocate_in(high, SMALL_MAX + 1, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null() && !big.is_null());
+        // High-domain "secrets".
+        // SAFETY: `p`/`big` are live with at least these many usable bytes.
+        unsafe {
+            ptr::write_bytes(p, 0xAB, 64);
+            ptr::write_bytes(big, 0xAB, SMALL_MAX + 1);
+        }
+
+        // Reset force-retires the arena's spans/larges; each backing is scrubbed
+        // before it returns to the shared pool (still mapped under the Retain policy).
+        let _ = treset(&a, high).expect("reset");
+        assert!(!a.owns(p) && !a.owns(big), "reset invalidated the objects");
+
+        // White-box: the (still-mapped) backings no longer hold the secret.
+        // SAFETY: the freed extents stay backed under Retain; we read raw bytes.
+        let small_bytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        // SAFETY: as above — `big`'s freed extent stays backed under Retain.
+        let large_bytes = unsafe { core::slice::from_raw_parts(big, SMALL_MAX + 1) };
+        assert!(
+            small_bytes.iter().all(|&b| b == 0),
+            "§36.12: a non-PUBLIC arena's small backing must be scrubbed before downgrade"
+        );
+        assert!(
+            large_bytes.iter().all(|&b| b == 0),
+            "§36.12: a non-PUBLIC arena's large backing must be scrubbed before downgrade"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// W18-6 defence-in-depth: with `secure-scrub` compiled in, **even a PUBLIC**
+    /// arena's backing is scrubbed on release — not only the non-PUBLIC arenas the
+    /// §36.12 MUST already covers.
+    #[cfg(feature = "secure-scrub")]
+    #[test]
+    fn secure_scrub_zeroes_even_a_public_arena_on_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A PUBLIC-label arena (the default for `explicit()`).
+        let pub_arena = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let p = a.allocate_in(pub_arena, 64, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null());
+        // SAFETY: 64 usable bytes.
+        unsafe { ptr::write_bytes(p, 0xCD, 64) };
+        let _ = treset(&a, pub_arena).expect("reset");
+        // SAFETY: still mapped under Retain; raw read of the scrubbed backing.
+        let bytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "secure-scrub zeroes a PUBLIC arena's backing too (defence-in-depth)"
+        );
         assert!(a.check_invariants());
     }
 

@@ -876,6 +876,14 @@ struct ArenaAtomics {
     /// the table lock at create/configure; **survives a reset** (placement config is
     /// sticky). Purely a policy value: a wrong read loses locality, never correctness.
     numa: AtomicU64,
+    /// The arena's information-flow [`Label`] (§36.12), mirrored from
+    /// [`ArenaMeta::label`] so the retire/teardown path can read it **lock-free**
+    /// (W18-6 scrub-before-downgrade). Set under the table lock at create/delegate
+    /// and fixed for the incarnation (a delegate cannot downgrade the label, and
+    /// `configure` never changes it — §36.4); a reset preserves it. The scrub
+    /// decision keys on `label != PUBLIC`, so a stale read could only over-scrub
+    /// (never under-scrub a live incarnation), keeping it safety-conservative.
+    label: AtomicU32,
 }
 
 impl ArenaAtomics {
@@ -894,6 +902,7 @@ impl ArenaAtomics {
             numa_bind_failures: AtomicU64::new(0),
             hook_slot: AtomicU8::new(0),
             numa: AtomicU64::new(NumaPolicy::OsDefault.encode()),
+            label: AtomicU32::new(Label::PUBLIC.0),
         }
     }
 }
@@ -1008,6 +1017,7 @@ impl ArenaTable {
             .store(Generation::FIRST.next().0, Ordering::Relaxed);
         a.quota_limit.store(p.quota_limit, Ordering::Relaxed);
         a.numa.store(p.numa.encode(), Ordering::Relaxed);
+        a.label.store(p.label.0, Ordering::Relaxed);
         // SAFETY: no other thread can observe `table` before `new` returns, so the
         // single-threaded initialization of `meta[0]` needs no lock.
         unsafe {
@@ -1142,6 +1152,9 @@ impl ArenaTable {
         a.hook_slot.store(0, Ordering::Relaxed);
         // The §15.5 placement policy (read lock-free on the alloc path, W13).
         a.numa.store(policy.numa.encode(), Ordering::Relaxed);
+        // The §36.12 information-flow label (read lock-free on the retire/teardown
+        // path, W18-6 scrub-before-downgrade).
+        a.label.store(policy.label.0, Ordering::Relaxed);
         // Initializing: descriptive fields written before the id is published.
         a.state
             .store(ArenaState::Initializing as u8, Ordering::Relaxed);
@@ -1664,6 +1677,17 @@ impl ArenaTable {
         match self.slot(arena) {
             Some(a) => NumaPolicy::decode(a.numa.load(Ordering::Relaxed)),
             None => NumaPolicy::OsDefault,
+        }
+    }
+
+    /// `arena`'s information-flow [`Label`] (§36.12), read **lock-free** from the
+    /// per-arena atomic — so the retire/teardown path can decide scrub-before-
+    /// downgrade (W18-6) without taking the table lock. An out-of-range id reads as
+    /// [`PUBLIC`](Label::PUBLIC) (the lowest domain, never triggering a scrub).
+    pub fn label_of(&self, arena: ArenaId) -> Label {
+        match self.slot(arena) {
+            Some(a) => Label(a.label.load(Ordering::Relaxed)),
+            None => Label::PUBLIC,
         }
     }
 
