@@ -80,7 +80,8 @@ pub use profile_api::{
     topomalloc_profile_rate, topomalloc_profile_set_rate, topomalloc_profile_sites,
 };
 pub use quarantine_api::{
-    topomalloc_quarantine_bytes, topomalloc_quarantine_enabled, topomalloc_quarantine_objects,
+    topomalloc_guard_sample_rate, topomalloc_guard_set_sample_rate, topomalloc_quarantine_bytes,
+    topomalloc_quarantine_enabled, topomalloc_quarantine_objects,
     topomalloc_quarantine_set_enabled, topomalloc_quarantine_set_limits,
 };
 pub use stats_api::{
@@ -297,6 +298,18 @@ impl AnyAllocator {
     #[cfg(feature = "quarantine")]
     pub fn quarantine_policy(&self) -> topo_core::QuarantinePolicy {
         dispatch!(self, a => a.quarantine_policy())
+    }
+
+    /// Set the W18-4 guarded-allocation sampling rate (§29.5): ~1 in `rate`
+    /// allocations is guarded (`0` = explicit `TOPO_GUARDED` only). No-op without the
+    /// `guard-pages` feature.
+    pub fn set_guard_sample_rate(&self, rate: u64) {
+        dispatch!(self, a => a.set_guard_sample_rate(rate))
+    }
+
+    /// The current guarded-allocation sampling rate (`0` = off).
+    pub fn guard_sample_rate(&self) -> u64 {
+        dispatch!(self, a => a.guard_sample_rate())
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
@@ -675,6 +688,7 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // guard, so an operator can arm the security quarantine at load. Off
                 // unless the env var requests it (and the `quarantine` feature is built).
                 crate::quarantine_api::init_from_env();
+                crate::quarantine_api::guard_init_from_env();
                 INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
                 // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);

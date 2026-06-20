@@ -2165,6 +2165,24 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         Ok(())
     }
 
+    /// W18-4 (§29.5): make the page-aligned sub-range `[addr, addr+len)`
+    /// **inaccessible** (a guard page, `accessible == false`) or restore it
+    /// read-write, via the provider's [`protect`](TopoBackingProvider::protect).
+    /// `addr` must lie in this manager's region. Best-effort: a provider without
+    /// page protection no-ops, so a guard is advisory (never load-bearing for
+    /// correctness, §2.4).
+    pub fn protect_range(
+        &self,
+        addr: usize,
+        len: usize,
+        accessible: bool,
+    ) -> Result<(), ExtentError> {
+        let offset = self.sub_offset(addr);
+        self.provider
+            .protect(self.region, offset, len, accessible)
+            .map_err(ExtentError::Backend)
+    }
+
     /// Lazily purge a **free**, [`Dirty`](ExtentState::Dirty) extent (§20.4): mark
     /// it discardable ([`Muzzy`](ExtentState::Muzzy)); the backing stays mapped and
     /// reuse is still cheap. No-op on a non-dirty extent.

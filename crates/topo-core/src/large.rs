@@ -65,6 +65,11 @@ struct LargeSlot {
     /// `1` ⇒ backed by an [`ExtentRef`] (`backing_id`/`backing_gen`); `0` ⇒
     /// served by the region cache (freed back to the cache, not the extent manager).
     has_extent: u8,
+    /// `1` ⇒ a **guarded** allocation (W18-4, §29.5): the descriptor's object region
+    /// is bracketed by inaccessible guard pages within the extent, and the free path
+    /// restores their protection before recycling. `0` ⇒ a normal allocation. Reset
+    /// on every (re)acquire so a recycled slot never carries a stale guard.
+    guarded: u8,
     /// Unused-slot stack link (valid when the slot is on the free list).
     free_next: u32,
 }
@@ -392,6 +397,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 }
                 None => (*slot).has_extent = 0,
             }
+            (*slot).guarded = 0; // a normal (un-guarded) allocation
         }
         // Publish into the pagemap (the W3-6 mutator). On metadata exhaustion, roll
         // back fully.
@@ -445,6 +451,101 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// uses [`allocate_in_hinted`](Self::allocate_in_hinted) to carry real hints.
     pub fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
         self.allocate_with_in(arena, bytes, align, Hints::default(), self.region_cache)
+    }
+
+    /// Allocate a **guarded** allocation (W18-4, §29.5): the user object sits in a
+    /// committed region bracketed by a leading and a trailing **inaccessible guard
+    /// page**, so an overrun or underrun faults immediately (where the platform
+    /// supports page protection — otherwise the guards are advisory and the
+    /// allocation is still correct, §2.4). Expensive (≥ 3 pages + 2 `mprotect`s per
+    /// object), so the engine only takes this path for an explicit `TOPO_GUARDED`
+    /// request or a sampled allocation. Always **extent-backed** (it bypasses the
+    /// region cache for uniform guard handling). Null on failure.
+    ///
+    /// The descriptor is registered over the **object** region (its base is the user
+    /// pointer, so `free` accepts it and `usable_size` excludes the guards); the slot
+    /// is marked guarded so [`free`](Self::free) restores the guards' protection
+    /// before recycling the extent.
+    pub fn allocate_guarded(&self, arena: ArenaId, size: usize, align: usize) -> *mut u8 {
+        // Object pages + one guard page on each side.
+        let object_pages = size.max(1).div_ceil(PAGE_SIZE);
+        let Some(total_bytes) = object_pages
+            .checked_add(2)
+            .and_then(|p| p.checked_mul(PAGE_SIZE))
+        else {
+            return ptr::null_mut();
+        };
+        // Reserve through the extent manager with no region cache (guards need a real
+        // extent to protect/restore).
+        let (region, backing, _zeroed) = match self.extents.alloc_large(
+            total_bytes,
+            PAGE_SIZE,
+            Hints::default(),
+            &NO_REGION_CACHE,
+        ) {
+            Ok(rb) => rb,
+            Err(_) => return ptr::null_mut(),
+        };
+        let ext_base = region.base as usize;
+        let object_base = ext_base + PAGE_SIZE;
+        let usable = object_pages * PAGE_SIZE;
+        // Protect the leading and trailing guard pages (best-effort; a no-op host
+        // fallback leaves them advisory).
+        let _ = self.extents.protect_range(ext_base, PAGE_SIZE, false);
+        let _ = self
+            .extents
+            .protect_range(object_base + usable, PAGE_SIZE, false);
+
+        let restore_and_free = |me: &Self, backing, region| {
+            // Restore both guards so the recycled extent is fully usable, then free.
+            let _ = me.extents.protect_range(ext_base, PAGE_SIZE, true);
+            let _ = me
+                .extents
+                .protect_range(object_base + usable, PAGE_SIZE, true);
+            me.return_backing(backing, region, &NO_REGION_CACHE, None);
+        };
+
+        self.lock.acquire();
+        // SAFETY: lock held ⇒ exclusive pool access.
+        let pool = unsafe { &mut *self.pool.get() };
+        let (idx, fresh) = match pool.acquire() {
+            Some(v) => v,
+            None => {
+                self.lock.release();
+                restore_and_free(self, backing, region);
+                return ptr::null_mut();
+            }
+        };
+        let id = LargeId(pool.next_id);
+        pool.next_id = pool.next_id.wrapping_add(1);
+        let slot = pool.slot_ptr(idx);
+        // SAFETY: `slot` is a valid pool slot; install-before-publish (F1).
+        unsafe {
+            if fresh {
+                (*slot).desc = LargeDescriptor::new(id, arena, object_base, usable, align);
+            } else {
+                (*slot).desc.recycle(arena, object_base, usable, align);
+            }
+            match backing {
+                Some(ext) => {
+                    (*slot).backing_id = ext.id.0;
+                    (*slot).backing_gen = ext.generation;
+                    (*slot).has_extent = 1;
+                }
+                None => (*slot).has_extent = 0,
+            }
+            (*slot).guarded = 1;
+        }
+        // SAFETY: `slot` is live and initialised; its descriptor is in never-freed metadata.
+        let installed = unsafe { self.pagemap.install_large(self.meta, &(*slot).desc) };
+        if installed.is_err() {
+            pool.release(idx);
+            self.lock.release();
+            restore_and_free(self, backing, region);
+            return ptr::null_mut();
+        }
+        self.lock.release();
+        object_base as *mut u8
     }
 
     /// The owning arena of the live large allocation based at `ptr`, or `None`
@@ -671,9 +772,9 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             self.lock.release();
             return (false, false);
         }
-        // Capture the backing and the region before retiring/recycling.
+        // Capture the backing, the region, and the guard marker before retiring.
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
-        let (backing, region) = unsafe {
+        let (backing, region, guarded) = unsafe {
             let region = Region {
                 base: (*slot).desc.base() as *mut u8,
                 len: (*slot).desc.usable_size(),
@@ -686,14 +787,31 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             } else {
                 None
             };
+            let guarded = (*slot).guarded != 0;
             // Retire the pagemap entry for the *old* address BEFORE the slot can be
             // recycled to a new address (so a classifier never resolves a stale
             // address to a recycled descriptor, §17.2 P-Map-006 / DD-1 F2).
             self.pagemap.retire_large(&(*slot).desc);
-            (backing, region)
+            (backing, region, guarded)
         };
         pool.release(idx);
         self.lock.release();
+
+        // W18-4 (§29.5): restore the leading and trailing guard pages to read-write
+        // *before* the extent is recycled, so the recycled pages are fully usable for
+        // the next allocation. The guard geometry is derived from the object region:
+        // the object base is `region.base`, with one guard page immediately before it
+        // and one immediately after `region.len` (the `allocate_guarded` layout).
+        // Best-effort: a host fallback with no page protection no-ops.
+        if guarded {
+            let object_base = region.base as usize;
+            let _ = self
+                .extents
+                .protect_range(object_base - PAGE_SIZE, PAGE_SIZE, true);
+            let _ = self
+                .extents
+                .protect_range(object_base + region.len, PAGE_SIZE, true);
+        }
 
         // Scrub the freed allocation's user bytes before the backing is returned
         // (and possibly decommitted). Race-free and fault-free here: the pagemap

@@ -714,6 +714,64 @@ impl Default for Quarantine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W18-4 — guarded-allocation sampler (§29.5)
+// ---------------------------------------------------------------------------
+
+/// Decides which allocations receive guard pages (W18-4, §29.5). A `TOPO_GUARDED`
+/// request is always honoured by the engine; this governs the *sampled* fraction of
+/// ordinary allocations: ~1 in `rate` (rate `0` ⇒ explicit requests only — the
+/// default, so the `hardened` build does not pay the ≥3-pages-per-object cost
+/// unasked). Lock-free: one relaxed load on the common (rate 0) path.
+pub struct GuardSampler {
+    rate: AtomicU64,
+    counter: AtomicU64,
+}
+
+impl GuardSampler {
+    /// A fresh sampler with sampling **off** (explicit `TOPO_GUARDED` only).
+    #[must_use]
+    pub const fn new() -> GuardSampler {
+        GuardSampler {
+            rate: AtomicU64::new(0),
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Sample ~1 in `rate` allocations (`0` disables sampling).
+    #[inline]
+    pub fn set_rate(&self, rate: u64) {
+        self.rate.store(rate, Ordering::Relaxed);
+    }
+
+    /// The current sampling rate (`0` = off).
+    #[inline]
+    #[must_use]
+    pub fn rate(&self) -> u64 {
+        self.rate.load(Ordering::Relaxed)
+    }
+
+    /// Whether to guard the next allocation **by sampling** (an explicit request is
+    /// decided by the caller). `false` immediately when sampling is off.
+    #[inline]
+    #[must_use]
+    pub fn sampled(&self) -> bool {
+        let rate = self.rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            return false;
+        }
+        self.counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(rate)
+    }
+}
+
+impl Default for GuardSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

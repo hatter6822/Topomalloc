@@ -64,6 +64,35 @@ pub extern "C" fn topomalloc_quarantine_set_limits(max_bytes: u64, max_objects: 
     }
 }
 
+/// `void topomalloc_guard_set_sample_rate(uint64_t rate)` (§10.5 W18-4, §29.5):
+/// guard ~1 in `rate` ordinary allocations with inaccessible pages (`0` = explicit
+/// `TOPO_GUARDED` only). A no-op without the `guard-pages` feature.
+#[no_mangle]
+pub extern "C" fn topomalloc_guard_set_sample_rate(rate: u64) {
+    if let Some(a) = global() {
+        a.set_guard_sample_rate(rate);
+    }
+}
+
+/// `uint64_t topomalloc_guard_sample_rate(void)` — the current rate (`0` = off).
+#[no_mangle]
+pub extern "C" fn topomalloc_guard_sample_rate() -> u64 {
+    global().map_or(0, |a| a.guard_sample_rate())
+}
+
+/// Honour `$TOPOMALLOC_GUARD_SAMPLE_RATE` at startup (§32.1): a positive integer
+/// sets the guarded-allocation sampling rate. A no-op without the `guard-pages`
+/// feature.
+pub(crate) fn guard_init_from_env() {
+    if let Ok(raw) = std::env::var("TOPOMALLOC_GUARD_SAMPLE_RATE") {
+        if let Ok(rate) = raw.trim().parse::<u64>() {
+            if let Some(a) = global() {
+                a.set_guard_sample_rate(rate);
+            }
+        }
+    }
+}
+
 /// Honour `$TOPOMALLOC_QUARANTINE` at startup (§32.1): a positive integer enables
 /// the quarantine and sets its `max_bytes` budget; `1`/`on`/`true` enables it with
 /// the default budget; `0`/unset leaves it off. Called under the bootstrap guard so

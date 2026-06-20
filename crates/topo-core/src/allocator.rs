@@ -691,6 +691,11 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// separately as `quarantine.bytes`, until a budget evicts them to their real free.
     #[cfg(feature = "quarantine")]
     quarantine: crate::harden::Quarantine,
+    /// W18-4 guarded-allocation sampler (§29.5). **Profile-gated**: present only with
+    /// the `guard-pages` feature. Off by default (explicit `TOPO_GUARDED` only); a
+    /// non-zero rate samples ordinary allocations into the guarded page path.
+    #[cfg(feature = "guard-pages")]
+    guard: crate::harden::GuardSampler,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
@@ -830,6 +835,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             learned: LearnedHints::new(),
             #[cfg(feature = "quarantine")]
             quarantine: crate::harden::Quarantine::new(),
+            #[cfg(feature = "guard-pages")]
+            guard: crate::harden::GuardSampler::new(),
         })
     }
 
@@ -1014,15 +1021,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let Some(req) = classify(size, align, flags.raw()) else {
             return ptr::null_mut();
         };
+        // W18-4 (§29.5): an explicit `TOPO_GUARDED` request or a sampled allocation
+        // takes the guarded page path (own pages bracketed by inaccessible guards),
+        // regardless of size class. A true `false` without the `guard-pages` feature.
+        let guarded = self.want_guarded(flags, req.align);
         // The byte count charged to the arena and recorded — the class's usable
-        // size, or the page-rounded extent length. Compute it (and fail on any
-        // medium/large rounding overflow) *before* any state change.
-        let usable = match req.kind {
-            RequestKind::Small { usable, .. } => usable,
-            RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                match medium_large_usable(size) {
-                    Some(bytes) => bytes,
-                    None => return ptr::null_mut(),
+        // size, or the page-rounded extent length. A guarded object is page-based
+        // whatever its size class. Compute it (and fail on any medium/large rounding
+        // overflow) *before* any state change.
+        let usable = if guarded {
+            match medium_large_usable(size) {
+                Some(bytes) => bytes,
+                None => return ptr::null_mut(),
+            }
+        } else {
+            match req.kind {
+                RequestKind::Small { usable, .. } => usable,
+                RequestKind::Medium { .. } | RequestKind::Large { .. } => {
+                    match medium_large_usable(size) {
+                        Some(bytes) => bytes,
+                        None => return ptr::null_mut(),
+                    }
                 }
             }
         };
@@ -1036,33 +1055,44 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // can elide the `memset` when its extent is freshly OS-zeroed, W15-5); the
         // engine then zeroes only the small + hooked-arena cases below.
         let mut large_self_zeroed = false;
-        let p = match req.kind {
-            RequestKind::Small { sc, .. } => {
-                self.alloc_small(arena, sc, self.small_place_class(&req))
+        let p = if guarded {
+            // The guarded page path (W18-4): own pages with guard pages on each side.
+            // Routed to the same backend a normal large would use, so the free path
+            // (which routes by arena) finds the descriptor in the right pool. Not
+            // self-zeroed — the zeroing/junk-fill block below handles the object.
+            match self.hook_backend(arena) {
+                Some(b) => b.large.allocate_guarded(arena, size, req.align),
+                None => self.large.allocate_guarded(arena, size, req.align),
             }
-            RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                // Route to the arena's own hooked large backing if it has one (W10);
-                // otherwise the shared backend, carrying the request's placement hints
-                // so a wired hugepage backend packs by hotness/lifetime (W11) and a live
-                // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
-                // the router need not know the arena). A hooked arena's custom backing
-                // does not place by hints (it is the user's memory source), so it takes
-                // the hint-less trait path — and the engine zeroes it (no commit-zeroed
-                // promise from a user backing).
-                match self.hook_backend(arena) {
-                    Some(b) => b.large.allocate_in(arena, usable, req.align),
-                    None => {
-                        let mut hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
-                        // W14: a placement-unhinted request adopts its bucket's learned
-                        // profile (the live learn → place loop); an explicit hint wins.
-                        let bucket = match req.kind {
-                            RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
-                            _ => SizeClassDist::BUCKET_LARGE,
-                        };
-                        Self::apply_learned(&self.learned, &mut hints, bucket);
-                        large_self_zeroed = true;
-                        self.large
-                            .allocate_in_hinted(arena, usable, req.align, hints)
+        } else {
+            match req.kind {
+                RequestKind::Small { sc, .. } => {
+                    self.alloc_small(arena, sc, self.small_place_class(&req))
+                }
+                RequestKind::Medium { .. } | RequestKind::Large { .. } => {
+                    // Route to the arena's own hooked large backing if it has one (W10);
+                    // otherwise the shared backend, carrying the request's placement hints
+                    // so a wired hugepage backend packs by hotness/lifetime (W11) and a live
+                    // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
+                    // the router need not know the arena). A hooked arena's custom backing
+                    // does not place by hints (it is the user's memory source), so it takes
+                    // the hint-less trait path — and the engine zeroes it (no commit-zeroed
+                    // promise from a user backing).
+                    match self.hook_backend(arena) {
+                        Some(b) => b.large.allocate_in(arena, usable, req.align),
+                        None => {
+                            let mut hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
+                            // W14: a placement-unhinted request adopts its bucket's learned
+                            // profile (the live learn → place loop); an explicit hint wins.
+                            let bucket = match req.kind {
+                                RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
+                                _ => SizeClassDist::BUCKET_LARGE,
+                            };
+                            Self::apply_learned(&self.learned, &mut hints, bucket);
+                            large_self_zeroed = true;
+                            self.large
+                                .allocate_in_hinted(arena, usable, req.align, hints)
+                        }
                     }
                 }
             }
@@ -1082,8 +1112,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // §31.5 exact medium/large internal fragmentation (W17-4): record the *requested*
         // size on the large descriptor so `usable − requested` is exact. Routed to the same
         // backend the allocation came from (hooked arena's own, or the shared large path); a
-        // no-op for small objects (sampled instead).
-        if !matches!(req.kind, RequestKind::Small { .. }) {
+        // no-op for small objects (sampled instead). A guarded object is a large descriptor
+        // regardless of its size class, so it is recorded too.
+        if guarded || !matches!(req.kind, RequestKind::Small { .. }) {
             match self.hook_backend(arena) {
                 Some(b) => b.large.note_requested(p, size),
                 None => self.large.note_requested(p, size),
@@ -1627,6 +1658,51 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     #[cfg(feature = "quarantine")]
     pub fn quarantine_policy(&self) -> crate::harden::QuarantinePolicy {
         self.quarantine.policy()
+    }
+
+    /// Whether this request should take the **guarded** page path (W18-4, §29.5): an
+    /// explicit `TOPO_GUARDED` flag, or a sampled allocation. Limited to
+    /// `align <= PAGE_SIZE` (the guarded object is placed on a page boundary; a
+    /// larger alignment falls back to the normal path — best-effort, §2.4). A true
+    /// `false` without the `guard-pages` feature.
+    #[cfg(feature = "guard-pages")]
+    #[inline]
+    fn want_guarded(&self, flags: RequestFlags, align: usize) -> bool {
+        align <= PAGE_SIZE && (flags.hints().guarded || self.guard.sampled())
+    }
+
+    #[cfg(not(feature = "guard-pages"))]
+    #[inline]
+    fn want_guarded(&self, _flags: RequestFlags, _align: usize) -> bool {
+        false
+    }
+
+    /// Set the guarded-allocation **sampling** rate (W18-4, §29.5): ~1 in `rate`
+    /// ordinary allocations is guarded (`0` = explicit `TOPO_GUARDED` only — the
+    /// default). A no-op without the `guard-pages` feature.
+    pub fn set_guard_sample_rate(&self, rate: u64) {
+        #[cfg(feature = "guard-pages")]
+        {
+            self.guard.set_rate(rate);
+        }
+        #[cfg(not(feature = "guard-pages"))]
+        {
+            let _ = rate;
+        }
+    }
+
+    /// The current guarded-allocation sampling rate (`0` = off). `0` without the
+    /// `guard-pages` feature.
+    #[inline]
+    pub fn guard_sample_rate(&self) -> u64 {
+        #[cfg(feature = "guard-pages")]
+        {
+            self.guard.rate()
+        }
+        #[cfg(not(feature = "guard-pages"))]
+        {
+            0
+        }
     }
 
     /// Try to hold a freed **small** object in the quarantine (§29.4, W18-3).
@@ -4562,6 +4638,80 @@ mod tests {
         );
         let s = a.stats();
         assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): an explicit `TOPO_GUARDED` request takes the guarded page path
+    /// — its own pages bracketed by guard pages — regardless of size class. Here the
+    /// in-crate `HostProvider` has no page protection, so the guards are *advisory*
+    /// (the real `mprotect` trap is exercised in the POSIX integration tests); this
+    /// pins the mechanism: a guarded object is page-based, writable, owned, and frees
+    /// cleanly (restoring the guards before recycling). Invariants hold throughout.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_is_page_based_writable_and_frees() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // A small request, forced guarded, becomes a page-based guarded allocation
+        // (not a slab object): usable is page-rounded and it is a large descriptor.
+        let p = a.allocate_in(ArenaId::DEFAULT, 100, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        assert!(a.owns(p));
+        assert_eq!(a.usable_size(p), Some(PAGE_SIZE), "one object page");
+        assert_eq!(a.live_large_count(), 1, "guarded ⇒ a large descriptor");
+        // Writable across the whole object.
+        // SAFETY: `p` has at least 100 usable bytes.
+        unsafe { ptr::write_bytes(p, 0x42, 100) };
+
+        // A multi-page guarded request.
+        let big = a.allocate_in(ArenaId::DEFAULT, 3 * PAGE_SIZE + 1, MIN_ALIGN, guarded);
+        assert!(!big.is_null());
+        assert_eq!(
+            a.usable_size(big),
+            Some(align_up(3 * PAGE_SIZE + 1, PAGE_SIZE).unwrap())
+        );
+
+        // Both free cleanly (guard restore + extent recycle); invariants hold and the
+        // freed accounting reconciles.
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, big), FreeOutcome::Freed);
+        assert_eq!(a.live_large_count(), 0);
+        let s = a.stats();
+        assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): the guarded-allocation **sampler** routes ordinary allocations
+    /// to the guarded page path at the configured rate (rate `1` guards every one);
+    /// rate `0` restores the normal path.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guard_sampling_routes_to_the_guarded_path() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // Off by default: a small allocation is a slab object (not page-based).
+        assert_eq!(a.guard_sample_rate(), 0);
+        let unsampled = a.malloc(64);
+        assert!(a.usable_size(unsampled).unwrap() < PAGE_SIZE, "slab object");
+        assert_eq!(tfree(&a, unsampled), FreeOutcome::Freed);
+
+        // Rate 1 guards every allocation ⇒ even a 64-byte request is page-based.
+        a.set_guard_sample_rate(1);
+        assert_eq!(a.guard_sample_rate(), 1);
+        let sampled = a.malloc(64);
+        assert_eq!(
+            a.usable_size(sampled),
+            Some(PAGE_SIZE),
+            "guarded ⇒ one page"
+        );
+        assert_eq!(tfree(&a, sampled), FreeOutcome::Freed);
+
+        a.set_guard_sample_rate(0);
         assert!(a.check_invariants());
     }
 
