@@ -320,6 +320,7 @@ where
     unsafe { core::ptr::write_bytes(p, 0xAB, 200) };
 
     // Reset force-retires the arena's span; its backing is scrubbed before recycle.
+    // SAFETY: the arena is quiesced (single-threaded test; no concurrent ops on it).
     let _ = unsafe { a.arena_reset(high) }.expect("reset");
     assert!(!a.owns(p), "reset invalidated the object");
     // White-box: the still-mapped backing no longer holds the secret.

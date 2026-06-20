@@ -190,7 +190,7 @@ pub unsafe fn verify_free_pattern(ptr: *const u8, len: usize) -> bool {
 /// label is an information-flow *MUST* (§36.12), not a debugging aid, so the
 /// primitive must exist in every profile. The `secure-scrub` feature governs only
 /// *how aggressively* the allocator chooses to invoke it (see
-/// [`scrub_before_downgrade`]).
+/// [`must_scrub_for_relabel`]).
 ///
 /// The trailing [`compiler_fence`] keeps the zeroing from being reordered after a
 /// subsequent revoke/relabel, so a reader at the new label can never observe the
