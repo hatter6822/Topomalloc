@@ -486,6 +486,35 @@ fn sampling_lifecycle_off_then_live_then_concurrent() {
     assert!(stats.alloc_samples > 0, "sampling fired on real traffic");
     assert!(stats.sites_tracked > 0, "at least one site was attributed");
 
+    // §31.5 sampled internal fragmentation (W17-4): an odd-sized batch kept *live* accumulates
+    // `usable − requested` waste in the live sampled set. Pick a size that is not a size-class
+    // boundary so every object genuinely wastes bytes.
+    let waste_size = 100usize;
+    let predicted =
+        topo_core::predicted_usable_size(waste_size, 16, topo_core::RequestFlags::NONE).unwrap();
+    assert!(
+        predicted > waste_size,
+        "the test size must have internal fragmentation (usable {predicted} > {waste_size})"
+    );
+    let held: Vec<*mut core::ffi::c_void> = (0..8000)
+        .map(|_| topomalloc_malloc(waste_size))
+        .inspect(|p| assert!(!p.is_null()))
+        .collect();
+    let frag_live = topo_abi::sampling::sampled_internal_fragmentation_bytes();
+    assert!(
+        frag_live > 0,
+        "live sampled odd-sized objects accumulate internal fragmentation"
+    );
+    for p in held {
+        // SAFETY: each `p` is a live `topomalloc_malloc(100)` allocation we still own.
+        unsafe { topomalloc_free(p) };
+    }
+    // Freeing the sampled objects removes their waste from the live set: fragmentation drops.
+    assert!(
+        topo_abi::sampling::sampled_internal_fragmentation_bytes() < frag_live,
+        "freeing sampled objects releases their internal-fragmentation accounting"
+    );
+
     // The profile dump is well-formed JSON; the C buffer contract agrees on length.
     let json = topo_abi::sampling::dump_json();
     let v: serde_json::Value = serde_json::from_str(&json).expect("dump is valid JSON");

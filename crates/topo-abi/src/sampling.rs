@@ -35,8 +35,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use topo_core::{
-    classify, PlacementStats, RequestFlags, RequestKind, SampleBloom, SampleConfig, SampledObjects,
-    SampledRecord, Sampler, SiteProfileTable, SizeClassDist, StackBuf, StackId,
+    classify, predicted_usable_size, PlacementStats, RequestFlags, RequestKind, SampleBloom,
+    SampleConfig, SampledObjects, SampledRecord, Sampler, SiteProfileTable, SizeClassDist,
+    StackBuf, StackId,
 };
 
 /// Distinct allocation sites the profile table holds (§24.4). Bounded and inline; see the
@@ -255,9 +256,16 @@ fn sample_alloc_slow(ptr: *mut u8, size: usize, align: usize, flags: RequestFlag
     let now = now_ms();
     let bucket = bucket_of(size, align, flags);
     let hotness = flags.hints().hotness;
+    // The usable size the allocator actually returned, computed *purely* from the request
+    // (the §10.3 `nallocx` oracle) — no allocator call-back, so the must-not-allocate
+    // sampled path stays alloc-free (§31.4). `usable >= size`; the difference is this
+    // object's §31.5 internal fragmentation (W17-4). `None` can't occur (the allocation
+    // succeeded), but fall back to `size` (zero waste) for total safety.
+    let usable = predicted_usable_size(size, align, flags).unwrap_or(size) as u64;
     let rec = SampledRecord {
         stack_id,
         bytes: size as u64,
+        usable,
         alloc_ms: now,
     };
     let st = state();
@@ -378,6 +386,29 @@ pub fn placement_stats() -> PlacementStats {
             g.profiles.stats()
         }
         None => PlacementStats::default(),
+    }
+}
+
+/// The **sampled internal-fragmentation** estimate (§31.5, W17-4): the sum over the live
+/// sampled objects of `usable − requested`. Computed on demand over the live set (the slow
+/// stats path), so it is exact for the *current* live sample by construction — no
+/// incremental accumulator to drift across the duplicate-overwrite / capacity-drop /
+/// censor-at-dump edges. `0` when profiling was never enabled (no samples ⇒ no estimate).
+///
+/// This is a *sampled* metric: it is the internal fragmentation of the objects the sampler
+/// happens to be tracking, not a scaled estimate of the whole heap (§31.5 "MAY sample it in
+/// performance mode"). With sampling off it is `0`, exactly as the rest of the profiler.
+pub fn sampled_internal_fragmentation_bytes() -> u64 {
+    match STATE.get() {
+        Some(m) => {
+            let g = m.lock().unwrap_or_else(|e| e.into_inner());
+            let mut frag: u64 = 0;
+            g.objects.for_each(|rec| {
+                frag = frag.saturating_add(rec.usable.saturating_sub(rec.bytes));
+            });
+            frag
+        }
+        None => 0,
     }
 }
 

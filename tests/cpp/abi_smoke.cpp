@@ -226,6 +226,26 @@ int main() {
         assert(topo_arena_create_hooked(nullptr, nullptr, 0, 0) == 0);
     }
 
+    // Statistics & observability (§31, plan 07 W17): the snapshot struct + JSON +
+    // explain entry points are usable from C++ and reconcile.
+    {
+        static_assert(sizeof(topomalloc_stats_t) == 20u * sizeof(uint64_t),
+                      "topomalloc_stats_t layout changed");
+        topomalloc_stats_t st{};
+        assert(topomalloc_stats_snapshot(&st, TOPOMALLOC_STATS_SUMMARY) == 0);
+        assert(st.epoch >= 1u);
+        assert(st.virtual_bytes == st.active_bytes + st.pageheap_free_bytes);
+        assert(st.pageheap_free_bytes ==
+               st.retained_bytes + st.dirty_bytes + st.muzzy_bytes + st.released_bytes);
+        char json[8192];
+        const std::size_t got = topomalloc_stats_json(json, sizeof json, TOPOMALLOC_STATS_BY_ARENA);
+        assert(got > 0u && got < sizeof json);
+        assert(std::strstr(json, "\"fragmentation\":") != nullptr);
+        char explain[512];
+        assert(topomalloc_explain_memory(explain, sizeof explain) > 0u);
+        assert(std::strstr(explain, "RSS is attributed to") != nullptr);
+    }
+
     std::printf("C++ ABI smoke: OK (version=%s, %u size classes)\n",
                 topomalloc_version(),
                 static_cast<unsigned>(TOPOMALLOC_NUM_SIZE_CLASSES));

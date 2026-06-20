@@ -42,7 +42,7 @@ use crate::arena::NumaPolicy;
 use crate::backend::{Region, TopoBackingProvider};
 use crate::extent::{BackendLock, RegionCacheHook};
 use crate::flags::{Hints, HugepagePolicy};
-use crate::huge::{HugePageBackend, HUGEPAGE_SIZE};
+use crate::huge::{HugePageBackend, HugeStats, HUGEPAGE_SIZE};
 use crate::ids::{ArenaId, NodeId};
 use crate::pinned::CoreProvider;
 use crate::topology::{NodePressure, RebalanceMove, Rebalancer, Topology, MAX_NODES};
@@ -336,6 +336,25 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
         }
     }
 
+    /// Aggregate §19.7 hugepage coverage across **every** backend — the per-node bound
+    /// backends and the unbound default (first-touch) backend — into one total (plan 07
+    /// W17-4). Each hugepage is owned by exactly one backend (H-003 within each, and the
+    /// backends partition the address space), so the field-wise sum double-counts nothing
+    /// and `sum(bin_counts)` still equals `coverage_bytes / hugepage_size`. The live
+    /// coverage the engine's stats JSON reports under the `hugepage` block.
+    pub fn coverage(&self) -> HugeStats {
+        let mut total = HugeStats::default();
+        for i in 0..self.n_nodes {
+            if let Some(b) = self.backend(i) {
+                total = total.add(b.coverage());
+            }
+        }
+        if let Some(def) = self.default_backend.as_ref() {
+            total = total.add(def.coverage());
+        }
+        total
+    }
+
     /// Whether every backend is well-formed — the per-node backends and the unbound default
     /// (delegates to each filler's §19.8 invariant check) — for debug assertions and tests.
     pub fn check_invariants(&self) -> bool {
@@ -504,6 +523,9 @@ pub trait RouterControl: Send + Sync {
     fn release_idle(&self, reserve_per_node: usize) -> usize;
     /// A snapshot of the router's running counters (§15.5). See [`NodeRouter::stats`].
     fn stats(&self) -> NodeRouterStats;
+    /// Aggregate §19.7 hugepage coverage across every backend (plan 07 W17-4). See
+    /// [`NodeRouter::coverage`].
+    fn coverage(&self) -> HugeStats;
 }
 
 impl<P: TopoBackingProvider + Send + Sync, C: CoreProvider + Send + Sync> RouterControl
@@ -524,6 +546,10 @@ impl<P: TopoBackingProvider + Send + Sync, C: CoreProvider + Send + Sync> Router
     #[inline]
     fn stats(&self) -> NodeRouterStats {
         NodeRouter::stats(self)
+    }
+    #[inline]
+    fn coverage(&self) -> HugeStats {
+        NodeRouter::coverage(self)
     }
 }
 

@@ -303,8 +303,15 @@ impl StackBuf {
 pub struct SampledRecord {
     /// The site that allocated it.
     pub stack_id: StackId,
-    /// Its usable byte size.
+    /// The **requested** byte size (what the application asked for) — the heap-profile
+    /// quantity reported as `sampled_live_bytes`, and the left operand of the §31.5
+    /// internal-fragmentation estimate `usable − bytes`.
     pub bytes: u64,
+    /// The **usable** byte size the allocator actually handed back (`>= bytes`). The
+    /// difference `usable − bytes` is this object's internal fragmentation (§31.5,
+    /// W17-4); summed over the live sampled set it is the sampled internal-fragmentation
+    /// metric.
+    pub usable: u64,
     /// The time (ms) it was allocated, for lifetime resolution.
     pub alloc_ms: u64,
 }
@@ -323,6 +330,7 @@ impl ObjSlot {
         rec: SampledRecord {
             stack_id: StackId::UNKNOWN,
             bytes: 0,
+            usable: 0,
             alloc_ms: 0,
         },
     };
@@ -687,6 +695,7 @@ mod tests {
         let rec = SampledRecord {
             stack_id: StackId(5),
             bytes: 4096,
+            usable: 4096,
             alloc_ms: 100,
         };
         assert!(set.on_alloc(0x4000, rec));
@@ -722,6 +731,7 @@ mod tests {
                 let rec = SampledRecord {
                     stack_id: StackId(addr as u64),
                     bytes: 64,
+                    usable: 64,
                     alloc_ms: 0,
                 };
                 if set.on_alloc(addr, rec) && !present.contains(&addr) {
@@ -755,6 +765,7 @@ mod tests {
                 SampledRecord {
                     stack_id: StackId(k as u64 + 1),
                     bytes: 64,
+                    usable: 64,
                     alloc_ms: 0,
                 },
             );

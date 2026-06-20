@@ -63,6 +63,20 @@ initialization phases; graceful extent-hook re-entrancy handling (a re-entrant
 hook's `malloc`/`free`/`realloc` is declined before any lock, never deadlocked);
 and a lock-free, allocation-free crash summary (`topomalloc_crash_summary`, §28.4).
 
+**Observability (W17) is landed**: an epoch-stamped, machine-readable snapshot
+that answers "where is the memory?" (§31.1) — every byte class (app, caches,
+central, the §20.1 backend split active/retained/dirty/muzzy/released, metadata,
+quarantine, hugepage coverage, per-arena, destroyed-arena count) plus §31.5
+fragmentation metrics — over the C `topomalloc_stats_json` / `_print` / `_snapshot`
+API with the §31.2 selection flags (`SUMMARY`/`BY_ARENA`/`BY_SIZE_CLASS`/…),
+additive JSON (§35.3), a human-readable `topomalloc_explain_memory()` RSS
+attribution (§31.6), and §36.12 label-scoped redaction (a low domain cannot infer
+a high domain's pattern — the Rust analogue of the proved `stats_observation_noninterference`).
+The §8.6 reconciliation identities (`virtual == active + pageheap_free`,
+`pageheap_free == retained + dirty + muzzy + released`) are a fixed-wall test, live
+and under concurrency. The minimal heap-sampling slice (W17-3, off by default)
+feeds the lifetime/hotness placement policy (W14) from real traffic.
+
 ## Quick start
 
 ```sh
@@ -112,11 +126,11 @@ are co-equal behind it from M1, so the core allocator is OS-agnostic and
 | Crate | Role | License |
 |-------|------|---------|
 | `topo-core` | classifier, size classes, seam, metadata, pagemap, extents, central-path allocator, capability-backed arena registry | MIT |
-| `topo-abi` | C/C++/Rust ABI surface (malloc, free, GlobalAlloc, C23, `topo_*x`) | MIT |
+| `topo-abi` | C/C++/Rust ABI surface (malloc, free, GlobalAlloc, C23, `topo_*x`, the `topomalloc_stats_*` / `explain_memory` observability surface, sampling control) | MIT |
 | `topo-backend-posix` | POSIX backend — mmap/madvise/mprotect | MIT |
 | `topo-backend-sele4n` | seLe4n simulator + (M1) real seLe4n ABI backend | GPL-3.0-or-later |
 | `topo-arch` | per-arch RSEQ assembly (x86-64, AArch64), fast-path mode selector | MIT |
-| `topo-stats` | statistics, JSON snapshots, version wiring | MIT |
+| `topo-stats` | statistics snapshot + flags, additive Appendix-D JSON, `explain` / label-scoped redaction, version wiring | MIT |
 | `topo-control` | configuration sources, control namespace | MIT |
 | `topo-test-support` | trace grammar, `LiveModel` oracle, deterministic PRNG | MIT |
 

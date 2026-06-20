@@ -261,6 +261,10 @@ pub struct AllocatorStats {
     /// arenas, per kind (§23, plan 06 W10). All zero unless a hooked arena's backing
     /// has faulted (and zero entirely for a program with no hooked arenas).
     pub hook_failures: HookFailureStats,
+    /// Cumulative arenas destroyed over the engine's lifetime (§31.1
+    /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may later
+    /// be recycled (§36.13), so this is an event count, not `created − live`.
+    pub arenas_destroyed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,6 +2384,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ok
     }
 
+    /// Visit each size class's central-resident free bytes — the per-class decomposition
+    /// of [`AllocatorStats::central_free_bytes`] for the §31.2 `BY_SIZE_CLASS` detail
+    /// view (plan 07 W17-2): `f(class_index, object_size, central_free_bytes)` for every
+    /// class. Lock-free approximate reads, exact when quiescent (§31.1) — exactly as
+    /// [`stats`](Self::stats) sums them. Touches only the shared backend's central lists.
+    pub fn for_each_size_class_central_free<F: FnMut(usize, u32, u64)>(&self, mut f: F) {
+        for (i, row) in SIZE_CLASSES.iter().enumerate() {
+            let free = self
+                .central
+                .bin(SizeClassId::new(i))
+                .map_or(0, |bin| bin.total_central_free() * row.size as u64);
+            f(i, row.size, free);
+        }
+    }
+
     /// Take a statistics snapshot (§31.1; the W8 DoD "state exposes stats and
     /// reconciles" surface). See [`AllocatorStats`] for the field semantics
     /// and consistency model.
@@ -2436,6 +2455,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
+            arenas_destroyed: self.arenas.destroyed_count(),
         }
     }
 

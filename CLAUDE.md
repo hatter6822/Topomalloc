@@ -361,8 +361,46 @@ example asserts the steady-state path runs at depth 1) + TLS-via-`dlopen` (`tls_
 hook-re-entry fail-safe test, and a TSan pass over the whole `topo-core` lib. The per-op gate (~13 ns,
 `benches/fork_gate.rs`) is the M2 fork-safety cost; per-CPU sharding removes the contended cacheline.
 
+Observability: stats, telemetry & profiling (W17) completes plan 07's observability track ahead of its M6
+slot. The pure renderer is `topo-stats` and the live C surface is `crates/topo-abi/src/stats_api.rs`. **W17-1a
+(stats core):** the §31.1 "where is the memory?" snapshot now carries *every* byte class as a non-negative
+`u64` — the §20.1 `backend.active_bytes` / `retained_bytes` distinction (Retained = the extent manager's
+`reserved`, distinct from advised-away `released`), `quarantine.bytes` (present, `0` until plan 08 wires byte
+accounting), and `arena.destroyed` (a real cumulative `ArenaTable::destroyed_count`, bumped at each
+`*→Destroyed` and never derivable from the recycled slot states) — beside the existing app/cache/central/
+hugepage/release/topology/placement blocks. **W17-1b (epoch + consistent snapshot):** a process-global
+monotonic `STATS_EPOCH` stamps every composed snapshot (§8.6 "MUST include an epoch or sequence number"),
+with `CONSISTENT_SNAPSHOT` the §31.2 read-mode flag; the §8.6 reconciliation convention is documented and
+**pinned by a fixed-wall test** (`tests/tests/stats.rs`) — `virtual == active + pageheap_free` and
+`pageheap_free == retained + dirty + muzzy + released` hold *algebraically* (even under a torn concurrent
+read), and `live + central_free <= active`, `live == allocated − freed` hold at any quiescent point, proven
+over a live allocator sequentially **and** under concurrent load that then quiesces. **W17-2 (snapshot/JSON/
+print API + flags):** the C `topomalloc_stats_json` / `_print(FILE*)` / `_snapshot(topomalloc_stats_t*)` trio
+(+ `_json_for_label`) renders a **live-composed** snapshot — allocator byte classes + the heap sampler + (under
+`hugepage-optimized`) the live NUMA router's §15/§19.7 coverage via the new `NodeRouter::coverage` /
+`RouterControl::coverage` — selected by `StatsFlags` (the eight §31.2 bits), with `BY_ARENA` per-arena lines
+(reconciling with `arenas.count`) and `BY_SIZE_CLASS` per-class central-free (summing to `central.free_bytes`);
+the JSON is additive (§35.3) and the `#[repr(C)] topomalloc_stats_t` struct + flag bits are frozen by the
+two-sided ABI smoke tests. **W17-4 (fragmentation):** a `fragmentation` block — `internal_sampled_bytes` (the
+§31.5 `Σ(usable − requested)` over the **live sampled set**, the sampler now recording `usable` on each
+`SampledRecord` and the sum computed on demand so it is exact for the live set and `0` when sampling is off),
+`external_bytes` (dirty + muzzy), `cache_bytes`, `hugepage_bytes` (§19.7), `metadata_overhead_bytes`. **W17-5
+(`explain_memory`):** `topomalloc_explain_memory()` + `Stats::explain()` render "RSS is attributed to: 2.5 GiB
+live, 700.0 MiB per-CPU cache, 1.4 GiB dirty retained, …" — byte classes named largest-first in integer-only
+binary units, decommitted bytes noted apart as managed-VM-not-RSS, idle made explicit. **W17-6 (label-scoped
+redaction, §36.12):** a pure `redact_arenas(lines, observer_label)` keeps only the arenas an observer
+dominates (`label <= observer`) and the C `topomalloc_stats_json_for_label` applies it to the `BY_ARENA`
+detail; pinned by `redaction_is_label_noninterference` (adding/changing any *higher*-labelled arena leaves the
+low view bit-for-bit identical) — the Rust analogue of the proved Lean `stats_observation_noninterference`.
+Stats are **derived observability, not an abstract §33.4 transition**, so there is **no Lean obligation**
+(the reconciliation is the fixed-wall test above, the redaction the cited non-interference theorem). The new
+keys reconcile into the `topo.stats.*` / `topo.backend.*` / `topo.quarantine.*` / `topo.fragmentation.*`
+control namespace (W20). The broader stats epoch *snapshot-isolation* (a seqlock over the fast path) and the
+seLe4n resource-server-enforced per-label aggregate scoping remain deferred (the §8.6 bounded-skew convention
++ the per-arena redaction cover the POSIX profile today).
+
 **Test counts:**
-- Rust: ~766 tests across 12 crates (`cargo test --workspace`)
+- Rust: ~790 tests across 12 crates (`cargo test --workspace`)
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
 - Fuzzing: 9 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, and `placement`)
@@ -386,11 +424,11 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
 | `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13), the lifetime/hotness/site-profile placement policy + the heap-sampling machinery (W14 + W17-3) | MIT | Yes |
-| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, the `topomalloc_profile_*` sampling control surface (W17-3), live sampler glue, errno, Rust `GlobalAlloc` | MIT | No |
+| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, the `topomalloc_stats_*` / `topomalloc_explain_memory` observability surface (§31, W17) + live snapshot composer, the `topomalloc_profile_*` sampling control surface (W17-3), live sampler glue, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery; `OsCore` — `sched_getcpu` current-CPU oracle (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
-| `topo-stats` | statistics snapshot, additive JSON, version wiring | MIT | Yes |
+| `topo-stats` | statistics snapshot + §31.2 flags, additive Appendix-D JSON, §31.6 `explain`, §36.12 label-scoped redaction, version wiring | MIT | Yes |
 | `topo-control` | configuration sources, control namespace (Appendix E) | MIT | Yes |
 | `topo-test-support` | trace grammar parser, `LiveModel` oracle, deterministic PRNG | MIT | No |
 
@@ -473,11 +511,11 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 topomalloc/
 ├── crates/
 │   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, hugepage filler, placement policy + sampling)
-│   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc, profile/sampling control)
+│   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc, stats/explain + profile/sampling control)
 │   ├── topo-backend-posix/    (mmap/madvise/mprotect — the POSIX backend)
 │   ├── topo-backend-sele4n/   (Sele4nSim + real seLe4n ABI — GPL-3.0-or-later)
 │   ├── topo-arch/             (per-arch RSEQ assembly: x86-64, AArch64)
-│   ├── topo-stats/            (statistics, JSON, version)
+│   ├── topo-stats/            (statistics snapshot + flags, Appendix-D JSON, explain, label redaction, version)
 │   ├── topo-control/          (config sources, control namespace)
 │   └── topo-test-support/     (trace grammar, LiveModel oracle, PRNG)
 ├── tools/

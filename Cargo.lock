@@ -757,9 +757,11 @@ version = "0.1.22"
 dependencies = [
  "criterion",
  "libc",
+ "serde_json",
  "topo-backend-posix",
  "topo-backend-sele4n",
  "topo-core",
+ "topo-stats",
 ]
 
 [[package]]

@@ -327,6 +327,63 @@ int main(void) {
     assert(strstr(summary, "live_bytes=") != NULL);
     assert(topomalloc_crash_summary(NULL, 16u) == 0u);
 
+    /* statistics & observability (Section 31, plan 07 W17). */
+    /* ABI: the snapshot struct layout is frozen (20 uint64_t fields, key offsets). */
+    _Static_assert(sizeof(topomalloc_stats_t) == 20u * sizeof(uint64_t),
+                   "topomalloc_stats_t layout changed");
+    _Static_assert(offsetof(topomalloc_stats_t, epoch) == 0, "epoch moved");
+    _Static_assert(offsetof(topomalloc_stats_t, live_bytes) == 8u, "live_bytes moved");
+    _Static_assert(offsetof(topomalloc_stats_t, virtual_bytes) == 12u * 8u, "virtual_bytes moved");
+    _Static_assert(offsetof(topomalloc_stats_t, arena_destroyed) == 19u * 8u, "arena_destroyed moved");
+    /* flag bits mirror the Rust topo_stats::StatsFlags exactly. */
+    _Static_assert(TOPOMALLOC_STATS_BY_ARENA == 1u, "BY_ARENA bit");
+    _Static_assert(TOPOMALLOC_STATS_BY_HUGEPAGE == 16u, "BY_HUGEPAGE bit");
+    _Static_assert(TOPOMALLOC_STATS_CONSISTENT_SNAPSHOT == 32u, "CONSISTENT_SNAPSHOT bit");
+
+    topomalloc_stats_t st;
+    assert(topomalloc_stats_snapshot(&st, TOPOMALLOC_STATS_SUMMARY) == 0);
+    assert(st.epoch >= 1u);
+    /* Section 8.6 reconciliation identities hold by construction. */
+    assert(st.pageheap_free_bytes ==
+           st.retained_bytes + st.dirty_bytes + st.muzzy_bytes + st.released_bytes);
+    assert(st.virtual_bytes == st.active_bytes + st.pageheap_free_bytes);
+    assert(st.arena_count >= 1u); /* the default arena is always present */
+    /* the epoch advances on the next snapshot (Section 8.6 sequence number). */
+    topomalloc_stats_t st2;
+    assert(topomalloc_stats_snapshot(&st2, 0) == 0 && st2.epoch > st.epoch);
+    assert(topomalloc_stats_snapshot(NULL, 0) == -1); /* NULL out is a clean error */
+
+    /* JSON: a single consistent snapshot into a fixed buffer (no length-query race). */
+    char json[8192];
+    size_t got = topomalloc_stats_json(json, sizeof json, TOPOMALLOC_STATS_BY_ARENA);
+    assert(got > 0u && got < sizeof json);
+    assert(strstr(json, "\"epoch\":") != NULL);
+    assert(strstr(json, "\"by_arena\":") != NULL);
+    assert(strstr(json, "\"quarantine\":") != NULL);
+    assert(strstr(json, "\"fragmentation\":") != NULL);
+    /* a length query (NULL buffer) returns a positive length without writing. */
+    assert(topomalloc_stats_json(NULL, 0, 0) > 0u);
+
+    /* label-scoped JSON: a PUBLIC (0) observer sees the PUBLIC default arena (Section 36.12). */
+    char ljson[8192];
+    size_t lgot = topomalloc_stats_json_for_label(ljson, sizeof ljson, TOPOMALLOC_STATS_BY_ARENA, 0u);
+    assert(lgot > 0u && lgot < sizeof ljson);
+    assert(strstr(ljson, "\"by_arena\":") != NULL);
+
+    /* explain_memory: a human-readable RSS attribution (Section 31.6). */
+    char explain[512];
+    size_t elen = topomalloc_explain_memory(explain, sizeof explain);
+    assert(elen > 0u);
+    assert(strstr(explain, "RSS is attributed to") != NULL);
+
+    /* print to /dev/null (Section 31.2). */
+    FILE *devnull = fopen("/dev/null", "w");
+    if (devnull) {
+        assert(topomalloc_stats_print(devnull, TOPOMALLOC_STATS_SUMMARY) == 0);
+        fclose(devnull);
+    }
+    assert(topomalloc_stats_print(NULL, 0) == -1); /* NULL stream is a clean error */
+
     printf("C ABI smoke: OK (version=%s, backend=%s, %u size classes)\n",
            v, backend, (unsigned) TOPOMALLOC_NUM_SIZE_CLASSES);
     return 0;

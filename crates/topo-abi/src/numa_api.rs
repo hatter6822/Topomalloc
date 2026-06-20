@@ -32,6 +32,14 @@ pub(crate) fn publish_router(router: &'static dyn RouterControl) {
     let _ = NUMA_ROUTER.set(router);
 }
 
+/// The live router's control handle, or `None` if no router is wired (the default extent
+/// build / single-node host). Used by the stats composer (plan 07 W17) to fold the §15.4/15.5
+/// NUMA counters and the §19.7 live hugepage coverage into the snapshot. Always available
+/// (the publish side is feature-gated; this read side returns `None` when nothing published).
+pub(crate) fn router() -> Option<&'static dyn RouterControl> {
+    NUMA_ROUTER.get().copied()
+}
+
 /// `int topomalloc_numa_rebalance_tick(void)` (§15.4, W13-3): drive **one** cross-domain
 /// rebalancer tick — move a donor node's idle memory toward a starved node, returning the
 /// idle hugepages to the OS. Returns `1` if a move was executed this tick, else `0` (nothing

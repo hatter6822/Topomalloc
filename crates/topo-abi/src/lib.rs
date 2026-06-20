@@ -46,6 +46,7 @@ mod numa_api;
 mod policy;
 mod profile_api;
 pub mod sampling;
+mod stats_api;
 
 pub use arena_api::{
     topo_arena_configure, topo_arena_create, topo_arena_create_ex, topo_arena_delegate,
@@ -76,6 +77,10 @@ pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use profile_api::{
     topomalloc_profile_confident_sites, topomalloc_profile_dump_json, topomalloc_profile_enabled,
     topomalloc_profile_rate, topomalloc_profile_set_rate, topomalloc_profile_sites,
+};
+pub use stats_api::{
+    topomalloc_explain_memory, topomalloc_stats_json, topomalloc_stats_json_for_label,
+    topomalloc_stats_print, topomalloc_stats_snapshot, topomalloc_stats_t,
 };
 
 /// Bytes of metadata arena reserved for the process-wide allocator (POSIX:
@@ -252,6 +257,14 @@ impl AnyAllocator {
     pub fn stats(&self) -> AllocatorStats {
         let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.stats())
+    }
+
+    /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
+    /// detail, plan 07 W17-2): `f(class_index, object_size, central_free_bytes)`.
+    /// The per-class decomposition the stats composer renders under the flag.
+    pub fn for_each_size_class_central_free<F: FnMut(usize, u32, u64)>(&self, f: F) {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.for_each_size_class_central_free(f))
     }
 
     /// A lock-free, allocation-free crash/signal-handler summary (§28.4, W16-6):

@@ -137,6 +137,27 @@ mismatched dealloc, or reentrancy is rejected) — so a backing must, e.g., hono
 the requested alignment (`aligned_alloc`, not bare `malloc`). Destroying the arena
 returns its region to the backing via `dealloc`.
 
+### Statistics & observability (§31, W17)
+
+| Symbol | Semantics |
+|--------|-----------|
+| `topomalloc_stats_t` | the fixed core byte-class snapshot struct — 20 `uint64_t` fields (epoch, application, cache, central, the §20.1 backend split, metadata, quarantine, hugepage coverage, fragmentation, arena counts). Additive across the 0.x series (fields append, never reorder); the layout is pinned by the ABI smoke tests. |
+| `topomalloc_stats_snapshot(out, flags)` | fill `*out` from a fresh live snapshot; `0` on success, `-1` on a NULL `out`. |
+| `topomalloc_stats_json(buf, cap, flags)` | render the snapshot as Appendix-D JSON into `buf` (NUL-terminated, truncated to `cap`); returns the full length (excl. NUL). `buf=NULL`/`cap=0` queries the length. |
+| `topomalloc_stats_json_for_label(buf, cap, flags, observer_label)` | as above, but the `BY_ARENA` detail is **redacted** to the arenas the `observer_label` domain may see (§36.12); a low domain cannot observe a higher domain's arenas. |
+| `topomalloc_stats_print(out, flags)` | write a human-readable dump (the §31.6 explanation + the JSON) to the `FILE* out`; `0` on success, `-1` on a NULL stream / short write. |
+| `topomalloc_explain_memory(buf, cap)` | render a one-line RSS attribution (§31.6, "RSS is attributed to: …") into `buf`; returns the full length. |
+
+`flags` is a `uint64_t` of `TOPOMALLOC_STATS_*` bits (§31.2): `SUMMARY` (0, always
+rendered) plus the additive `BY_ARENA` / `BY_SIZE_CLASS` / `BY_CPU` / `BY_NUMA` /
+`BY_HUGEPAGE` detail selectors and the `CONSISTENT_SNAPSHOT` / `RESET_PEAKS` read
+modes. Unknown bits are ignored (forward-compatible). Every snapshot carries a
+monotonic `epoch` (§8.6); the reconciliation identities `virtual == active +
+pageheap_free` and `pageheap_free == retained + dirty + muzzy + released` hold by
+construction. Sampling-derived fields (`fragmentation.internal_sampled`,
+`placement.*`) are `0` unless heap sampling is enabled
+(`topomalloc_profile_set_rate`).
+
 ### Behavior contracts
 
 * **errno (W8-1b):** allocation failure ⇒ `ENOMEM`; validation failure ⇒
@@ -167,13 +188,16 @@ returns its region to the backing via `dealloc`.
   `GlobalAlloc` adapter relies on). The probes read the span free-bitmap
   lock-free; the authoritative double-free check remains on the locked free
   path.
-* **Stats (§31.1/§8.6):** `AnyAllocator::stats()` snapshots the engine
+* **Stats (§31.1/§8.6, W17):** `AnyAllocator::stats()` snapshots the engine
   (live/allocated/freed usable bytes, central-free bytes, both regions'
-  §20.1 state breakdowns, pagemap metadata bytes, live span/large counts);
-  `topo_stats::Stats::record_allocator` maps it into the Appendix-D JSON.
-  `live == allocated − freed` holds by construction; the reconciliation
-  tests and the `malloc_api` fuzz target assert the rest. A C-callable
-  stats entry point arrives with the plan 07 control surface.
+  §20.1 state breakdowns, pagemap metadata bytes, live span/large counts,
+  the cumulative destroyed-arena count); `topo_stats::Stats::record_allocator`
+  maps it into the Appendix-D JSON. The C `topomalloc_stats_*` family above
+  composes a **live, epoch-stamped** snapshot (engine + heap sampler + the live
+  NUMA router's coverage) and renders it. `live == allocated − freed` and the
+  §8.6 reconciliation identities hold by construction; the `tests/tests/stats.rs`
+  battery (live, sequential and under concurrency) and the `malloc_api` fuzz
+  target assert them.
 * **Omitted compatibility shims:** `valloc`/`pvalloc` (SPEC §10.1 "optional
   compatibility") are deliberately not exported; the `aligned_alloc` family +
   `memalign` cover their uses without baking page-size assumptions into the

@@ -41,21 +41,42 @@ pub struct Stats {
     pub metadata_bytes: u64,
 
     // --- back-end physical state (§20.1/§21.2, plan 04 W4-3a) ---------------
+    /// In-use backing bytes — the §20.1 *active* state, i.e. virtual memory carved
+    /// into live spans / large mappings. The application classes (`live_bytes`,
+    /// `central_free_bytes`, the caches, `quarantine_bytes`) partition this modulo
+    /// slab-packing residual; the §8.6 reconciliation identity is
+    /// `virtual_bytes == active_bytes + pageheap_free_bytes` (W17-1a).
+    pub active_bytes: u64,
+    /// Virtual address range retained for future use but **not** physically backed
+    /// (§20.1 *Retained*; the extent manager's `reserved`). §31.1 `backend.retained_bytes`
+    /// (W17-1a) — distinct from `released_bytes` (advised-away, needs recommit).
+    pub retained_bytes: u64,
     /// Free, physically-backed bytes that may hold old data (§20.1 *dirty*).
     pub dirty_bytes: u64,
     /// Free, lazily-purged/scrubbed bytes (§20.1 *muzzy*).
     pub muzzy_bytes: u64,
-    /// Free bytes returned to the OS, needing recommit (§20.1 *released*).
+    /// Free bytes advised away / decommitted, needing recommit (§20.1 *Released*).
     pub released_bytes: u64,
-    /// All free back-end bytes (§21.2 `pageheap_free_bytes`): reserved + dirty +
+    /// All free back-end bytes (§21.2 `pageheap_free_bytes`): retained + dirty +
     /// muzzy + released.
     pub pageheap_free_bytes: u64,
     /// Total virtual bytes the back-end manages (§21.2 `virtual_bytes`).
     pub virtual_bytes: u64,
 
+    // --- quarantine (§17.5/§31.1, plan 08 W18) ------------------------------
+    /// Bytes held in quarantine (delayed-reuse freed memory, §17.5). §31.1
+    /// `quarantine.bytes`. Present and non-negative (W17-1a); `0` until the
+    /// hardened/debug quarantine byte accounting lands (plan 08 W18) — TopoMalloc
+    /// keeps quarantine *flags* per span today, not a live byte total.
+    pub quarantine_bytes: u64,
+
     // --- arenas (§22/§36.4, plan 06 W9) -------------------------------------
     /// Arenas currently registered, including the always-present default.
     pub live_arenas: u64,
+    /// Cumulative arenas destroyed over the engine's lifetime (§31.1
+    /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may be
+    /// recycled (§36.13), so this is an event count, not `created − live`.
+    pub arenas_destroyed: u64,
     /// Cumulative NUMA binding failures across all arenas (§15.5).
     pub numa_bind_failures: u64,
     /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
@@ -99,6 +120,76 @@ pub struct Stats {
     /// [`record_placement`](Self::record_placement). These are *profiling* estimates, not a
     /// managed-memory byte class, so they do not enter the §8.6 VM reconciliation.
     pub placement: topo_core::PlacementStats,
+    /// The §31.5 **sampled internal fragmentation**: the sum of `usable − requested` over
+    /// the live sampled objects (W17-4). A profiling estimate (`0` unless sampling is on),
+    /// so — like `placement` — it sits outside the §8.6 byte reconciliation. Set via
+    /// [`record_fragmentation`](Self::record_fragmentation).
+    pub sampled_internal_fragmentation_bytes: u64,
+}
+
+/// Stats selection flags (§31.2) — which views a snapshot / JSON / print renders. The
+/// always-present summary blocks answer "where is the memory?" (§31.1); the `BY_*` flags
+/// add per-entity detail; `CONSISTENT_SNAPSHOT` / `RESET_PEAKS` are read modes. A `u64`
+/// newtype (no external `bitflags` dep — the kernel allows only `libc`/dev-only crates),
+/// laid out so the C ABI (`TOPOMALLOC_STATS_*`) and Rust agree bit-for-bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct StatsFlags(pub u64);
+
+impl StatsFlags {
+    /// The summary view (`0`) — always rendered; the other flags are additive.
+    pub const SUMMARY: StatsFlags = StatsFlags(0);
+    /// Per-arena breakdown (§22): one line per live arena (id, label, used, reserved).
+    pub const BY_ARENA: StatsFlags = StatsFlags(1 << 0);
+    /// Per-size-class breakdown: central-free bytes per class.
+    pub const BY_SIZE_CLASS: StatsFlags = StatsFlags(1 << 1);
+    /// Per-CPU cache breakdown (front-end caches, M2 — empty until then).
+    pub const BY_CPU: StatsFlags = StatsFlags(1 << 2);
+    /// Per-NUMA-node breakdown (§15): the topology / router counters block.
+    pub const BY_NUMA: StatsFlags = StatsFlags(1 << 3);
+    /// Per-hugepage breakdown (§19.4): the occupancy-bin distribution.
+    pub const BY_HUGEPAGE: StatsFlags = StatsFlags(1 << 4);
+    /// Consistent-snapshot read mode (§8.6): read cumulative counters skew-free.
+    pub const CONSISTENT_SNAPSHOT: StatsFlags = StatsFlags(1 << 5);
+    /// Reset peak gauges after reading (§31.2 `RESET_PEAKS`).
+    pub const RESET_PEAKS: StatsFlags = StatsFlags(1 << 6);
+
+    /// Every defined flag bit OR-ed together — the validity mask (reserved bits must be 0).
+    pub const ALL: StatsFlags = StatsFlags(
+        Self::BY_ARENA.0
+            | Self::BY_SIZE_CLASS.0
+            | Self::BY_CPU.0
+            | Self::BY_NUMA.0
+            | Self::BY_HUGEPAGE.0
+            | Self::CONSISTENT_SNAPSHOT.0
+            | Self::RESET_PEAKS.0,
+    );
+
+    /// The raw bits.
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Whether **every** bit in `other` is set (so `SUMMARY`/`0` is always contained).
+    #[inline]
+    pub const fn contains(self, other: StatsFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any bit outside [`ALL`](Self::ALL) is set — an invalid flag word (§10.4).
+    #[inline]
+    pub const fn has_unknown_bits(self) -> bool {
+        self.0 & !Self::ALL.0 != 0
+    }
+}
+
+impl core::ops::BitOr for StatsFlags {
+    type Output = StatsFlags;
+    #[inline]
+    fn bitor(self, rhs: StatsFlags) -> StatsFlags {
+        StatsFlags(self.0 | rhs.0)
+    }
 }
 
 /// The active build/runtime profile (§30.1). Profiles are features, not forks.
@@ -155,11 +246,25 @@ impl Stats {
     /// `virtual_bytes == live + dirty + muzzy + released + (reserved/active backing)`
     /// is the extent manager's `StateBytes::total()`.
     pub fn record_backend(&mut self, sb: topo_core::StateBytes) {
+        self.active_bytes = sb.active as u64;
+        // §20.1 *Retained* (the extent manager's `reserved`): virtual range kept for reuse
+        // but not physically backed — §31.1 `backend.retained_bytes`, distinct from
+        // `released_bytes` (advised-away). The §8.6 identities then hold by construction:
+        // `pageheap_free == retained + dirty + muzzy + released` and
+        // `virtual == active + pageheap_free`.
+        self.retained_bytes = sb.reserved as u64;
         self.dirty_bytes = sb.dirty as u64;
         self.muzzy_bytes = sb.muzzy as u64;
         self.released_bytes = sb.released as u64;
         self.pageheap_free_bytes = sb.free() as u64;
         self.virtual_bytes = sb.total() as u64;
+    }
+
+    /// Record the §31.5 sampled internal-fragmentation estimate (W17-4): the sum of
+    /// `usable − requested` over the live sampled objects. A profiling estimate (`0` unless
+    /// heap sampling is on), recorded alongside [`record_placement`](Self::record_placement).
+    pub fn record_fragmentation(&mut self, sampled_internal_bytes: u64) {
+        self.sampled_internal_fragmentation_bytes = sampled_internal_bytes;
     }
 
     /// Record an [`Allocator`](topo_core::Allocator) snapshot (plan 06 W8 —
@@ -175,6 +280,7 @@ impl Stats {
         self.central_free_bytes = a.central_free_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
         self.live_arenas = a.live_arenas;
+        self.arenas_destroyed = a.arenas_destroyed;
         self.numa_bind_failures = a.numa_bind_failures;
         self.hook_failures = a.hook_failures;
         let combined = topo_core::StateBytes {
@@ -238,15 +344,25 @@ impl Stats {
         self.placement = ps;
     }
 
-    /// Render the snapshot as JSON in the Appendix-D shape. The renderer is
-    /// additive: new fields may be added in later milestones, never removed or
-    /// renamed within a release series (§35.3). Strings here are fixed ASCII
-    /// identifiers, so no escaping is required.
+    /// Render the snapshot as summary JSON in the Appendix-D shape (the §31.1 "where is
+    /// the memory?" view). Equivalent to [`to_json_with`](Self::to_json_with) with
+    /// [`StatsFlags::SUMMARY`] and no detail. The renderer is additive: new fields may be
+    /// added in later milestones, never removed or renamed within a release series (§35.3).
     pub fn to_json(&self) -> String {
-        // §19.4 bin distribution (W11-4a), rendered as a compact JSON array. Built
-        // here rather than inline in the template so it tracks `HugeBin::COUNT`
-        // automatically; this is the slow stats surface, so the small per-element
-        // allocations are immaterial.
+        self.to_json_with(StatsFlags::SUMMARY, &StatsDetail::EMPTY)
+    }
+
+    /// Render the snapshot as JSON (§31.2), honoring the selection `flags` (§31.2): the
+    /// always-present summary blocks answer "where is the memory?" (§31.1); the `BY_*`
+    /// flags append per-entity detail blocks from `detail` (which the live composer in
+    /// `topo-abi` populates — `topo-stats` is a pure renderer). Strings here are fixed
+    /// ASCII identifiers, so no escaping is required. Additive across a release series
+    /// (§35.3): callers parsing a known field are never broken by a newer field.
+    pub fn to_json_with(&self, flags: StatsFlags, detail: &StatsDetail) -> String {
+        use core::fmt::Write as _;
+        // §19.4 bin distribution (W11-4a), rendered as a compact JSON array. Built here
+        // rather than inline so it tracks `HugeBin::COUNT` automatically; this is the slow
+        // stats surface, so the small per-element allocations are immaterial.
         let mut hp_bins = String::from("[");
         for (i, count) in self.hugepage.bins.iter().enumerate() {
             if i > 0 {
@@ -255,7 +371,18 @@ impl Stats {
             hp_bins.push_str(&count.to_string());
         }
         hp_bins.push(']');
-        format!(
+        // §31.5 fragmentation, derived from the byte classes (W17-4). `external` is the free
+        // **physically-backed** back-end memory not immediately useful (dirty + muzzy;
+        // `released` is unbacked, so excluded); `cache` is the bytes stranded in front-end
+        // caches (per-CPU + thread + transfer, 0 until M2).
+        let frag_external = self.dirty_bytes.saturating_add(self.muzzy_bytes);
+        let frag_cache = self
+            .per_cpu_bytes
+            .saturating_add(self.thread_cache_bytes)
+            .saturating_add(self.transfer_bytes);
+        // The always-present summary object, *without* its closing brace, so the flag-gated
+        // detail blocks (and the brace) can be appended below.
+        let mut out = format!(
             concat!(
                 "{{\n",
                 "  \"topomalloc_version\": \"{version}\",\n",
@@ -276,6 +403,7 @@ impl Stats {
                 "  }},\n",
                 "  \"arenas\": {{\n",
                 "    \"count\": {live_arenas},\n",
+                "    \"destroyed\": {arenas_destroyed},\n",
                 "    \"numa_bind_failures\": {numa_bind_failures},\n",
                 "    \"hook_failures\": {{\n",
                 "      \"commit\": {hf_commit},\n",
@@ -285,11 +413,16 @@ impl Stats {
                 "    }}\n",
                 "  }},\n",
                 "  \"backend\": {{\n",
+                "    \"active_bytes\": {active},\n",
+                "    \"retained_bytes\": {retained},\n",
                 "    \"dirty_bytes\": {dirty},\n",
                 "    \"muzzy_bytes\": {muzzy},\n",
                 "    \"released_bytes\": {released},\n",
                 "    \"pageheap_free_bytes\": {pageheap},\n",
                 "    \"virtual_bytes\": {virtual_b}\n",
+                "  }},\n",
+                "  \"quarantine\": {{\n",
+                "    \"bytes\": {quarantine}\n",
                 "  }},\n",
                 "  \"hugepage\": {{\n",
                 "    \"coverage_bytes\": {hp_coverage},\n",
@@ -329,10 +462,16 @@ impl Stats {
                 "    \"evictions\": {pl_evict},\n",
                 "    \"sampled_live_bytes\": {pl_live}\n",
                 "  }},\n",
+                "  \"fragmentation\": {{\n",
+                "    \"internal_sampled_bytes\": {frag_internal},\n",
+                "    \"external_bytes\": {frag_external},\n",
+                "    \"cache_bytes\": {frag_cache},\n",
+                "    \"hugepage_bytes\": {hp_fragmentation},\n",
+                "    \"metadata_overhead_bytes\": {metadata}\n",
+                "  }},\n",
                 "  \"metadata\": {{\n",
                 "    \"bytes\": {metadata}\n",
-                "  }}\n",
-                "}}"
+                "  }}"
             ),
             version = VERSION,
             epoch = self.epoch,
@@ -345,16 +484,20 @@ impl Stats {
             transfer = self.transfer_bytes,
             central = self.central_free_bytes,
             live_arenas = self.live_arenas,
+            arenas_destroyed = self.arenas_destroyed,
             numa_bind_failures = self.numa_bind_failures,
             hf_commit = self.hook_failures.commit,
             hf_release = self.hook_failures.release,
             hf_split = self.hook_failures.split,
             hf_merge = self.hook_failures.merge,
+            active = self.active_bytes,
+            retained = self.retained_bytes,
             dirty = self.dirty_bytes,
             muzzy = self.muzzy_bytes,
             released = self.released_bytes,
             pageheap = self.pageheap_free_bytes,
             virtual_b = self.virtual_bytes,
+            quarantine = self.quarantine_bytes,
             hp_coverage = self.hugepage.coverage_bytes,
             hp_intact = self.hugepage.live_bytes_on_intact,
             hp_partial = self.hugepage.live_bytes_on_partial,
@@ -385,9 +528,194 @@ impl Stats {
             pl_censored = self.placement.censored_samples,
             pl_evict = self.placement.evictions,
             pl_live = self.placement.sampled_live_bytes,
+            frag_internal = self.sampled_internal_fragmentation_bytes,
+            frag_external = frag_external,
+            frag_cache = frag_cache,
             metadata = self.metadata_bytes,
-        )
+        );
+        // --- flag-gated detail blocks (§31.2) -------------------------------------------
+        if flags.contains(StatsFlags::BY_ARENA) {
+            out.push_str(",\n  \"by_arena\": [");
+            for (i, a) in detail.arenas.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"id\": {}, \"label\": {}, \"used_bytes\": {}, \"reserved_bytes\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    a.id,
+                    a.label,
+                    a.used,
+                    a.reserved,
+                );
+            }
+            out.push_str(if detail.arenas.is_empty() {
+                "]"
+            } else {
+                "\n  ]"
+            });
+        }
+        if flags.contains(StatsFlags::BY_SIZE_CLASS) {
+            out.push_str(",\n  \"by_size_class\": [");
+            for (i, c) in detail.size_classes.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"class\": {}, \"size\": {}, \"free_bytes\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    c.class,
+                    c.size,
+                    c.free_bytes,
+                );
+            }
+            out.push_str(if detail.size_classes.is_empty() {
+                "]"
+            } else {
+                "\n  ]"
+            });
+        }
+        if flags.contains(StatsFlags::BY_CPU) {
+            // Front-end per-CPU caches land at M2; the breakdown is an empty array until
+            // then (the flag resolves to a defined, additive shape, never a missing key).
+            out.push_str(",\n  \"by_cpu\": []");
+        }
+        out.push_str("\n}");
+        out
     }
+
+    /// A human-readable, single-paragraph RSS attribution string (§31.6 `topo_explain_memory`,
+    /// W17-5): "RSS is attributed to: …", naming the largest contributors to resident memory
+    /// in descending order. Adoption often hinges on RSS being *explainable*, not just
+    /// measurable; this renders the same byte classes [`to_json`](Self::to_json) reports into
+    /// prose. Sizes are rendered in binary units (KiB/MiB/GiB).
+    pub fn explain(&self) -> String {
+        use core::fmt::Write as _;
+        // (label, bytes) for every contributor worth naming; sorted descending, the
+        // nonzero ones joined into the explanation. A fixed small set, so a tiny `Vec`.
+        let mut parts: alloc::vec::Vec<(&'static str, u64)> = alloc::vec![
+            ("live", self.live_bytes),
+            ("per-CPU cache", self.per_cpu_bytes),
+            ("thread cache", self.thread_cache_bytes),
+            ("transfer cache", self.transfer_bytes),
+            ("central free lists", self.central_free_bytes),
+            ("dirty retained", self.dirty_bytes),
+            ("muzzy (lazily purged)", self.muzzy_bytes),
+            ("empty hugepages retained", self.hugepage.empty_backed_bytes),
+            ("metadata", self.metadata_bytes),
+            ("quarantine", self.quarantine_bytes),
+        ];
+        // Stable, deterministic order: bytes descending, then first-listed wins ties.
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut out = String::from("RSS is attributed to: ");
+        let mut first = true;
+        for (label, bytes) in parts {
+            if bytes == 0 {
+                continue;
+            }
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            let _ = write!(out, "{} {}", human_bytes(bytes), label);
+        }
+        if first {
+            // Nothing live anywhere — be explicit rather than emit a dangling colon.
+            out.push_str("no resident allocator memory (idle)");
+        }
+        out.push('.');
+        // The released (unbacked) bytes are managed VM but not RSS; note them so an operator
+        // reconciling RSS against `virtual_bytes` understands the difference (§8.6).
+        if self.released_bytes > 0 {
+            let _ = write!(
+                out,
+                " Additionally {} is decommitted (retained in the address space, not resident).",
+                human_bytes(self.released_bytes)
+            );
+        }
+        out
+    }
+}
+
+/// Render `bytes` in binary units (B/KiB/MiB/GiB/TiB) with one decimal place for the
+/// fractional units — the §31.6 explanation's human sizes. Integer-only (the kernel is
+/// floating-point-free, §6): the tenths are computed as `(rem * 10) / divisor`.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("TiB", 1u64 << 40),
+        ("GiB", 1u64 << 30),
+        ("MiB", 1u64 << 20),
+        ("KiB", 1u64 << 10),
+    ];
+    for &(name, div) in UNITS {
+        if bytes >= div {
+            let whole = bytes / div;
+            let tenths = (bytes % div).saturating_mul(10) / div;
+            return format!("{whole}.{tenths} {name}");
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// One line of the §31.2 `BY_ARENA` per-arena breakdown (W17-2): a single arena's id, its
+/// §36.12 security label, and its live/reserved byte accounting. The unit the W17-6
+/// label-scoped redaction filters over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArenaLine {
+    /// The arena id (`TOPO_ARENA(id)` routes to it).
+    pub id: u32,
+    /// The arena's §36.12 information-flow label (`0` = the POSIX `PUBLIC` domain).
+    pub label: u32,
+    /// Live (own) bytes charged to the arena (§36.4 quota accounting).
+    pub used: u64,
+    /// Reserved child-delegation quota (§36.4).
+    pub reserved: u64,
+}
+
+/// One line of the §31.2 `BY_SIZE_CLASS` per-class breakdown (W17-2): central-resident free
+/// bytes for a size class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SizeClassLine {
+    /// The size-class index.
+    pub class: u32,
+    /// The class's object size in bytes.
+    pub size: u32,
+    /// Free object bytes resident in the class's central list.
+    pub free_bytes: u64,
+}
+
+/// The per-entity detail the `BY_*` flags render (§31.2). `topo-stats` is a pure renderer:
+/// the live composer (`topo-abi`) fills these from the running allocator/registry and passes
+/// them to [`Stats::to_json_with`]. Borrowed slices so the renderer allocates nothing extra.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsDetail<'a> {
+    /// `BY_ARENA` lines (already label-redacted by the composer if a low domain is reading).
+    pub arenas: &'a [ArenaLine],
+    /// `BY_SIZE_CLASS` lines.
+    pub size_classes: &'a [SizeClassLine],
+}
+
+impl StatsDetail<'_> {
+    /// No detail — the summary-only view.
+    pub const EMPTY: StatsDetail<'static> = StatsDetail {
+        arenas: &[],
+        size_classes: &[],
+    };
+}
+
+/// **Label-scoped stats redaction (§36.12, W17-6).** Keep only the arena lines an observer
+/// at `observer_label` is authorized to see — those whose label the observer dominates
+/// (`label <= observer_label`, the POSIX/total-order projection of the §36.12 lattice) —
+/// and **drop** every higher-domain line. Mirrors the Lean `stats_observation_noninterference`
+/// (`lean/TopoMalloc/SeLe4n/InformationFlow.lean`): a low observer's view is a pure function
+/// of the low-labelled arenas, so high-domain allocation activity is invisible to it — a low
+/// domain cannot infer a high domain's patterns. Pure and total.
+///
+/// On POSIX every arena carries the single `PUBLIC` (`0`) label, so a `PUBLIC` observer sees
+/// everything (the identity case); the redaction has teeth only under the seLe4n multi-label
+/// profile (plan 09), where it is the Rust-side analogue of the proved non-interference.
+pub fn redact_arenas(arenas: &[ArenaLine], observer_label: u32) -> alloc::vec::Vec<ArenaLine> {
+    arenas
+        .iter()
+        .copied()
+        .filter(|a| a.label <= observer_label)
+        .collect()
 }
 
 #[cfg(test)]
@@ -633,6 +961,7 @@ mod tests {
                 split: 14,
                 merge: 15,
             },
+            arenas_destroyed: 4,
         };
         let mut s = Stats::default();
         s.record_allocator(&snap);
@@ -647,7 +976,11 @@ mod tests {
         assert_eq!(s.freed_bytes_total, 500);
         assert_eq!(s.central_free_bytes, 256);
         assert_eq!(s.metadata_bytes, 8192);
+        // The cumulative destroyed-arena count maps through (§31.1, W17-1a).
+        assert_eq!(s.arenas_destroyed, 4);
         // The two regions sum into the single back-end view (§20.1/§21.2).
+        assert_eq!(s.active_bytes, 22); // 20 + 2
+        assert_eq!(s.retained_bytes, 11); // reserved: 10 + 1 (§20.1 Retained)
         assert_eq!(s.dirty_bytes, 33);
         assert_eq!(s.muzzy_bytes, 44);
         assert_eq!(s.released_bytes, 55);
@@ -655,6 +988,14 @@ mod tests {
             s.virtual_bytes,
             (10 + 20 + 30 + 40 + 50) + (1 + 2 + 3 + 4 + 5)
         );
+        // §8.6 reconciliation identities hold by construction (W17-1b):
+        //   pageheap_free == retained + dirty + muzzy + released, and
+        //   virtual       == active + pageheap_free.
+        assert_eq!(
+            s.pageheap_free_bytes,
+            s.retained_bytes + s.dirty_bytes + s.muzzy_bytes + s.released_bytes
+        );
+        assert_eq!(s.virtual_bytes, s.active_bytes + s.pageheap_free_bytes);
         // The application identity §8.6: live == allocated - freed.
         assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
         // JSON renders the recorded values (additive schema, §35.3).
@@ -663,10 +1004,178 @@ mod tests {
         assert!(json.contains("\"allocated_bytes_total\": 1500"));
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["arenas"]["count"], 3);
+        assert_eq!(v["arenas"]["destroyed"], 4);
         assert_eq!(v["arenas"]["numa_bind_failures"], 7);
         assert_eq!(v["arenas"]["hook_failures"]["commit"], 12);
         assert_eq!(v["arenas"]["hook_failures"]["release"], 13);
         assert_eq!(v["arenas"]["hook_failures"]["split"], 14);
         assert_eq!(v["arenas"]["hook_failures"]["merge"], 15);
+        assert_eq!(v["backend"]["active_bytes"], 22);
+        assert_eq!(v["backend"]["retained_bytes"], 11);
+    }
+
+    #[test]
+    fn quarantine_and_fragmentation_blocks_are_present_and_nonnegative() {
+        // W17-1a: the §31.1 `quarantine.bytes` class is present (0 until plan 08 wires it).
+        // W17-4: the §31.5 fragmentation block is present and derived from the byte classes.
+        let s = Stats {
+            dirty_bytes: 4096,
+            muzzy_bytes: 2048,
+            released_bytes: 1024,
+            per_cpu_bytes: 512,
+            metadata_bytes: 8192,
+            sampled_internal_fragmentation_bytes: 333,
+            hugepage: topo_core::HugeStats {
+                fragmentation_bytes: 65536,
+                ..topo_core::HugeStats::default()
+            },
+            ..Stats::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&s.to_json()).expect("valid JSON");
+        // Quarantine class present.
+        assert_eq!(v["quarantine"]["bytes"], 0);
+        // §31.5 fragmentation derived correctly: external = dirty + muzzy (backed, free, not
+        // immediately useful — `released` is unbacked so excluded); cache = the cache bytes;
+        // hugepage from HugeStats; internal is the sampled estimate; metadata overhead.
+        assert_eq!(v["fragmentation"]["internal_sampled_bytes"], 333);
+        assert_eq!(v["fragmentation"]["external_bytes"], 4096 + 2048);
+        assert_eq!(v["fragmentation"]["cache_bytes"], 512);
+        assert_eq!(v["fragmentation"]["hugepage_bytes"], 65536);
+        assert_eq!(v["fragmentation"]["metadata_overhead_bytes"], 8192);
+    }
+
+    #[test]
+    fn flags_contains_bitor_and_validity() {
+        // SUMMARY (0) is contained in everything; BY_* compose by bitor; reserved bits flag.
+        let f = StatsFlags::BY_ARENA | StatsFlags::BY_NUMA;
+        assert!(f.contains(StatsFlags::BY_ARENA));
+        assert!(f.contains(StatsFlags::BY_NUMA));
+        assert!(f.contains(StatsFlags::SUMMARY));
+        assert!(!f.contains(StatsFlags::BY_CPU));
+        assert!(!StatsFlags::ALL.has_unknown_bits());
+        assert!(StatsFlags(1 << 40).has_unknown_bits());
+        assert_eq!(StatsFlags::default(), StatsFlags::SUMMARY);
+    }
+
+    #[test]
+    fn by_arena_detail_block_renders_when_flagged() {
+        // W17-2: BY_ARENA appends a per-arena array; absent without the flag (additive).
+        let s = Stats::default();
+        let arenas = [
+            ArenaLine {
+                id: 0,
+                label: 0,
+                used: 1000,
+                reserved: 0,
+            },
+            ArenaLine {
+                id: 3,
+                label: 0,
+                used: 4096,
+                reserved: 256,
+            },
+        ];
+        let detail = StatsDetail {
+            arenas: &arenas,
+            size_classes: &[],
+        };
+        // Without the flag: no by_arena key.
+        let summary: serde_json::Value =
+            serde_json::from_str(&s.to_json_with(StatsFlags::SUMMARY, &detail)).unwrap();
+        assert!(summary.get("by_arena").is_none());
+        // With the flag: the array is present and carries both lines.
+        let v: serde_json::Value =
+            serde_json::from_str(&s.to_json_with(StatsFlags::BY_ARENA, &detail)).expect("valid");
+        let by = v["by_arena"].as_array().expect("by_arena array");
+        assert_eq!(by.len(), 2);
+        assert_eq!(by[1]["id"], 3);
+        assert_eq!(by[1]["used_bytes"], 4096);
+        assert_eq!(by[1]["reserved_bytes"], 256);
+        // An empty BY_ARENA still renders a valid empty array (not a missing key).
+        let e: serde_json::Value =
+            serde_json::from_str(&s.to_json_with(StatsFlags::BY_ARENA, &StatsDetail::EMPTY))
+                .expect("valid");
+        assert_eq!(e["by_arena"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn explain_names_the_largest_contributors() {
+        // W17-5: a human-readable RSS attribution, largest first, with released noted apart.
+        let s = Stats {
+            live_bytes: 2 * (1 << 30) + (1 << 29), // 2.5 GiB
+            per_cpu_bytes: 700 * (1 << 20),        // 700 MiB
+            dirty_bytes: 1400 * (1 << 20),         // ~1.4 GiB
+            released_bytes: 256 * (1 << 20),       // 256 MiB decommitted
+            ..Stats::default()
+        };
+        let e = s.explain();
+        assert!(e.starts_with("RSS is attributed to: "));
+        // Largest (live, 2.5 GiB) is named before per-CPU (700 MiB).
+        let live_at = e.find("live").expect("live named");
+        let cpu_at = e.find("per-CPU cache").expect("cpu named");
+        assert!(live_at < cpu_at, "contributors are ordered largest-first");
+        assert!(e.contains("GiB") && e.contains("MiB"));
+        // Released is decommitted, not resident — called out separately.
+        assert!(e.contains("decommitted"));
+        // The idle case is explicit, never a dangling colon.
+        assert_eq!(
+            Stats::default().explain(),
+            "RSS is attributed to: no resident allocator memory (idle)."
+        );
+    }
+
+    #[test]
+    fn redaction_is_label_noninterference() {
+        // W17-6 (§36.12): the Rust analogue of `stats_observation_noninterference`. A low
+        // observer's redacted view is a pure function of the low-labelled arenas, so adding
+        // or changing any *higher*-labelled arena leaves the low view bit-for-bit identical.
+        let low = ArenaLine {
+            id: 1,
+            label: 0,
+            used: 4096,
+            reserved: 0,
+        };
+        let high1 = ArenaLine {
+            id: 2,
+            label: 5,
+            used: 1 << 20,
+            reserved: 0,
+        };
+        let high2 = ArenaLine {
+            id: 2,
+            label: 5,
+            used: 999 << 20, // different high-domain activity
+            reserved: 4096,
+        };
+        // Observer at label 0 sees only the low arena, regardless of the high one's bytes.
+        let view_a = redact_arenas(&[low, high1], 0);
+        let view_b = redact_arenas(&[low, high2], 0);
+        assert_eq!(
+            view_a, view_b,
+            "high-domain activity is invisible to a low observer"
+        );
+        assert_eq!(view_a, alloc::vec![low]);
+        // A high observer (label 5) dominates both labels and sees everything.
+        assert_eq!(redact_arenas(&[low, high1], 5).len(), 2);
+        // The default JSON for a redacted (low) view never leaks a high arena's line.
+        let s = Stats::default();
+        let redacted = redact_arenas(&[low, high1], 0);
+        let json = s.to_json_with(
+            StatsFlags::BY_ARENA,
+            &StatsDetail {
+                arenas: &redacted,
+                size_classes: &[],
+            },
+        );
+        assert!(!json.contains("1048576")); // the high arena's bytes never appear
+    }
+
+    #[test]
+    fn human_bytes_renders_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(3 << 20), "3.0 MiB");
+        assert_eq!(human_bytes((1 << 30) + (1 << 29)), "1.5 GiB");
     }
 }

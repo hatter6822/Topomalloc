@@ -967,6 +967,12 @@ pub struct ArenaTable {
     meta: core::cell::UnsafeCell<[ArenaMeta; MAX_ARENAS]>,
     /// Lock-guarded head-state.
     inner: core::cell::UnsafeCell<TableInner>,
+    /// Cumulative count of arenas that have reached `Destroyed` (§31.1
+    /// `arena.destroyed_count`, plan 07 W17-1a). A destroyed slot may later be
+    /// recycled for a new incarnation (§36.13, behind a generation bump), so this
+    /// is a monotonic *event* counter — it cannot be derived from the live slot
+    /// states. A relaxed stats counter (§27.3 ordering map).
+    destroyed_count: AtomicU64,
 }
 
 // SAFETY: every hot-path field is an atomic; the `meta`/`inner` `UnsafeCell`s are
@@ -991,6 +997,7 @@ impl ArenaTable {
             atomics: [const { ArenaAtomics::empty() }; MAX_ARENAS],
             meta: core::cell::UnsafeCell::new([const { ArenaMeta::empty() }; MAX_ARENAS]),
             inner: core::cell::UnsafeCell::new(TableInner { high_water: 1 }),
+            destroyed_count: AtomicU64::new(0),
         };
         // Install the default arena (id 0) at generation 1, Active, ambient.
         let p = ArenaPolicy::ambient_default();
@@ -1385,6 +1392,9 @@ impl ArenaTable {
         a.generation.store(gen.0, Ordering::Relaxed);
         a.state
             .store(ArenaState::Destroyed as u8, Ordering::Release);
+        // §31.1 `arena.destroyed_count`: count the reached-`Destroyed` event (W17-1a).
+        // Relaxed — a monotonic stats counter (§27.3 map), read with the same ordering.
+        self.destroyed_count.fetch_add(1, Ordering::Relaxed);
         Ok(gen)
     }
 
@@ -1783,6 +1793,14 @@ impl ArenaTable {
                     != ArenaState::Destroyed
             })
             .count()
+    }
+
+    /// Cumulative number of arenas destroyed over the table's lifetime (§31.1
+    /// `arena.destroyed_count`, plan 07 W17-1a) — a monotonic counter bumped at
+    /// each `* → Destroyed` transition (in [`finish_destroy`](Self::finish_destroy)),
+    /// surfaced in the engine's stats snapshot. Lock-free relaxed read.
+    pub fn destroyed_count(&self) -> u64 {
+        self.destroyed_count.load(Ordering::Relaxed)
     }
 
     /// Whether the table is well-formed (Appendix B.5 — the debug/test oracle):
@@ -2216,13 +2234,20 @@ mod tests {
             Err(ArenaError::IsDefault)
         );
 
+        // §31.1 `arena.destroyed_count` (W17-1a): no destroy has completed yet.
+        assert_eq!(t.destroyed_count(), 0);
+
         // Happy path: Active → Draining → Destroyed, incarnation generation++.
         let handle = t.handle(id).unwrap();
         t.begin_destroy(id).unwrap();
         assert_eq!(t.state(id), Some(ArenaState::Draining));
+        // Beginning a destroy does not yet count as destroyed (the drain may quarantine).
+        assert_eq!(t.destroyed_count(), 0);
         let g1 = t.finish_destroy(id).unwrap();
         assert_eq!(t.state(id), Some(ArenaState::Destroyed));
         assert_ne!(g1, g0, "destroy bumps the incarnation generation (§36.13)");
+        // Reaching `Destroyed` bumps the cumulative count exactly once.
+        assert_eq!(t.destroyed_count(), 1);
         assert!(
             !t.is_registered(id),
             "a destroyed slot is available for reuse"
@@ -2241,6 +2266,8 @@ mod tests {
         assert_eq!(t.state(id2), Some(ArenaState::ErrorQuarantined));
         // A quarantined arena can never be finalized as Destroyed (§36.13).
         assert_eq!(t.finish_destroy(id2), Err(ArenaError::IllegalTransition));
+        // A quarantine is *not* a destroy: the cumulative count is unchanged (still 1).
+        assert_eq!(t.destroyed_count(), 1);
         assert!(t.check_invariants());
     }
 
