@@ -303,6 +303,7 @@ impl Stats {
         self.central_free_bytes = a.central_free_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
         self.exact_internal_fragmentation_bytes = a.live_internal_fragmentation_bytes;
+        self.quarantine_bytes = a.quarantine_bytes;
         self.live_arenas = a.live_arenas;
         self.arenas_destroyed = a.arenas_destroyed;
         self.numa_bind_failures = a.numa_bind_failures;
@@ -1124,6 +1125,7 @@ mod tests {
             arenas_destroyed: 4,
             peak_live_bytes: 2000,
             live_internal_fragmentation_bytes: 512,
+            quarantine_bytes: 256,
         };
         let mut s = Stats::default();
         s.record_allocator(&snap);
@@ -1140,7 +1142,8 @@ mod tests {
         assert_eq!(s.metadata_bytes, 8192);
         // The cumulative destroyed-arena count maps through (§31.1, W17-1a).
         assert_eq!(s.arenas_destroyed, 4);
-        // The two regions sum into the single back-end view (§20.1/§21.2).
+        assert_eq!(s.quarantine_bytes, 256); // W18-3: held bytes mapped through (§29.4)
+                                             // The two regions sum into the single back-end view (§20.1/§21.2).
         assert_eq!(s.active_bytes, 22); // 20 + 2
         assert_eq!(s.retained_bytes, 11); // reserved: 10 + 1 (§20.1 Retained)
         assert_eq!(s.dirty_bytes, 33);

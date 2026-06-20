@@ -275,6 +275,10 @@ pub struct AllocatorStats {
     /// page-rounding is where internal waste dominates. Small-object internal fragmentation is
     /// the *sampled* estimate in the placement profiler (§31.5 "MAY sample in performance mode").
     pub live_internal_fragmentation_bytes: u64,
+    /// Bytes held in the security quarantine (§29.4, W18-3): freed objects delayed
+    /// from reuse, accounted **separately** from live / central-free (§8.6). `0`
+    /// unless the `quarantine` feature is compiled in *and* the runtime switch is on.
+    pub quarantine_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +685,12 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// winning. Empty (and the read short-circuits to neutral) until a confident hint is
     /// published, so the medium/large placement outcome is unchanged when nothing is learned.
     learned: LearnedHints,
+    /// W18-3 delayed-reuse quarantine (§29.4). **Profile-gated**: the field exists
+    /// only with the `quarantine` feature, so the `performance` build carries none of
+    /// its (tens-of-KiB) state and pays nothing. Freed objects are held here, accounted
+    /// separately as `quarantine.bytes`, until a budget evicts them to their real free.
+    #[cfg(feature = "quarantine")]
+    quarantine: crate::harden::Quarantine,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
@@ -818,6 +828,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             hooks: HookRegistry::new(),
             retired_hooks: AtomicHookFailures::new(),
             learned: LearnedHints::new(),
+            #[cfg(feature = "quarantine")]
+            quarantine: crate::harden::Quarantine::new(),
         })
     }
 
@@ -1478,6 +1490,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // and recycle under a racing thread, and its class/arena with it.
                 let usable = size_class::usable_size(span.size_class());
                 let arena = span.arena();
+                // W18-3 (§29.4): when the quarantine is active it may *hold* this
+                // freed object out of circulation (delaying reuse) or detect a
+                // quarantine-hit double free — returning the final outcome; a true
+                // no-op (always `None`) without the `quarantine` feature.
+                if let Some(outcome) = self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
+                    return outcome;
+                }
                 // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the
                 // use-after-free canary under the span lock; a true no-op otherwise.
                 let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
@@ -1509,6 +1528,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // usable size is captured first: after the free the descriptor may
                 // recycle.
                 let usable = owner.usable_size(ptr).unwrap_or(0);
+                // W18-3 (§29.4): the quarantine may hold this freed large (delaying
+                // reuse) or detect a quarantine-hit double free. A held large keeps
+                // its descriptor live, so a later double free re-resolves it and is
+                // caught as a hit. `usable == 0` (already freed) is left to the
+                // immediate path's double-free check. No-op without `quarantine`.
+                if let Some(outcome) = self.maybe_quarantine_large(ptr, arena, usable) {
+                    return outcome;
+                }
                 // W18-6 (§36.12): zero the freed bytes before the backing returns to
                 // the shared pool when this arena could be reused at a lower label
                 // (decided lock-free); the scrub itself happens race-free under the
@@ -1526,6 +1553,250 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
             }
             Err(e) => FreeOutcome::Invalid(e),
+        }
+    }
+
+    /// Bytes currently held in the security quarantine (§29.4, W18-3) — reported as
+    /// `quarantine.bytes` and accounted **separately** from live / central-free
+    /// (§8.6). Always `0` without the `quarantine` feature (one branch folds away).
+    #[inline]
+    pub fn quarantine_bytes(&self) -> u64 {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.held_bytes()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            0
+        }
+    }
+
+    /// Objects currently held in the security quarantine (§29.4). `0` without the
+    /// `quarantine` feature.
+    #[inline]
+    pub fn quarantine_objects(&self) -> u32 {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.held_objects()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            0
+        }
+    }
+
+    /// Enable or disable the security quarantine at runtime (§29.4, W18-3). It is
+    /// **off by default** even with the feature compiled in (the opt-in cost model).
+    /// Disabling **drains** the held objects (really freeing them). A no-op without
+    /// the `quarantine` feature.
+    pub fn set_quarantine_enabled(&self, on: bool) {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.set_enabled(on);
+            if !on {
+                self.drain_quarantine();
+            }
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            let _ = on;
+        }
+    }
+
+    /// Whether the quarantine is currently active (feature compiled **and** runtime
+    /// switch on).
+    #[inline]
+    pub fn quarantine_active(&self) -> bool {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.is_enabled()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            false
+        }
+    }
+
+    /// Install a new quarantine policy (§29.4 knobs). A no-op without the feature.
+    #[cfg(feature = "quarantine")]
+    pub fn set_quarantine_policy(&self, policy: crate::harden::QuarantinePolicy) {
+        self.quarantine.set_policy(policy);
+    }
+
+    /// The current quarantine policy (§29.4).
+    #[cfg(feature = "quarantine")]
+    pub fn quarantine_policy(&self) -> crate::harden::QuarantinePolicy {
+        self.quarantine.policy()
+    }
+
+    /// Try to hold a freed **small** object in the quarantine (§29.4, W18-3).
+    /// Returns `Some(outcome)` when the quarantine handled the free — it *held* the
+    /// object (`Freed`; reuse delayed) or detected a double free — and `None` when
+    /// the caller should free it immediately (quarantine disabled / policy declined).
+    /// The app-facing free is accounted here on the held path; the object's physical
+    /// return is deferred until an eviction drains it (`drain_one`). A true no-op
+    /// (`None`) without the `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    fn maybe_quarantine_small(
+        &self,
+        ptr: *mut u8,
+        span: &SpanDescriptor,
+        idx: u16,
+        arena: ArenaId,
+        usable: usize,
+    ) -> Option<FreeOutcome> {
+        if !self.quarantine.is_enabled() {
+            return None;
+        }
+        // A double free of an object that was already *immediately* freed (now
+        // central-free): the bitmap says so (lock-free atomic read). Reject as a
+        // double free without holding — holding a central-free object could let a
+        // concurrent reuse and the deferred drain collide (§2.4: never corrupt).
+        if span.is_central_free(idx as usize) {
+            return Some(FreeOutcome::DoubleFree);
+        }
+        let entry = crate::harden::QuarantineEntry {
+            user_ptr: ptr,
+            span: span as *const SpanDescriptor,
+            index: idx,
+            arena,
+            bytes: usable.min(u32::MAX as usize) as u32,
+        };
+        let mut evicted = crate::harden::EvictBatch::new();
+        match self.quarantine.offer(entry, &mut evicted) {
+            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
+            crate::harden::Offer::Declined => None,
+            crate::harden::Offer::Held => {
+                self.account_quarantined_free(arena, usable, evicted.as_slice());
+                Some(FreeOutcome::Freed)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn maybe_quarantine_small(
+        &self,
+        _ptr: *mut u8,
+        _span: &SpanDescriptor,
+        _idx: u16,
+        _arena: ArenaId,
+        _usable: usize,
+    ) -> Option<FreeOutcome> {
+        None
+    }
+
+    /// Try to hold a freed **large** allocation in the quarantine (§29.4, W18-3).
+    /// As [`maybe_quarantine_small`](Self::maybe_quarantine_small). `usable == 0`
+    /// (already freed) is never held — the immediate path's double-free check owns
+    /// that case. A held large keeps its descriptor live, so a later double free
+    /// re-resolves it (`usable > 0`) and is caught as a quarantine hit.
+    #[cfg(feature = "quarantine")]
+    fn maybe_quarantine_large(
+        &self,
+        ptr: *mut u8,
+        arena: ArenaId,
+        usable: usize,
+    ) -> Option<FreeOutcome> {
+        if !self.quarantine.is_enabled() || usable == 0 {
+            return None;
+        }
+        let entry = crate::harden::QuarantineEntry {
+            user_ptr: ptr,
+            span: ptr::null(),
+            index: 0,
+            arena,
+            bytes: usable.min(u32::MAX as usize) as u32,
+        };
+        let mut evicted = crate::harden::EvictBatch::new();
+        match self.quarantine.offer(entry, &mut evicted) {
+            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
+            crate::harden::Offer::Declined => None,
+            crate::harden::Offer::Held => {
+                self.account_quarantined_free(arena, usable, evicted.as_slice());
+                Some(FreeOutcome::Freed)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn maybe_quarantine_large(
+        &self,
+        _ptr: *mut u8,
+        _arena: ArenaId,
+        _usable: usize,
+    ) -> Option<FreeOutcome> {
+        None
+    }
+
+    /// Account an object entering quarantine (the app-facing free) and drain any
+    /// entries its admission evicted (their *real* physical free), **outside** the
+    /// quarantine lock (the §27.2 leaf discipline). The held object's bytes are not
+    /// counted as freed-physically here — only as app-freed (`freed_bytes`) — and
+    /// stay in the separate `quarantine.bytes` until they too are evicted.
+    #[cfg(feature = "quarantine")]
+    fn account_quarantined_free(
+        &self,
+        arena: ArenaId,
+        usable: usize,
+        evicted: &[crate::harden::QuarantineEntry],
+    ) {
+        // The application's free completes now (the object is out of its hands),
+        // even though physical reuse is delayed (§29.4 "free from the application
+        // perspective but not available for allocation").
+        self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
+        self.arenas.credit(arena, usable as u64);
+        for e in evicted {
+            self.drain_one(e);
+        }
+    }
+
+    /// Really free a quarantine entry that has been **evicted or drained** (§29.4):
+    /// the deferred `insert_batch` (small) / large free. Does **not** touch
+    /// `freed_bytes` — the app-facing free was accounted when the object entered
+    /// quarantine; this only performs the physical return and any span retirement.
+    /// The quarantine released the entry's separate byte accounting when it handed it
+    /// back. Tolerant of a span that was force-retired (arena reset) while the object
+    /// was held: the insert reports nothing inserted and this no-ops.
+    #[cfg(feature = "quarantine")]
+    fn drain_one(&self, e: &crate::harden::QuarantineEntry) {
+        if e.is_small() {
+            // SAFETY: `e.span` was captured from a live descriptor at free time;
+            // descriptors live in never-freed metadata (§27.5), so the pointer
+            // stays valid even though the span may since have retired/recycled.
+            let span = unsafe { &*e.span };
+            let r = self.central.insert_batch_scrubbing(span, &[e.index], 1);
+            if r.inserted > 0 && r.span_empty {
+                self.retire_span(span);
+            }
+        } else {
+            let owner = self.large_owner_for(e.arena);
+            let scrub_zero = self.scrub_on_release(e.arena);
+            // SAFETY: `e.user_ptr` was a live large base captured at free time; the
+            // large free re-resolves it under its own lock and rejects a stale ptr
+            // (so a span/extent recycled in the meantime cannot be double-freed).
+            unsafe {
+                owner.free_scrubbing(e.user_ptr, scrub_zero);
+            }
+        }
+    }
+
+    /// Drain the whole quarantine, really freeing every held object (§29.4 drain
+    /// protocol). Used before an arena teardown (so no held object dangles into a
+    /// retired span / freed extent) and on a runtime disable. A no-op without the
+    /// `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    fn drain_quarantine(&self) {
+        loop {
+            let batch = self.quarantine.drain_batch();
+            let entries = batch.as_slice();
+            if entries.is_empty() {
+                break;
+            }
+            for e in entries {
+                self.drain_one(e);
+            }
         }
     }
 
@@ -2440,6 +2711,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// allocation or free of its objects (the §22.5/§36.13 precondition the
     /// lifecycle transition established).
     unsafe fn drain_arena(&self, arena: ArenaId) -> bool {
+        // W18-3 (§29.4): drain the quarantine first, so no held object dangles into
+        // a span/extent this teardown is about to retire. Each held object returns to
+        // its own central list / backend (the deferred physical free); the reset
+        // arena's then become central-free and are discarded with the span below.
+        #[cfg(feature = "quarantine")]
+        self.drain_quarantine();
         let mut all_revoked = true;
         // Step 1 (small): force-retire every active span of this arena. Walk the
         // descriptor pool; a slot's descriptor is stable to read because slots
@@ -2609,6 +2886,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
             arenas_destroyed: self.arenas.destroyed_count(),
+            quarantine_bytes: self.quarantine_bytes(),
         }
     }
 
@@ -2884,7 +3162,10 @@ mod tests {
         assert_eq!(r, p, "freed slot reused");
         // SAFETY: `r == p` is live again with 64 usable bytes.
         let rbytes = unsafe { core::slice::from_raw_parts(r, 64) };
-        assert!(rbytes.iter().all(|&b| b == ALLOC_PATTERN), "re-fill on reuse");
+        assert!(
+            rbytes.iter().all(|&b| b == ALLOC_PATTERN),
+            "re-fill on reuse"
+        );
 
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert_eq!(tfree(&a, r), FreeOutcome::Freed);
@@ -4161,6 +4442,126 @@ mod tests {
             large_bytes.iter().all(|&b| b == 0),
             "§36.12: a non-PUBLIC arena's large backing must be scrubbed before downgrade"
         );
+        assert!(a.check_invariants());
+    }
+
+    /// W18-3 (§29.4): the live quarantine delays reuse of freed objects, accounts
+    /// the held bytes separately, detects a double free of a held object, and an
+    /// over-budget admission evicts (really frees) the oldest. Invariants hold
+    /// throughout, and disabling drains everything back to circulation.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn quarantine_delays_reuse_accounts_separately_and_drains() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // A small object budget so reuse is delayed but eviction is observable.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 8,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let live_before = a.stats().live_bytes;
+        assert!(live_before > 0);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Held: accounted separately (§29.4); the app-facing free dropped `live`.
+        assert!(
+            a.quarantine_bytes() >= 64,
+            "held bytes accounted separately"
+        );
+        assert_eq!(a.quarantine_objects(), 1);
+        assert!(
+            a.stats().live_bytes < live_before,
+            "a quarantined object is freed from the app's view (not live)"
+        );
+        assert!(a.check_invariants(), "invariants hold with an object held");
+
+        // Reuse is delayed: the freed object is not handed straight back.
+        let q = a.malloc(64);
+        assert_ne!(q, p, "quarantine delays reuse of the freed object");
+
+        // Double free of the held object is a quarantine hit (§29.3).
+        // SAFETY: `p` is the (held) object's pointer; the free path rejects it.
+        assert_eq!(unsafe { a.free(p) }, FreeOutcome::DoubleFree);
+        assert_eq!(a.quarantine_objects(), 1, "the hit changed nothing");
+
+        // Push past the object budget so `p` is evicted (FIFO) and really freed.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let x = a.malloc(64);
+            assert!(!x.is_null());
+            held.push(x);
+        }
+        for x in &held {
+            assert_eq!(tfree(&a, *x), FreeOutcome::Freed);
+        }
+        assert!(a.quarantine_objects() <= 8, "object budget enforced");
+        assert!(a.check_invariants());
+
+        // Disabling drains everything; the separate accounting returns to zero and
+        // the engine's live/freed totals still reconcile.
+        a.set_quarantine_enabled(false);
+        assert_eq!(a.quarantine_bytes(), 0, "disable drains the quarantine");
+        assert_eq!(a.quarantine_objects(), 0);
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        let s = a.stats();
+        assert_eq!(
+            s.live_bytes,
+            s.allocated_bytes_total - s.freed_bytes_total,
+            "§8.6: live == allocated − freed after the quarantine drains"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// W18-3 (§29.4): an arena reset/destroy **drains the quarantine first**, so no
+    /// held object dangles into a span/extent the teardown retires. The held objects
+    /// return to circulation (or are discarded with the reset arena's spans), the
+    /// arena's accounting still reconciles, and invariants hold.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn quarantine_is_drained_before_an_arena_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        a.set_quarantine_enabled(true);
+
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        // Allocate and free a batch in the arena — each free is held in quarantine.
+        let mut ptrs = Vec::new();
+        for _ in 0..20 {
+            let p = a.allocate_in(id, 100, MIN_ALIGN, RequestFlags::NONE);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in &ptrs {
+            // SAFETY: each `p` is a live object of `id` we still own.
+            assert_eq!(unsafe { a.free(*p) }, FreeOutcome::Freed);
+        }
+        assert!(a.quarantine_objects() > 0, "the arena's frees are held");
+        // The arena's own bytes are already credited (app-facing free happened).
+        assert_eq!(a.arena_stats(id).unwrap().used, 0);
+
+        // Reset drains the quarantine before force-retiring the arena's spans.
+        let _ = treset(&a, id).expect("reset");
+        assert_eq!(
+            a.quarantine_objects(),
+            0,
+            "reset drained the quarantine (no dangling held object)"
+        );
+        assert_eq!(a.quarantine_bytes(), 0);
+        assert_eq!(
+            a.arena_stats(id).unwrap().used,
+            0,
+            "B.5: no live arena bytes"
+        );
+        let s = a.stats();
+        assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
         assert!(a.check_invariants());
     }
 

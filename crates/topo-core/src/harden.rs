@@ -38,8 +38,14 @@
 //! carved slab, so on every reuse [`verify_free_pattern`] can assert the object
 //! still reads as [`FREE_PATTERN`]; a mismatch is a write-after-free.
 
+use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::ids::ArenaId;
+use crate::lock::{LockRank, RankedLock};
+use crate::sampling::SampleBloom;
+use crate::span::SpanDescriptor;
 
 /// Byte written over freshly-allocated user memory in junk-fill builds (§29.6),
 /// so reading it before initialisation is obvious. Mirrors jemalloc's `0xa5`
@@ -199,8 +205,9 @@ pub unsafe fn verify_free_pattern(ptr: *const u8, len: usize) -> bool {
 pub unsafe fn scrub(ptr: *mut u8, len: usize) {
     // SAFETY: forwarded from this function's contract — a writable, quiesced region.
     unsafe { ptr::write_bytes(ptr, 0, len) };
-    // Prevent the zeroing from being reordered past the caller's later
-    // revoke/relabel (it is observable by the next, lower-label, reader).
+    // A compiler fence pins the bulk zeroing *before* the caller's later
+    // revoke/relabel so the scrub cannot be sunk past it / elided.
+    // SeqCst: a *compiler* fence, not inter-thread atomic ordering — no atomic here, so the §27.3 map does not apply.
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -219,6 +226,492 @@ pub unsafe fn scrub(ptr: *mut u8, len: usize) {
 #[must_use]
 pub fn must_scrub_for_relabel(old: crate::ids::Label, new: crate::ids::Label) -> bool {
     old != new
+}
+
+// ---------------------------------------------------------------------------
+// W18-3 — quarantine (§29.4)
+// ---------------------------------------------------------------------------
+
+/// Ring capacity of the [`Quarantine`] — the hard ceiling on held objects
+/// (`max_objects` is clamped to this). A fixed array, so the quarantine never
+/// allocates (it *is* the allocator, Appendix F). Sized for a few-tens-of-KiB
+/// footprint that exists **only** in builds with the `quarantine` feature (the
+/// engine's field is `#[cfg]`-gated, so `performance` pays nothing).
+pub const QUARANTINE_CAP: usize = 1024;
+
+/// Most entries a single [`Quarantine::offer`] / [`Quarantine::drain_batch`] can
+/// hand back for the caller to really free. One admission evicts ~one object, so a
+/// small chunk covers the common case; a budget tightening evicts in bounded chunks
+/// that converge over successive offers, and the per-object byte accounting is exact
+/// regardless, so a transient over-budget never loses bytes.
+pub const QUARANTINE_MAX_BATCH: usize = 8;
+
+/// A freed allocation held out of circulation (§29.4). The engine performs the
+/// deferred *real* free (the `insert_batch` / large free) when it is evicted or
+/// drained. `Copy` (it is a few words of plain data); the raw pointers reach
+/// never-freed span metadata / live user memory.
+#[derive(Clone, Copy)]
+pub struct QuarantineEntry {
+    /// The user pointer — the membership key, and the free pointer for a large.
+    pub user_ptr: *mut u8,
+    /// The owning span (small object); null for a large allocation.
+    pub span: *const SpanDescriptor,
+    /// The object index within `span` (small only; ignored for large).
+    pub index: u16,
+    /// The owning arena (routes the deferred free's accounting).
+    pub arena: ArenaId,
+    /// Usable bytes held (the separate quarantine byte accounting, §29.4).
+    pub bytes: u32,
+}
+
+impl QuarantineEntry {
+    /// Whether this entry is a small-object hold (vs. a large allocation).
+    #[inline]
+    #[must_use]
+    pub fn is_small(&self) -> bool {
+        !self.span.is_null()
+    }
+}
+
+/// A bounded batch of entries the caller must really free (an offer's evictions
+/// or one drain step). Fixed-size so the quarantine never allocates.
+pub struct EvictBatch {
+    entries: [QuarantineEntry; QUARANTINE_MAX_BATCH],
+    len: usize,
+}
+
+impl EvictBatch {
+    /// A fresh, empty eviction buffer (the caller's stack scratch for
+    /// [`Quarantine::offer`] / [`Quarantine::drain_batch`]).
+    #[inline]
+    #[must_use]
+    pub fn new() -> EvictBatch {
+        EvictBatch {
+            entries: [QuarantineEntry {
+                user_ptr: ptr::null_mut(),
+                span: ptr::null(),
+                index: 0,
+                arena: ArenaId::DEFAULT,
+                bytes: 0,
+            }; QUARANTINE_MAX_BATCH],
+            len: 0,
+        }
+    }
+
+    /// The evicted entries the caller must really free (drain).
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[QuarantineEntry] {
+        &self.entries[..self.len]
+    }
+
+    /// Whether the batch is full (the offer/drain stopped at the chunk bound).
+    #[inline]
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.len == QUARANTINE_MAX_BATCH
+    }
+
+    #[inline]
+    fn push(&mut self, e: QuarantineEntry) -> bool {
+        if self.len < QUARANTINE_MAX_BATCH {
+            self.entries[self.len] = e;
+            self.len += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for EvictBatch {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Outcome of offering a freed allocation to the [`Quarantine`]. Any evictions the
+/// admission caused are written into the caller's `evicted` out-parameter (so this
+/// stays a small, copy-cheap enum — the eviction buffer lives on the caller's stack).
+pub enum Offer {
+    /// `user_ptr` is already in quarantine → a double free (§29.3 quarantine hit).
+    AlreadyQuarantined,
+    /// The entry was held; the caller MUST really free (drain) the entries written
+    /// into its `evicted` buffer.
+    Held,
+    /// Policy declined to quarantine this free — the caller frees it immediately.
+    Declined,
+}
+
+/// The §29.4 quarantine policy knobs. Runtime-configurable (held as atomics inside
+/// [`Quarantine`]); the defaults match the §32.3 hardened profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuarantinePolicy {
+    /// Total bytes the quarantine may hold before evicting (§29.4 `max_bytes`).
+    pub max_bytes: u64,
+    /// Total objects the quarantine may hold (≤ [`QUARANTINE_CAP`], §29.4
+    /// `max_objects`).
+    pub max_objects: u32,
+    /// Per-arena byte ceiling (`0` = unlimited; §29.4 `per_arena_limit`): a free
+    /// that would push one arena over this is not quarantined (freed immediately),
+    /// so one arena cannot monopolise the quarantine.
+    pub per_arena_bytes: u64,
+    /// Evict a **random** victim rather than the oldest (§29.4 `random_evict`):
+    /// defeats an attacker timing reuse off a deterministic FIFO.
+    pub random_evict: bool,
+    /// Quarantine only a sampled fraction of frees (§29.4 `sampled_only`): one in
+    /// `sample_shift` powers of two (so `0` = all frees, `k` = ~1 in 2^k).
+    pub sample_shift: u8,
+}
+
+impl QuarantinePolicy {
+    /// The default hardened policy (§32.3): hold up to 16 MiB / 4096 objects,
+    /// no per-arena cap, FIFO eviction, every free quarantined.
+    pub const DEFAULT: QuarantinePolicy = QuarantinePolicy {
+        max_bytes: 16 * 1024 * 1024,
+        max_objects: QUARANTINE_CAP as u32,
+        per_arena_bytes: 0,
+        random_evict: false,
+        sample_shift: 0,
+    };
+}
+
+/// The mutable ring state, guarded by the quarantine lock.
+struct QRing {
+    slots: [QuarantineEntry; QUARANTINE_CAP],
+    /// Index of the oldest held entry.
+    head: usize,
+    /// Number of held entries.
+    len: usize,
+    /// Inserts since the membership filter was last rebuilt (caps its
+    /// false-positive rate by triggering a periodic rebuild).
+    inserts_since_rebuild: u32,
+}
+
+/// The W18-3 delayed-reuse quarantine (§29.4): a bounded FIFO of freed
+/// allocations held out of circulation, with byte/object/per-arena budgets, an
+/// optional random-eviction and sampling policy, and a drain protocol. Accounted
+/// **separately** — held bytes are reported as `quarantine.bytes`, never as live
+/// or central-free. A decoupled leaf: an eviction is *returned* and really freed
+/// by the caller after the quarantine lock is released (rank [`LockRank::QUARANTINE`]).
+pub struct Quarantine {
+    lock: RankedLock<{ LockRank::QUARANTINE }>,
+    ring: UnsafeCell<QRing>,
+    /// Lock-free membership *negative* (a false answer is exact); a positive is
+    /// confirmed by an exact ring scan under the lock. Bounds the double-free check
+    /// on the free hot path to O(1) for the overwhelmingly common non-member case.
+    bloom: SampleBloom,
+    /// Held bytes — read lock-free for `quarantine.bytes` in stats (§29.4/§8.6).
+    bytes: AtomicU64,
+    /// Held objects — read lock-free for stats.
+    count: AtomicU32,
+    /// Per-arena held bytes (enforces `per_arena_bytes`).
+    per_arena: [AtomicU64; crate::arena::MAX_ARENAS],
+    /// Runtime master switch (in addition to the compile-time `quarantine` feature).
+    enabled: AtomicBool,
+    // --- policy (runtime-configurable atomics) ---
+    max_bytes: AtomicU64,
+    max_objects: AtomicU32,
+    per_arena_bytes: AtomicU64,
+    random_evict: AtomicBool,
+    sample_shift: AtomicU32,
+    /// xorshift state for `random_evict` / sampling decisions.
+    rng: AtomicU64,
+}
+
+// SAFETY: every access to the interior `ring` is serialised by `lock`; the atomics
+// are independently synchronised; the raw pointers in entries reach never-freed
+// span metadata or live user memory whose lifetime the engine manages. So the
+// `Quarantine` is safe to share across threads.
+unsafe impl Sync for Quarantine {}
+// SAFETY: as above — no thread-affine state.
+unsafe impl Send for Quarantine {}
+
+impl Quarantine {
+    /// A fresh, **empty** quarantine with the [`DEFAULT`](QuarantinePolicy::DEFAULT)
+    /// policy and the runtime switch **off** (opt-in, like the W17 sampler): the
+    /// compiled-in machinery costs nothing until an operator enables it via the
+    /// control plane / `TOPOMALLOC_QUARANTINE`, since holding objects out of
+    /// circulation has an RSS/latency cost the `hardened` build should not impose
+    /// unasked. Whether it can hold anything at all is *also* gated by the
+    /// compile-time `quarantine` feature (a `performance` build never reaches `offer`).
+    #[must_use]
+    pub fn new() -> Quarantine {
+        const EMPTY: QuarantineEntry = QuarantineEntry {
+            user_ptr: ptr::null_mut(),
+            span: ptr::null(),
+            index: 0,
+            arena: ArenaId::DEFAULT,
+            bytes: 0,
+        };
+        let p = QuarantinePolicy::DEFAULT;
+        Quarantine {
+            lock: RankedLock::new(),
+            ring: UnsafeCell::new(QRing {
+                slots: [EMPTY; QUARANTINE_CAP],
+                head: 0,
+                len: 0,
+                inserts_since_rebuild: 0,
+            }),
+            bloom: SampleBloom::new(),
+            bytes: AtomicU64::new(0),
+            count: AtomicU32::new(0),
+            per_arena: [const { AtomicU64::new(0) }; crate::arena::MAX_ARENAS],
+            enabled: AtomicBool::new(false),
+            max_bytes: AtomicU64::new(p.max_bytes),
+            max_objects: AtomicU32::new(p.max_objects),
+            per_arena_bytes: AtomicU64::new(p.per_arena_bytes),
+            random_evict: AtomicBool::new(p.random_evict),
+            sample_shift: AtomicU32::new(p.sample_shift as u32),
+            rng: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+        }
+    }
+
+    /// Held bytes, read lock-free (§29.4 separate accounting; `quarantine.bytes`).
+    #[inline]
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Held object count, read lock-free.
+    #[inline]
+    #[must_use]
+    pub fn held_objects(&self) -> u32 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Whether the runtime master switch is on (and the feature is compiled in).
+    #[inline]
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        quarantine_enabled() && self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Turn the runtime master switch on/off. Turning it off does **not** drain —
+    /// the caller drains explicitly so it can really free the held objects.
+    #[inline]
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Install a new policy (clamping `max_objects` to [`QUARANTINE_CAP`]). Does not
+    /// itself evict; the next [`offer`](Self::offer) (or an explicit drain) brings
+    /// the ring within the new budget.
+    pub fn set_policy(&self, p: QuarantinePolicy) {
+        self.max_bytes.store(p.max_bytes, Ordering::Relaxed);
+        self.max_objects
+            .store(p.max_objects.min(QUARANTINE_CAP as u32), Ordering::Relaxed);
+        self.per_arena_bytes
+            .store(p.per_arena_bytes, Ordering::Relaxed);
+        self.random_evict.store(p.random_evict, Ordering::Relaxed);
+        self.sample_shift
+            .store(p.sample_shift as u32, Ordering::Relaxed);
+    }
+
+    /// The current policy.
+    #[must_use]
+    pub fn policy(&self) -> QuarantinePolicy {
+        QuarantinePolicy {
+            max_bytes: self.max_bytes.load(Ordering::Relaxed),
+            max_objects: self.max_objects.load(Ordering::Relaxed),
+            per_arena_bytes: self.per_arena_bytes.load(Ordering::Relaxed),
+            random_evict: self.random_evict.load(Ordering::Relaxed),
+            sample_shift: self.sample_shift.load(Ordering::Relaxed) as u8,
+        }
+    }
+
+    /// Next xorshift value (for sampling / random eviction).
+    #[inline]
+    fn next_rng(&self) -> u64 {
+        // A relaxed read-modify-write loop is fine: we only need a fast,
+        // decorrelated stream, not a strict sequence.
+        let mut x = self.rng.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng.store(x, Ordering::Relaxed);
+        x
+    }
+
+    /// Whether sampling admits this free (`sample_shift == 0` ⇒ always).
+    #[inline]
+    fn sampled_in(&self) -> bool {
+        let shift = self.sample_shift.load(Ordering::Relaxed);
+        if shift == 0 {
+            return true;
+        }
+        let mask = (1u64 << shift.min(63)) - 1;
+        self.next_rng() & mask == 0
+    }
+
+    /// Exact membership (double-free of a held object), bounded to O(1) on the
+    /// common non-member path by the lock-free [`SampleBloom`] negative. Caller
+    /// holds the lock.
+    fn contains_locked(&self, user_ptr: usize) -> bool {
+        if !self.bloom.maybe_contains(user_ptr) {
+            return false;
+        }
+        // SAFETY: the quarantine lock is held ⇒ exclusive ring access.
+        let r = unsafe { &*self.ring.get() };
+        for k in 0..r.len {
+            let i = (r.head + k) % QUARANTINE_CAP;
+            if r.slots[i].user_ptr as usize == user_ptr {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Offer a freed allocation to the quarantine (§29.4). The caller has already
+    /// established `entry` is a *genuine* live→free transition (not already
+    /// central-free); this adds the §29.3 "already in quarantine" double-free guard
+    /// and the policy decision. Any entries this admission evicts are appended to
+    /// `evicted` (a fresh, caller-owned [`EvictBatch`]); the caller must really free
+    /// them. Returns:
+    /// * [`Offer::AlreadyQuarantined`] — `user_ptr` is held ⇒ a double free;
+    /// * [`Offer::Held`] — held; the caller drains `evicted`;
+    /// * [`Offer::Declined`] — policy declined; the caller frees `entry` now.
+    ///
+    /// The held bytes/objects are charged to the separate accounting here; an
+    /// eviction's bytes are released when it is moved into `evicted` (the caller
+    /// really frees it). So `held_bytes` is always exact.
+    pub fn offer(&self, entry: QuarantineEntry, evicted: &mut EvictBatch) -> Offer {
+        evicted.len = 0;
+        let admit_sampled = self.sampled_in();
+        self.lock.acquire();
+        if self.contains_locked(entry.user_ptr as usize) {
+            self.lock.release();
+            return Offer::AlreadyQuarantined;
+        }
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        let max_objects = self.max_objects.load(Ordering::Relaxed) as usize;
+        let bytes = entry.bytes as u64;
+        // Decline (free immediately) when: sampling skipped it, the object alone
+        // exceeds the whole budget (it could never fit), or it would push its arena
+        // past the per-arena ceiling.
+        let per_arena_limit = self.per_arena_bytes.load(Ordering::Relaxed);
+        let arena_idx = entry.arena.0 as usize;
+        let arena_held = self
+            .per_arena
+            .get(arena_idx)
+            .map_or(0, |a| a.load(Ordering::Relaxed));
+        let declines = !admit_sampled
+            || max_objects == 0
+            || bytes > max_bytes
+            || (per_arena_limit != 0 && arena_held + bytes > per_arena_limit);
+        if declines {
+            self.lock.release();
+            return Offer::Declined;
+        }
+        // Evict until the new entry fits within both budgets (bounded per call).
+        // SAFETY: the lock is held ⇒ exclusive ring access throughout.
+        let r = unsafe { &mut *self.ring.get() };
+        while (self.bytes.load(Ordering::Relaxed) + bytes > max_bytes || r.len >= max_objects)
+            && r.len > 0
+            && !evicted.is_full()
+        {
+            let victim_off = if self.random_evict.load(Ordering::Relaxed) {
+                (self.next_rng() as usize) % r.len
+            } else {
+                0 // FIFO: the oldest
+            };
+            let vi = (r.head + victim_off) % QUARANTINE_CAP;
+            let v = r.slots[vi];
+            // Compact: move the head entry into the victim's slot, advance head.
+            r.slots[vi] = r.slots[r.head];
+            r.head = (r.head + 1) % QUARANTINE_CAP;
+            r.len -= 1;
+            self.release_accounting(&v);
+            evicted.push(v);
+        }
+        // Push the new entry at the tail.
+        if r.len < QUARANTINE_CAP {
+            let ti = (r.head + r.len) % QUARANTINE_CAP;
+            r.slots[ti] = entry;
+            r.len += 1;
+            r.inserts_since_rebuild += 1;
+            self.bloom.insert(entry.user_ptr as usize);
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.count.fetch_add(1, Ordering::Relaxed);
+            if let Some(a) = self.per_arena.get(arena_idx) {
+                a.fetch_add(bytes, Ordering::Relaxed);
+            }
+            // Periodically rebuild the membership filter so drained entries' stale
+            // bits cannot accumulate into a high false-positive rate.
+            if r.inserts_since_rebuild as usize >= QUARANTINE_CAP {
+                self.rebuild_bloom(r);
+            }
+        } else {
+            // Ring full at capacity even after eviction (max_objects == CAP and the
+            // batch bound stopped eviction): decline rather than drop the entry, so
+            // the caller frees it now (never leaked). Any evictions already collected
+            // are still in `evicted` for the caller to drain.
+            self.lock.release();
+            return if evicted.len > 0 {
+                Offer::Held
+            } else {
+                Offer::Declined
+            };
+        }
+        self.lock.release();
+        Offer::Held
+    }
+
+    /// Pop up to [`QUARANTINE_MAX_BATCH`] held entries for the caller to really free
+    /// — the **drain protocol** (§29.4). Returns an empty batch when the quarantine
+    /// is empty; the caller loops until then (each batch freed outside the lock).
+    /// Used at shutdown, on a runtime disable, and before an arena teardown so no
+    /// held object dangles into a retired span.
+    pub fn drain_batch(&self) -> EvictBatch {
+        let mut out = EvictBatch::new();
+        self.lock.acquire();
+        // SAFETY: the lock is held ⇒ exclusive ring access.
+        let r = unsafe { &mut *self.ring.get() };
+        while r.len > 0 && !out.is_full() {
+            let e = r.slots[r.head];
+            r.head = (r.head + 1) % QUARANTINE_CAP;
+            r.len -= 1;
+            self.release_accounting(&e);
+            out.push(e);
+        }
+        if r.len == 0 {
+            // Empty ring ⇒ no stale membership bits can matter; reset the filter.
+            self.bloom.reset();
+            r.inserts_since_rebuild = 0;
+        }
+        self.lock.release();
+        out
+    }
+
+    /// Release an entry's separate accounting as it leaves the quarantine (evicted
+    /// or drained). Caller holds the lock.
+    #[inline]
+    fn release_accounting(&self, e: &QuarantineEntry) {
+        self.bytes.fetch_sub(e.bytes as u64, Ordering::Relaxed);
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        if let Some(a) = self.per_arena.get(e.arena.0 as usize) {
+            a.fetch_sub(e.bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Rebuild the membership filter from the live ring (caller holds the lock):
+    /// reset, then re-insert every held entry, clearing stale (drained) bits.
+    fn rebuild_bloom(&self, r: &mut QRing) {
+        self.bloom.reset();
+        for k in 0..r.len {
+            let i = (r.head + k) % QUARANTINE_CAP;
+            self.bloom.insert(r.slots[i].user_ptr as usize);
+        }
+        r.inserts_since_rebuild = 0;
+    }
+}
+
+impl Default for Quarantine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +782,158 @@ mod tests {
         buf[17] = 0x00; // a stray write-after-free
                         // SAFETY: `buf` is a live 32-byte region.
         assert!(!unsafe { verify_free_pattern(buf.as_ptr(), buf.len()) });
+    }
+
+    // --- W18-3 quarantine (the data structure; exercised with opaque pointers it
+    // never dereferences) ---
+
+    fn small_entry(addr: usize, bytes: u32) -> QuarantineEntry {
+        // A small-object entry; the quarantine treats `span` as opaque (non-null ⇒
+        // small) and `user_ptr` as the membership key — it dereferences neither.
+        QuarantineEntry {
+            user_ptr: addr as *mut u8,
+            span: addr as *const SpanDescriptor,
+            index: 0,
+            arena: ArenaId::DEFAULT,
+            bytes,
+        }
+    }
+
+    /// Offer an entry, returning the outcome and any evictions (the out-param form
+    /// the engine uses, wrapped for the tests).
+    fn offer(q: &Quarantine, e: QuarantineEntry) -> (Offer, EvictBatch) {
+        let mut ev = EvictBatch::new();
+        let o = q.offer(e, &mut ev);
+        (o, ev)
+    }
+
+    #[test]
+    fn quarantine_holds_and_accounts_separately() {
+        let q = Quarantine::new();
+        assert_eq!(q.held_bytes(), 0);
+        for k in 1..=4u64 {
+            let (o, _) = offer(&q, small_entry(0x1000 * k as usize, 100));
+            assert!(matches!(o, Offer::Held));
+        }
+        assert_eq!(q.held_objects(), 4);
+        assert_eq!(q.held_bytes(), 400);
+    }
+
+    #[test]
+    fn quarantine_detects_a_double_offer_as_a_hit() {
+        let q = Quarantine::new();
+        let p = 0xDEAD_0000usize;
+        assert!(matches!(offer(&q, small_entry(p, 64)).0, Offer::Held));
+        // Offering the same pointer again is a quarantine hit (double free, §29.3).
+        assert!(matches!(
+            offer(&q, small_entry(p, 64)).0,
+            Offer::AlreadyQuarantined
+        ));
+        // Accounted once, not twice.
+        assert_eq!(q.held_objects(), 1);
+        assert_eq!(q.held_bytes(), 64);
+    }
+
+    #[test]
+    fn quarantine_evicts_the_oldest_over_the_byte_budget() {
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 250,
+            max_objects: QUARANTINE_CAP as u32,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        // Three 100-byte holds: the third pushes total to 300 > 250, evicting the
+        // oldest so the held total stays within budget.
+        let _ = offer(&q, small_entry(0xA000, 100)); // oldest
+        let _ = offer(&q, small_entry(0xB000, 100));
+        let (o, ev) = offer(&q, small_entry(0xC000, 100));
+        assert!(matches!(o, Offer::Held));
+        assert_eq!(ev.as_slice().len(), 1, "one eviction");
+        assert_eq!(
+            ev.as_slice()[0].user_ptr as usize,
+            0xA000,
+            "FIFO: oldest out"
+        );
+        assert_eq!(q.held_bytes(), 200, "two 100-byte holds remain");
+        // The evicted one is no longer a member; the kept ones still are.
+        assert!(matches!(
+            offer(&q, small_entry(0xB000, 100)).0,
+            Offer::AlreadyQuarantined
+        ));
+    }
+
+    #[test]
+    fn quarantine_object_budget_is_enforced() {
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 2,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        let _ = offer(&q, small_entry(0x10, 8));
+        let _ = offer(&q, small_entry(0x20, 8));
+        let (o, ev) = offer(&q, small_entry(0x30, 8));
+        assert!(matches!(o, Offer::Held));
+        assert_eq!(ev.as_slice().len(), 1, "evict one to stay at max_objects=2");
+        assert_eq!(q.held_objects(), 2);
+    }
+
+    #[test]
+    fn quarantine_per_arena_cap_declines() {
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: QUARANTINE_CAP as u32,
+            per_arena_bytes: 150,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        assert!(matches!(offer(&q, small_entry(0x1, 100)).0, Offer::Held));
+        // 100 + 100 > 150 ⇒ the second is declined (freed immediately), so one
+        // arena cannot monopolise the quarantine.
+        assert!(matches!(
+            offer(&q, small_entry(0x2, 100)).0,
+            Offer::Declined
+        ));
+        assert_eq!(q.held_objects(), 1);
+    }
+
+    #[test]
+    fn quarantine_object_larger_than_budget_is_declined() {
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 64,
+            ..QuarantinePolicy::DEFAULT
+        });
+        // A 128-byte object can never fit a 64-byte budget ⇒ declined, never held.
+        assert!(matches!(
+            offer(&q, small_entry(0x1, 128)).0,
+            Offer::Declined
+        ));
+        assert_eq!(q.held_bytes(), 0);
+    }
+
+    #[test]
+    fn quarantine_drains_everything() {
+        let q = Quarantine::new();
+        for k in 0..100usize {
+            let _ = offer(&q, small_entry(0x1_0000 + k * 0x100, 16));
+        }
+        assert_eq!(q.held_objects(), 100);
+        let mut drained = 0usize;
+        loop {
+            let b = q.drain_batch();
+            if b.as_slice().is_empty() {
+                break;
+            }
+            drained += b.as_slice().len();
+        }
+        assert_eq!(drained, 100, "drain returns every held object exactly once");
+        assert_eq!(q.held_bytes(), 0);
+        assert_eq!(q.held_objects(), 0);
     }
 }

@@ -45,6 +45,7 @@ mod hooks_api;
 mod numa_api;
 mod policy;
 mod profile_api;
+mod quarantine_api;
 pub mod sampling;
 mod stats_api;
 
@@ -77,6 +78,10 @@ pub use policy::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use profile_api::{
     topomalloc_profile_confident_sites, topomalloc_profile_dump_json, topomalloc_profile_enabled,
     topomalloc_profile_rate, topomalloc_profile_set_rate, topomalloc_profile_sites,
+};
+pub use quarantine_api::{
+    topomalloc_quarantine_bytes, topomalloc_quarantine_enabled, topomalloc_quarantine_objects,
+    topomalloc_quarantine_set_enabled, topomalloc_quarantine_set_limits,
 };
 pub use stats_api::{
     topomalloc_explain_memory, topomalloc_stats_json, topomalloc_stats_json_for_label,
@@ -257,6 +262,41 @@ impl AnyAllocator {
     pub fn stats(&self) -> AllocatorStats {
         let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.stats())
+    }
+
+    /// Enable/disable the security quarantine at runtime (§29.4, W18-3). No-op
+    /// without the `quarantine` feature; disabling drains the held objects.
+    pub fn set_quarantine_enabled(&self, on: bool) {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.set_quarantine_enabled(on))
+    }
+
+    /// Whether the quarantine is currently active (feature **and** runtime switch).
+    pub fn quarantine_active(&self) -> bool {
+        dispatch!(self, a => a.quarantine_active())
+    }
+
+    /// Bytes currently held in the quarantine (§29.4; `quarantine.bytes`).
+    pub fn quarantine_bytes(&self) -> u64 {
+        dispatch!(self, a => a.quarantine_bytes())
+    }
+
+    /// Objects currently held in the quarantine (§29.4).
+    pub fn quarantine_objects(&self) -> u32 {
+        dispatch!(self, a => a.quarantine_objects())
+    }
+
+    /// Install a new quarantine policy (§29.4 knobs).
+    #[cfg(feature = "quarantine")]
+    pub fn set_quarantine_policy(&self, policy: topo_core::QuarantinePolicy) {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.set_quarantine_policy(policy))
+    }
+
+    /// The current quarantine policy (§29.4).
+    #[cfg(feature = "quarantine")]
+    pub fn quarantine_policy(&self) -> topo_core::QuarantinePolicy {
+        dispatch!(self, a => a.quarantine_policy())
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
@@ -631,6 +671,10 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // allocations are served by the system allocator and the first real sample
                 // is already armed. Only arms when the engine built.
                 crate::sampling::init_from_env();
+                // W18-3 (§29.4): honour `$TOPOMALLOC_QUARANTINE` (§32.1) under the same
+                // guard, so an operator can arm the security quarantine at load. Off
+                // unless the env var requests it (and the `quarantine` feature is built).
+                crate::quarantine_api::init_from_env();
                 INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
                 // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);

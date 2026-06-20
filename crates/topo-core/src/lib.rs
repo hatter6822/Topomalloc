@@ -87,8 +87,9 @@ pub use extent::{
 };
 pub use flags::{Hints, HugepagePolicy, Lifetime, RequestFlags};
 pub use harden::{
-    guard_pages_enabled, junk_fill_enabled, quarantine_enabled, secure_scrub_enabled,
-    ALLOC_PATTERN, FREE_PATTERN,
+    guard_pages_enabled, junk_fill_enabled, quarantine_enabled, secure_scrub_enabled, EvictBatch,
+    Offer, Quarantine, QuarantineEntry, QuarantinePolicy, ALLOC_PATTERN, FREE_PATTERN,
+    QUARANTINE_CAP,
 };
 pub use hooks::{ExtentHooks, HookProvider};
 pub use huge::{

@@ -114,6 +114,14 @@ impl LockRank {
     pub const BACKEND: u8 = 8;
     /// Stats shard lock. Reserved (stats are relaxed atomics today).
     pub const STATS: u8 = 9;
+    /// Security **quarantine** ring (W18-3, §29.4). The **highest** rank by design:
+    /// it is a decoupled *leaf*. The free path enters the quarantine holding no other
+    /// lock, and an eviction is *returned* to the caller and drained (the real
+    /// `insert_batch` / large free, which take `CENTRAL`/`SPAN`/`BACKEND`) **after**
+    /// the quarantine lock is released — never nested under it. Making it the top rank
+    /// lets the checker *enforce* that: acquiring any lower lock while holding the
+    /// quarantine lock would trip the order checker.
+    pub const QUARANTINE: u8 = 10;
 }
 
 /// A test-and-test-and-set spinlock carrying a **compile-time rank** (W16-1a),
@@ -413,6 +421,7 @@ mod tests {
             LockRank::SPAN,
             LockRank::BACKEND,
             LockRank::STATS,
+            LockRank::QUARANTINE,
         ];
         for pair in order.windows(2) {
             assert!(
