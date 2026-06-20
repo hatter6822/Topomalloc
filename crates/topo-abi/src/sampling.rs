@@ -35,8 +35,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use topo_core::{
-    classify, PlacementStats, RequestFlags, RequestKind, SampleBloom, SampleConfig, SampledObjects,
-    SampledRecord, Sampler, SiteProfileTable, SizeClassDist, StackBuf, StackId,
+    classify, predicted_usable_size, PlacementStats, RequestFlags, RequestKind, SampleBloom,
+    SampleConfig, SampledObjects, SampledRecord, Sampler, SiteProfileTable, SizeClassDist,
+    StackBuf, StackId,
 };
 
 /// Distinct allocation sites the profile table holds (§24.4). Bounded and inline; see the
@@ -255,9 +256,14 @@ fn sample_alloc_slow(ptr: *mut u8, size: usize, align: usize, flags: RequestFlag
     let now = now_ms();
     let bucket = bucket_of(size, align, flags);
     let hotness = flags.hints().hotness;
+    // The usable size to record for this sample (§31.5 split, W17-4): small objects feed the
+    // *sampled* estimate with their real page/slab waste; medium/large record zero waste because
+    // the large path counts their page-tail exactly (see [`sampled_usable`]).
+    let usable = sampled_usable(bucket, size, align, flags);
     let rec = SampledRecord {
         stack_id,
         bytes: size as u64,
+        usable,
         alloc_ms: now,
     };
     let st = state();
@@ -327,6 +333,24 @@ fn bucket_of(size: usize, align: usize, flags: RequestFlags) -> u16 {
     }
 }
 
+/// The `usable` size to record for a sample (§31.5 split, W17-4). For a **small** object it is
+/// the true predicted usable (the §10.3 `nallocx` oracle, computed purely from the request — no
+/// allocator call-back, so the must-not-allocate sampled path stays alloc-free, §31.4), so the
+/// object's slab/page waste `usable − requested` feeds the *sampled* fragmentation estimate. For
+/// a **medium/large** object it is `size` (zero waste): that allocation's page-tail is tracked
+/// *exactly* by the large path (every live descriptor), so counting it in the sampled estimate
+/// too would double-count the same bytes in both the sampled and exact fragmentation fields. The
+/// `predicted_usable_size` `None` arm cannot occur (the allocation succeeded) but falls back to
+/// `size` (zero waste) for total safety.
+#[inline]
+fn sampled_usable(bucket: u16, size: usize, align: usize, flags: RequestFlags) -> u64 {
+    if bucket < SizeClassDist::BUCKET_MEDIUM {
+        predicted_usable_size(size, align, flags).unwrap_or(size) as u64
+    } else {
+        size as u64
+    }
+}
+
 /// Capture the current call stack into the thread-local buffer and fold it to a
 /// [`StackId`]. Uses the glibc `backtrace` unwinder, which writes return addresses into a
 /// caller-provided fixed array — **no allocation** (after the enable-time warm-up). On
@@ -378,6 +402,29 @@ pub fn placement_stats() -> PlacementStats {
             g.profiles.stats()
         }
         None => PlacementStats::default(),
+    }
+}
+
+/// The **sampled internal-fragmentation** estimate (§31.5, W17-4): the sum over the live
+/// sampled objects of `usable − requested`. Computed on demand over the live set (the slow
+/// stats path), so it is exact for the *current* live sample by construction — no
+/// incremental accumulator to drift across the duplicate-overwrite / capacity-drop /
+/// censor-at-dump edges. `0` when profiling was never enabled (no samples ⇒ no estimate).
+///
+/// This is a *sampled* metric: it is the internal fragmentation of the objects the sampler
+/// happens to be tracking, not a scaled estimate of the whole heap (§31.5 "MAY sample it in
+/// performance mode"). With sampling off it is `0`, exactly as the rest of the profiler.
+pub fn sampled_internal_fragmentation_bytes() -> u64 {
+    match STATE.get() {
+        Some(m) => {
+            let g = m.lock().unwrap_or_else(|e| e.into_inner());
+            let mut frag: u64 = 0;
+            g.objects.for_each(|rec| {
+                frag = frag.saturating_add(rec.usable.saturating_sub(rec.bytes));
+            });
+            frag
+        }
+        None => 0,
     }
 }
 
@@ -503,6 +550,42 @@ mod tests {
         assert_eq!(
             bucket_of(usize::MAX, 1, RequestFlags::NONE),
             SizeClassDist::BUCKET_LARGE
+        );
+    }
+
+    #[test]
+    fn sampled_usable_excludes_medium_and_large_from_fragmentation() {
+        // PR #21 review (§31.5 split, W17-4): a small sample records its real usable, so its
+        // slab/page waste feeds the *sampled* estimate; a medium/large sample records zero waste
+        // (`usable == bytes`), because the large path counts that page-tail *exactly* — recording
+        // it here too would double-count it in both the sampled and exact fragmentation fields.
+        // Small: real usable ≥ size (a 100-byte request rounds up to a slab class with slack).
+        let sb = bucket_of(100, 8, RequestFlags::NONE);
+        assert!(
+            sb < SizeClassDist::BUCKET_MEDIUM,
+            "100 bytes is a small class"
+        );
+        assert!(
+            sampled_usable(sb, 100, 8, RequestFlags::NONE) >= 100,
+            "a small sample records its true (slack-carrying) usable"
+        );
+        // Medium: zero waste recorded.
+        let medium = 80_000usize;
+        let mb = bucket_of(medium, 16, RequestFlags::NONE);
+        assert_eq!(mb, SizeClassDist::BUCKET_MEDIUM);
+        assert_eq!(
+            sampled_usable(mb, medium, 16, RequestFlags::NONE),
+            medium as u64,
+            "a medium sample records zero waste (tracked exactly by the large path)"
+        );
+        // Large: zero waste recorded, even with a non-page-multiple request that genuinely wastes.
+        let large = 4 * 1024 * 1024 + 123;
+        let lb = bucket_of(large, 16, RequestFlags::NONE);
+        assert_eq!(lb, SizeClassDist::BUCKET_LARGE);
+        assert_eq!(
+            sampled_usable(lb, large, 16, RequestFlags::NONE),
+            large as u64,
+            "a large sample records zero waste (no sampled/exact double-count)"
         );
     }
 }

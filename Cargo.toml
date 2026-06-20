@@ -89,10 +89,21 @@ exclude = ["fuzz", "vendor/sele4n"]
 # **re-entrancy-aware** (a nested entry nests on a per-thread depth instead of parking on the
 # fork bit, closing a latent drain deadlock), the `topomalloc_numa_*` control surface is
 # fork-gated (it takes backend locks), and the hook re-entrancy fail-safe now declines
-# `free`/`realloc`/in-place-resize too (not just `malloc`); regression tests pin each. In a 0.x
+# `free`/`realloc`/in-place-resize too (not just `malloc`); regression tests pin each. 0.1.23: W17
+# deep-audit pass — exact medium/large internal fragmentation (§31.5) now refreshes the recorded
+# request on every in-place resize, including a *same-page-count* shrink/grow that moves no backing
+# (`apply_inplace_large_resize`), so the "exact" figure never reads a stale request; a regression
+# test (`exact_fragmentation_tracks_a_same_page_request_change`) pins it, and the peak-gauge
+# charge-point comment is corrected to a sound bound. Six PR #21 review fixes followed (each
+# regression-tested): a declined in-place grow no longer clamps the still-live object's request
+# (preserving its exact waste); a successful in-place grow now bumps the §31.3 peak high-water (so
+# it is not forgotten after free); `RESET_PEAKS` no longer fires on a JSON length-query sizing call
+# nor for a redacted/low observer (a cross-domain write); the *sampled* fragmentation estimate
+# excludes medium/large (counted exactly elsewhere — no double-count); and `CONSISTENT_SNAPSHOT`
+# compares the whole `AllocatorStats` for stability, not just the cumulative totals. In a 0.x
 # series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
 # axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

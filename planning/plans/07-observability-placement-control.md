@@ -1,8 +1,10 @@
 # Plan 07 — Observability, Placement & Control
 
 **Workstreams:** W17 (stats/telemetry/profiling), W14 (lifetime/hotness/placement), W20 (config/control plane)
-· **Status:** rev 2.2 — **W14 landed (all units), with the minimal W17-3 sampling slice that feeds it
-live.** · **Overview:** [README.md](README.md)
+· **Status:** rev 2.3 — **W14 landed (all units); W17 landed (all units — stats core, epoch/consistent
+snapshot, JSON/print/snapshot API + flags, fragmentation, `explain_memory`, label-scoped redaction —
+ahead of its M6 slot, the W17-3 sampling slice having landed first to feed W14).** · **Overview:**
+[README.md](README.md)
 **SPEC anchors:** §31, §8.6, §19.7, §36.12, §24, §32, §10.5, Appendices D/E; O-001..O-007.
 **Upstream deps:** every state-owner (stats read all of them), [04](04-backend-hugepages-release.md) (coverage),
 [08](08-security-debug-testing.md)/[02](02-formal-model.md) (sampling unwind safety). **Downstream:**
@@ -30,16 +32,16 @@ placement (consumed by plan 04 filler): hot/cold + lifetime hints; allocation-si
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
-| W17-1a | Stats core (§31.1, O-002): all byte classes (app/cache/central/backend/metadata/quarantine/hugepage/arena). | M | | classes present; non-negative. |
-| W17-1b | Epoch/sequence + consistent-snapshot mode (§8.6): a snapshot reconciles to managed VM modulo the documented convention. | M | ∥ | reconciliation test passes. |
-| W17-2 | Snapshot/JSON/print API (§31.2) + flags (SUMMARY/BY_ARENA/BY_SIZE_CLASS/BY_CPU/BY_NUMA/BY_HUGEPAGE); additive-field rule (§35.3). | M | | JSON matches Appendix D shape. |
+| W17-1a | Stats core (§31.1, O-002): all byte classes (app/cache/central/backend/metadata/quarantine/hugepage/arena). | M | | classes present; non-negative. ✅ every §31.1 class is in the snapshot/JSON, all `u64` (non-negative by construction): the §20.1 `backend.active_bytes` / `retained_bytes` distinction (Retained = the extent manager's `reserved`), `quarantine.bytes` (present, `0` until plan 08 wires byte accounting), `arena.destroyed` (a real cumulative `ArenaTable::destroyed_count`, bumped at each `*→Destroyed`), alongside the already-present app/cache/central/hugepage/release/topology/placement blocks. |
+| W17-1b | Epoch/sequence + consistent-snapshot mode (§8.6): a snapshot reconciles to managed VM modulo the documented convention. | M | ∥ | reconciliation test passes. ✅ a process-global monotonic `STATS_EPOCH` stamps every composed snapshot (`topomalloc_stats_*`); `CONSISTENT_SNAPSHOT` is the §31.2 read-mode flag. The §8.6 convention is documented + tested: `virtual == active + pageheap_free` and `pageheap_free == retained + dirty + muzzy + released` hold *algebraically* (even under a torn concurrent read), and `live + central_free <= active`, `live == allocated − freed` hold at any quiescent point — proven over a live allocator, sequential **and** under concurrent load that then quiesces (`tests/tests/stats.rs`). |
+| W17-2 | Snapshot/JSON/print API (§31.2) + flags (SUMMARY/BY_ARENA/BY_SIZE_CLASS/BY_CPU/BY_NUMA/BY_HUGEPAGE); additive-field rule (§35.3). | M | | JSON matches Appendix D shape. ✅ the C `topomalloc_stats_json` / `_print(FILE*)` / `_snapshot(topomalloc_stats_t*)` trio (plus `_json_for_label`) over a **live composed** snapshot — allocator byte classes + the heap sampler + the live NUMA router's §15/§19.7 coverage. `StatsFlags` (the eight §31.2 bits) gate `BY_ARENA` (per-arena lines, reconciling with `arenas.count`) and `BY_SIZE_CLASS` (per-class central-free, summing to `central.free_bytes`); the renderer is additive (§35.3, new fields only append). |
 | W17-3a | Sampling mechanism (§31.4): per-thread/per-CPU bytes-between-samples counter (Poisson), **no hot-path lock**. | M | | sampling decision lock-free; rate configurable. ✅ (landed early to feed W14) `topo_core::sampling::Sampler` — a per-thread Poisson "bytes-until-next-sample" counter (fixed-point exponential interval, so the core stays FP-free); the decision touches only thread-local state (no lock/syscall/alloc). Wired into `AnyAllocator::{allocate,free,realloc}`; rate set by `$TOPOMALLOC_SAMPLE_RATE` / `topomalloc_profile_set_rate`. Off by default. |
 | W17-3b | Stack capture on a sampled alloc **without recursive malloc** (bounded, alloc-free unwind into a fixed buffer). | M | | unwinder never re-enters the allocator (§31.4). ✅ (early) `StackBuf` — a fixed `[usize; MAX_STACK_FRAMES]` the platform unwinder (`libc::backtrace`, warmed up once at enable) fills *in place*; folds to an opaque `StackId`. A thread-local re-entrancy guard makes the sampled slow path non-re-entrant; `sampling_lifecycle_*` pins that the sampler never re-enters the allocator. |
 | W17-3c | Sampled-object bookkeeping: track sampled live objects, free them safely, right-censored lifetime accounting. | M | ∥ | freeing a sampled object is correct + accounted. ✅ (early) `SampledObjects` — a fixed-capacity, alloc-free live set (open addressing + backward-shift deletion); a sampled free resolves the object's lifetime; `fold_censored` right-censors still-live objects at dump. The **free hot path stays lock-free** via the atomic `SampleBloom` (no false negatives), so only a maybe-positive consults the locked set (DD-1 F2). |
 | W17-3d | Heap + lifetime profile aggregation + dump format (§31.3). | M | ∥ | profiles dumpable; low overhead. ✅ (early) aggregation **is** `SiteProfileTable` (W14-2); `topomalloc_profile_dump_json` renders the §31.3 dump. (The broader W17 stats core / epoch snapshot / flags / redaction / `explain` remain for M6.) |
-| W17-4 | Fragmentation metrics (§31.5) + hugepage coverage (§19.7) wired from plan 04 W11-5. | M | ∥ | internal/external/cache/hugepage fragmentation reported. |
-| W17-5 | `topo_explain_memory()` (§31.6): a human-readable RSS attribution string. | S | ∥ | returns e.g. "RSS high because: 2.1 GiB live, 700 MiB per-CPU cache, …". |
-| W17-6 | **Label-scoped & redacted stats** (§36.12): low domains cannot infer high-domain patterns. | M | | stats-redaction test (§36.16); mirrors `stats_observation_noninterference` (plan 02 W1-12d). |
+| W17-4 | Fragmentation metrics (§31.5) + hugepage coverage (§19.7) wired from plan 04 W11-5. | M | ∥ | internal/external/cache/hugepage fragmentation reported. ✅ a `fragmentation` JSON block: `internal_sampled_bytes` (the §31.5 `Σ(usable − requested)` over the **live sampled set** — the sampler now records both sizes; computed on demand, exact for the live set, `0` when sampling is off), `external_bytes` (dirty + muzzy — free backed bytes not immediately useful), `cache_bytes` (per-CPU + thread + transfer), `hugepage_bytes` (from §19.7 `HugeStats`, wired live through `NodeRouter::coverage`), `metadata_overhead_bytes`. |
+| W17-5 | `topo_explain_memory()` (§31.6): a human-readable RSS attribution string. | S | ∥ | returns e.g. "RSS high because: 2.1 GiB live, 700 MiB per-CPU cache, …". ✅ `topomalloc_explain_memory()` + `Stats::explain()` render "RSS is attributed to: 2.5 GiB live, 700.0 MiB per-CPU cache, 1.4 GiB dirty retained, …" — the byte classes named largest-first in binary units (integer-only), with decommitted (`released`) bytes noted apart as managed-VM-not-RSS, and an explicit idle case. |
+| W17-6 | **Label-scoped & redacted stats** (§36.12): low domains cannot infer high-domain patterns. | M | | stats-redaction test (§36.16); mirrors `stats_observation_noninterference` (plan 02 W1-12d). ✅ a pure `redact_arenas(lines, observer_label)` keeps only the arenas an observer dominates (`label <= observer`), dropping every higher-domain line; the C `topomalloc_stats_json_for_label` applies it to the `BY_ARENA` detail. Pinned by `redaction_is_label_noninterference` (changing/adding any *higher*-labelled arena leaves the low view bit-for-bit identical) — the Rust analogue of the proved Lean `stats_observation_noninterference`. On POSIX every arena is `PUBLIC`, so a `PUBLIC` observer sees everything (identity); the redaction has teeth under the seLe4n multi-label profile (plan 09). |
 
 > **▸ Decomposition — W17-3 (sampled profiling), the "don't re-enter yourself" problem.** Split the *sampling
 > decision* (W17-3a, must be lock-free on the hot path), the *stack capture* (W17-3b, must unwind without
@@ -53,6 +55,41 @@ placement (consumed by plan 04 filler): hot/cold + lifetime hints; allocation-si
 > snapshotting* (W17-1b). The hard part is §8.6: a snapshot taken while threads allocate must still reconcile
 > (sum of parts == managed VM, modulo a documented convention). An epoch/sequence number lets readers get a
 > coherent view without locking the fast path.
+
+> **▸ Implementation status.** W17 is **landed** (all units, ahead of its M6 slot). The pure renderer is
+> `topo-stats` (`Stats` summary + `StatsFlags` + `StatsDetail` + `ArenaLine`/`SizeClassLine` + `redact_arenas`
+> + `explain`); the live composer + C surface is `crates/topo-abi/src/stats_api.rs`
+> (`topomalloc_stats_json` / `_json_for_label` / `_print` / `_snapshot` + `topomalloc_explain_memory`, with a
+> monotonic `STATS_EPOCH`). Composition reads the running engine (`AllocatorStats`, with the new
+> `arenas_destroyed` from `ArenaTable::destroyed_count` and the per-class central-free decomposition), the
+> heap sampler (`PlacementStats` + the new §31.5 `sampled_internal_fragmentation_bytes`, fed by `usable` now
+> carried on each `SampledRecord`), and — under `hugepage-optimized` — the live router (`NodeRouterStats` +
+> the new `NodeRouter::coverage` / `RouterControl::coverage`). Stats are **derived observability**, not an
+> abstract state-machine transition, so there is **no §33.4 obligation**: the reconciliation is pinned by the
+> fixed-wall `tests/tests/stats.rs` battery, and the W17-6 redaction is the Rust analogue of the proved Lean
+> `stats_observation_noninterference` theorem (pinned by `redaction_is_label_noninterference`). The control
+> namespace (W20) and the C header gain the matching keys/symbols; the ABI struct/flags are frozen by the
+> two-sided ABI smoke tests.
+>
+> **Optimal-completion pass.** A self-audit found several pieces "present but inert" or hollow-by-default;
+> they are now genuinely complete: **(W17-6)** redaction is no longer detail-only — `redact_summary` scopes
+> the *whole* summary a low observer receives (cross-domain aggregates zeroed; `live_bytes` recomputed from
+> the visible arenas via `Σ arena.used == live_bytes`), so the JSON is genuinely non-interfering (the
+> property is fuzzed in `fuzz/fuzz_targets/stats_render.rs` and unit-pinned by
+> `summary_redaction_is_noninterference_for_the_whole_view`). **(W17-1b)** `CONSISTENT_SNAPSHOT` now *does
+> something*: a read-twice-until-stable loop over the cumulative counters yields a coherent snapshot.
+> **(W17-2)** `RESET_PEAKS` is real — a true `peak_live_bytes` high-water is maintained at the allocation
+> charge point and cleared by the flag; `BY_NUMA` renders a genuine per-node array (`NodeRouter::node_coverage`)
+> and `BY_HUGEPAGE` a labeled per-bin array; an unknown flag bit is **strictly rejected** (§10.4), and the
+> `topomalloc_stats_t` struct grew to the full 27-field snapshot. **(W17-4)** internal fragmentation is now
+> *exact* for medium/large (the large descriptor records each request; the live waste is summed by a
+> free-path-agnostic walk, robust to single/arena-bulk/realloc frees) alongside the sampled small-object
+> estimate. **(W17-5)** `explain_memory` reads the **real RSS** (`/proc/self/statm`), leads with it, partitions
+> the resident footprint, and attributes the non-heap remainder. The remaining deferrals are narrow: true stats
+> epoch **snapshot-isolation** (a seqlock over the fast path; the read-twice loop + §8.6 bounded-skew convention
+> cover operational debugging today) and the **seLe4n resource-server-enforced** per-label backend/cache
+> partitioning (the per-arena + whole-summary redaction is the complete Rust-side mechanism for the POSIX
+> profile, and the analogue the seLe4n server will enforce at its IPC boundary, plan 09).
 
 ---
 

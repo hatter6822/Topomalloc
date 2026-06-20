@@ -34,7 +34,7 @@ Formal: Lean model + seLe4n bridge                           lean/
 | `topo-backend-posix` | `PosixBackingProvider` (degenerate single-authority case) | MIT |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later |
 | `topo-arch` | per-arch identity + the RSEQ restartable per-CPU sequences (plan 05 W7) | MIT |
-| `topo-stats` | stats snapshot + additive JSON (`topomalloc_version`) | MIT |
+| `topo-stats` | stats snapshot + §31.2 flags, additive Appendix-D JSON, §31.6 `explain`, §36.12 redaction (`topomalloc_version`) | MIT |
 | `topo-control` | configuration + control namespace | MIT |
 | `topo-test-support` | trace parser, deterministic PRNG, executable model | MIT |
 

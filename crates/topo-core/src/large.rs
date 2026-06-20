@@ -715,6 +715,56 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         res
     }
 
+    /// Record the **requested** size of the live large allocation at base `ptr` (§31.5 exact
+    /// internal fragmentation, plan 07 W17-4). A no-op if `ptr` is not a live large allocation
+    /// of this allocator (e.g. it belongs to a hooked arena's own backend). Stats-only; never
+    /// affects a free/realloc/usable_size.
+    pub fn note_requested(&self, ptr: *mut u8, requested: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        self.lock.acquire();
+        if let Some(desc_ptr) = self.pagemap.lookup(ptr as usize).large_ptr() {
+            // SAFETY: lock held ⇒ exclusive pool access; resolve the slot as `usable_size` does.
+            let pool = unsafe { &*self.pool.get() };
+            if let Some(idx) = pool.index_of(desc_ptr) {
+                // SAFETY: `idx` is a live slot under the lock; `set_requested` is an atomic store.
+                unsafe { (*pool.slot_ptr(idx)).desc.set_requested(requested) };
+            }
+        }
+        self.lock.release();
+    }
+
+    /// The **exact** internal fragmentation of the live large allocations (§31.5, W17-4):
+    /// `Σ(usable − requested)` over every live descriptor. Computed without a scratch buffer
+    /// or a free-path counter: the total waste over `0..high_water` minus the waste still
+    /// charged to the free-list slots (whose descriptors keep their last allocation's sizes
+    /// until recycled), which leaves exactly the *live* waste. Robust to **every** free path
+    /// (single free, arena bulk free, realloc shrink) because it reads only the current pool
+    /// state under the pool lock. O(slots) — the slow stats surface.
+    pub fn internal_fragmentation_bytes(&self) -> usize {
+        self.lock.acquire();
+        // SAFETY: lock held ⇒ exclusive pool access (the slots and the free list are stable).
+        let pool = unsafe { &*self.pool.get() };
+        let waste = |d: &LargeDescriptor| d.usable_size().saturating_sub(d.requested());
+        let mut total = 0usize;
+        for i in 0..pool.high_water {
+            // SAFETY: `i < high_water <= cap`, a valid slot.
+            total = total.saturating_add(waste(unsafe { &(*pool.slot_ptr(i)).desc }));
+        }
+        // Subtract the waste still sitting on the free-list slots (not live).
+        let mut free_waste = 0usize;
+        let mut j = pool.free_head;
+        while j != NIL {
+            // SAFETY: `j` is a valid slot index on the free list (pushed by `release`).
+            let slot = unsafe { &*pool.slot_ptr(j) };
+            free_waste = free_waste.saturating_add(waste(&slot.desc));
+            j = slot.free_next;
+        }
+        self.lock.release();
+        total.saturating_sub(free_waste)
+    }
+
     /// **In-place shrink** (§25.3, plan 06 W15-3b): reduce the live large
     /// allocation at base `ptr` to `new_usable` page-rounded bytes, splitting off
     /// and returning its tail `[base + new_usable, base + old_usable)` to the
@@ -1051,6 +1101,10 @@ pub trait LargeBacking {
     fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8;
     /// The usable size of the live large allocation at `ptr` *in this backend*.
     fn usable_size(&self, ptr: *mut u8) -> Option<usize>;
+    /// Record the **requested** size of the live large allocation at `ptr` *if it belongs to
+    /// this backend* (§31.5 exact internal fragmentation, W17-4); see
+    /// [`LargeAllocator::note_requested`]. Stats-only; a no-op for a foreign `ptr`.
+    fn note_requested(&self, ptr: *mut u8, requested: usize);
     /// The owning arena of the live large allocation at `ptr` *in this backend*.
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId>;
     /// Free the large allocation at `ptr` *if it belongs to this backend*.
@@ -1099,6 +1153,10 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
     #[inline]
     fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
         LargeAllocator::usable_size(self, ptr)
+    }
+    #[inline]
+    fn note_requested(&self, ptr: *mut u8, requested: usize) {
+        LargeAllocator::note_requested(self, ptr, requested)
     }
     #[inline]
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId> {

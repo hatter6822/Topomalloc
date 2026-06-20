@@ -261,6 +261,20 @@ pub struct AllocatorStats {
     /// arenas, per kind (§23, plan 06 W10). All zero unless a hooked arena's backing
     /// has faulted (and zero entirely for a program with no hooked arenas).
     pub hook_failures: HookFailureStats,
+    /// Cumulative arenas destroyed over the engine's lifetime (§31.1
+    /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may later
+    /// be recycled (§36.13), so this is an event count, not `created − live`.
+    pub arenas_destroyed: u64,
+    /// The high-water mark of `live_bytes` since the last reset (§31.2/§31.3 sampled peak
+    /// heap, plan 07 W17-2). A true high-water mark maintained on the allocation charge
+    /// path (`fetch_max` of live after each charge), reset by `topomalloc_stats` `RESET_PEAKS`.
+    pub peak_live_bytes: u64,
+    /// **Exact** internal fragmentation of the live medium/large (extent-backed) allocations
+    /// (§31.5, plan 07 W17-4): `Σ(usable − requested)` over every live large allocation. The
+    /// large path records each allocation's requested size, so this is exact and always-on —
+    /// page-rounding is where internal waste dominates. Small-object internal fragmentation is
+    /// the *sampled* estimate in the placement profiler (§31.5 "MAY sample in performance mode").
+    pub live_internal_fragmentation_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +659,11 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// Cumulative usable bytes ever returned. `live = allocated - freed` by
     /// construction, so the §8.6 application-side identity cannot drift.
     freed_bytes: AtomicU64,
+    /// High-water mark of live bytes since the last reset (§31.2/§31.3 peak heap, W17-2):
+    /// `fetch_max`'d with `live` after each allocation charge. Relaxed (a stats gauge). The
+    /// exact medium/large internal fragmentation (§31.5) is tracked by the large allocator
+    /// itself ([`LargeAllocator::internal_fragmentation_bytes`]), which owns the descriptors.
+    peak_live_bytes: AtomicU64,
     /// Per-arena hooked backing regions (plan 06 W10, §22.2): an arena created with
     /// [`arena_create_hooked`](Self::arena_create_hooked) serves its span/large
     /// allocations from its own [`ExtentHooks`] instead of the shared backend.
@@ -795,6 +814,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span_lock: RankedLock::new(),
             allocated_bytes: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
+            peak_live_bytes: AtomicU64::new(0),
             hooks: HookRegistry::new(),
             retired_hooks: AtomicHookFailures::new(),
             learned: LearnedHints::new(),
@@ -1041,8 +1061,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             self.arenas.credit(arena, usable as u64);
             return ptr::null_mut();
         }
-        self.allocated_bytes
-            .fetch_add(usable as u64, Ordering::Relaxed);
+        let new_allocated = self
+            .allocated_bytes
+            .fetch_add(usable as u64, Ordering::Relaxed)
+            .wrapping_add(usable as u64);
+        // §31.2/§31.3 peak heap (W17-2): bump the live high-water for this fresh charge.
+        self.bump_peak_after_alloc(new_allocated);
+        // §31.5 exact medium/large internal fragmentation (W17-4): record the *requested*
+        // size on the large descriptor so `usable − requested` is exact. Routed to the same
+        // backend the allocation came from (hooked arena's own, or the shared large path); a
+        // no-op for small objects (sampled instead).
+        if !matches!(req.kind, RequestKind::Small { .. }) {
+            match self.hook_backend(arena) {
+                Some(b) => b.large.note_requested(p, size),
+                None => self.large.note_requested(p, size),
+            }
+        }
         // §26.2 zeroing: small objects (recycled slab memory, always dirty) and
         // hooked-arena large allocations are zeroed here; the shared medium/large path
         // already zeroed itself, eliding the `memset` when its extent was freshly
@@ -1761,6 +1795,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                                         ptr,
                                         usable,
                                         rounded,
+                                        new_size,
                                         flags.hints().zero,
                                     )
                                 };
@@ -1817,6 +1852,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     ///
     /// `ptr` is the live base pointer being resized (the §25 realloc / §10.3 xallocx
     /// contract); the caller does not concurrently free or realloc it.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn apply_inplace_large_resize(
         &self,
         arena: ArenaId,
@@ -1824,6 +1860,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ptr: *mut u8,
         usable: usize,
         rounded: usize,
+        requested: usize,
         zero: bool,
     ) -> usize {
         if rounded < usable {
@@ -1831,6 +1868,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             if let Some(freed) = unsafe { owner.shrink(ptr, rounded) } {
                 self.freed_bytes.fetch_add(freed as u64, Ordering::Relaxed);
                 self.arenas.credit(arena, freed as u64);
+                // §31.5: the allocation now holds `requested` of `usable − freed` usable bytes.
+                owner.note_requested(ptr, requested);
                 return usable - freed;
             }
         } else if rounded > usable {
@@ -1840,8 +1879,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             if self.arenas.try_charge(arena, extra).is_ok() {
                 // SAFETY: as above.
                 if let Some(grown) = unsafe { owner.grow(ptr, rounded) } {
-                    self.allocated_bytes
-                        .fetch_add(grown as u64, Ordering::Relaxed);
+                    let new_allocated = self
+                        .allocated_bytes
+                        .fetch_add(grown as u64, Ordering::Relaxed)
+                        .wrapping_add(grown as u64);
+                    // §31.3 peak heap (W17-2): an in-place grow raises live too, so bump the
+                    // high-water here as well — otherwise the peak forgets the grow once the
+                    // grown object is freed and `stats()` falls back to the pre-grow high-water.
+                    self.bump_peak_after_alloc(new_allocated);
                     // §26.2 zeroing: an in-place grow absorbs the address-adjacent free
                     // extent, which may be a **dirty** (retained) range carrying recycled
                     // bytes. A `TOPO_ZERO` realloc/xallocx must hand back the newly exposed
@@ -1855,10 +1900,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                         // is in bounds and exclusively owned (the realloc/xallocx contract).
                         unsafe { ptr::write_bytes(ptr.add(usable), 0, grown) };
                     }
+                    // §31.5: the grown allocation now holds `requested` of its larger usable.
+                    owner.note_requested(ptr, requested);
                     return usable + grown;
                 }
                 self.arenas.credit(arena, extra);
             }
+        }
+        // §31.5 (W17-4) exactness: when the allocation is kept whole with a request that still
+        // fits its current `usable` — a same-page-count change (`rounded == usable`) or a shrink
+        // the backend declined (cache-served / exhausted-split) — record the new request, so
+        // `usable − requested` is not read from the *stale* pre-resize value. We must NOT do this
+        // for a declined **grow** (`rounded > usable`): there the allocation is unchanged and may
+        // stay live (xallocx keeps it; a realloc whose move then fails preserves the original),
+        // and clamping the larger request down to `usable` would erase that still-live object's
+        // real `usable − requested` waste. A no-op for a foreign / non-large ptr.
+        if rounded <= usable {
+            owner.note_requested(ptr, requested);
         }
         usable
     }
@@ -1930,6 +1988,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                         ptr,
                         usable,
                         rounded,
+                        new_size,
                         flags.hints().zero,
                     )
                 })
@@ -2380,6 +2439,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ok
     }
 
+    /// Visit each size class's central-resident free bytes — the per-class decomposition
+    /// of [`AllocatorStats::central_free_bytes`] for the §31.2 `BY_SIZE_CLASS` detail
+    /// view (plan 07 W17-2): `f(class_index, object_size, central_free_bytes)` for every
+    /// class. Lock-free approximate reads, exact when quiescent (§31.1) — exactly as
+    /// [`stats`](Self::stats) sums them. Touches only the shared backend's central lists.
+    pub fn for_each_size_class_central_free<F: FnMut(usize, u32, u64)>(&self, mut f: F) {
+        for (i, row) in SIZE_CLASSES.iter().enumerate() {
+            let free = self
+                .central
+                .bin(SizeClassId::new(i))
+                .map_or(0, |bin| bin.total_central_free() * row.size as u64);
+            f(i, row.size, free);
+        }
+    }
+
     /// Take a statistics snapshot (§31.1; the W8 DoD "state exposes stats and
     /// reconciles" surface). See [`AllocatorStats`] for the field semantics
     /// and consistency model.
@@ -2401,6 +2475,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let mut span_backend = self.span_extents.state_bytes();
         let mut large_backend = self.large.state_bytes();
         let mut live_large = self.large.live_count() as u64;
+        // §31.5 exact medium/large internal fragmentation (W17-4), summed over the shared
+        // backend and every hooked region (so a hooked arena's large waste counts too).
+        let mut live_internal_frag = self.large.internal_fragmentation_bytes() as u64;
         // Cumulative hook failures: the persistent total from torn-down backings
         // plus every live backing's current counts (W10 observability).
         let mut hf = self.retired_hooks.snapshot();
@@ -2412,6 +2489,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     span_backend = span_backend.add(b.span_extents.state_bytes());
                     large_backend = large_backend.add(b.large.state_bytes());
                     live_large += b.large.live_count() as u64;
+                    live_internal_frag += b.large.internal_fragmentation_bytes() as u64;
                     let s = b.hook_failure_stats();
                     hf.commit += s.commit;
                     hf.release += s.release;
@@ -2425,6 +2503,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // Saturating: `freed` can transiently exceed `allocated` only in
             // a torn relaxed read during concurrent ops; never report a wrap.
             live_bytes: allocated.saturating_sub(freed),
+            // The high-water mark, never below the live bytes we just computed (§31.3).
+            peak_live_bytes: self
+                .peak_live_bytes
+                .load(Ordering::Relaxed)
+                .max(allocated.saturating_sub(freed)),
             allocated_bytes_total: allocated,
             freed_bytes_total: freed,
             central_free_bytes,
@@ -2433,10 +2516,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
             live_spans: self.live_span_count() as u64,
             live_large,
+            live_internal_fragmentation_bytes: live_internal_frag,
             live_arenas: self.arenas.live_count() as u64,
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
+            arenas_destroyed: self.arenas.destroyed_count(),
         }
+    }
+
+    /// Raise the §31.3 peak-live high-water after `allocated_bytes` advanced to `new_allocated`
+    /// — a fresh charge **or** an in-place grow (W17-2): `live = new_allocated − freed`, then
+    /// `fetch_max`. `live <= new_allocated <= allocated_bytes_total`, so the gauge is bounded by
+    /// cumulative allocations and can never exceed them; a concurrent free not yet visible in the
+    /// relaxed `freed` load can only transiently inflate it within the §8.6 bytes-in-flight skew.
+    /// Relaxed — a best-effort diagnostic gauge re-anchored by `RESET_PEAKS`, never load-bearing.
+    #[inline]
+    fn bump_peak_after_alloc(&self, new_allocated: u64) {
+        let live = new_allocated.saturating_sub(self.freed_bytes.load(Ordering::Relaxed));
+        self.peak_live_bytes.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// Reset the §31.3 peak-live high-water mark to the **current** live bytes (the
+    /// `RESET_PEAKS` control, W17-2). After this, the peak re-accumulates from now.
+    pub fn reset_peak_live(&self) {
+        let live = self
+            .allocated_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.freed_bytes.load(Ordering::Relaxed));
+        self.peak_live_bytes.store(live, Ordering::Relaxed);
     }
 
     /// A minimal allocator summary safe for a crash/signal handler (W16-6, §28.4):
@@ -3216,6 +3323,87 @@ mod tests {
         assert_eq!(tfree(&a, pb), FreeOutcome::Freed);
         assert_eq!(a.stats().live_bytes, 0);
         assert!(a.check_invariants());
+    }
+
+    /// W17-2 (PR #21 review): a successful medium/large **in-place grow** raises live bytes, so
+    /// the §31.3 peak high-water must capture it — otherwise, once the grown object is freed,
+    /// `peak_live_bytes` wrongly falls back to the pre-grow high-water and under-reports the
+    /// largest live heap reached via `xallocx` / in-place `realloc` growth.
+    #[test]
+    fn peak_live_captures_an_in_place_grow_after_free() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(80_000);
+        assert!(!p.is_null());
+        let old_usable = a.usable_size(p).unwrap();
+
+        // Grow in place by absorbing the adjacent free remainder (a true in-place grow).
+        let new = 150_000usize;
+        let new_usable = align_up(new, PAGE_SIZE).unwrap();
+        assert!(
+            new_usable > old_usable,
+            "the grow must cross a page boundary upward"
+        );
+        // SAFETY: `p` is the live base pointer we own and do not concurrently free/realloc.
+        let grown = unsafe { a.resize_in_place(p, new, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(
+            grown,
+            Some(new_usable),
+            "the grow absorbed the adjacent free in place"
+        );
+        assert!(
+            a.stats().peak_live_bytes >= new_usable as u64,
+            "the peak captured the grown live"
+        );
+
+        // Free; the peak must persist at the grown high-water, not fall back to the pre-grow size.
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_bytes, 0);
+        assert!(
+            a.stats().peak_live_bytes >= new_usable as u64,
+            "the peak persists at the in-place-grow high-water after free (W17-2 fix)"
+        );
+    }
+
+    /// W17-4 (PR #21 review): when an in-place grow is **declined** (no adjacent free), the
+    /// original allocation is unchanged and may stay live (`xallocx` keeps it; a `realloc` whose
+    /// move then fails preserves it). Its exact internal fragmentation must be preserved — the
+    /// larger requested size must NOT be clamped onto the descriptor, which would erase the
+    /// still-live object's `usable − requested` waste.
+    #[test]
+    fn declined_in_place_grow_preserves_the_live_objects_waste() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let req = 80_000usize; // not a page multiple ⇒ a genuine page-tail waste
+        let pa = a.malloc(req);
+        let pb = a.malloc(80_000); // carved right after `pa` ⇒ pa's neighbour is Active (blocks grow)
+        assert!(!pa.is_null() && !pb.is_null());
+        let pa_usable = a.usable_size(pa).unwrap();
+        assert!(pa_usable > req, "the request wastes the page tail");
+        let frag_before = a.stats().live_internal_fragmentation_bytes;
+
+        // Try to grow `pa` in place; blocked by `pb`, so the grow is declined and `pa` is unchanged.
+        // SAFETY: `pa` is the live base pointer we own and do not concurrently free/realloc.
+        let kept = unsafe { a.resize_in_place(pa, 150_000, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(
+            kept,
+            Some(pa_usable),
+            "a blocked grow keeps the original usable (declined)"
+        );
+        assert_eq!(
+            a.stats().live_internal_fragmentation_bytes,
+            frag_before,
+            "a declined grow preserves the still-live object's exact fragmentation"
+        );
+        assert_eq!(a.usable_size(pa).unwrap(), pa_usable, "pa is unchanged");
+
+        assert_eq!(tfree(&a, pa), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, pb), FreeOutcome::Freed);
+        assert_eq!(a.stats().live_internal_fragmentation_bytes, 0);
     }
 
     /// W15-3a/b via the `xallocx` engine (`resize_in_place`): a medium/large

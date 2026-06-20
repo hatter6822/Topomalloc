@@ -30,6 +30,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h> /* FILE, for topomalloc_stats_print */
 
 #include "topomalloc_tables.h"
 
@@ -370,6 +371,97 @@ uint64_t topomalloc_profile_confident_sites(void);
  * returning the full length in bytes (excl. NUL); pass buf=NULL/cap=0 to query
  * the length only. */
 size_t topomalloc_profile_dump_json(char *buf, size_t cap);
+
+/* ------------------------------------------------------------------------
+ * Statistics & observability (Section 31, plan 07 W17)
+ *
+ * "Where is the memory?" in machine-readable, epoch-consistent form (Section
+ * 31.1), plus a human-readable RSS explanation (Section 31.6). Every snapshot
+ * carries a monotonic epoch (Section 8.6). The reconciliation identities hold
+ * by construction at any quiescent point:
+ *   virtual_bytes       == active_bytes + pageheap_free_bytes
+ *   pageheap_free_bytes == retained_bytes + dirty_bytes + muzzy_bytes + released_bytes
+ * Sampling-derived fields (fragmentation.internal_sampled, placement.*) are 0
+ * unless heap sampling is enabled (topomalloc_profile_set_rate).
+ * --------------------------------------------------------------------- */
+
+/* topo_stats flag bits (Section 31.2). SUMMARY (0) is always rendered; the BY_*
+ * flags add per-entity detail blocks; CONSISTENT_SNAPSHOT / RESET_PEAKS are read
+ * modes. Unknown bits are ignored (forward-compatible). These mirror the Rust
+ * topo_stats::StatsFlags bits exactly. */
+#define TOPOMALLOC_STATS_SUMMARY ((uint64_t) 0)
+#define TOPOMALLOC_STATS_BY_ARENA ((uint64_t) 1 << 0)
+#define TOPOMALLOC_STATS_BY_SIZE_CLASS ((uint64_t) 1 << 1)
+#define TOPOMALLOC_STATS_BY_CPU ((uint64_t) 1 << 2)
+#define TOPOMALLOC_STATS_BY_NUMA ((uint64_t) 1 << 3)
+#define TOPOMALLOC_STATS_BY_HUGEPAGE ((uint64_t) 1 << 4)
+#define TOPOMALLOC_STATS_CONSISTENT_SNAPSHOT ((uint64_t) 1 << 5)
+#define TOPOMALLOC_STATS_RESET_PEAKS ((uint64_t) 1 << 6)
+
+/* The fixed core byte-class snapshot (Section 31.2), for operators who want the
+ * numbers without parsing JSON. All fields uint64_t (stable ABI); additive across
+ * the 0.x series (new fields append, never reorder — pinned by the ABI tests). */
+typedef struct topomalloc_stats_s {
+  uint64_t epoch;                 /* monotonic snapshot sequence (>= 1) */
+  uint64_t live_bytes;            /* application.live_bytes */
+  uint64_t allocated_bytes_total; /* application.allocated_bytes_total */
+  uint64_t freed_bytes_total;     /* application.freed_bytes_total */
+  uint64_t cache_bytes;           /* per-CPU + thread + transfer (0 until M2) */
+  uint64_t central_free_bytes;    /* central.free_bytes */
+  uint64_t active_bytes;          /* backend.active_bytes (Section 20.1 active) */
+  uint64_t retained_bytes;        /* backend.retained_bytes (Section 20.1 Retained) */
+  uint64_t dirty_bytes;           /* backend.dirty_bytes */
+  uint64_t muzzy_bytes;           /* backend.muzzy_bytes */
+  uint64_t released_bytes;        /* backend.released_bytes */
+  uint64_t pageheap_free_bytes;   /* backend.pageheap_free_bytes */
+  uint64_t virtual_bytes;         /* backend.virtual_bytes (total managed VM) */
+  uint64_t metadata_bytes;        /* metadata.bytes */
+  uint64_t quarantine_bytes;      /* quarantine.bytes (0 until plan 08) */
+  uint64_t hugepage_coverage_bytes;               /* hugepage.coverage_bytes */
+  uint64_t fragmentation_internal_sampled_bytes;  /* Section 31.5, sampled */
+  uint64_t fragmentation_external_bytes;          /* Section 31.5 (dirty+muzzy) */
+  uint64_t arena_count;           /* arenas.count */
+  uint64_t arena_destroyed;       /* arenas.destroyed (cumulative) */
+  /* appended in the W17 completion pass (additive, Section 35.3) */
+  uint64_t peak_live_bytes;       /* application.peak_live_bytes (Section 31.3) */
+  uint64_t rss_bytes;             /* application.rss_bytes (Section 31.6; 0 if n/a) */
+  uint64_t total_managed_vm_bytes;            /* virtual_bytes + metadata_bytes */
+  uint64_t fragmentation_internal_exact_bytes; /* Section 31.5, exact medium/large */
+  uint64_t hugepage_coverage_ratio_bp;        /* Section 19.7 (0..10000 bp) */
+  uint64_t sampled_live_bytes;    /* placement.sampled_live_bytes (0 unless sampling) */
+  uint64_t numa_nodes;            /* topology.numa_nodes (0 when no router) */
+} topomalloc_stats_t;
+
+/* Fill the fixed core byte-class struct from a fresh live snapshot. Returns 0 on
+ * success, -1 on a NULL out OR an unknown flag bit (Section 10.4 strict
+ * validation). `flags` selects the read mode (Section 8.6). */
+int topomalloc_stats_snapshot(topomalloc_stats_t *out, uint64_t flags);
+
+/* Render the live snapshot as JSON (Appendix-D shape) into buf (NUL-terminated,
+ * truncated to cap), returning the full length in bytes (excl. NUL). Pass
+ * buf=NULL/cap=0 to query the length only. `flags` selects detail; an unknown
+ * flag bit is rejected (writes nothing, returns 0 — Section 10.4). */
+size_t topomalloc_stats_json(char *buf, size_t cap, uint64_t flags);
+
+/* Like topomalloc_stats_json, but the BY_ARENA per-arena detail (and, for a
+ * redacted low observer, ALL cross-domain summary aggregates) are REDACTED to
+ * only what an observer at `observer_label` is authorized to see (Section 36.12):
+ * a low domain cannot observe a higher domain's activity. On POSIX every arena is
+ * PUBLIC (0), so a PUBLIC observer sees everything (the identity case). */
+size_t topomalloc_stats_json_for_label(char *buf, size_t cap, uint64_t flags,
+                                       uint32_t observer_label);
+
+/* Write a human-readable dump (the RSS explanation followed by the JSON) to the
+ * stream `out`. A single snapshot is taken, so the two are consistent. Returns 0
+ * on success, -1 on a NULL stream or short write. */
+int topomalloc_stats_print(FILE *out, uint64_t flags);
+
+/* Render a one-line human-readable RSS attribution (Section 31.6 — "RSS is
+ * attributed to: 2.5 GiB live, 700.0 MiB per-CPU cache, ...") into buf
+ * (NUL-terminated, truncated to cap); returns the full length (excl. NUL).
+ * buf=NULL/cap=0 queries the length only. RSS must be explainable, not just
+ * measurable. */
+size_t topomalloc_explain_memory(char *buf, size_t cap);
 
 /* ------------------------------------------------------------------------
  * Crash / signal-handler diagnostics (Section 28.4)

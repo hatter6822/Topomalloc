@@ -109,6 +109,9 @@ fuzz_target!(|data: &[u8]| {
                     SampledRecord {
                         stack_id: site,
                         bytes: (b as u64) + 1,
+                        // usable >= requested; the fuzzer rounds up by a byte to exercise
+                        // the §31.5 internal-fragmentation accounting (usable − bytes).
+                        usable: (b as u64) + 1,
                         alloc_ms: now,
                     },
                 ) {
