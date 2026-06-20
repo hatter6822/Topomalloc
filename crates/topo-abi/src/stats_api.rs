@@ -79,7 +79,7 @@ fn checked_flags(flags: u64) -> Option<StatsFlags> {
 /// epoch is bumped exactly once per public stats call.
 type Composed = (Stats, Vec<ArenaLine>, Vec<SizeClassLine>, Vec<NumaNodeLine>);
 
-fn compose(flags: StatsFlags, observer_label: Option<u32>) -> Composed {
+fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> Composed {
     let mut s = Stats {
         epoch: next_epoch(),
         profile: Profile::active(),
@@ -88,11 +88,6 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>) -> Composed {
     let consistent = flags.contains(StatsFlags::CONSISTENT_SNAPSHOT);
     if let Some(eng) = global() {
         s.record_allocator(&allocator_stats(eng, consistent));
-        // §31.2 RESET_PEAKS: the snapshot above already captured the peak; clear it so the
-        // next reader sees the high-water *since now*.
-        if flags.contains(StatsFlags::RESET_PEAKS) {
-            eng.reset_peak_live();
-        }
     }
     // Heap-sampler estimates (off-by-default; all-zero unless sampling is enabled).
     s.record_placement(crate::sampling::placement_stats());
@@ -125,6 +120,20 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>) -> Composed {
         }
         None => (s, all_arenas, false),
     };
+    // §31.2 RESET_PEAKS: the snapshot above already captured the peak; clear the engine gauge so
+    // the next reader sees the high-water *since now* — but only when we are actually
+    // **delivering** this snapshot (a `buf == NULL` / `cap == 0` length-query sizing call must
+    // not clear the gauge the caller's data call then reads), and only for a reader **authorized**
+    // to see the global peak (an unscoped reader, or a label observer that dominates every arena —
+    // `!redacting`). A redacted/low observer's peak is itself redacted to 0, so resetting the real
+    // process-wide gauge would be a cross-domain write — letting a low domain destroy a high
+    // domain's high-water for later authorized readers (§36.12). On POSIX (single PUBLIC label)
+    // this is always the identity case, so RESET_PEAKS behaves exactly as before.
+    if flags.contains(StatsFlags::RESET_PEAKS) && delivering && !redacting {
+        if let Some(eng) = global() {
+            eng.reset_peak_live();
+        }
+    }
     let arenas = if flags.contains(StatsFlags::BY_ARENA) {
         visible_arenas
     } else {
@@ -166,18 +175,23 @@ fn numa_node_lines() -> Vec<NumaNodeLine> {
 }
 
 /// Take an [`AllocatorStats`] snapshot, optionally in **consistent** mode (§8.6 / §31.2
-/// `CONSISTENT_SNAPSHOT`): read the engine until the cumulative `(allocated, freed)` pair is
-/// unchanged across a read window — meaning no concurrent allocation/free perturbed it — so
-/// the snapshot is coherent. Bounded retries (it is opt-in operational debugging); the last
-/// read is returned regardless, so it always terminates. Plain mode is a single read.
+/// `CONSISTENT_SNAPSHOT`): read the engine until **two successive reads agree on every field** —
+/// not merely the cumulative `(allocated, freed)` totals, but the backend-state, central-list,
+/// arena, and fragmentation fields too — meaning no concurrent allocation/free perturbed any of
+/// them across the read window, so the snapshot is coherent. (An allocation can mutate backend or
+/// central state *before* bumping the cumulative counters, so comparing the totals alone could
+/// accept a torn read; full-struct equality closes that window.) This tightens but does not
+/// replace true snapshot isolation — the documented seqlock deferral: the struct is still
+/// assembled from many relaxed reads, so an equal pair is a strong coherence signal, not an
+/// atomic capture. Bounded retries (opt-in operational debugging); the last read is returned
+/// regardless, so it always terminates even under continuous load. Plain mode is a single read.
 fn allocator_stats(eng: &AnyAllocator, consistent: bool) -> topo_core::AllocatorStats {
     let mut snap = eng.stats();
     if consistent {
         for _ in 0..8 {
             let again = eng.stats();
-            if again.allocated_bytes_total == snap.allocated_bytes_total
-                && again.freed_bytes_total == snap.freed_bytes_total
-            {
+            // Full-struct equality (`AllocatorStats: PartialEq`): every byte class stable.
+            if again == snap {
                 return again;
             }
             snap = again;
@@ -257,9 +271,10 @@ fn size_class_lines() -> Vec<SizeClassLine> {
 }
 
 /// Compose and render the snapshot as JSON honoring `flags`, redacting arena detail for
-/// `observer_label` if given.
-fn render_json(flags: StatsFlags, observer_label: Option<u32>) -> String {
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, observer_label);
+/// `observer_label` if given. `delivering` is false for a length-query (`buf == NULL`) sizing
+/// call, so a `RESET_PEAKS` request does not clear the gauge before the caller's data call reads.
+fn render_json(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> String {
+    let (s, arenas, size_classes, numa_nodes) = compose(flags, observer_label, delivering);
     s.to_json_with(
         flags,
         &StatsDetail {
@@ -422,7 +437,10 @@ pub unsafe extern "C" fn topomalloc_stats_json(buf: *mut c_char, cap: usize, fla
         return 0;
     };
     let _op = topo_core::fork::operation_guard();
-    let json = render_json(flags, None);
+    // A length-query (NULL buf / zero cap) does not deliver, so a `RESET_PEAKS` request must not
+    // clear the gauge on it — only the caller's real data call resets (§31.2).
+    let delivering = !buf.is_null() && cap > 0;
+    let json = render_json(flags, None, delivering);
     // SAFETY: the caller's `buf`/`cap` contract is forwarded verbatim.
     unsafe { write_to_c_buf(&json, buf, cap) }
 }
@@ -447,7 +465,11 @@ pub unsafe extern "C" fn topomalloc_stats_json_for_label(
         return 0;
     };
     let _op = topo_core::fork::operation_guard();
-    let json = render_json(flags, Some(observer_label));
+    // As `topomalloc_stats_json`, a length-query does not reset peaks; additionally, `compose`
+    // only resets for a non-redacting (authorized) observer, so a low label cannot clear the
+    // process-wide peak it cannot even see (§36.12 cross-domain write).
+    let delivering = !buf.is_null() && cap > 0;
+    let json = render_json(flags, Some(observer_label), delivering);
     // SAFETY: the caller's `buf`/`cap` contract is forwarded verbatim.
     unsafe { write_to_c_buf(&json, buf, cap) }
 }
@@ -472,7 +494,8 @@ pub unsafe extern "C" fn topomalloc_stats_snapshot(
         return -1;
     }
     let _op = topo_core::fork::operation_guard();
-    let (s, ..) = compose(flags, None);
+    // `out` is non-null here, so this call always delivers (RESET_PEAKS, if set, takes effect).
+    let (s, ..) = compose(flags, None, true);
     let c = topomalloc_stats_t::from_stats(&s);
     // SAFETY: `out` is non-null and the caller guarantees it points to a writable struct.
     unsafe { *out = c };
@@ -496,7 +519,8 @@ pub unsafe extern "C" fn topomalloc_stats_print(out: *mut libc::FILE, flags: u64
         return -1;
     }
     let _op = topo_core::fork::operation_guard();
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, None);
+    // `out` is non-null here, so this call always delivers (RESET_PEAKS, if set, takes effect).
+    let (s, arenas, size_classes, numa_nodes) = compose(flags, None, true);
     let json = s.to_json_with(
         flags,
         &StatsDetail {
@@ -539,7 +563,8 @@ pub unsafe extern "C" fn topomalloc_stats_print(out: *mut libc::FILE, flags: u64
 #[no_mangle]
 pub unsafe extern "C" fn topomalloc_explain_memory(buf: *mut c_char, cap: usize) -> usize {
     let _op = topo_core::fork::operation_guard();
-    let (s, ..) = compose(StatsFlags::SUMMARY, None);
+    // SUMMARY carries no RESET_PEAKS, so `delivering` is moot here; pass the honest value anyway.
+    let (s, ..) = compose(StatsFlags::SUMMARY, None, !buf.is_null());
     let text = s.explain();
     // SAFETY: the caller's `buf`/`cap` contract is forwarded verbatim.
     unsafe { write_to_c_buf(&text, buf, cap) }
@@ -549,11 +574,15 @@ pub unsafe extern "C" fn topomalloc_explain_memory(buf: *mut c_char, cap: usize)
 mod tests {
     use super::*;
 
+    /// Serializes the tests that read/reset the **process-global** peak gauge, so they cannot
+    /// perturb each other's high-water assertions when the harness runs tests in parallel.
+    static PEAK_GAUGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn epoch_is_monotonic_across_snapshots() {
         // W17-1b: every composed snapshot carries a strictly newer epoch.
-        let (a, ..) = compose(StatsFlags::SUMMARY, None);
-        let (b, ..) = compose(StatsFlags::SUMMARY, None);
+        let (a, ..) = compose(StatsFlags::SUMMARY, None, true);
+        let (b, ..) = compose(StatsFlags::SUMMARY, None, true);
         assert!(
             b.epoch > a.epoch,
             "epoch is monotonic ({} -> {})",
@@ -566,7 +595,7 @@ mod tests {
     fn json_is_wellformed_and_reconciles() {
         // Make a little live traffic so the snapshot is non-trivial.
         let p = crate::topomalloc_malloc(4096);
-        let json = render_json(StatsFlags::SUMMARY, None);
+        let json = render_json(StatsFlags::SUMMARY, None, true);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         // §8.6 reconciliation identities hold (quiescent at read on this thread).
         let backend = &v["backend"];
@@ -647,12 +676,12 @@ mod tests {
     fn by_arena_json_carries_an_arena_line_and_redaction_is_total() {
         // The default arena (id 0, PUBLIC) is always present, so BY_ARENA has at least one
         // line, and a PUBLIC observer (the POSIX case) sees it (identity redaction).
-        let json = render_json(StatsFlags::BY_ARENA, None);
+        let json = render_json(StatsFlags::BY_ARENA, None, true);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let arenas = v["by_arena"].as_array().expect("by_arena present");
         assert!(arenas.iter().any(|a| a["id"] == 0));
         // Redacting for the PUBLIC (0) observer keeps the PUBLIC default arena.
-        let redacted = render_json(StatsFlags::BY_ARENA, Some(0));
+        let redacted = render_json(StatsFlags::BY_ARENA, Some(0), true);
         let rv: serde_json::Value = serde_json::from_str(&redacted).unwrap();
         assert!(rv["by_arena"]
             .as_array()
@@ -716,7 +745,7 @@ mod tests {
         // W17-1b: with CONSISTENT_SNAPSHOT, the cumulative identity is exact (no torn read)
         // when this thread is the only mutator — the read-twice-stable loop converges.
         let p = crate::topomalloc_malloc(123);
-        let (s, ..) = compose(StatsFlags::CONSISTENT_SNAPSHOT, None);
+        let (s, ..) = compose(StatsFlags::CONSISTENT_SNAPSHOT, None, true);
         assert_eq!(
             s.live_bytes,
             s.allocated_bytes_total - s.freed_bytes_total,
@@ -730,11 +759,14 @@ mod tests {
 
     #[test]
     fn reset_peaks_clears_the_high_water() {
+        let _serial = PEAK_GAUGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // W17-2: a large live allocation lifts the peak; RESET_PEAKS drops it back to the
         // (lower) live bytes after the allocation is freed.
         let big = crate::topomalloc_malloc(8 << 20); // 8 MiB, lifts peak well above steady state
         assert!(!big.is_null());
-        let (after_alloc, ..) = compose(StatsFlags::SUMMARY, None);
+        let (after_alloc, ..) = compose(StatsFlags::SUMMARY, None, true);
         assert!(
             after_alloc.peak_live_bytes >= 8 << 20,
             "peak captured the spike"
@@ -742,8 +774,8 @@ mod tests {
         // SAFETY: live allocation we own.
         unsafe { crate::topomalloc_free(big) };
         // Reset while live is now low; the peak collapses to ~current live.
-        let (reset, ..) = compose(StatsFlags::RESET_PEAKS, None);
-        let (next, ..) = compose(StatsFlags::SUMMARY, None);
+        let (reset, ..) = compose(StatsFlags::RESET_PEAKS, None, true);
+        let (next, ..) = compose(StatsFlags::SUMMARY, None, true);
         assert!(
             next.peak_live_bytes < 8 << 20,
             "peak {} dropped after RESET_PEAKS (was >= 8 MiB)",
@@ -753,14 +785,60 @@ mod tests {
     }
 
     #[test]
+    fn reset_peaks_is_skipped_on_a_length_query() {
+        let _serial = PEAK_GAUGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // PR #21 review: with RESET_PEAKS, a length-query (NULL buf) sizing call must NOT clear
+        // the gauge — only the caller's real data call resets. Otherwise the documented
+        // size-then-write JSON pattern receives an already-reset peak on the data call.
+        let big = crate::topomalloc_malloc(8 << 20); // lifts the peak well above steady state
+        assert!(!big.is_null());
+        // SAFETY: live allocation we own.
+        unsafe { crate::topomalloc_free(big) };
+        let (before, ..) = compose(StatsFlags::SUMMARY, None, true);
+        assert!(before.peak_live_bytes >= 8 << 20, "peak established");
+
+        // A RESET_PEAKS length-query (NULL buf): returns the full length, must NOT reset.
+        // SAFETY: a NULL buffer is exactly the length-query contract.
+        let n =
+            unsafe { topomalloc_stats_json(ptr::null_mut(), 0, StatsFlags::RESET_PEAKS.bits()) };
+        assert!(n > 0, "the length query reports a length");
+        let (after_query, ..) = compose(StatsFlags::SUMMARY, None, true);
+        assert!(
+            after_query.peak_live_bytes >= 8 << 20,
+            "a RESET_PEAKS length query must not reset the gauge (peak {})",
+            after_query.peak_live_bytes
+        );
+
+        // A real **delivering** data call with RESET_PEAKS does reset it.
+        let mut buf = [0u8; 8192];
+        // SAFETY: 8192 writable bytes matching `cap`.
+        let n2 = unsafe {
+            topomalloc_stats_json(
+                buf.as_mut_ptr().cast::<c_char>(),
+                buf.len(),
+                StatsFlags::RESET_PEAKS.bits(),
+            )
+        };
+        assert!(n2 > 0);
+        let (after_data, ..) = compose(StatsFlags::SUMMARY, None, true);
+        assert!(
+            after_data.peak_live_bytes < 8 << 20,
+            "the delivering data call reset the peak (now {})",
+            after_data.peak_live_bytes
+        );
+    }
+
+    #[test]
     fn by_numa_detail_block_is_present_when_flagged() {
         // W17-2: BY_NUMA renders a defined (possibly empty) per-node array — never a missing
         // key. (Populated under the live router; empty in the default extent build.)
-        let json = render_json(StatsFlags::BY_NUMA, None);
+        let json = render_json(StatsFlags::BY_NUMA, None, true);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(v["by_numa_node"].is_array());
         // BY_HUGEPAGE renders the labeled per-bin distribution.
-        let hj = render_json(StatsFlags::BY_HUGEPAGE, None);
+        let hj = render_json(StatsFlags::BY_HUGEPAGE, None, true);
         let hv: serde_json::Value = serde_json::from_str(&hj).unwrap();
         let bins = hv["by_hugepage_bin"].as_array().expect("by_hugepage_bin");
         assert_eq!(bins.len(), 9, "the nine §19.4 occupancy bins");
@@ -770,7 +848,7 @@ mod tests {
     #[test]
     fn rss_is_read_from_the_os_on_linux() {
         // W17-5: a live process has a non-zero RSS, so the explanation leads with it.
-        let (s, ..) = compose(StatsFlags::SUMMARY, None);
+        let (s, ..) = compose(StatsFlags::SUMMARY, None, true);
         assert!(s.rss_bytes > 0, "RSS read from /proc/self/statm");
         assert!(s.explain().starts_with("RSS is "));
     }
@@ -783,7 +861,7 @@ mod tests {
         let p = crate::topomalloc_malloc(req);
         assert!(!p.is_null());
         let usable = crate::topomalloc_malloc_usable_size(p);
-        let (with_live, ..) = compose(StatsFlags::SUMMARY, None);
+        let (with_live, ..) = compose(StatsFlags::SUMMARY, None, true);
         // The exact figure includes at least this allocation's waste (other live larges may add).
         assert!(
             with_live.exact_internal_fragmentation_bytes >= (usable - req) as u64,

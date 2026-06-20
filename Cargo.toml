@@ -94,7 +94,13 @@ exclude = ["fuzz", "vendor/sele4n"]
 # request on every in-place resize, including a *same-page-count* shrink/grow that moves no backing
 # (`apply_inplace_large_resize`), so the "exact" figure never reads a stale request; a regression
 # test (`exact_fragmentation_tracks_a_same_page_request_change`) pins it, and the peak-gauge
-# charge-point comment is corrected to a sound bound. In a 0.x
+# charge-point comment is corrected to a sound bound. Six PR #21 review fixes followed (each
+# regression-tested): a declined in-place grow no longer clamps the still-live object's request
+# (preserving its exact waste); a successful in-place grow now bumps the §31.3 peak high-water (so
+# it is not forgotten after free); `RESET_PEAKS` no longer fires on a JSON length-query sizing call
+# nor for a redacted/low observer (a cross-domain write); the *sampled* fragmentation estimate
+# excludes medium/large (counted exactly elsewhere — no double-count); and `CONSISTENT_SNAPSHOT`
+# compares the whole `AllocatorStats` for stability, not just the cumulative totals. In a 0.x
 # series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
 # axis), keeping `^0.1.0` inter-crate reqs satisfied.
 version = "0.1.23"
