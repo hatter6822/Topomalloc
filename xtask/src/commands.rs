@@ -432,6 +432,23 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "debug-checks"],
     );
+    // W18 hardened profile (plan 08): the full hardening composition — junk-fill +
+    // quarantine + guard-pages + secure-scrub on top of debug-checks. Runs the core
+    // suite so every protection's wiring + accounting is exercised *together* (the
+    // composed profile, not just each feature alone).
+    r.run(
+        "test hardened profile (W18)",
+        "cargo",
+        &["test", "-p", "topo-core", "--features", "hardened"],
+    );
+    // The W18 hardening integration tests over the **real POSIX provider**: the
+    // guarded-allocation `mprotect` death test (overrun/underrun ⇒ SIGSEGV) and the
+    // live quarantine control surface, which the in-crate `HostProvider` cannot.
+    r.run(
+        "test W18 hardening integration (POSIX)",
+        "cargo",
+        &["test", "-p", "topo-tests", "--features", "hardened"],
+    );
     // Hardened **release** pass (W16-1b / G-conc): in a `--release --features
     // debug-checks` artifact `debug_assertions` is off, so this proves the
     // lock-order checker (and its `assert!`-based trip) is still compiled in and
