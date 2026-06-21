@@ -744,6 +744,26 @@ fn tsan_steps(r: &mut Runner<'_>) {
             "--lib",
         ],
     );
+    // W18-3 (#20): race-check the hardening concurrency — the quarantine's ranked lock
+    // + its lock-free stat atomics + membership filter under the concurrent
+    // offer/drain stress test (`quarantine_concurrent_*`), and the junk-fill/guard
+    // paths — by running the lib suite again with the composed `hardened` features on.
+    r.run(
+        "tsan: hardening concurrency (topo-core lib, hardened)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--features",
+            "hardened",
+            "--lib",
+        ],
+    );
     std::env::remove_var("RUSTFLAGS");
 }
 

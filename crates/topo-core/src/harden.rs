@@ -1229,6 +1229,88 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_concurrent_offers_and_drains_conserve_and_stay_well_formed() {
+        // W18-3 (#20): the quarantine is shared across threads (it is `Sync` behind one
+        // ranked lock). Many threads concurrently offer (disjoint key ranges, so no
+        // cross-thread double-offer) and drain; the invariant holds throughout, the
+        // budgets are respected, and **exact byte conservation** holds across all
+        // threads — every offered byte is freed exactly once (held-then-drained,
+        // declined, or evicted). Run under TSan (the `hardened` lib pass) this is also
+        // the data-race check for the lock + the lock-free stat atomics + the bloom.
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let q = Arc::new(Quarantine::new());
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 8192,
+            max_objects: 48,
+            random_evict: true,
+            ..QuarantinePolicy::DEFAULT
+        });
+        let offered = Arc::new(AtomicU64::new(0));
+        let freed = Arc::new(AtomicU64::new(0));
+        const THREADS: usize = 4;
+        const PER: usize = 4000;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let q = Arc::clone(&q);
+                let offered = Arc::clone(&offered);
+                let freed = Arc::clone(&freed);
+                scope.spawn(move || {
+                    // Disjoint key space per thread ⇒ keys are globally unique.
+                    let mut key = 0x100_0000usize + t * 0x40_0000;
+                    let mut rng = 0xC0FF_EE00_u64 ^ (t as u64).wrapping_mul(0x9E37_79B9);
+                    let mut next = || {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng
+                    };
+                    for _ in 0..PER {
+                        if next() % 4 == 0 {
+                            for e in q.drain_batch().as_slice() {
+                                freed.fetch_add(e.bytes, Ordering::Relaxed);
+                            }
+                        } else {
+                            key += 0x40;
+                            let bytes = 16 + (next() % 16) * 16;
+                            offered.fetch_add(bytes, Ordering::Relaxed);
+                            let mut ev = EvictBatch::new();
+                            match q.offer(small_entry(key, bytes), &mut ev) {
+                                Offer::Declined => {
+                                    freed.fetch_add(bytes, Ordering::Relaxed);
+                                }
+                                Offer::Held | Offer::AlreadyQuarantined => {}
+                            }
+                            for e in ev.as_slice() {
+                                freed.fetch_add(e.bytes, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Quiescent: invariant holds, budgets respected, then drain the remainder.
+        assert!(q.check_invariants());
+        assert!(q.held_bytes() <= 8192 && q.held_objects() <= 48);
+        loop {
+            let b = q.drain_batch();
+            if b.as_slice().is_empty() {
+                break;
+            }
+            for e in b.as_slice() {
+                freed.fetch_add(e.bytes, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(q.held_objects(), 0);
+        assert_eq!(
+            offered.load(Ordering::Relaxed),
+            freed.load(Ordering::Relaxed),
+            "byte conservation across all threads"
+        );
+    }
+
+    #[test]
     fn quarantine_drain_excess_converges_to_a_lowered_budget() {
         // Hold a full quarantine, then lower the budget at runtime: `drain_excess`
         // brings the held set down to the new budget (oldest-first), and never below.
