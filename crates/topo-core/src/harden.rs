@@ -435,33 +435,34 @@ struct QRing {
 ///
 /// The SPEC's per-**span** `QUARANTINED` flag (`SpanDescriptor::set_quarantined` →
 /// [`PointerClass::Quarantined`](crate::ptr_class::PointerClass) →
-/// `InvalidFree::DoubleFreeQuarantined`) and the §16.4 `NonCentralResidency.quarantined`
-/// residency term are a **different granularity** — whole-span quarantine — that this
-/// per-object mechanism deliberately does not drive (flagging a whole span would
-/// mis-classify its still-live objects). They remain defined and tested for that
-/// distinct use; the two are complementary, not redundant.
+/// `InvalidFree::DoubleFreeQuarantined`) is a **different granularity** — whole-span
+/// quarantine — that this per-object mechanism deliberately does not drive (flagging a
+/// whole span would mis-classify its still-live objects). It remains defined for that
+/// distinct use.
 ///
-/// ## Double-free detection is best-effort in the eviction window (§29.4)
+/// ## Double-free detection is sound through the eviction window (§29.3)
 ///
-/// Double-free detection of a *held* object is **best-effort**, exactly as the §29.4
-/// hardening framing intends. The common case is caught precisely: re-freeing an
-/// object still in the ring resolves to [`AlreadyQuarantined`](Offer::AlreadyQuarantined).
-/// There is one narrow, concurrency-only gap: because the quarantine lock is the §27.2
-/// **leaf** (rank [`LockRank::QUARANTINE`]), an evicted object is removed from the ring
-/// here and only *then* physically freed by the caller **after the lock is released**
-/// (the drain cannot run under this lock — it needs the lower-ranked span/backend lock).
-/// In the brief interval between "removed from the ring" and "inserted into the central
-/// free list", a concurrent double free of *that same object* is missed by both the
-/// ring scan (already evicted) and the engine's `is_central_free` check (not yet
-/// central). This requires the opt-in quarantine to be enabled **and** a genuine
-/// concurrent double free (itself UB) racing the eviction — it never affects a correct
-/// program. Closing it completely needs an **authoritative per-object `quarantined`
-/// bitmap state** (the §16.4/§17.5 scaffolding above), set under the span lock at hold
-/// time and transitioned to central-free atomically on drain — a span-metadata change
-/// deferred as disproportionate to this narrow window. A purely lock-free "draining
-/// set" cannot close it soundly: keyed on address, it races address **reuse** (a
-/// re-vended object would be falsely rejected), trading a missed double free for a
-/// rejected *valid* free — strictly worse.
+/// A double free of a *held* object is caught with **no window**, including the
+/// concurrency-sensitive eviction case. The mechanism has two layers:
+///
+/// * The ring's membership check catches a re-free of an object still held
+///   ([`AlreadyQuarantined`](Offer::AlreadyQuarantined)).
+/// * An **authoritative per-object quarantined state** — a second per-object bitmap on
+///   the [`SpanDescriptor`] for small objects (`SpanGuard::mark_quarantined` /
+///   `SpanDescriptor::is_object_quarantined`), and a per-descriptor mark for larges
+///   (`LargeAllocator::mark_quarantined`) — covers the gap the ring alone cannot. The
+///   bit is set under the span lock when an object is held and stays set after an
+///   eviction removes it from the ring; only the **drain** clears it, and the drain
+///   sets the central-free bit *before* clearing the quarantined bit (free-bit-first),
+///   both under the span lock. So a lock-free `is_object_quarantined(i) ||
+///   is_central_free(i)` check on the free path always observes at least one bit set
+///   from hold until the object is legitimately re-vended — closing the window without
+///   restructuring the §27.2 leaf-lock discipline.
+///
+/// This is keyed on the *slot*, not the address, so it is immune to address reuse (a
+/// re-vended object reads as neither quarantined nor central-free — correctly *not* a
+/// double free), unlike an address-keyed scheme. Only compiled in `quarantine` builds,
+/// so `performance` pays nothing.
 ///
 /// ## Sampling independence
 ///

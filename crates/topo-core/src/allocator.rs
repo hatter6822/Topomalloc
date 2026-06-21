@@ -1754,6 +1754,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         arena: ArenaId,
         usable: usize,
     ) -> Option<FreeOutcome> {
+        // A double free of a **held** object: the authoritative per-object quarantined
+        // bit says so (lock-free atomic read, W18-3). Checked FIRST and unconditionally
+        // — even when the runtime switch is off, held objects may still be draining, and
+        // a free of one is a double free. This closes the eviction-window gap: a held
+        // object's bit is set from hold until the drain transitions it under the span
+        // lock, so a concurrent double free of an evicted-but-not-yet-drained object is
+        // still caught here (it is not in the ring, but its bit is set).
+        if span.is_object_quarantined(idx as usize) {
+            return Some(FreeOutcome::DoubleFree);
+        }
         if !self.quarantine.is_enabled() {
             return None;
         }
@@ -1776,6 +1786,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
             crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
+                // Mark the object quarantined under the span lock — the authoritative
+                // marker. The ring's `AlreadyQuarantined` covered the brief window from
+                // `offer` until now; from here the bit covers it (including after an
+                // eviction removes it from the ring). Then account the app-free and
+                // drain any evicted objects (their bits are cleared by the drain's
+                // `insert_batch`, free-bit-first).
+                {
+                    let sg = span.lock();
+                    sg.mark_quarantined(idx as usize);
+                }
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
             }
@@ -1807,6 +1827,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         arena: ArenaId,
         usable: usize,
     ) -> Option<FreeOutcome> {
+        let owner = self.large_owner_for(arena);
+        // A double free of a **held** large: the authoritative per-descriptor mark says
+        // so (checked under the pool lock). Checked FIRST and unconditionally — even
+        // when disabled, held larges may still be draining — so a concurrent double free
+        // of an evicted-but-not-yet-drained large is still caught (it left the ring, but
+        // its descriptor mark is set), closing the eviction-window gap for the large path.
+        if owner.is_quarantined(ptr) {
+            return Some(FreeOutcome::DoubleFree);
+        }
         if !self.quarantine.is_enabled() || usable == 0 {
             return None;
         }
@@ -1822,6 +1851,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
             crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
+                // Mark the descriptor quarantine-held (authoritative). The ring covered
+                // it from `offer` until now; the mark covers it after (incl. eviction).
+                owner.mark_quarantined(ptr);
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
             }

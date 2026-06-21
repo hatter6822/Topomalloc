@@ -70,6 +70,13 @@ struct LargeSlot {
     /// restores their protection before recycling. `0` ⇒ a normal allocation. Reset
     /// on every (re)acquire so a recycled slot never carries a stale guard.
     guarded: u8,
+    /// `1` ⇒ this large allocation is **held in the quarantine** (W18-3, §29.4):
+    /// app-freed but not yet really freed. The authoritative double-free marker for a
+    /// held large (the ring covers it until set, and an eviction removes it from the
+    /// ring while this stays set), checked under the pool lock on the free path. The
+    /// drain (`free_*` retiring the descriptor) makes the slot non-resolvable; reset on
+    /// every (re)acquire so a recycled slot never carries a stale mark.
+    quarantined: u8,
     /// Unused-slot stack link (valid when the slot is on the free list).
     free_next: u32,
 }
@@ -418,6 +425,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 None => (*slot).has_extent = 0,
             }
             (*slot).guarded = 0; // a normal (un-guarded) allocation
+            (*slot).quarantined = 0; // a fresh allocation is not quarantined (W18-3)
         }
         // Publish into the pagemap (the W3-6 mutator). On metadata exhaustion, roll
         // back fully.
@@ -571,6 +579,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 None => (*slot).has_extent = 0,
             }
             (*slot).guarded = 1;
+            (*slot).quarantined = 0; // a fresh guarded allocation is not quarantined
         }
         // SAFETY: `slot` is live and initialised; its descriptor is in never-freed metadata.
         let installed = unsafe { self.pagemap.install_large(self.meta, &(*slot).desc) };
@@ -923,6 +932,59 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         };
         self.lock.release();
         res
+    }
+
+    /// W18-3 (§29.4): mark the live large at `ptr` as **held in the quarantine** — the
+    /// authoritative double-free marker that closes the eviction-window gap (the ring
+    /// covers a held large until this is set; an eviction then removes it from the ring
+    /// while this stays set, until the drain retires the descriptor). Resolved under the
+    /// pool lock (as `usable_size`). Returns whether `ptr` was a live large of this
+    /// backend (so the caller can fall back if it is not ours).
+    pub fn mark_quarantined(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        self.lock.acquire();
+        let r = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                match pool.index_of(desc_ptr) {
+                    Some(idx) => {
+                        // SAFETY: `idx` is a live slot under the lock.
+                        unsafe { (*pool.slot_ptr(idx)).quarantined = 1 };
+                        true
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        self.lock.release();
+        r
+    }
+
+    /// W18-3 (§29.4): whether the large at `ptr` is currently **held in the quarantine**
+    /// (its slot's quarantined mark is set). The authoritative double-free check for a
+    /// held large, resolved under the pool lock. `false` if `ptr` is not a live large of
+    /// this backend.
+    pub fn is_quarantined(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        self.lock.acquire();
+        let r = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr)
+                    // SAFETY: `idx` is a live slot under the lock.
+                    .is_some_and(|idx| unsafe { (*pool.slot_ptr(idx)).quarantined != 0 })
+            }
+            None => false,
+        };
+        self.lock.release();
+        r
     }
 
     /// Record the **requested** size of the live large allocation at base `ptr` (§31.5 exact
@@ -1326,6 +1388,14 @@ pub trait LargeBacking {
     fn note_requested(&self, ptr: *mut u8, requested: usize);
     /// The owning arena of the live large allocation at `ptr` *in this backend*.
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId>;
+    /// W18-3 (§29.4): mark the live large at `ptr` as quarantine-held *if it belongs to
+    /// this backend*; returns whether it did. See [`LargeAllocator::mark_quarantined`].
+    #[cfg(feature = "quarantine")]
+    fn mark_quarantined(&self, ptr: *mut u8) -> bool;
+    /// W18-3 (§29.4): whether the live large at `ptr` is quarantine-held *in this
+    /// backend*. See [`LargeAllocator::is_quarantined`].
+    #[cfg(feature = "quarantine")]
+    fn is_quarantined(&self, ptr: *mut u8) -> bool;
     /// Free the large allocation at `ptr` *if it belongs to this backend*.
     ///
     /// # Safety
@@ -1387,6 +1457,16 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
     #[inline]
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId> {
         LargeAllocator::arena_of(self, ptr)
+    }
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn mark_quarantined(&self, ptr: *mut u8) -> bool {
+        LargeAllocator::mark_quarantined(self, ptr)
+    }
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn is_quarantined(&self, ptr: *mut u8) -> bool {
+        LargeAllocator::is_quarantined(self, ptr)
     }
     #[inline]
     unsafe fn free(&self, ptr: *mut u8) -> bool {
@@ -2018,6 +2098,47 @@ mod tests {
         assert!(!p2.is_null(), "reuse of the retained extent succeeds");
         // SAFETY: `p2` is a live large of this allocator.
         assert!(unsafe { la.free(p2) });
+        assert!(la.check_invariants());
+    }
+
+    /// W18-3 (§29.4): the per-descriptor **quarantined** mark — the authoritative
+    /// double-free marker that closes the eviction-window gap for large allocations. A
+    /// live large can be marked held (resolvable while live); the drain (a real free)
+    /// retires the descriptor so it no longer resolves, and a recycle resets the mark.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn large_quarantined_mark_round_trips_and_retires_on_free() {
+        let la = large(64, 8);
+        let p = la.allocate(3 * PAGE, PAGE);
+        assert!(!p.is_null());
+        assert!(
+            !la.is_quarantined(p),
+            "a fresh allocation is not quarantined"
+        );
+        // Mark it held (as the quarantine does on an offer-Held): now a double free of
+        // it is detectable via the mark, even after it leaves the ring on eviction.
+        assert!(la.mark_quarantined(p), "marking a live large succeeds");
+        assert!(
+            la.is_quarantined(p),
+            "the descriptor reads as quarantine-held"
+        );
+        // The drain is a real free: it retires the descriptor, which then no longer
+        // resolves (so a later double free is rejected at classification).
+        // SAFETY: `p` is a live large of this allocator.
+        assert!(unsafe { la.free(p) });
+        assert!(
+            !la.is_quarantined(p),
+            "a retired descriptor does not resolve"
+        );
+        // A recycle gives a fresh, un-marked slot.
+        let q = la.allocate(3 * PAGE, PAGE);
+        assert!(!q.is_null());
+        assert!(
+            !la.is_quarantined(q),
+            "a recycled slot carries no stale mark"
+        );
+        // SAFETY: `q` is a live large of this allocator.
+        assert!(unsafe { la.free(q) });
         assert!(la.check_invariants());
     }
 }

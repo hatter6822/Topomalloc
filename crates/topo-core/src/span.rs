@@ -416,6 +416,17 @@ pub struct SpanDescriptor {
     lock: SpanLock,
     /// Authoritative central-residency bitmap (§16.4), hybrid inline/out-of-line.
     free_bitmap: FreeBitmap,
+    /// W18-3 (§29.4): per-object **quarantined** state — `bit(i) = 1` ⟺ object `i` is
+    /// held in the delayed-reuse quarantine (app-freed, *not* central-resident, *not*
+    /// re-vendable). Span-lock protected like `free_bitmap`, and **mutually exclusive**
+    /// with it (an object is at most one of central-free / quarantined / live). This is
+    /// the authoritative double-free marker that closes the eviction-window gap: a held
+    /// object's bit stays set from hold until the drain transitions it, under the span
+    /// lock, to central-free (**set free *before* clearing quarantined**, so a lock-free
+    /// `is_quarantined || is_central_free` check always sees one bit set during the
+    /// transition). Only present in `quarantine` builds, so `performance` pays nothing.
+    #[cfg(feature = "quarantine")]
+    quarantined_bitmap: FreeBitmap,
     /// Next span in the central free list's partial chain (W5-4a), or null.
     /// Protected by the owning [`CentralBin`](crate::central::CentralBin)'s
     /// lock, **not** the span lock — the span lock protects bitmap/counts, the
@@ -427,9 +438,18 @@ pub struct SpanDescriptor {
 // layout deterministic; this compile-time bound guards against a footprint
 // regression (the hybrid bitmap keeps the descriptor compact whatever the class),
 // and `descriptor_footprint_is_pinned` pins the exact size.
+#[cfg(not(feature = "quarantine"))]
 const _: () = assert!(
     core::mem::size_of::<SpanDescriptor>() <= 128,
     "SpanDescriptor footprint regressed past its 128-byte budget"
+);
+// The `quarantine` build adds a second per-object bitmap (the §29.4 quarantined
+// state) — a non-`performance` profile, so the footprint budget is relaxed by exactly
+// one `FreeBitmap` (32 bytes); the default/`performance` build keeps the 128 budget.
+#[cfg(feature = "quarantine")]
+const _: () = assert!(
+    core::mem::size_of::<SpanDescriptor>() <= 128 + core::mem::size_of::<FreeBitmap>(),
+    "SpanDescriptor footprint regressed past its (quarantine) budget"
 );
 // Descriptors are pointed at by the pagemap, whose entry tag needs the low 3 bits
 // (W3-3b), so the descriptor must be at least 8-aligned.
@@ -459,6 +479,8 @@ impl SpanDescriptor {
         meta: &dyn MetadataAlloc,
     ) -> Option<Self> {
         let free_bitmap = FreeBitmap::new_for(object_count, meta)?;
+        #[cfg(feature = "quarantine")]
+        let quarantined_bitmap = FreeBitmap::new_for(object_count, meta)?;
         let desc = Self {
             base: AtomicUsize::new(base),
             id,
@@ -476,6 +498,8 @@ impl SpanDescriptor {
             state: AtomicU8::new(SpanState::Active as u8),
             lock: SpanLock::new(),
             free_bitmap,
+            #[cfg(feature = "quarantine")]
+            quarantined_bitmap,
             central_next: AtomicPtr::new(ptr::null_mut()),
         };
         desc.refresh_integrity();
@@ -780,6 +804,14 @@ impl SpanDescriptor {
         if !self.free_bitmap.recycle_to(object_count, meta) {
             return false;
         }
+        // W18-3: resize/clear the quarantined bitmap too. A recycle only happens for an
+        // **empty** span (no live, no central-free, and — checked by the empty oracle —
+        // no quarantined objects), so this clears an already-empty bitmap; a grow that
+        // fails leaves the span usable for its old class (safe failure, like above).
+        #[cfg(feature = "quarantine")]
+        if !self.quarantined_bitmap.recycle_to(object_count, meta) {
+            return false;
+        }
         self.live_count.store(0, Ordering::Relaxed);
         self.central_free_count.store(0, Ordering::Relaxed);
 
@@ -825,6 +857,29 @@ impl SpanDescriptor {
     #[inline]
     pub fn is_central_free(&self, i: usize) -> bool {
         self.free_bitmap.contains(i)
+    }
+
+    /// Whether object `i` is currently **quarantined** (W18-3, §29.4) — a lock-free
+    /// read of the quarantined bitmap, the authoritative double-free marker for a held
+    /// object. Sound to read lock-free on the free path because the drain transitions
+    /// `quarantined → central-free` by setting the free bit **before** clearing the
+    /// quarantined bit (both under the span lock), so a concurrent
+    /// `is_quarantined(i) || is_central_free(i)` check always observes at least one bit
+    /// set until the object is legitimately re-vended (§29.3 double-free detection).
+    /// Always `false` without the `quarantine` feature (the bitmap does not exist).
+    /// Distinct from the whole-span [`is_quarantined`](Self::is_quarantined) flag — this
+    /// is the per-**object** W18-3 state.
+    #[inline]
+    pub fn is_object_quarantined(&self, i: usize) -> bool {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantined_bitmap.contains(i)
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            let _ = i;
+            false
+        }
     }
 
     /// Objects currently owned by the application (lock-free approximate read).
@@ -952,6 +1007,48 @@ impl SpanGuard<'_> {
         } else {
             false
         }
+    }
+
+    /// W18-3 (§29.4): mark object `i` **quarantined** (live → held). Sets the
+    /// quarantined bit without touching `live_count` (a held object stays counted as
+    /// live so its slab cannot recycle while held — the separate `quarantine.bytes`
+    /// ledger reports it). `false` if it was already quarantined (a redundant mark).
+    /// The free bit is untouched (a held object is *not* central-resident).
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    pub fn mark_quarantined(&self, i: usize) -> bool {
+        if i >= self.span.object_count() as usize {
+            return false;
+        }
+        self.span.quarantined_bitmap.insert(i)
+    }
+
+    /// W18-3 (§29.4): clear object `i`'s **quarantined** bit (the second half of the
+    /// drain transition; the first half — `central_insert`, setting the free bit — MUST
+    /// run first under this same lock so a lock-free `is_quarantined || is_central_free`
+    /// check never sees a gap). A no-op when not quarantined (so the normal free path
+    /// may call it unconditionally). `true` if a bit was cleared.
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    pub fn clear_quarantined(&self, i: usize) -> bool {
+        if i >= self.span.object_count() as usize {
+            return false;
+        }
+        self.span.quarantined_bitmap.remove(i)
+    }
+
+    /// Whether object `i` is quarantined (consistent under the lock).
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    pub fn is_object_quarantined(&self, i: usize) -> bool {
+        self.span.quarantined_bitmap.contains(i)
+    }
+
+    /// `popcount(quarantined_bitmap)` (consistent under the lock).
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    pub fn quarantined_count(&self) -> usize {
+        self.span.quarantined_bitmap.count()
     }
 
     /// Set the live count (testing / W5 activation accounting).
@@ -1562,12 +1659,65 @@ mod tests {
         // fixed, compact size for every class — a 32-byte control block (inline
         // 2-word bitmap + out-of-line pointer + word counts) plus a 64-byte header.
         assert_eq!(core::mem::size_of::<FreeBitmap>(), 32);
+        // The default/`performance` descriptor is 104 bytes; a `quarantine` build adds
+        // exactly one more `FreeBitmap` (the §29.4 per-object quarantined state, W18-3).
+        #[cfg(not(feature = "quarantine"))]
         assert_eq!(core::mem::size_of::<SpanDescriptor>(), 104);
+        #[cfg(feature = "quarantine")]
+        assert_eq!(
+            core::mem::size_of::<SpanDescriptor>(),
+            104 + core::mem::size_of::<FreeBitmap>()
+        );
         // The old design carried a 128-byte inline bitmap in *every* descriptor; the
-        // hybrid is well under that whatever the class.
+        // hybrid is well under that whatever the class (plus one bitmap for quarantine).
+        #[cfg(not(feature = "quarantine"))]
         assert!(core::mem::size_of::<SpanDescriptor>() <= 128);
         assert!(core::mem::align_of::<SpanDescriptor>() >= 8);
         assert!(core::mem::align_of::<LargeDescriptor>() >= 8);
+    }
+
+    /// W18-3 (§29.4): the per-object quarantined state and its **free-bit-first** drain
+    /// transition — the invariant that makes a lock-free `is_object_quarantined ||
+    /// is_central_free` double-free check sound through the eviction window. At no point
+    /// from hold to re-vend are both bits clear, so a held/draining object is always
+    /// detectable as a double free; only a legitimate re-vend (central-free → live,
+    /// under the span lock) clears the last bit.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn quarantined_drain_is_free_bit_first() {
+        let m = meta(64 * 1024);
+        let s = span(64, &m);
+        {
+            let sg = s.lock();
+            sg.set_live_count(10); // pretend 10 objects are live
+                                   // Hold object 3 (live → quarantined): bit set, NOT central-free.
+            assert!(sg.mark_quarantined(3));
+            assert!(sg.is_object_quarantined(3));
+            assert!(!sg.central_resident(3), "a held object is not central-free");
+            assert!(!sg.mark_quarantined(3), "re-mark is a no-op (already held)");
+        }
+        // Lock-free reads see the held state.
+        assert!(s.is_object_quarantined(3));
+        assert!(!s.is_central_free(3));
+
+        // Drain: free-bit-first. `central_insert` sets the free bit BEFORE
+        // `clear_quarantined` clears the quarantined bit, so a lock-free check always
+        // observes at least one bit set.
+        {
+            let sg = s.lock();
+            assert!(sg.central_insert(3)); // free bit set
+            sg.set_live_count(9); // the drain decrements live (as insert_batch does)
+                                  // Mid-transition: free bit set, quarantined bit STILL set — a double-free
+                                  // check here sees BOTH (never a gap).
+            assert!(sg.central_resident(3));
+            assert!(sg.is_object_quarantined(3));
+            assert!(sg.clear_quarantined(3)); // now clear the quarantined bit
+            assert!(!sg.is_object_quarantined(3));
+            assert!(sg.central_resident(3));
+        }
+        // Final: object 3 is central-free (re-vendable), not quarantined.
+        assert!(s.is_central_free(3));
+        assert!(!s.is_object_quarantined(3));
     }
 
     #[test]

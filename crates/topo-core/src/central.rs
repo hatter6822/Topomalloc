@@ -756,6 +756,13 @@ impl CentralCache {
                         }
                     }
                 }
+                // W18-3 (§29.4): complete a drain's `quarantined → central-free`
+                // transition by clearing the quarantined bit **after** the free bit was
+                // set above (free-bit-first), so a concurrent lock-free
+                // `is_quarantined || is_central_free` double-free check always observes
+                // at least one bit set. A no-op for a normal (never-quarantined) free.
+                #[cfg(feature = "quarantine")]
+                sg.clear_quarantined(idx);
             } else {
                 // central_insert returns false for two reasons:
                 //   (a) idx >= object_count (out-of-range index), or
