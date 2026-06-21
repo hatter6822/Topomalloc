@@ -2926,11 +2926,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.span_extents.committed_bytes()
     }
 
-    /// Whether both shared back-ends, **every per-arena hooked backing**, and the
-    /// arena registry are well-formed (W4-5 + B.5 oracle; debug/tests).
+    /// Whether the whole live allocator is well-formed — the Appendix B oracle for
+    /// the engine (W19-1, DD-2): the shared span/large back-ends and **every
+    /// per-arena hooked backing** (B.1/B.4), the central free-list layer and its
+    /// spans (B.1/B.3), and the arena registry (B.5). Total + side-effect-free;
+    /// run from `debug_assert!` at engine transitions and as the G-core/G-mem/
+    /// G-arena test oracle. The per-CPU/thread/transfer cache layer (B.2) is
+    /// checked separately by its own [`check_invariants`](crate::CpuCache::check_invariants)
+    /// methods (those structures are not owned by the engine at M1).
     pub fn check_invariants(&self) -> bool {
         let mut ok = self.span_extents.check_invariants()
             && self.large.check_invariants()
+            && self.central.check_invariants()
             && self.arenas.check_invariants();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();

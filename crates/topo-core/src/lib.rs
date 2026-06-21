@@ -23,6 +23,7 @@ pub mod central;
 pub mod classify;
 pub mod compat;
 pub mod cpu_cache;
+pub mod debug;
 pub mod error;
 pub mod extent;
 pub mod fe;
@@ -78,6 +79,7 @@ pub use central::{
     Batch, CentralCache, CentralError, InsertResult, RemoveResult, ANY_PLACE_CLASS, MAX_BATCH_LEN,
 };
 pub use classify::{classify, Request, RequestKind};
+pub use debug::{check_b2_cache, runtime_checks_enabled, Group as BCheckGroup};
 pub use compat::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
 pub use error::BackendError;
 pub use extent::{

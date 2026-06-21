@@ -120,6 +120,51 @@ impl TransferBin {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Appendix B.2 (cache invariants, W19-1b): this bin is within capacity and
+    /// holds **distinct, non-null** object addresses. Acquires the bin lock for a
+    /// consistent snapshot, then is read-only — total + side-effect-free.
+    ///
+    /// * `len <= capacity` — the buffer bound (a write past it would corrupt
+    ///   neighbouring metadata);
+    /// * the `len` resident addresses are pairwise **distinct** — a duplicate is
+    ///   a double-listed object (a double-free or freelist corruption, §29.3 /
+    ///   S-009), the safety-critical transfer-cache clause of Appendix B.2;
+    /// * no resident address is null (`0` is never a live object address).
+    ///
+    /// Distinctness is O(len²); the bin is bounded by `batch × 4` objects
+    /// ([`default_capacity`]), so this is a small fixed cost paid only by a
+    /// `debug-checks`/hardened build. The single bin lock (rank `TRANSFER`) is the
+    /// only lock taken, so calling this from an unlocked context never violates
+    /// the §27.2 lock order.
+    pub fn check_invariants(&self) -> bool {
+        let _guard = self.lock();
+        if !self.is_initialized() {
+            return true;
+        }
+        let len = self.len() as usize;
+        let cap = self.capacity() as usize;
+        if len > cap {
+            return false;
+        }
+        let buf = self.buf_ptr();
+        for i in 0..len {
+            // SAFETY: `i < len <= cap`; `buf` is a valid array of `cap` `usize`
+            // from `MetadataAlloc` (never freed); the bin lock is held, so no
+            // concurrent writer.
+            let a = unsafe { *buf.add(i) };
+            if a == 0 {
+                return false;
+            }
+            for j in (i + 1)..len {
+                // SAFETY: `j < len <= cap`, as above.
+                if a == unsafe { *buf.add(j) } {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// RAII guard for a locked [`TransferBin`].
@@ -162,6 +207,16 @@ impl TransferCache {
     #[inline]
     pub fn bin(&self, sc: SizeClassId) -> Option<&TransferBin> {
         self.bins.get(sc.index())
+    }
+
+    /// Appendix B.2 (cache invariants, W19-1b): **every** transfer bin is
+    /// well-formed — within capacity and holding distinct, non-null objects (see
+    /// [`TransferBin::check_invariants`]). Total + side-effect-free; the
+    /// `debug-checks`/test oracle for the transfer layer. Each bin is keyed by
+    /// (and therefore consistent in) its size class by construction, so the
+    /// Appendix-B "batches have consistent size class" clause holds structurally.
+    pub fn check_invariants(&self) -> bool {
+        self.bins.iter().all(TransferBin::check_invariants)
     }
 
     /// Pop up to `max` addresses from the transfer bin for `(arena, sc)` into

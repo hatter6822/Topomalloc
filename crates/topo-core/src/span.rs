@@ -53,6 +53,7 @@ use crate::ids::{ArenaId, Generation, LargeId, SizeClassId, SpanId};
 use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
 use crate::size_class;
+use crate::slab::SlabLayout;
 
 /// Largest `objects_per_slab` over every size class in the generated table — the
 /// number of bits the widest slab's bitmap must cover. Computed from the table (a
@@ -956,6 +957,97 @@ impl SpanDescriptor {
     #[inline]
     pub fn reconstruct_non_central_residency(&self) -> NonCentralResidency {
         NonCentralResidency::NONE
+    }
+
+    /// Appendix B.3 (span invariants, W19-1c): this span descriptor is internally
+    /// well-formed. Acquires the span lock for a consistent snapshot of the
+    /// accounting, then checks the §16.2/§16.4 clauses; total + side-effect-free.
+    /// See [`check_invariants_locked`](Self::check_invariants_locked) for the
+    /// clause list. The single span lock (rank `SPAN`) is the only lock taken, so
+    /// calling this from a context that holds a lower-ranked lock (e.g. the central
+    /// bin lock, rank `CENTRAL`) respects the §27.2 order.
+    pub fn check_invariants(&self) -> bool {
+        let g = self.lock();
+        self.check_invariants_locked(&g)
+    }
+
+    /// Appendix B.3 (span invariants, W19-1c) under an already-held span lock —
+    /// for a caller composing the check with other locked work (e.g. the central
+    /// list walk). Total + side-effect-free. The clauses, mapped to Appendix B.3:
+    ///
+    /// * **size class valid + ranges fit** — the span's size class indexes a real
+    ///   generated row, and the carved `object_count` does not exceed what the
+    ///   §16.3 slab geometry ([`SlabLayout`]) admits at this base/header, so every
+    ///   object range lies within the span (disjointness then holds by
+    ///   construction: `size` is a multiple of `align`, no inter-object padding);
+    /// * **free count == authoritative representation** — `central_free_count ==
+    ///   popcount(free_bitmap)` (§8.5), the cached aggregate never drifts from the
+    ///   bitmap;
+    /// * **partition bound (§16.4)** — `live + central_free <= object_count`; the
+    ///   implementation's `live_count` already subsumes the per-CPU/transfer/thread
+    ///   cache *and* quarantine residency (an object removed from central but not
+    ///   yet returned stays counted as live), so this is the exact law (an equality
+    ///   once the span is fully activated), with the cache/quarantine terms folded
+    ///   into `live`, never double-counted;
+    /// * **quarantine exclusivity (W18-3)** — in a `quarantine` build, the held set
+    ///   is a subset of `live` (`quarantined <= live`) and an object is never
+    ///   simultaneously central-free and quarantined (the two bitmaps are
+    ///   disjoint), so the authoritative double-free marker can never alias a
+    ///   re-vendable object;
+    /// * **generation integrity** — under `debug-checks`, the §17.3 integrity tag
+    ///   (which covers the `generation` field, the §16.6/§27.5 stale-reuse guard)
+    ///   still validates, so a corrupted descriptor header is caught.
+    pub fn check_invariants_locked(&self, g: &SpanGuard<'_>) -> bool {
+        let sc = self.size_class();
+        // Size class must index a real generated row.
+        if size_class::checked_row(sc).is_none() {
+            return false;
+        }
+        let object_count = self.object_count() as usize;
+        // The carved object count must fit the slab geometry at this base/header
+        // (B.3 "object ranges fit within span"; disjointness is then structural).
+        match SlabLayout::compute(sc, self.base(), self.slab_header() as usize) {
+            Some(layout) if object_count <= layout.object_count => {}
+            _ => return false,
+        }
+        // B.3: free count equals the authoritative bitmap popcount.
+        if !g.central_count_matches_bitmap() {
+            return false;
+        }
+        // B.3 / §16.4: the tracked terms never over-fill the span. `live_count`
+        // is the implementation's "removed from central" aggregate — it already
+        // subsumes the per-CPU/transfer/thread *and* quarantine residency (a held
+        // object keeps `live_count` incremented so its slab cannot recycle, W18-3),
+        // so the exact law is `live + central_free <= object_count` (equality once
+        // the span is fully activated; the cache/quarantine terms are *inside*
+        // `live`, never added again).
+        let live = g.live_count() as usize;
+        let central_free = g.central_free_count() as usize;
+        if live + central_free > object_count {
+            return false;
+        }
+        // W18-3: the quarantine state is a subset of `live` (a held object stays
+        // counted as live), and central-free and quarantined are mutually
+        // exclusive per object (the authoritative double-free marker can never
+        // alias a re-vendable, central-resident object).
+        #[cfg(feature = "quarantine")]
+        {
+            if g.quarantined_count() > live {
+                return false;
+            }
+            for i in 0..object_count {
+                if g.central_resident(i) && g.is_object_quarantined(i) {
+                    return false;
+                }
+            }
+        }
+        // B.3 (generation): the §17.3 integrity tag covers `generation`, so a
+        // validating tag witnesses an un-corrupted stale-reuse guard.
+        #[cfg(feature = "debug-checks")]
+        if !self.validate_integrity() {
+            return false;
+        }
+        true
     }
 }
 

@@ -152,6 +152,16 @@ pub fn refill(
                     }
                 }
             }
+            // B.2 (cache refill preserves object count, W19-1b): every object the
+            // central list handed out converts to an address — the index→address
+            // mapping never drops an object (the indices are in `0..object_count`,
+            // so `object_addr` always succeeds and `batch.len() <= batch_size <=
+            // MAX_BATCH_LEN` never trips the cap). A mismatch is a refill leak.
+            debug_assert_eq!(
+                addr_count,
+                batch.len(),
+                "refill lost objects converting central indices to addresses"
+            );
 
             // Push addresses into the CPU cache slot.
             let pushed = cpu_cache.push_batch(core, sc, &addrs[..addr_count]);
@@ -258,6 +268,15 @@ pub fn flush(
     // Step 3: transfer was full (partially or fully). Flush remainder to
     // central free list. The transfer lock was released in step 2.
     let remainder = &buf[pushed_to_transfer..popped];
+    // B.2 (cache flush preserves object count, W19-1b): every object popped from
+    // the CPU cache is routed exactly once — `pushed_to_transfer` to the transfer
+    // cache and the rest to central — so the two destinations partition `popped`
+    // with nothing created or dropped at the routing step.
+    debug_assert_eq!(
+        pushed_to_transfer + remainder.len(),
+        popped,
+        "flush routing did not preserve the popped object count"
+    );
     let spans_emptied = flush_addrs_to_central(remainder, sc, central, pagemap);
 
     FlushResult {
@@ -441,6 +460,64 @@ mod tests {
             m,
         )
         .expect("span creation failed")
+    }
+
+    #[test]
+    fn flush_refill_round_trip_conserves_objects_and_invariants() {
+        // B.2 (W19-1c): a refill (central → CPU) followed by a flush (CPU →
+        // central) neither creates nor destroys an object, and every layer's
+        // Appendix-B checker holds at each step. The span's §16.4 law
+        // `live + central_free == object_count` is the conservation witness
+        // (cache residency keeps `live_count` incremented).
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3); // 64-byte class
+        let core = CoreId::DEFAULT;
+        let base = 0x4000_0000usize;
+
+        let span = make_span(1, sc, base, &m);
+        let obj_count = size_class::row(sc).objects_per_slab;
+        central.activate_span(&span, &pm, &m).unwrap();
+        cc.init_slot(core, sc, &m, 32);
+
+        // Invariants hold and everything is central-free initially.
+        assert!(cc.check_invariants() && tc.check_invariants() && central.check_invariants());
+        assert_eq!(span.central_free_count(), obj_count);
+        assert_eq!(span.live_count(), 0);
+
+        // Refill: pull a batch from central into the CPU cache.
+        let r = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+        );
+        assert!(r.filled > 0 && !r.need_span);
+        // Conservation: the objects pulled into the cache are now "live" (held by
+        // the cache), the rest remain central-free, and the two sum to the slab.
+        assert_eq!(span.live_count(), r.filled as u32);
+        assert_eq!(span.central_free_count(), obj_count - r.filled as u32);
+        assert_eq!(span.live_count() + span.central_free_count(), obj_count);
+        assert!(cc.check_invariants() && tc.check_invariants() && central.check_invariants());
+        assert!(span.check_invariants());
+
+        // Flush: push the CPU cache's objects back down (to transfer here, since
+        // it is not full). No object is created or lost.
+        let f = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        assert_eq!(f.flushed, r.filled);
+        // The objects are now in the transfer cache; conservation still holds.
+        assert!(cc.check_invariants() && tc.check_invariants() && central.check_invariants());
+        assert_eq!(span.live_count() + span.central_free_count(), obj_count);
+        assert!(span.check_invariants());
     }
 
     #[test]

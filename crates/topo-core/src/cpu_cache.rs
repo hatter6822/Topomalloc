@@ -160,6 +160,33 @@ impl CpuSlot {
             .store(cap.min(hard).max(1), Ordering::Relaxed);
     }
 
+    /// Appendix B.2 (cache invariants, W19-1b): this slot is within its capacity
+    /// bounds (§11.5). Total + side-effect-free; the `debug-checks`/test oracle
+    /// for one per-CPU slot. An **uninitialized** slot is vacuously well-formed
+    /// (it holds nothing). For an initialized slot:
+    ///
+    /// * `len <= hard_capacity` — the §11.5 absolute ceiling is never breached;
+    /// * `1 <= soft_capacity <= hard_capacity` — the budget controller (W6-5)
+    ///   keeps the soft target inside the legal window, so a push always has a
+    ///   meaningful bound and the buffer (sized at `hard_capacity`) never tears;
+    /// * `hard_capacity == max_local_capacity(sc)` — the geometry the slot was
+    ///   initialized with, so a corrupted ceiling (which would mis-size the
+    ///   buffer-bounds reasoning) is caught.
+    ///
+    /// Reads are lock-free relaxed snapshots; exact when the slot is quiescent.
+    pub fn check_invariants(&self, sc: SizeClassId) -> bool {
+        if !self.is_initialized() {
+            return true;
+        }
+        let len = self.len();
+        let soft = self.soft_capacity();
+        let hard = self.hard_capacity();
+        len <= hard
+            && soft >= 1
+            && soft <= hard
+            && hard == size_class::max_local_capacity(sc) as u32
+    }
+
     /// Initialize the slot: allocate the address buffer from `meta`.
     /// Must be called under the per-CPU lock. Returns `false` on metadata
     /// exhaustion.
@@ -443,6 +470,27 @@ impl CpuCache {
     #[inline]
     pub fn per_cpu(&self, core: CoreId) -> Option<&PerCpu> {
         self.cpus.get(core.index())
+    }
+
+    /// Appendix B.2 (cache invariants, W19-1b): **every** per-CPU slot is within
+    /// its capacity bounds (§11.5). Total + side-effect-free, O(`MAX_CPUS` × sc);
+    /// the `debug-checks`/test oracle for the per-CPU front-end, and the runtime
+    /// counterpart of the "per-CPU cache counts do not exceed capacity / bytes do
+    /// not exceed the hard budget" Appendix-B clauses (each slot's bytes are
+    /// bounded by `len × object_size <= hard_capacity × object_size`).
+    ///
+    /// Iterates **all** `MAX_CPUS`, not just the active count, so a slot
+    /// initialized on a core that later went offline is still checked. Reads are
+    /// lock-free relaxed snapshots, exact when the cache is quiescent.
+    pub fn check_invariants(&self) -> bool {
+        for cpu in self.cpus.iter() {
+            for (sc_idx, slot) in cpu.slots.iter().enumerate() {
+                if !slot.check_invariants(SizeClassId::new(sc_idx)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Initialize a slot for `(core, sc)` with the given initial capacity.
