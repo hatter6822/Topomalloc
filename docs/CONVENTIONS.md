@@ -38,6 +38,16 @@ Never gate a *memory-safety* invariant behind `debug_assert!` if violating it in
 branch that fails the allocation safely. Conversely, never put an O(n) invariant
 sweep on the `performance` hot path.
 
+The Appendix-B checklist (W19-1, DD-2) is **first-class runtime code**: one *total*,
+side-effect-free `check_invariants` method per type, landing with the state it checks
+(`SpanDescriptor`/`CentralCache` for B.3/B.1, the `CpuCache`/`TransferCache`/`ThreadCache`
+trio for B.2, `HugePageFiller` for B.4, `ArenaTable` for B.5), gathered and documented by
+invariant group in the `crate::debug` module (the B.1–B.5 → code map, the `check_b2_cache`
+group callable, the `Group` enum). `Allocator::check_invariants` aggregates the
+engine-owned groups; the cache group is checked on its own (standalone at M1). A WU that
+adds state adds its checker (DoD addendum), with a **negative** test proving the checker
+catches a real violation.
+
 Corollary (Appendix F): error logging and profiling callbacks **must not**
 allocate through TopoMalloc (no recursion); assertion-failure paths must be
 allocation-free.

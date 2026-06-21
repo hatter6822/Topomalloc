@@ -163,7 +163,7 @@ pub fn in_sampler() -> bool {
 /// Reset the per-thread sampler **seed base** (§30.4, W19-3 deterministic mode):
 /// threads built after this draw their independent sampling streams from the new
 /// origin, so a deterministic run produces reproducible sampling. A single-threaded
-/// replay (one [`next_seed`] draw) is then fully reproducible. Existing threads'
+/// replay (one `next_seed` draw) is then fully reproducible. Existing threads'
 /// samplers re-sync lazily on the next rate change; for a fresh deterministic run
 /// set the seed before arming sampling.
 pub fn set_base_seed(seed: u64) {

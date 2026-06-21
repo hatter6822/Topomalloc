@@ -54,8 +54,10 @@
 //!   popcount(free_bitmap)` (§8.5);
 //! * *empty-span detection accounts for local/transfer/central/quarantine* — the
 //!   central walk classifies partial vs empty consistently with residency, and the
-//!   §16.4 partition bound `live + central_free + quarantined ≤ object_count` holds
-//!   with the (non-negative, untracked) cache terms;
+//!   §16.4 partition bound `live + central_free ≤ object_count` holds (the
+//!   implementation's `live_count` already subsumes the cache *and* quarantine
+//!   residency — an object removed from central but not yet returned stays counted
+//!   as live — so those terms are folded into `live`, with `quarantined ≤ live`);
 //! * *generation prevents stale descriptor reuse* — the §17.3 integrity tag (which
 //!   covers `generation`) validates under `debug-checks`.
 //!

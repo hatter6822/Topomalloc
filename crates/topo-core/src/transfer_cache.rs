@@ -133,7 +133,7 @@ impl TransferBin {
     /// * no resident address is null (`0` is never a live object address).
     ///
     /// Distinctness is O(len²); the bin is bounded by `batch × 4` objects
-    /// ([`default_capacity`]), so this is a small fixed cost paid only by a
+    /// (`default_capacity`), so this is a small fixed cost paid only by a
     /// `debug-checks`/hardened build. The single bin lock (rank `TRANSFER`) is the
     /// only lock taken, so calling this from an unlocked context never violates
     /// the §27.2 lock order.

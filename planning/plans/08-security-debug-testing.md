@@ -113,6 +113,56 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 
 **Depends on:** plan 03 (W5,W3), plan 04 W11. **Enables:** M7.
 
+> **Status — landed (ahead of its M7 slot).** All three units are implemented; the
+> Appendix-B checkers are **first-class runtime code** (principle 7), gated behind the
+> `debug-checks` feature on hot paths so `performance` pays nothing.
+>
+> **W19-1 (Appendix B as runtime code, DD-2).** One callable, *total*,
+> side-effect-free checker per invariant group, each landing with the state it checks
+> and gathered/documented in the new `crate::debug` module. **B.1 global / B.3 span /
+> B.1-reachability** — `SpanDescriptor::check_invariants{,_locked}` (slab-geometry fit,
+> sc validity, `central_free == popcount(free_bitmap)`, the exact §16.4 partition bound
+> `live + central_free ≤ object_count` with `quarantined ⊆ live`, quarantine
+> exclusivity, the §17.3 integrity tag) and `CentralCache::check_invariants` (acyclic
+> partial/empty span lists walked under the central→span lock order, per-span
+> well-formedness, and `Σ central_free == bin aggregate` — the free-structure
+> reachability law); `Allocator::check_invariants` now also walks the central layer, so
+> the engine oracle covers B.1/B.3/B.4/B.5. **B.2 cache** — `CpuCache`, `TransferCache`
+> (object distinctness + non-null, the safety-critical double-free witness), and
+> `ThreadCache` `check_invariants`, plus the `debug::check_b2_cache` group callable and
+> flush/refill count-preservation assertions at the `cache_ops` transition sites.
+> **B.4 hugepage** was already comprehensive (H-001..H-005); **B.5 arena** gained the
+> stale-reuse generation guard (a non-`Destroyed` arena carries a nonzero incarnation
+> generation) and the high-water bound. Each checker has positive **and** negative
+> tests (a deliberately corrupted state is shown to fail it).
+>
+> **W19-2 (sanitizers, §30.3).** ASan and MSan join the existing TSan support:
+> `cargo xtask test --kind asan|msan` run the `topo-core` library (ASan: default +
+> hardened, `detect_leaks=0` for the leaked-metadata model; MSan: the no_std-capable
+> core, where the hot paths take no libc) under `-Zsanitizer=address|memory`, with CI
+> jobs mirroring `tsan`. A `topo-arch` `build.rs` sets `cfg(topo_sanitize_no_asm)` under
+> Address/MemorySanitizer, so `rseq::enable()` returns `false` and the hand-written
+> restartable sequences (which those sanitizers cannot instrument) are never executed —
+> the locked baseline runs instead. TSan is excluded (it ignores asm and runs the RSEQ
+> equivalence battery on purpose). Validated green: ASan 530 + 544 hardened, MSan 530,
+> zero sanitizer reports.
+>
+> **W19-3 (deterministic mode, §30.4).** A pure, `no_std`, process-global `deterministic`
+> control block: an enabled flag (auto-on under `deterministic-test`), a seed with a
+> SplitMix64 `domain_seed` derivation (distinct, decorrelated, non-zero per-domain
+> streams), the `force_slow_path`/`force_purge` flags, and the canonical monotonic
+> `next_trace_id`. Randomization is disabled-unless-seeded — the guard-page sampler,
+> the quarantine evictor, and the heap sampler all reseed from the domain seed
+> (`apply_deterministic_seed`); cache refill order is already strict LIFO. The force
+> flags drive concrete hooks (central declines empty-span cache reuse; the extent free
+> path releases eagerly), proven by a serialized integration binary. A
+> `topomalloc_deterministic_*` C surface (+ `$TOPOMALLOC_DETERMINISTIC_SEED` env) and the
+> Appendix-E `topo.deterministic.*` read keys expose it. It is **policy/operational, not
+> an abstract §33.4 transition**, so there is no Lean obligation; the reproducibility is
+> pinned by the fixed-wall tests (`guard_sampler_is_reproducible_given_a_seed`,
+> `quarantine_random_evict_is_reproducible_given_a_seed`, the integration force-flag
+> tests).
+
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
 | W19-1a | Global invariant checks (B.1): one-owner, live-disjoint, free-structure reachability, page↔descriptor, released-no-live. | M | | each a callable checker; runs in debug CI. |

@@ -94,9 +94,7 @@ impl Control {
             "topo.deterministic.enabled" => {
                 Some(bool_str(topo_core::is_deterministic()).to_string())
             }
-            "topo.deterministic.seed" => {
-                Some(topo_core::deterministic::seed().to_string())
-            }
+            "topo.deterministic.seed" => Some(topo_core::deterministic::seed().to_string()),
             "topo.deterministic.force_slow_path" => {
                 Some(bool_str(topo_core::force_slow_path()).to_string())
             }

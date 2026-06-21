@@ -783,7 +783,7 @@ fn tsan_steps(r: &mut Runner<'_>) {
 /// nightly is noted and skipped, not a failure.
 ///
 /// **RSEQ asm:** the hand-written restartable sequences disable themselves under
-/// ASan (`build.rs` → `cfg(topo_sanitize_no_asm)` → [`topo_arch::rseq::enable`]
+/// ASan (`build.rs` → `cfg(topo_sanitize_no_asm)` → `topo_arch::rseq::enable`
 /// returns `false`), so the locked baseline runs and there are no asm false
 /// positives. **Leaks:** the lib tests intentionally leak their metadata arenas
 /// (`Box::into_raw`, the `MetadataAlloc` monotonic-metadata model), so the
@@ -843,7 +843,7 @@ fn asan_steps(r: &mut Runner<'_>) {
 /// MemorySanitizer over the `topo-core` library (W19-2, §30.3). MSan catches reads
 /// of uninitialized memory — the strictest sanitizer. It is scoped to the
 /// `no_std`-capable core, whose hot paths take **no** libc calls (all OS access is
-/// behind the [`TopoBackingProvider`](topo_core::TopoBackingProvider) seam, mocked
+/// behind the `TopoBackingProvider` seam, mocked
 /// with in-process metadata in the lib tests); running MSan over code that calls an
 /// **uninstrumented** libc (the POSIX backend's `mmap`/`madvise`) would false-
 /// positive, so those crates are intentionally excluded (§30.3 "where practical").

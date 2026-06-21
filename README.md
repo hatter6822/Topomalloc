@@ -97,6 +97,23 @@ recycle (the §36.12 MUST, feature-independent), the runtime image of the Lean
 Out-of-line large metadata + generation/integrity tags (W18-1) and double/invalid-free
 detection (W18-2) are always-on.
 
+**Debugging & sanitization modes (W19) are landed**: the **Appendix-B invariant
+checklist as first-class runtime code** (§30.2, DD-2) — one *total*, side-effect-free
+callable per group (B.1 global / B.2 cache / B.3 span / B.4 hugepage / B.5 arena),
+gathered in `crate::debug`, run as `debug_assert!`s under the `debug-checks` feature and
+as the G-core/G-conc/G-mem/G-arena test oracles, so `performance` pays nothing.
+**Sanitizers** (§30.3): `cargo xtask test --kind tsan|asan|msan` runs ThreadSanitizer
+over the concurrency + hardening paths and **AddressSanitizer / MemorySanitizer** over the
+`topo-core` library (default + hardened); the hand-written RSEQ assembly disables itself
+under ASan/MSan (which cannot instrument it) via a `build.rs`-set `cfg(topo_sanitize_no_asm)`,
+so the locked baseline runs and there are no asm false positives. **Deterministic test
+mode** (§30.4, `crate::deterministic`): a process-global control block with seeded
+randomization (one `domain_seed` derivation feeds the guard-page, quarantine, and heap
+samplers), strict-LIFO refill, optional force-slow-path / force-frequent-purge, and a
+monotonic trace-id source — exposed through the `topomalloc_deterministic_*` C surface and
+`$TOPOMALLOC_DETERMINISTIC_SEED` — so a captured §33.7 trace replays identically (the
+differential runner's prerequisite).
+
 ## Quick start
 
 ```sh
