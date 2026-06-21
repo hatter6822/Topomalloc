@@ -191,6 +191,73 @@ fn reconciliation_holds_under_concurrent_load_then_quiesces() {
     assert_eq!(s.live_bytes, 0, "every thread freed its allocations");
 }
 
+/// W18-3 / §8.6 (#23): the reconciliation identities hold with the **quarantine
+/// enabled** under concurrent load. A quarantined object is accounted as app-freed
+/// (excluded from `live_bytes`) and reported separately as `quarantine.bytes` — never
+/// double-counted — so `live == allocated - freed` still holds while objects are held,
+/// and disabling (draining) returns `quarantine.bytes` to zero with reconciliation
+/// intact. Gated on the `quarantine` feature (the `hardened` profile).
+#[cfg(feature = "quarantine")]
+#[test]
+fn reconciliation_holds_with_quarantine_under_concurrent_load() {
+    let eng = engine();
+    eng.set_quarantine_enabled(true);
+    eng.set_quarantine_policy(topo_core::QuarantinePolicy {
+        max_bytes: 1 << 20,
+        max_objects: 4096,
+        ..topo_core::QuarantinePolicy::DEFAULT
+    });
+    const WORKERS: usize = 4;
+    let finished = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for t in 0..WORKERS {
+            let finished = Arc::clone(&finished);
+            scope.spawn(move || {
+                let mut live: Vec<*mut u8> = Vec::new();
+                for i in 0..2000 {
+                    let sz = 16 + ((i * 7 + t) % 2048);
+                    let p = eng.allocate(sz, 16, RequestFlags::NONE);
+                    if !p.is_null() {
+                        live.push(p);
+                    }
+                    if live.len() > 16 {
+                        let p = live.swap_remove(0);
+                        // SAFETY: a live pointer this thread owns (may be held in quarantine).
+                        unsafe { eng.free(p) };
+                    }
+                }
+                for p in live {
+                    // SAFETY: a live pointer this thread owns.
+                    unsafe { eng.free(p) };
+                }
+                finished.fetch_add(1, Ordering::Release);
+            });
+        }
+        let finished_r = Arc::clone(&finished);
+        scope.spawn(move || {
+            while finished_r.load(Ordering::Acquire) < WORKERS {
+                // The algebraic identities hold mid-flight even with objects held.
+                assert_reconciles(&snapshot(eng), false);
+            }
+        });
+    });
+    // Quiescent, quarantine still holding: every app-free happened, so `live_bytes == 0`
+    // (held objects are app-freed, not live) and the reconciliation is exact. The held
+    // bytes show up only as `quarantine.bytes`, never as live or central-free.
+    let s = snapshot(eng);
+    assert_reconciles(&s, true);
+    assert_eq!(
+        s.live_bytes, 0,
+        "quarantined objects are app-freed, not live"
+    );
+    // Drain by disabling: `quarantine.bytes` returns to zero, reconciliation intact.
+    eng.set_quarantine_enabled(false);
+    let s2 = snapshot(eng);
+    assert_eq!(s2.quarantine_bytes, 0, "disable drains the quarantine");
+    assert_reconciles(&s2, true);
+    assert_eq!(s2.live_bytes, 0, "every allocation ultimately freed");
+}
+
 #[test]
 fn exact_large_fragmentation_and_peak_track_the_engine() {
     // W17-4: exact medium/large internal fragmentation = usable − requested, live-set accurate.
