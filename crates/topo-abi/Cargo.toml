@@ -41,6 +41,25 @@ sele4n-sim = ["dep:topo-backend-sele4n"]
 # The `hugepage_optimized` profile (plan 04 W11): the global POSIX allocator serves
 # its medium/large path from a hugepage backend. Off by default (the M1 extent path).
 hugepage-optimized = ["topo-core/hugepage-optimized"]
+# W18 (plan 08, §29) hardening profiles, surfaced so a deployable `libtopomalloc`
+# can be built hardened/debug and the ABI exercised under them. Composed from this
+# crate's own granular units (each forwarding to `topo-core`) so that `topo-abi`'s
+# `cfg!(feature = "…")` gates are accurate under the profile, not just `topo-core`'s.
+# The default MIT/POSIX artifact enables none.
+hardened = [
+    "topo-core/hardened",
+    "junk-fill",
+    "quarantine",
+    "guard-pages",
+    "secure-scrub",
+]
+debug = ["topo-core/debug", "junk-fill"]
+# The individual W18 units, forwarded so a deployment can opt into one protection
+# without the whole profile (e.g. just delayed-reuse quarantine).
+junk-fill = ["topo-core/junk-fill"]
+quarantine = ["topo-core/quarantine"]
+guard-pages = ["topo-core/guard-pages"]
+secure-scrub = ["topo-core/secure-scrub"]
 
 [dev-dependencies]
 # Micro-benchmark harness (W0-8, §34.6). Default features (rayon, plotters, and

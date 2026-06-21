@@ -65,6 +65,18 @@ struct LargeSlot {
     /// `1` ⇒ backed by an [`ExtentRef`] (`backing_id`/`backing_gen`); `0` ⇒
     /// served by the region cache (freed back to the cache, not the extent manager).
     has_extent: u8,
+    /// `1` ⇒ a **guarded** allocation (W18-4, §29.5): the descriptor's object region
+    /// is bracketed by inaccessible guard pages within the extent, and the free path
+    /// restores their protection before recycling. `0` ⇒ a normal allocation. Reset
+    /// on every (re)acquire so a recycled slot never carries a stale guard.
+    guarded: u8,
+    /// `1` ⇒ this large allocation is **held in the quarantine** (W18-3, §29.4):
+    /// app-freed but not yet really freed. The authoritative double-free marker for a
+    /// held large (the ring covers it until set, and an eviction removes it from the
+    /// ring while this stays set), checked under the pool lock on the free path. The
+    /// drain (`free_*` retiring the descriptor) makes the slot non-resolvable; reset on
+    /// every (re)acquire so a recycled slot never carries a stale mark.
+    quarantined: u8,
     /// Unused-slot stack link (valid when the slot is on the free list).
     free_next: u32,
 }
@@ -351,10 +363,29 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> *mut u8 {
-        let (region, backing, zeroed) = match self.extents.alloc_large(bytes, align, hints, hook) {
+        let (region, backing, prov) = match self.extents.alloc_large(bytes, align, hints, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
         };
+
+        // W18-5 (§29.6) verify-on-reuse: when this region was carved from a retained,
+        // canary-filled extent (`prov.canary`, only ever true in a `junk-fill` build),
+        // its committed bytes must still read as the FREE-pattern canary. A mismatch is
+        // a use-after-free that corrupted the freed region between free and reuse —
+        // abort loudly rather than hand out a compromised allocation (§2.4). The region
+        // is exclusively ours from `alloc_large`, and this read precedes every write
+        // (the calloc memset / `fill_on_alloc` below), so the canary is intact here. A
+        // no-op without `junk-fill` (`prov.canary` is then always false). This is the
+        // large-object analogue of `hand_out_object`'s small-object check.
+        if prov.canary {
+            // SAFETY: `region` is `region.len` committed, exclusively-owned bytes.
+            if !unsafe { crate::harden::verify_free_pattern(region.base, region.len) } {
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected before reuse \
+                     (large-allocation junk-fill verify-on-reuse canary, §29.6)\n",
+                );
+            }
+        }
 
         self.lock.acquire();
         // SAFETY: lock held ⇒ exclusive access to the pool.
@@ -363,9 +394,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         let (idx, fresh) = match acquired {
             Some(v) => v,
             None => {
-                // Pool full: undo the extent/cache allocation and fail.
+                // Pool full: undo the extent/cache allocation and fail. The fresh
+                // region was never canary-filled, so it is not verify-on-reuse eligible.
                 self.lock.release();
-                self.return_backing(backing, region, hook, None);
+                self.return_backing(backing, region, hook, None, false);
                 return ptr::null_mut();
             }
         };
@@ -392,6 +424,8 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 }
                 None => (*slot).has_extent = 0,
             }
+            (*slot).guarded = 0; // a normal (un-guarded) allocation
+            (*slot).quarantined = 0; // a fresh allocation is not quarantined (W18-3)
         }
         // Publish into the pagemap (the W3-6 mutator). On metadata exhaustion, roll
         // back fully.
@@ -401,22 +435,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         if installed.is_err() {
             pool.release(idx);
             self.lock.release();
-            self.return_backing(backing, region, hook, None);
+            self.return_backing(backing, region, hook, None, false);
             return ptr::null_mut();
         }
         self.lock.release();
         // W15-5 calloc zeroing (§26.2/§26.3): a `TOPO_ZERO` request returns zeroed
         // memory. **Skip the redundant `memset` when the backing is freshly OS-zeroed**
-        // (a fresh extent under a zeroing provider — `alloc_large`'s `zeroed`); zero it
-        // otherwise (a reused/cache-served region). The skip rests on the provider's
-        // `committed_memory_is_zeroed` promise (§26.2); debug builds spot-check it so a
-        // lying provider is caught, never silently trusted.
-        if hints.zero && !zeroed {
+        // (a fresh extent under a zeroing provider — `alloc_large`'s `prov.zeroed`);
+        // zero it otherwise (a reused/cache-served region). The skip rests on the
+        // provider's `committed_memory_is_zeroed` promise (§26.2); debug builds
+        // spot-check it so a lying provider is caught, never silently trusted.
+        if hints.zero && !prov.zeroed {
             // SAFETY: `region` is `region.len` committed, owned bytes just vended.
             unsafe { ptr::write_bytes(region.base, 0, region.len) };
         }
         #[cfg(debug_assertions)]
-        if hints.zero && zeroed {
+        if hints.zero && prov.zeroed {
             let n = region.len;
             // SAFETY: `region` is `n` committed, owned bytes; the head slice is in bounds.
             let head_zero = unsafe { core::slice::from_raw_parts(region.base, n.min(PAGE_SIZE)) }
@@ -445,6 +479,118 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// uses [`allocate_in_hinted`](Self::allocate_in_hinted) to carry real hints.
     pub fn allocate_in(&self, arena: ArenaId, bytes: usize, align: usize) -> *mut u8 {
         self.allocate_with_in(arena, bytes, align, Hints::default(), self.region_cache)
+    }
+
+    /// Allocate a **guarded** allocation (W18-4, §29.5): the user object sits in a
+    /// committed region bracketed by a leading and a trailing **inaccessible guard
+    /// page**, so an overrun or underrun faults immediately (where the platform
+    /// supports page protection — otherwise the guards are advisory and the
+    /// allocation is still correct, §2.4). Expensive (≥ 3 pages + 2 `mprotect`s per
+    /// object), so the engine only takes this path for an explicit `TOPO_GUARDED`
+    /// request or a sampled allocation. Always **extent-backed** (it bypasses the
+    /// region cache for uniform guard handling). Null on failure.
+    ///
+    /// The descriptor is registered over the **object** region (its base is the user
+    /// pointer, so `free` accepts it and `usable_size` excludes the guards); the slot
+    /// is marked guarded so [`free`](Self::free) restores the guards' protection
+    /// before recycling the extent.
+    pub fn allocate_guarded(&self, arena: ArenaId, size: usize, align: usize) -> *mut u8 {
+        // Tight, alignment-rounded usable size. The object is **right-aligned**
+        // against the trailing guard so an overrun at `usable` traps immediately
+        // (Electric Fence's `PROTECT_BELOW=0` default — overruns dominate heap bugs),
+        // and `usable_size`/accounting stay tight (page padding is *not* counted as
+        // fragmentation). `usable` MUST equal the engine's charge `align_up(size,
+        // align)`; both use this exact formula. (Underruns are still caught by the
+        // leading guard, page-granularly.)
+        let want = size.max(1);
+        let Some(usable) = align_up(want, align.max(1)) else {
+            return ptr::null_mut();
+        };
+        // Object pages + one guard page on each side.
+        let object_pages = want.div_ceil(PAGE_SIZE);
+        let Some(total_bytes) = object_pages
+            .checked_add(2)
+            .and_then(|p| p.checked_mul(PAGE_SIZE))
+        else {
+            return ptr::null_mut();
+        };
+        // Reserve through the extent manager with no region cache (guards need a real
+        // extent to protect/restore).
+        let (region, backing, _prov) = match self.extents.alloc_large(
+            total_bytes,
+            PAGE_SIZE,
+            Hints::default(),
+            &NO_REGION_CACHE,
+        ) {
+            Ok(rb) => rb,
+            Err(_) => return ptr::null_mut(),
+        };
+        let ext_base = region.base as usize;
+        // `[object_base, object_base + usable)` ends exactly at the trailing guard page
+        // (`usable <= object_pages * PAGE`, so the object stays inside the object region);
+        // `object_base` is `align`-aligned (trailing_guard_start is page-aligned, `usable`
+        // is `align`-aligned, `align <= PAGE`).
+        let trailing_guard_start = ext_base + (object_pages + 1) * PAGE_SIZE;
+        let object_base = trailing_guard_start - usable;
+        // Protect the leading and trailing guard pages (best-effort; a no-op host
+        // fallback leaves them advisory).
+        let _ = self.extents.protect_range(ext_base, PAGE_SIZE, false);
+        let _ = self
+            .extents
+            .protect_range(object_base + usable, PAGE_SIZE, false);
+
+        let restore_and_free = |me: &Self, backing, region| {
+            // Restore both guards so the recycled extent is fully usable, then free.
+            let _ = me.extents.protect_range(ext_base, PAGE_SIZE, true);
+            let _ = me
+                .extents
+                .protect_range(object_base + usable, PAGE_SIZE, true);
+            // A guarded reservation being undone was never canary-filled (not eligible).
+            me.return_backing(backing, region, &NO_REGION_CACHE, None, false);
+        };
+
+        self.lock.acquire();
+        // SAFETY: lock held ⇒ exclusive pool access.
+        let pool = unsafe { &mut *self.pool.get() };
+        let (idx, fresh) = match pool.acquire() {
+            Some(v) => v,
+            None => {
+                self.lock.release();
+                restore_and_free(self, backing, region);
+                return ptr::null_mut();
+            }
+        };
+        let id = LargeId(pool.next_id);
+        pool.next_id = pool.next_id.wrapping_add(1);
+        let slot = pool.slot_ptr(idx);
+        // SAFETY: `slot` is a valid pool slot; install-before-publish (F1).
+        unsafe {
+            if fresh {
+                (*slot).desc = LargeDescriptor::new(id, arena, object_base, usable, align);
+            } else {
+                (*slot).desc.recycle(arena, object_base, usable, align);
+            }
+            match backing {
+                Some(ext) => {
+                    (*slot).backing_id = ext.id.0;
+                    (*slot).backing_gen = ext.generation;
+                    (*slot).has_extent = 1;
+                }
+                None => (*slot).has_extent = 0,
+            }
+            (*slot).guarded = 1;
+            (*slot).quarantined = 0; // a fresh guarded allocation is not quarantined
+        }
+        // SAFETY: `slot` is live and initialised; its descriptor is in never-freed metadata.
+        let installed = unsafe { self.pagemap.install_large(self.meta, &(*slot).desc) };
+        if installed.is_err() {
+            pool.release(idx);
+            self.lock.release();
+            restore_and_free(self, backing, region);
+            return ptr::null_mut();
+        }
+        self.lock.release();
+        object_base as *mut u8
     }
 
     /// The owning arena of the live large allocation based at `ptr`, or `None`
@@ -499,7 +645,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// its large allocations) — the §22.5/§36.13 reset/destroy precondition. Each
     /// freed pointer is a live base pointer this allocator handed out, so the
     /// per-free [`free`](Self::free) contract is met.
-    pub unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+    pub unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool) {
         let mut count = 0usize;
         let mut bytes = 0usize;
         let mut all_revoked = true;
@@ -535,8 +681,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                     // SAFETY: `base` is the current base pointer of a live large
                     // allocation of this allocator (the pagemap confirmed it under
                     // the lock); freeing it meets the `free` contract. Revoke the
-                    // backing's descendants before recycling (§36.6/§36.13).
-                    let (retired, revoked) = unsafe { self.free_revoking(base as *mut u8, arena) };
+                    // backing's descendants before recycling (§36.6/§36.13), zeroing
+                    // first when the arena may be reused at a lower label (W18-6).
+                    let (retired, revoked) =
+                        unsafe { self.free_revoking(base as *mut u8, arena, scrub_zero) };
                     if retired {
                         // The object is gone regardless of revoke; count its bytes.
                         count += 1;
@@ -571,8 +719,24 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     ///
     /// SPEC-transition: `large free` (pagemap clear §17.2 + extent free §18.3)
     pub unsafe fn free_with(&self, ptr: *mut u8, hook: &dyn RegionCacheHook) -> bool {
-        // SAFETY: identical contract, forwarded; `None` = no capability revoke.
-        unsafe { self.free_inner(ptr, hook, None) }.0
+        // SAFETY: identical contract, forwarded; `None` = no capability revoke, and
+        // no zero-scrub (junk-fill, if compiled, still scrubs the freed bytes).
+        unsafe { self.free_inner(ptr, hook, None, false) }.0
+    }
+
+    /// As [`free`](Self::free) but with the **scrub-before-downgrade** decision
+    /// passed in (W18-6, §36.12): `scrub_zero` zeroes the freed bytes before the
+    /// backing returns to the shared pool, where a lower-label arena may reuse it.
+    /// The engine computes it from the source arena's label (it owns the registry);
+    /// `false` here behaves exactly like [`free`](Self::free).
+    ///
+    /// # Safety
+    ///
+    /// As [`free_with`](Self::free_with).
+    pub unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool {
+        // SAFETY: identical contract, forwarded; the installed region cache routes a
+        // cache-served free back to it (W11).
+        unsafe { self.free_inner(ptr, self.region_cache, None, scrub_zero) }.0
     }
 
     /// Free a live large of `arena`, **revoking its backing's descendants before
@@ -586,11 +750,18 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// # Safety
     ///
     /// As [`free_with`](Self::free_with).
-    pub unsafe fn free_revoking(&self, ptr: *mut u8, arena: ArenaId) -> (bool, bool) {
+    pub unsafe fn free_revoking(
+        &self,
+        ptr: *mut u8,
+        arena: ArenaId,
+        scrub_zero: bool,
+    ) -> (bool, bool) {
         // SAFETY: identical contract, forwarded; `Some(arena)` = revoke first. The
         // installed region cache (the hugepage backend when wired, W11) routes a
         // cache-served arena-drain free back to it rather than dropping it.
-        unsafe { self.free_inner(ptr, self.region_cache, Some(arena)) }
+        // `scrub_zero` zeroes the freed bytes first when the arena may be reused at a
+        // lower label (W18-6, §36.12).
+        unsafe { self.free_inner(ptr, self.region_cache, Some(arena), scrub_zero) }
     }
 
     /// The shared body of the large-free paths. `revoke` selects whether the
@@ -606,6 +777,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         ptr: *mut u8,
         hook: &dyn RegionCacheHook,
         revoke: Option<ArenaId>,
+        scrub_zero: bool,
     ) -> (bool, bool) {
         if ptr.is_null() {
             return (false, false);
@@ -645,9 +817,9 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             self.lock.release();
             return (false, false);
         }
-        // Capture the backing and the region before retiring/recycling.
+        // Capture the backing, the region, and the guard marker before retiring.
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
-        let (backing, region) = unsafe {
+        let (backing, region, guarded) = unsafe {
             let region = Region {
                 base: (*slot).desc.base() as *mut u8,
                 len: (*slot).desc.usable_size(),
@@ -660,19 +832,66 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             } else {
                 None
             };
+            let guarded = (*slot).guarded != 0;
             // Retire the pagemap entry for the *old* address BEFORE the slot can be
             // recycled to a new address (so a classifier never resolves a stale
             // address to a recycled descriptor, §17.2 P-Map-006 / DD-1 F2).
             self.pagemap.retire_large(&(*slot).desc);
-            (backing, region)
+            (backing, region, guarded)
         };
         pool.release(idx);
         self.lock.release();
 
+        // W18-4 (§29.5): restore the leading and trailing guard pages to read-write
+        // *before* the extent is recycled, so the recycled pages are fully usable for
+        // the next allocation. The object is right-aligned: its end (`base + region.len`)
+        // is the page-aligned trailing guard, and the leading guard is the first page of
+        // the extent — `object_pages = ceil(usable/PAGE)` pages of object + 1 below it.
+        // Best-effort: a host fallback with no page protection no-ops.
+        if guarded {
+            let object_base = region.base as usize;
+            let trailing_guard_start = object_base + region.len;
+            let object_pages = region.len.div_ceil(PAGE_SIZE);
+            let ext_base = trailing_guard_start.wrapping_sub((object_pages + 1) * PAGE_SIZE);
+            let _ = self.extents.protect_range(ext_base, PAGE_SIZE, true);
+            let _ = self
+                .extents
+                .protect_range(trailing_guard_start, PAGE_SIZE, true);
+        }
+
+        // Destroy the freed allocation's user bytes before the backing is returned
+        // (and possibly decommitted). Race-free and fault-free here: the pagemap entry
+        // is already retired and the slot released, so a concurrent double free re-reads
+        // `None` and never reaches this point, yet `return_backing` has not decommitted
+        // the region — it is committed and exclusively ours. Two mutually-exclusive
+        // ways to destroy the contents:
+        //   * a §36.12 label-downgrade **scrub** zeroes the bytes when `scrub_zero` is
+        //     set (the source arena is non-PUBLIC / `secure-scrub` is on) so a
+        //     lower-label reader cannot observe old data — the scrubbed bytes are
+        //     **zero** (matching the Lean `scrub_before_downgrade` model), so they are
+        //     deliberately **not** the canary and the extent is not verify-on-reuse
+        //     eligible (`did_fill = false`);
+        //   * otherwise the junk-fill **FREE-pattern canary** (W18-5, §29.6, no-op
+        //     without `junk-fill`), the last write, so a retained reuse of these exact
+        //     committed bytes can verify it (`did_fill` true iff the canary was written).
+        // A scrubbed (zeroed) extent reused later simply skips verify (its provenance
+        // carries no canary — never a false abort); the AND-join on coalesce keeps a
+        // mixed scrub/canary merge non-verifiable too. `region` is this allocation's
+        // committed user range; after retire + release we are its sole accessor.
+        let did_fill = if scrub_zero {
+            // SAFETY: see above — sole accessor of the committed user range.
+            unsafe { crate::harden::scrub(region.base, region.len) };
+            false
+        } else {
+            // SAFETY: see above — sole accessor of the committed user range.
+            unsafe { crate::harden::fill_on_free(region.base, region.len) };
+            crate::harden::junk_fill_enabled()
+        };
+
         // Return the backing outside the pool lock (the provider call is the slow,
         // §27.2-lowest step). A failed extent free still leaves us well-formed;
         // a failed *revoke* (drain path) is reported so the caller quarantines.
-        let reclaimed = self.return_backing(backing, region, hook, revoke);
+        let reclaimed = self.return_backing(backing, region, hook, revoke, did_fill);
         (true, reclaimed)
     }
 
@@ -713,6 +932,59 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         };
         self.lock.release();
         res
+    }
+
+    /// W18-3 (§29.4): mark the live large at `ptr` as **held in the quarantine** — the
+    /// authoritative double-free marker that closes the eviction-window gap (the ring
+    /// covers a held large until this is set; an eviction then removes it from the ring
+    /// while this stays set, until the drain retires the descriptor). Resolved under the
+    /// pool lock (as `usable_size`). Returns whether `ptr` was a live large of this
+    /// backend (so the caller can fall back if it is not ours).
+    pub fn mark_quarantined(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        self.lock.acquire();
+        let r = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                match pool.index_of(desc_ptr) {
+                    Some(idx) => {
+                        // SAFETY: `idx` is a live slot under the lock.
+                        unsafe { (*pool.slot_ptr(idx)).quarantined = 1 };
+                        true
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        self.lock.release();
+        r
+    }
+
+    /// W18-3 (§29.4): whether the large at `ptr` is currently **held in the quarantine**
+    /// (its slot's quarantined mark is set). The authoritative double-free check for a
+    /// held large, resolved under the pool lock. `false` if `ptr` is not a live large of
+    /// this backend.
+    pub fn is_quarantined(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        self.lock.acquire();
+        let r = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                pool.index_of(desc_ptr)
+                    // SAFETY: `idx` is a live slot under the lock.
+                    .is_some_and(|idx| unsafe { (*pool.slot_ptr(idx)).quarantined != 0 })
+            }
+            None => false,
+        };
+        self.lock.release();
+        r
     }
 
     /// Record the **requested** size of the live large allocation at base `ptr` (§31.5 exact
@@ -1047,19 +1319,28 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// fully reclaimed (no revoke requested, revoke succeeded, or cache-served);
     /// `false` only when a requested revoke failed (the extent then stays
     /// allocated and well-formed, the §36.13 partial-failure signal).
+    ///
+    /// `canary` records whether the caller canary-filled the region's bytes as their
+    /// last write (W18-5, §29.6) — only a freed-and-retained extent so marked is
+    /// verify-on-reuse eligible. A rollback of an un-filled fresh allocation passes
+    /// `false`, so its reuse is never (falsely) verified.
     fn return_backing(
         &self,
         backing: Option<ExtentRef>,
         region: Region,
         hook: &dyn RegionCacheHook,
         revoke: Option<ArenaId>,
+        canary: bool,
     ) -> bool {
         match backing {
             Some(ext) => match revoke {
-                Some(arena) => self.extents.free_revoking(ext, arena).is_ok(),
+                Some(arena) => self
+                    .extents
+                    .free_revoking_canary(ext, arena, canary)
+                    .is_ok(),
                 // a failed free still leaves us well-formed (W4-5)
                 None => {
-                    let _ = self.extents.free(ext);
+                    let _ = self.extents.free_canary(ext, canary);
                     true
                 }
             },
@@ -1107,6 +1388,14 @@ pub trait LargeBacking {
     fn note_requested(&self, ptr: *mut u8, requested: usize);
     /// The owning arena of the live large allocation at `ptr` *in this backend*.
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId>;
+    /// W18-3 (§29.4): mark the live large at `ptr` as quarantine-held *if it belongs to
+    /// this backend*; returns whether it did. See [`LargeAllocator::mark_quarantined`].
+    #[cfg(feature = "quarantine")]
+    fn mark_quarantined(&self, ptr: *mut u8) -> bool;
+    /// W18-3 (§29.4): whether the live large at `ptr` is quarantine-held *in this
+    /// backend*. See [`LargeAllocator::is_quarantined`].
+    #[cfg(feature = "quarantine")]
+    fn is_quarantined(&self, ptr: *mut u8) -> bool;
     /// Free the large allocation at `ptr` *if it belongs to this backend*.
     ///
     /// # Safety
@@ -1131,12 +1420,19 @@ pub trait LargeBacking {
     /// # Safety
     /// As [`shrink`](Self::shrink).
     unsafe fn grow(&self, ptr: *mut u8, new_usable: usize) -> Option<usize>;
+    /// Free a large allocation with the scrub-before-downgrade decision passed in
+    /// (W18-6, §36.12); see [`LargeAllocator::free_scrubbing`].
+    ///
+    /// # Safety
+    /// As [`free`](Self::free).
+    unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool;
     /// Free every live large of `arena` (reset/destroy); see
-    /// [`LargeAllocator::free_arena`].
+    /// [`LargeAllocator::free_arena`]. `scrub_zero` zeroes each freed allocation
+    /// before recycling when the arena may be reused at a lower label (W18-6).
     ///
     /// # Safety
     /// `arena` is quiesced (the §22.5/§36.13 precondition).
-    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool);
+    unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool);
     /// Number of large allocations currently live in this backend.
     fn live_count(&self) -> usize;
     /// The §20.1 physical-state byte breakdown of this backend's large region.
@@ -1162,6 +1458,16 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
     fn arena_of(&self, ptr: *mut u8) -> Option<ArenaId> {
         LargeAllocator::arena_of(self, ptr)
     }
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn mark_quarantined(&self, ptr: *mut u8) -> bool {
+        LargeAllocator::mark_quarantined(self, ptr)
+    }
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn is_quarantined(&self, ptr: *mut u8) -> bool {
+        LargeAllocator::is_quarantined(self, ptr)
+    }
     #[inline]
     unsafe fn free(&self, ptr: *mut u8) -> bool {
         // SAFETY: forwarded unchanged from the trait's `free` contract.
@@ -1178,9 +1484,14 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
         unsafe { LargeAllocator::grow(self, ptr, new_usable) }
     }
     #[inline]
-    unsafe fn free_arena(&self, arena: ArenaId) -> (usize, usize, bool) {
+    unsafe fn free_scrubbing(&self, ptr: *mut u8, scrub_zero: bool) -> bool {
+        // SAFETY: forwarded unchanged from the trait's `free_scrubbing` contract.
+        unsafe { LargeAllocator::free_scrubbing(self, ptr, scrub_zero) }
+    }
+    #[inline]
+    unsafe fn free_arena(&self, arena: ArenaId, scrub_zero: bool) -> (usize, usize, bool) {
         // SAFETY: forwarded unchanged from the trait's `free_arena` contract.
-        unsafe { LargeAllocator::free_arena(self, arena) }
+        unsafe { LargeAllocator::free_arena(self, arena, scrub_zero) }
     }
     #[inline]
     fn live_count(&self) -> usize {
@@ -1706,7 +2017,7 @@ mod tests {
         assert_eq!(la.live_count(), 1);
         // Drain the arena: the cache-served region returns via `try_cache_revoking`.
         // SAFETY: `p` is a live large of `ArenaId::DEFAULT` from this allocator.
-        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT) };
+        let (retired, _) = unsafe { la.free_revoking(p, ArenaId::DEFAULT, false) };
         assert!(retired, "the cache-served large is retired on drain");
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(
@@ -1760,6 +2071,74 @@ mod tests {
             "cache-served free returns to the cache"
         );
         assert_eq!(la.live_count(), 0);
+        assert!(la.check_invariants());
+    }
+
+    /// W18-5 (§29.6): a large allocation freed and then **reused** from its retained
+    /// extent passes verify-on-reuse — the free wrote the FREE-pattern canary as its
+    /// last write, and nothing touched the bytes before reuse, so the check does
+    /// **not** false-abort a correct program. Exercises the whole provenance→verify
+    /// plumbing end to end (only meaningful with the canary actually written, so it is
+    /// gated on `junk-fill`; the default test build under the retain policy reuses the
+    /// same extent, so verify genuinely runs here).
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn large_reuse_passes_verify_on_reuse_without_false_abort() {
+        let la = large(64, 8);
+        // Allocate, scribble user data, then free (canary-filled last).
+        let p1 = la.allocate(8 * PAGE, PAGE);
+        assert!(!p1.is_null());
+        // SAFETY: `p1` is a live 8-page allocation, exclusively ours.
+        unsafe { core::ptr::write_bytes(p1, 0x42, 8 * PAGE) };
+        // SAFETY: `p1` is a live large of this allocator.
+        assert!(unsafe { la.free(p1) });
+        // Reuse the same size: the retained, canary-filled extent is carved again and
+        // verify-on-reuse runs. A spurious failure would have aborted before this line.
+        let p2 = la.allocate(8 * PAGE, PAGE);
+        assert!(!p2.is_null(), "reuse of the retained extent succeeds");
+        // SAFETY: `p2` is a live large of this allocator.
+        assert!(unsafe { la.free(p2) });
+        assert!(la.check_invariants());
+    }
+
+    /// W18-3 (§29.4): the per-descriptor **quarantined** mark — the authoritative
+    /// double-free marker that closes the eviction-window gap for large allocations. A
+    /// live large can be marked held (resolvable while live); the drain (a real free)
+    /// retires the descriptor so it no longer resolves, and a recycle resets the mark.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn large_quarantined_mark_round_trips_and_retires_on_free() {
+        let la = large(64, 8);
+        let p = la.allocate(3 * PAGE, PAGE);
+        assert!(!p.is_null());
+        assert!(
+            !la.is_quarantined(p),
+            "a fresh allocation is not quarantined"
+        );
+        // Mark it held (as the quarantine does on an offer-Held): now a double free of
+        // it is detectable via the mark, even after it leaves the ring on eviction.
+        assert!(la.mark_quarantined(p), "marking a live large succeeds");
+        assert!(
+            la.is_quarantined(p),
+            "the descriptor reads as quarantine-held"
+        );
+        // The drain is a real free: it retires the descriptor, which then no longer
+        // resolves (so a later double free is rejected at classification).
+        // SAFETY: `p` is a live large of this allocator.
+        assert!(unsafe { la.free(p) });
+        assert!(
+            !la.is_quarantined(p),
+            "a retired descriptor does not resolve"
+        );
+        // A recycle gives a fresh, un-marked slot.
+        let q = la.allocate(3 * PAGE, PAGE);
+        assert!(!q.is_null());
+        assert!(
+            !la.is_quarantined(q),
+            "a recycled slot carries no stale mark"
+        );
+        // SAFETY: `q` is a live large of this allocator.
+        assert!(unsafe { la.free(q) });
         assert!(la.check_invariants());
     }
 }

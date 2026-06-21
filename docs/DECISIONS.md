@@ -1998,3 +1998,22 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   `global()` fast path returns the cached allocator with no gate cost, so the bootstrap depth-1 proof still
   holds. Pinned by `register_atfork_is_idempotent_and_reentrancy_safe` (concurrent + repeated registration:
   no panic/deadlock/double-register) and the existing fork battery (no regression).
+
+* **W18 — security & hardening: granular features composed by profiles (plan 08, §29).**
+  Each §29 protection is its **own opt-in Cargo feature** in `topo-core` (`junk-fill`,
+  `quarantine`, `guard-pages`, `secure-scrub`) rather than a single `hardened` umbrella, and the
+  `hardened`/`debug` profiles *compose* the ones they want. The decision follows "profiles are
+  features, not forks" (principle 8) to its conclusion: a deployment can opt into one protection
+  without the rest, and — crucially — a feature that is **off compiles every entry point to a
+  true no-op**, so the `performance` build is byte-for-byte the un-hardened one (the protections'
+  state, e.g. the quarantine ring and the guard sampler, lives behind `#[cfg]`-gated engine
+  fields that do not exist without their feature). The runtime-expensive protections (quarantine,
+  guard sampling) are **off by default even when compiled in** — the RSS/latency cost is not
+  imposed unasked — and are armed via the `topomalloc_quarantine_*` / `topomalloc_guard_*` control
+  surface or `$TOPOMALLOC_*` env, mirroring the W17 sampler. The single seam this adds to the
+  provider trait is `protect` (the W18-4 guard-page `mprotect`), defaulted to a no-op so a backend
+  without page protection (or the Sim) treats guards as advisory — the allocator never relies on a
+  guard for correctness (§2.4). W18 adds **no abstract §33.4 transition** (the quarantine still
+  "frees" from the application's view, guards/scrub change only placement/contents, never
+  size/alignment/validity); the one model tie is W18-6, whose runtime scrub is the image of the
+  pre-existing Lean `scrub_before_downgrade` theorem.

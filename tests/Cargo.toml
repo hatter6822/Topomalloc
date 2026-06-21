@@ -20,6 +20,14 @@ path = "src/lib.rs"
 [features]
 default = []
 sele4n-sim = ["dep:topo-backend-sele4n", "topo-abi/sele4n-sim"]
+# W18 hardening profiles, so the integration suite can exercise the live guarded
+# allocations (real `mprotect` trap), quarantine, scrub, and junk fill over the
+# POSIX / seLe4n providers (plan 08).
+hardened = ["topo-abi/hardened", "guard-pages", "quarantine", "secure-scrub", "junk-fill"]
+guard-pages = ["topo-abi/guard-pages"]
+quarantine = ["topo-abi/quarantine"]
+secure-scrub = ["topo-abi/secure-scrub", "topo-core/secure-scrub"]
+junk-fill = ["topo-abi/junk-fill", "topo-core/junk-fill"]
 
 [dependencies]
 # `std` so the integration tests exercise topo-core's thread-local safety

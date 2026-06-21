@@ -102,8 +102,21 @@ exclude = ["fuzz", "vendor/sele4n"]
 # excludes medium/large (counted exactly elsewhere — no double-count); and `CONSISTENT_SNAPSHOT`
 # compares the whole `AllocatorStats` for stability, not just the cumulative totals. In a 0.x
 # series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
-# axis), keeping `^0.1.0` inter-crate reqs satisfied.
-version = "0.1.23"
+# axis), keeping `^0.1.0` inter-crate reqs satisfied. 0.1.24: W18 (plan 08) — security &
+# hardening: the `crate::harden` module + granular profile-composed features (`junk-fill`,
+# `quarantine`, `guard-pages`, `secure-scrub`). Junk filling (fill-on-alloc/free +
+# verify-on-reuse, §29.6); the delayed-reuse quarantine (§29.4, accounted as `quarantine.bytes`,
+# policy knobs + drain + the `topomalloc_quarantine_*` control surface); sampled guarded
+# allocations with a real `mprotect` guard-page trap (§29.5, the new `TopoBackingProvider::protect`
+# seam + `LargeAllocator::allocate_guarded` + `GuardSampler`); and scrub-before-downgrade
+# (§36.12, a lock-free per-arena `label` + the engine scrubs a non-PUBLIC arena's backing before
+# recycle, runtime image of the Lean `scrub_before_downgrade` theorem). Performance pays nothing
+# (every protection's field/entry point is `#[cfg]`-gated to a no-op). Mechanisms/policy, not new
+# §33.4 transitions; pinned by fixed-wall tests incl. a POSIX guard-page SIGSEGV death test, a
+# large use-after-free SIGABRT death test (verify-on-reuse over a per-extent canary provenance),
+# and a POSIX/Sim scrub-before-downgrade co-equality test (G-sim). 0.1.25 — W18 optimal-completion:
+# large verify-on-reuse, randomized/tight guards, quarantine invariant-checker + fuzz + convergence.
+version = "0.1.25"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

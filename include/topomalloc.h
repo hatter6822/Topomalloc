@@ -373,6 +373,37 @@ uint64_t topomalloc_profile_confident_sites(void);
 size_t topomalloc_profile_dump_json(char *buf, size_t cap);
 
 /* ------------------------------------------------------------------------
+ * Security & hardening control (Section 29, plan 08 W18)
+ *
+ * These drive the opt-in hardening protections compiled into the `hardened`
+ * profile. Without the corresponding feature they are safe no-ops (the *_bytes /
+ * *_rate readers return 0). The quarantine and guard sampler are OFF by default
+ * even when compiled in; $TOPOMALLOC_QUARANTINE / $TOPOMALLOC_GUARD_SAMPLE_RATE
+ * arm them at startup.
+ * --------------------------------------------------------------------- */
+
+/* W18-3 quarantine (Section 29.4): delay reuse of freed objects so a use-after-
+ * free is more likely to hit still-quarantined memory. Enable/disable at runtime
+ * (disabling drains the held objects); read the separately-accounted held bytes/
+ * objects (also the `quarantine.bytes` stats class); set the eviction budgets. */
+void topomalloc_quarantine_set_enabled(int on);
+int topomalloc_quarantine_enabled(void);
+uint64_t topomalloc_quarantine_bytes(void);
+uint64_t topomalloc_quarantine_objects(void);
+void topomalloc_quarantine_set_limits(uint64_t max_bytes, uint64_t max_objects);
+uint64_t topomalloc_quarantine_max_bytes(void);
+uint64_t topomalloc_quarantine_max_objects(void);
+/* Background convergence: after lowering the budget on a quiescent heap, really
+ * free any held objects beyond the new budget (idempotent; no-op within budget). */
+void topomalloc_quarantine_converge(void);
+
+/* W18-4 guarded allocations (Section 29.5): bracket a sampled object with
+ * inaccessible guard pages so an overrun/underrun faults. Guard ~1 in `rate`
+ * allocations (0 = explicit TOPO_GUARDED only). */
+void topomalloc_guard_set_sample_rate(uint64_t rate);
+uint64_t topomalloc_guard_sample_rate(void);
+
+/* ------------------------------------------------------------------------
  * Statistics & observability (Section 31, plan 07 W17)
  *
  * "Where is the memory?" in machine-readable, epoch-consistent form (Section

@@ -227,6 +227,24 @@ impl TopoBackingProvider for PosixBackingProvider {
         unsafe { sys::purge_forced(addr, len) }
     }
 
+    fn protect(
+        &self,
+        region: Region,
+        offset: usize,
+        len: usize,
+        accessible: bool,
+    ) -> Result<(), BackendError> {
+        // W18-4 (§29.5): `mprotect` a guard page inaccessible (`PROT_NONE`) or restore
+        // it read-write. The address is validated as an in-bounds sub-range; a guard
+        // is OS-page-aligned (the caller passes page-aligned offsets/lengths).
+        let addr = Self::checked_subrange(region, offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping.
+        unsafe { sys::protect(addr, len, accessible) }
+    }
+
     fn release(&self, _arena: ArenaId, region: Region) -> Result<(), BackendError> {
         let mut owned = self.owned.lock().expect("provider mutex poisoned");
         let base = region.base as usize;
@@ -433,6 +451,30 @@ mod sys {
         }
     }
 
+    /// `mprotect` `[addr, addr+len)` inaccessible (`PROT_NONE`) or restore it
+    /// read-write — a W18-4 guard page (§29.5).
+    ///
+    /// # Safety
+    /// `[addr, addr+len)` is an OS-page-aligned sub-range of a live reservation.
+    pub(super) unsafe fn protect(
+        addr: usize,
+        len: usize,
+        accessible: bool,
+    ) -> Result<(), BackendError> {
+        let prot = if accessible {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_NONE
+        };
+        // SAFETY: page-aligned in-bounds range of our mapping.
+        let rc = unsafe { libc::mprotect(addr as *mut libc::c_void, len, prot) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::OutOfMemory)
+        }
+    }
+
     /// Drop the backing of `[addr, addr+len)` (MADV_DONTNEED). Guard mode also
     /// `mprotect(PROT_NONE)`s it so a use-after-free faults.
     ///
@@ -628,6 +670,19 @@ mod sys {
     /// In-bounds sub-range of a live reservation.
     pub(super) unsafe fn purge_lazy(_addr: usize, _len: usize) -> Result<(), BackendError> {
         Ok(()) // lazy: contents retained on the host (a valid MADV_FREE outcome)
+    }
+
+    /// W18-4 guard pages are **advisory** on the host fallback (no page protection):
+    /// a no-op, so a guarded allocation still works but does not hardware-trap.
+    ///
+    /// # Safety
+    /// In-bounds sub-range of a live reservation.
+    pub(super) unsafe fn protect(
+        _addr: usize,
+        _len: usize,
+        _accessible: bool,
+    ) -> Result<(), BackendError> {
+        Ok(())
     }
 
     /// # Safety

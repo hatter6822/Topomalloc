@@ -432,6 +432,36 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "debug-checks"],
     );
+    // W18 hardened profile (plan 08): the full hardening composition — junk-fill +
+    // quarantine + guard-pages + secure-scrub on top of debug-checks. Runs the core
+    // suite so every protection's wiring + accounting is exercised *together* (the
+    // composed profile, not just each feature alone).
+    r.run(
+        "test hardened profile (W18)",
+        "cargo",
+        &["test", "-p", "topo-core", "--features", "hardened"],
+    );
+    // W18 (#26): each hardening unit must build **and test alone**, not only inside the
+    // composed `hardened` profile. A feature that secretly leans on a sibling (a symbol
+    // or code path only compiled under another feature) would pass the composed run yet
+    // break a deployment that opts into just one protection — exactly the "features, not
+    // forks" composition `profiles/README.md` (principle 8) promises. Each single-feature
+    // run also exercises that protection's own `#[cfg(feature = "…")]` tests in isolation.
+    for feat in ["junk-fill", "quarantine", "guard-pages", "secure-scrub"] {
+        r.run(
+            &format!("test W18 feature alone: {feat}"),
+            "cargo",
+            &["test", "-p", "topo-core", "--features", feat, "--lib"],
+        );
+    }
+    // The W18 hardening integration tests over the **real POSIX provider**: the
+    // guarded-allocation `mprotect` death test (overrun/underrun ⇒ SIGSEGV) and the
+    // live quarantine control surface, which the in-crate `HostProvider` cannot.
+    r.run(
+        "test W18 hardening integration (POSIX)",
+        "cargo",
+        &["test", "-p", "topo-tests", "--features", "hardened"],
+    );
     // Hardened **release** pass (W16-1b / G-conc): in a `--release --features
     // debug-checks` artifact `debug_assertions` is off, so this proves the
     // lock-order checker (and its `assert!`-based trip) is still compiled in and
@@ -711,6 +741,26 @@ fn tsan_steps(r: &mut Runner<'_>) {
             T,
             "-p",
             "topo-core",
+            "--lib",
+        ],
+    );
+    // W18-3 (#20): race-check the hardening concurrency — the quarantine's ranked lock
+    // + its lock-free stat atomics + membership filter under the concurrent
+    // offer/drain stress test (`quarantine_concurrent_*`), and the junk-fill/guard
+    // paths — by running the lib suite again with the composed `hardened` features on.
+    r.run(
+        "tsan: hardening concurrency (topo-core lib, hardened)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--features",
+            "hardened",
             "--lib",
         ],
     );

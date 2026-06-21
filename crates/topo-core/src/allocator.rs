@@ -275,6 +275,10 @@ pub struct AllocatorStats {
     /// page-rounding is where internal waste dominates. Small-object internal fragmentation is
     /// the *sampled* estimate in the placement profiler (§31.5 "MAY sample in performance mode").
     pub live_internal_fragmentation_bytes: u64,
+    /// Bytes held in the security quarantine (§29.4, W18-3): freed objects delayed
+    /// from reuse, accounted **separately** from live / central-free (§8.6). `0`
+    /// unless the `quarantine` feature is compiled in *and* the runtime switch is on.
+    pub quarantine_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +685,17 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// winning. Empty (and the read short-circuits to neutral) until a confident hint is
     /// published, so the medium/large placement outcome is unchanged when nothing is learned.
     learned: LearnedHints,
+    /// W18-3 delayed-reuse quarantine (§29.4). **Profile-gated**: the field exists
+    /// only with the `quarantine` feature, so the `performance` build carries none of
+    /// its (tens-of-KiB) state and pays nothing. Freed objects are held here, accounted
+    /// separately as `quarantine.bytes`, until a budget evicts them to their real free.
+    #[cfg(feature = "quarantine")]
+    quarantine: crate::harden::Quarantine,
+    /// W18-4 guarded-allocation sampler (§29.5). **Profile-gated**: present only with
+    /// the `guard-pages` feature. Off by default (explicit `TOPO_GUARDED` only); a
+    /// non-zero rate samples ordinary allocations into the guarded page path.
+    #[cfg(feature = "guard-pages")]
+    guard: crate::harden::GuardSampler,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
@@ -818,6 +833,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             hooks: HookRegistry::new(),
             retired_hooks: AtomicHookFailures::new(),
             learned: LearnedHints::new(),
+            #[cfg(feature = "quarantine")]
+            quarantine: crate::harden::Quarantine::new(),
+            #[cfg(feature = "guard-pages")]
+            guard: crate::harden::GuardSampler::new(),
         })
     }
 
@@ -1002,15 +1021,29 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let Some(req) = classify(size, align, flags.raw()) else {
             return ptr::null_mut();
         };
+        // W18-4 (§29.5): an explicit `TOPO_GUARDED` request or a sampled allocation
+        // takes the guarded page path (own pages bracketed by inaccessible guards),
+        // regardless of size class. A true `false` without the `guard-pages` feature.
+        let guarded = self.want_guarded(flags, req.align);
         // The byte count charged to the arena and recorded — the class's usable
-        // size, or the page-rounded extent length. Compute it (and fail on any
-        // medium/large rounding overflow) *before* any state change.
-        let usable = match req.kind {
-            RequestKind::Small { usable, .. } => usable,
-            RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                match medium_large_usable(size) {
-                    Some(bytes) => bytes,
-                    None => return ptr::null_mut(),
+        // size, or the page-rounded extent length. A **guarded** object is right-aligned
+        // against its trailing guard, so its usable is *tight* (`align_up(size, align)`,
+        // matching `LargeAllocator::allocate_guarded`) — the guard pages are allocator
+        // overhead, not charged to the arena, and not counted as fragmentation. Compute
+        // it (failing on any rounding overflow) *before* any state change.
+        let usable = if guarded {
+            match crate::overflow::align_up(size.max(1), req.align.max(1)) {
+                Some(bytes) => bytes,
+                None => return ptr::null_mut(),
+            }
+        } else {
+            match req.kind {
+                RequestKind::Small { usable, .. } => usable,
+                RequestKind::Medium { .. } | RequestKind::Large { .. } => {
+                    match medium_large_usable(size) {
+                        Some(bytes) => bytes,
+                        None => return ptr::null_mut(),
+                    }
                 }
             }
         };
@@ -1024,33 +1057,44 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // can elide the `memset` when its extent is freshly OS-zeroed, W15-5); the
         // engine then zeroes only the small + hooked-arena cases below.
         let mut large_self_zeroed = false;
-        let p = match req.kind {
-            RequestKind::Small { sc, .. } => {
-                self.alloc_small(arena, sc, self.small_place_class(&req))
+        let p = if guarded {
+            // The guarded page path (W18-4): own pages with guard pages on each side.
+            // Routed to the same backend a normal large would use, so the free path
+            // (which routes by arena) finds the descriptor in the right pool. Not
+            // self-zeroed — the zeroing/junk-fill block below handles the object.
+            match self.hook_backend(arena) {
+                Some(b) => b.large.allocate_guarded(arena, size, req.align),
+                None => self.large.allocate_guarded(arena, size, req.align),
             }
-            RequestKind::Medium { .. } | RequestKind::Large { .. } => {
-                // Route to the arena's own hooked large backing if it has one (W10);
-                // otherwise the shared backend, carrying the request's placement hints
-                // so a wired hugepage backend packs by hotness/lifetime (W11) and a live
-                // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
-                // the router need not know the arena). A hooked arena's custom backing
-                // does not place by hints (it is the user's memory source), so it takes
-                // the hint-less trait path — and the engine zeroes it (no commit-zeroed
-                // promise from a user backing).
-                match self.hook_backend(arena) {
-                    Some(b) => b.large.allocate_in(arena, usable, req.align),
-                    None => {
-                        let mut hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
-                        // W14: a placement-unhinted request adopts its bucket's learned
-                        // profile (the live learn → place loop); an explicit hint wins.
-                        let bucket = match req.kind {
-                            RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
-                            _ => SizeClassDist::BUCKET_LARGE,
-                        };
-                        Self::apply_learned(&self.learned, &mut hints, bucket);
-                        large_self_zeroed = true;
-                        self.large
-                            .allocate_in_hinted(arena, usable, req.align, hints)
+        } else {
+            match req.kind {
+                RequestKind::Small { sc, .. } => {
+                    self.alloc_small(arena, sc, self.small_place_class(&req))
+                }
+                RequestKind::Medium { .. } | RequestKind::Large { .. } => {
+                    // Route to the arena's own hooked large backing if it has one (W10);
+                    // otherwise the shared backend, carrying the request's placement hints
+                    // so a wired hugepage backend packs by hotness/lifetime (W11) and a live
+                    // NUMA router places by the arena's policy (§15.5, W13 — resolved here so
+                    // the router need not know the arena). A hooked arena's custom backing
+                    // does not place by hints (it is the user's memory source), so it takes
+                    // the hint-less trait path — and the engine zeroes it (no commit-zeroed
+                    // promise from a user backing).
+                    match self.hook_backend(arena) {
+                        Some(b) => b.large.allocate_in(arena, usable, req.align),
+                        None => {
+                            let mut hints = req.flags.hints_with_numa(self.arenas.numa_of(arena));
+                            // W14: a placement-unhinted request adopts its bucket's learned
+                            // profile (the live learn → place loop); an explicit hint wins.
+                            let bucket = match req.kind {
+                                RequestKind::Medium { .. } => SizeClassDist::BUCKET_MEDIUM,
+                                _ => SizeClassDist::BUCKET_LARGE,
+                            };
+                            Self::apply_learned(&self.learned, &mut hints, bucket);
+                            large_self_zeroed = true;
+                            self.large
+                                .allocate_in_hinted(arena, usable, req.align, hints)
+                        }
                     }
                 }
             }
@@ -1070,8 +1114,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // §31.5 exact medium/large internal fragmentation (W17-4): record the *requested*
         // size on the large descriptor so `usable − requested` is exact. Routed to the same
         // backend the allocation came from (hooked arena's own, or the shared large path); a
-        // no-op for small objects (sampled instead).
-        if !matches!(req.kind, RequestKind::Small { .. }) {
+        // no-op for small objects (sampled instead). A guarded object is a large descriptor
+        // regardless of its size class, so it is recorded too.
+        if guarded || !matches!(req.kind, RequestKind::Small { .. }) {
             match self.hook_backend(arena) {
                 Some(b) => b.large.note_requested(p, size),
                 None => self.large.note_requested(p, size),
@@ -1081,10 +1126,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // hooked-arena large allocations are zeroed here; the shared medium/large path
         // already zeroed itself, eliding the `memset` when its extent was freshly
         // OS-zeroed (W15-5).
-        if req.flags.hints().zero && !large_self_zeroed {
-            // SAFETY: `p` is a live allocation with at least `usable` writable
-            // bytes (the class's usable size, or the page-rounded extent length).
-            unsafe { ptr::write_bytes(p, 0, usable) };
+        if req.flags.hints().zero {
+            if !large_self_zeroed {
+                // SAFETY: `p` is a live allocation with at least `usable` writable
+                // bytes (the class's usable size, or the page-rounded extent length).
+                unsafe { ptr::write_bytes(p, 0, usable) };
+            }
+        } else {
+            // W18-5 (§29.6): junk-fill the freshly handed-out object with the ALLOC
+            // pattern so an uninitialised read is conspicuous. Mutually exclusive with
+            // zeroing (which the caller asked for) and a true no-op unless `junk-fill`
+            // is compiled in. For small objects this also overwrites the FREE canary
+            // that `hand_out_object` already verified.
+            // SAFETY: `p` is a live allocation with at least `usable` writable bytes.
+            unsafe { crate::harden::fill_on_alloc(p, usable) };
         }
         p
     }
@@ -1184,7 +1239,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // SAFETY: the batch's span pointer was installed from a
                     // valid descriptor in never-freed metadata (§27.5).
                     let span = unsafe { &*batch.span() };
-                    return self.object_ptr(span, batch.index(0));
+                    return self.hand_out_object(span, batch.index(0));
                 }
                 RemoveResult::NeedSpan => {
                     if self.create_span(arena, sc, class).is_err() {
@@ -1202,7 +1257,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                             RemoveResult::Ok(batch) => {
                                 // SAFETY: as above — a live descriptor in never-freed metadata.
                                 let span = unsafe { &*batch.span() };
-                                self.object_ptr(span, batch.index(0))
+                                self.hand_out_object(span, batch.index(0))
                             }
                             RemoveResult::NeedSpan => ptr::null_mut(),
                         };
@@ -1210,6 +1265,35 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
             }
         }
+    }
+
+    /// Hand object `index` out of `span`: resolve its pointer ([`object_ptr`](Self::object_ptr))
+    /// and, in `junk-fill` builds, **verify-on-reuse** (§29.6, W18-5) that the slot
+    /// still reads as the use-after-free canary before the caller overwrites it
+    /// (fills with the alloc pattern, or zeroes). The check is read-only — it never
+    /// mutates allocator state — and a true no-op (always returns `true`) unless
+    /// `junk-fill` is compiled in, so the `performance` build pays nothing. A
+    /// mismatch is a write-after-free and aborts loudly (allocation-free message,
+    /// Appendix F); aborting is the §2.4-safe response to detected corruption.
+    /// Returns null exactly when [`object_ptr`](Self::object_ptr) does.
+    #[inline]
+    fn hand_out_object(&self, span: &SpanDescriptor, index: u16) -> *mut u8 {
+        let p = self.object_ptr(span, index);
+        if !p.is_null() {
+            let usable = size_class::usable_size(span.size_class());
+            // SAFETY: `p` points at `usable` readable bytes of the just-removed
+            // object (its class object size); it is exclusively ours until returned.
+            if !unsafe { crate::harden::verify_free_pattern(p, usable) } {
+                // A write-after-free corrupted the canary: abort rather than hand out a
+                // compromised object (§2.4). A true no-op when `junk-fill` is off
+                // (`verify_free_pattern` is always `true`, so this is never reached).
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected before reuse \
+                     (junk-fill verify-on-reuse canary, §29.6)\n",
+                );
+            }
+        }
+        p
     }
 
     /// Convert an object index in `span` into a provenance-correct pointer.
@@ -1269,6 +1353,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         };
         let base_ptr = region.base;
         let base = base_ptr as usize;
+        // W18-5 (§29.6): fill the freshly carved slab with the FREE pattern so
+        // *every* central-free object — fresh now or recycled later — reads as the
+        // use-after-free canary, making `verify_free_pattern` sound on the first
+        // reuse of each slot. A true no-op unless `junk-fill` is compiled in. The
+        // whole slab is committed, writable backing (the provider mapped it RW at
+        // `reserve`), so this never touches an unbacked page.
+        // SAFETY: `base_ptr` is the provider mapping for `[base, base + bytes)`, a
+        // freshly allocated, committed, exclusively-owned slab no object has been
+        // carved from yet.
+        unsafe { crate::harden::fill_fresh_slab(base_ptr, bytes) };
         let Some(layout) = SlabLayout::compute(sc, base, 0) else {
             let _ = backing.free(ext);
             return Err(ExtentError::Exhausted);
@@ -1432,7 +1526,16 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // and recycle under a racing thread, and its class/arena with it.
                 let usable = size_class::usable_size(span.size_class());
                 let arena = span.arena();
-                let r = self.central.insert_batch(span, &[idx], 1);
+                // W18-3 (§29.4): when the quarantine is active it may *hold* this
+                // freed object out of circulation (delaying reuse) or detect a
+                // quarantine-hit double free — returning the final outcome; a true
+                // no-op (always `None`) without the `quarantine` feature.
+                if let Some(outcome) = self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
+                    return outcome;
+                }
+                // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the
+                // use-after-free canary under the span lock; a true no-op otherwise.
+                let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
                 if r.inserted == 0 {
                     // Already central-free (double free) or the span raced
                     // its teardown; nothing was mutated (W8 hardening).
@@ -1461,9 +1564,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // usable size is captured first: after the free the descriptor may
                 // recycle.
                 let usable = owner.usable_size(ptr).unwrap_or(0);
+                // W18-3 (§29.4): the quarantine may hold this freed large (delaying
+                // reuse) or detect a quarantine-hit double free. A held large keeps
+                // its descriptor live, so a later double free re-resolves it and is
+                // caught as a hit. `usable == 0` (already freed) is left to the
+                // immediate path's double-free check. No-op without `quarantine`.
+                if let Some(outcome) = self.maybe_quarantine_large(ptr, arena, usable) {
+                    return outcome;
+                }
+                // W18-6 (§36.12): zero the freed bytes before the backing returns to
+                // the shared pool when this arena could be reused at a lower label
+                // (decided lock-free); the scrub itself happens race-free under the
+                // large pool lock inside `free_inner`.
+                let scrub_zero = self.scrub_on_release(arena);
                 // SAFETY: this method's own contract is the large path's
                 // contract, forwarded unchanged.
-                if unsafe { owner.free(ptr) } {
+                if unsafe { owner.free_scrubbing(ptr, scrub_zero) } {
                     self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
                     // Credit the owning arena's quota (§36.17 exact accounting).
                     self.arenas.credit(arena, usable as u64);
@@ -1473,6 +1589,355 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
             }
             Err(e) => FreeOutcome::Invalid(e),
+        }
+    }
+
+    /// Bytes currently held in the security quarantine (§29.4, W18-3) — reported as
+    /// `quarantine.bytes` and accounted **separately** from live / central-free
+    /// (§8.6). Always `0` without the `quarantine` feature (one branch folds away).
+    #[inline]
+    pub fn quarantine_bytes(&self) -> u64 {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.held_bytes()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            0
+        }
+    }
+
+    /// Objects currently held in the security quarantine (§29.4). `0` without the
+    /// `quarantine` feature.
+    #[inline]
+    pub fn quarantine_objects(&self) -> u32 {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.held_objects()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            0
+        }
+    }
+
+    /// Enable or disable the security quarantine at runtime (§29.4, W18-3). It is
+    /// **off by default** even with the feature compiled in (the opt-in cost model).
+    /// Disabling **drains** the held objects (really freeing them). A no-op without
+    /// the `quarantine` feature.
+    pub fn set_quarantine_enabled(&self, on: bool) {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.set_enabled(on);
+            if !on {
+                self.drain_quarantine();
+            }
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            let _ = on;
+        }
+    }
+
+    /// Whether the quarantine is currently active (feature compiled **and** runtime
+    /// switch on).
+    #[inline]
+    pub fn quarantine_active(&self) -> bool {
+        #[cfg(feature = "quarantine")]
+        {
+            self.quarantine.is_enabled()
+        }
+        #[cfg(not(feature = "quarantine"))]
+        {
+            false
+        }
+    }
+
+    /// Install a new quarantine policy (§29.4 knobs), then **converge** to it: if the
+    /// new budget is smaller than the held set, the now-excess oldest objects are
+    /// really freed at once (rather than waiting for incremental eviction on the next
+    /// frees). A no-op without the feature.
+    #[cfg(feature = "quarantine")]
+    pub fn set_quarantine_policy(&self, policy: crate::harden::QuarantinePolicy) {
+        self.quarantine.set_policy(policy);
+        self.converge_quarantine();
+    }
+
+    /// **Background convergence** (§29.4, W18-3): really free any held objects beyond
+    /// the current quarantine budget (after a runtime budget reduction), bringing
+    /// `quarantine.bytes`/objects down to budget. Host-driven (the allocator spawns
+    /// no threads); idempotent — a no-op when already within budget or without the
+    /// `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    pub fn converge_quarantine(&self) {
+        loop {
+            let batch = self.quarantine.drain_excess();
+            let entries = batch.as_slice();
+            if entries.is_empty() {
+                break;
+            }
+            for e in entries {
+                self.drain_one(e);
+            }
+        }
+    }
+
+    /// Without the `quarantine` feature, convergence is a no-op.
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    pub fn converge_quarantine(&self) {}
+
+    /// The current quarantine policy (§29.4).
+    #[cfg(feature = "quarantine")]
+    pub fn quarantine_policy(&self) -> crate::harden::QuarantinePolicy {
+        self.quarantine.policy()
+    }
+
+    /// Whether this request should take the **guarded** page path (W18-4, §29.5): an
+    /// explicit `TOPO_GUARDED` flag, or a sampled allocation. Limited to
+    /// `align <= PAGE_SIZE` (the guarded object is placed on a page boundary; a
+    /// larger alignment falls back to the normal path — best-effort, §2.4). A true
+    /// `false` without the `guard-pages` feature.
+    #[cfg(feature = "guard-pages")]
+    #[inline]
+    fn want_guarded(&self, flags: RequestFlags, align: usize) -> bool {
+        align <= PAGE_SIZE && (flags.hints().guarded || self.guard.sampled())
+    }
+
+    #[cfg(not(feature = "guard-pages"))]
+    #[inline]
+    fn want_guarded(&self, _flags: RequestFlags, _align: usize) -> bool {
+        false
+    }
+
+    /// Set the guarded-allocation **sampling** rate (W18-4, §29.5): ~1 in `rate`
+    /// ordinary allocations is guarded (`0` = explicit `TOPO_GUARDED` only — the
+    /// default). A no-op without the `guard-pages` feature.
+    pub fn set_guard_sample_rate(&self, rate: u64) {
+        #[cfg(feature = "guard-pages")]
+        {
+            self.guard.set_rate(rate);
+        }
+        #[cfg(not(feature = "guard-pages"))]
+        {
+            let _ = rate;
+        }
+    }
+
+    /// The current guarded-allocation sampling rate (`0` = off). `0` without the
+    /// `guard-pages` feature.
+    #[inline]
+    pub fn guard_sample_rate(&self) -> u64 {
+        #[cfg(feature = "guard-pages")]
+        {
+            self.guard.rate()
+        }
+        #[cfg(not(feature = "guard-pages"))]
+        {
+            0
+        }
+    }
+
+    /// Try to hold a freed **small** object in the quarantine (§29.4, W18-3).
+    /// Returns `Some(outcome)` when the quarantine handled the free — it *held* the
+    /// object (`Freed`; reuse delayed) or detected a double free — and `None` when
+    /// the caller should free it immediately (quarantine disabled / policy declined).
+    /// The app-facing free is accounted here on the held path; the object's physical
+    /// return is deferred until an eviction drains it (`drain_one`). A true no-op
+    /// (`None`) without the `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    fn maybe_quarantine_small(
+        &self,
+        ptr: *mut u8,
+        span: &SpanDescriptor,
+        idx: u16,
+        arena: ArenaId,
+        usable: usize,
+    ) -> Option<FreeOutcome> {
+        // A double free of a **held** object: the authoritative per-object quarantined
+        // bit says so (lock-free atomic read, W18-3). Checked FIRST and unconditionally
+        // — even when the runtime switch is off, held objects may still be draining, and
+        // a free of one is a double free. This closes the eviction-window gap: a held
+        // object's bit is set from hold until the drain transitions it under the span
+        // lock, so a concurrent double free of an evicted-but-not-yet-drained object is
+        // still caught here (it is not in the ring, but its bit is set).
+        if span.is_object_quarantined(idx as usize) {
+            return Some(FreeOutcome::DoubleFree);
+        }
+        if !self.quarantine.is_enabled() {
+            return None;
+        }
+        // A double free of an object that was already *immediately* freed (now
+        // central-free): the bitmap says so (lock-free atomic read). Reject as a
+        // double free without holding — holding a central-free object could let a
+        // concurrent reuse and the deferred drain collide (§2.4: never corrupt).
+        if span.is_central_free(idx as usize) {
+            return Some(FreeOutcome::DoubleFree);
+        }
+        let entry = crate::harden::QuarantineEntry {
+            user_ptr: ptr,
+            span: span as *const SpanDescriptor,
+            index: idx,
+            arena,
+            bytes: usable as u64,
+        };
+        let mut evicted = crate::harden::EvictBatch::new();
+        match self.quarantine.offer(entry, &mut evicted) {
+            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
+            crate::harden::Offer::Declined => None,
+            crate::harden::Offer::Held => {
+                // Mark the object quarantined under the span lock — the authoritative
+                // marker. The ring's `AlreadyQuarantined` covered the brief window from
+                // `offer` until now; from here the bit covers it (including after an
+                // eviction removes it from the ring). Then account the app-free and
+                // drain any evicted objects (their bits are cleared by the drain's
+                // `insert_batch`, free-bit-first).
+                {
+                    let sg = span.lock();
+                    sg.mark_quarantined(idx as usize);
+                }
+                self.account_quarantined_free(arena, usable, evicted.as_slice());
+                Some(FreeOutcome::Freed)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn maybe_quarantine_small(
+        &self,
+        _ptr: *mut u8,
+        _span: &SpanDescriptor,
+        _idx: u16,
+        _arena: ArenaId,
+        _usable: usize,
+    ) -> Option<FreeOutcome> {
+        None
+    }
+
+    /// Try to hold a freed **large** allocation in the quarantine (§29.4, W18-3).
+    /// As [`maybe_quarantine_small`](Self::maybe_quarantine_small). `usable == 0`
+    /// (already freed) is never held — the immediate path's double-free check owns
+    /// that case. A held large keeps its descriptor live, so a later double free
+    /// re-resolves it (`usable > 0`) and is caught as a quarantine hit.
+    #[cfg(feature = "quarantine")]
+    fn maybe_quarantine_large(
+        &self,
+        ptr: *mut u8,
+        arena: ArenaId,
+        usable: usize,
+    ) -> Option<FreeOutcome> {
+        let owner = self.large_owner_for(arena);
+        // A double free of a **held** large: the authoritative per-descriptor mark says
+        // so (checked under the pool lock). Checked FIRST and unconditionally — even
+        // when disabled, held larges may still be draining — so a concurrent double free
+        // of an evicted-but-not-yet-drained large is still caught (it left the ring, but
+        // its descriptor mark is set), closing the eviction-window gap for the large path.
+        if owner.is_quarantined(ptr) {
+            return Some(FreeOutcome::DoubleFree);
+        }
+        if !self.quarantine.is_enabled() || usable == 0 {
+            return None;
+        }
+        let entry = crate::harden::QuarantineEntry {
+            user_ptr: ptr,
+            span: ptr::null(),
+            index: 0,
+            arena,
+            bytes: usable as u64,
+        };
+        let mut evicted = crate::harden::EvictBatch::new();
+        match self.quarantine.offer(entry, &mut evicted) {
+            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
+            crate::harden::Offer::Declined => None,
+            crate::harden::Offer::Held => {
+                // Mark the descriptor quarantine-held (authoritative). The ring covered
+                // it from `offer` until now; the mark covers it after (incl. eviction).
+                owner.mark_quarantined(ptr);
+                self.account_quarantined_free(arena, usable, evicted.as_slice());
+                Some(FreeOutcome::Freed)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn maybe_quarantine_large(
+        &self,
+        _ptr: *mut u8,
+        _arena: ArenaId,
+        _usable: usize,
+    ) -> Option<FreeOutcome> {
+        None
+    }
+
+    /// Account an object entering quarantine (the app-facing free) and drain any
+    /// entries its admission evicted (their *real* physical free), **outside** the
+    /// quarantine lock (the §27.2 leaf discipline). The held object's bytes are not
+    /// counted as freed-physically here — only as app-freed (`freed_bytes`) — and
+    /// stay in the separate `quarantine.bytes` until they too are evicted.
+    #[cfg(feature = "quarantine")]
+    fn account_quarantined_free(
+        &self,
+        arena: ArenaId,
+        usable: usize,
+        evicted: &[crate::harden::QuarantineEntry],
+    ) {
+        // The application's free completes now (the object is out of its hands),
+        // even though physical reuse is delayed (§29.4 "free from the application
+        // perspective but not available for allocation").
+        self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
+        self.arenas.credit(arena, usable as u64);
+        for e in evicted {
+            self.drain_one(e);
+        }
+    }
+
+    /// Really free a quarantine entry that has been **evicted or drained** (§29.4):
+    /// the deferred `insert_batch` (small) / large free. Does **not** touch
+    /// `freed_bytes` — the app-facing free was accounted when the object entered
+    /// quarantine; this only performs the physical return and any span retirement.
+    /// The quarantine released the entry's separate byte accounting when it handed it
+    /// back. Tolerant of a span that was force-retired (arena reset) while the object
+    /// was held: the insert reports nothing inserted and this no-ops.
+    #[cfg(feature = "quarantine")]
+    fn drain_one(&self, e: &crate::harden::QuarantineEntry) {
+        if e.is_small() {
+            // SAFETY: `e.span` was captured from a live descriptor at free time;
+            // descriptors live in never-freed metadata (§27.5), so the pointer
+            // stays valid even though the span may since have retired/recycled.
+            let span = unsafe { &*e.span };
+            let r = self.central.insert_batch_scrubbing(span, &[e.index], 1);
+            if r.inserted > 0 && r.span_empty {
+                self.retire_span(span);
+            }
+        } else {
+            let owner = self.large_owner_for(e.arena);
+            let scrub_zero = self.scrub_on_release(e.arena);
+            // SAFETY: `e.user_ptr` was a live large base captured at free time; the
+            // large free re-resolves it under its own lock and rejects a stale ptr
+            // (so a span/extent recycled in the meantime cannot be double-freed).
+            unsafe {
+                owner.free_scrubbing(e.user_ptr, scrub_zero);
+            }
+        }
+    }
+
+    /// Drain the whole quarantine, really freeing every held object (§29.4 drain
+    /// protocol). Used before an arena teardown (so no held object dangles into a
+    /// retired span / freed extent) and on a runtime disable. A no-op without the
+    /// `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    fn drain_quarantine(&self) {
+        loop {
+            let batch = self.quarantine.drain_batch();
+            let entries = batch.as_slice();
+            if entries.is_empty() {
+                break;
+            }
+            for e in entries {
+                self.drain_one(e);
+            }
         }
     }
 
@@ -1564,6 +2029,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// caller turns that into a §36.13 quarantine (drain) or a safe leak (normal
     /// retirement). (No per-arena pool exists yet — were one added for
     /// same-domain reuse, M3+, this revoke could be elided for that path.)
+    /// Whether memory released from `arena` must be **scrubbed before downgrade**
+    /// (W18-6, §36.12): zeroed before its backing can be recycled to a possibly
+    /// lower-labelled arena. True when the arena is non-PUBLIC (a downgrade is then
+    /// possible — the §36.12 MUST, feature-independent) or, as hardened
+    /// defence-in-depth, whenever `secure-scrub` is compiled in. One lock-free label
+    /// load; `false` (no scrub) for the PUBLIC POSIX common case with the feature off.
+    #[inline]
+    fn scrub_on_release(&self, arena: ArenaId) -> bool {
+        crate::harden::secure_scrub_enabled()
+            || crate::harden::must_scrub_for_relabel(self.arenas.label_of(arena), Label::PUBLIC)
+    }
+
     fn reclaim_span_slot(&self, span: &SpanDescriptor, arena: ArenaId) -> bool {
         self.pagemap.retire_span(span);
 
@@ -1590,11 +2067,31 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             ext
         };
         self.span_lock.release();
+        let backing = self.span_backing(arena);
+        // W18-6 (§36.12): scrub the slab before the backing crosses to the shared
+        // span pool, where a *different*-label arena may reuse it — high-domain
+        // dirty memory MUST NOT be observable at a lower label. Required whenever the
+        // owning arena is non-PUBLIC (a downgrade is then possible — the §36.12 MUST,
+        // independent of any feature), and, as hardened defence-in-depth, whenever
+        // `secure-scrub` is compiled in. A true no-op for the PUBLIC (POSIX) common
+        // case with the feature off — one lock-free label load, no scrub. This is the
+        // runtime image of the Lean `scrub_before_downgrade` protocol: the frame is
+        // scrubbed before the revoke-and-recycle that makes it reusable elsewhere.
+        // It also covers the *forced* retire of an arena reset/destroy, where live
+        // objects (never individually freed/scrubbed) are discarded with the span.
+        if self.scrub_on_release(arena) {
+            if let Some(region) = backing.region_of(ext) {
+                // SAFETY: `region` is this span's committed slab; the span is retired
+                // (no live objects, unlinked, pagemap cleared) and `free_revoking` has
+                // not yet revoked/recycled/decommitted it, so we are its sole accessor.
+                unsafe { crate::harden::scrub(region.base, region.len) };
+            }
+        }
         // Revoke-before-recycle; a revoke failure leaves the extent allocated
         // (well-formed) and is reported so a drain quarantines (§36.13). Route to
         // the arena's own hooked backing if it has one (W10) — the same backing the
         // extent was carved from in `create_span`.
-        self.span_backing(arena).free_revoking(ext, arena).is_ok()
+        backing.free_revoking(ext, arena).is_ok()
     }
 
     // -- introspection --------------------------------------------------------
@@ -2355,6 +2852,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// allocation or free of its objects (the §22.5/§36.13 precondition the
     /// lifecycle transition established).
     unsafe fn drain_arena(&self, arena: ArenaId) -> bool {
+        // W18-3 (§29.4): drain the quarantine first, so no held object dangles into
+        // a span/extent this teardown is about to retire. Each held object returns to
+        // its own central list / backend (the deferred physical free); the reset
+        // arena's then become central-free and are discarded with the span below.
+        #[cfg(feature = "quarantine")]
+        self.drain_quarantine();
         let mut all_revoked = true;
         // Step 1 (small): force-retire every active span of this arena. Walk the
         // descriptor pool; a slot's descriptor is stable to read because slots
@@ -2381,9 +2884,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // arena's own `used` is zeroed by the reset/destroy completion.
         // SAFETY: the arena is quiesced (its objects are not concurrently freed),
         // the reset/destroy precondition. Route to the arena's own hooked large
-        // backing if it has one (W10).
+        // backing if it has one (W10). `scrub_zero` (W18-6) zeroes each freed large
+        // before recycle when the arena may be reused at a lower label.
+        let scrub_zero = self.scrub_on_release(arena);
+        // SAFETY: the arena is quiesced (its objects are not concurrently freed).
         let (_, large_bytes, large_revoked) =
-            unsafe { self.large_backing(arena).free_arena(arena) };
+            unsafe { self.large_backing(arena).free_arena(arena, scrub_zero) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
@@ -2521,6 +3027,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
             arenas_destroyed: self.arenas.destroyed_count(),
+            quarantine_bytes: self.quarantine_bytes(),
         }
     }
 
@@ -2760,6 +3267,71 @@ mod tests {
         let q = a.malloc(64);
         assert_eq!(p, q, "freed object must be reused (no leak)");
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-5 (§29.6): in `junk-fill` builds a non-zeroed allocation is filled with
+    /// [`ALLOC_PATTERN`](crate::harden::ALLOC_PATTERN), a freed object is scrubbed to
+    /// [`FREE_PATTERN`](crate::harden::FREE_PATTERN), and reusing the slot succeeds
+    /// (the canary verifies). Two live objects keep the span from retiring, so the
+    /// freed slot's backing stays mapped for the white-box read.
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn junk_fill_brackets_an_objects_life_with_patterns() {
+        use crate::harden::{ALLOC_PATTERN, FREE_PATTERN};
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        let q = a.malloc(64); // keeps the span live after p is freed
+        assert!(!p.is_null() && !q.is_null());
+        // Fresh allocation is filled with the alloc pattern (not zero).
+        // SAFETY: `p` has at least 64 writable/readable usable bytes.
+        let pbytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(pbytes.iter().all(|&b| b == ALLOC_PATTERN), "fill-on-alloc");
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Freed memory is scrubbed to the free pattern (the span did not retire — `q`
+        // is still live — so the slot's backing is still mapped).
+        // SAFETY: `p`'s slab is still mapped (the span has a live object `q`).
+        let freed = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(freed.iter().all(|&b| b == FREE_PATTERN), "fill-on-free");
+
+        // Reuse the slot: verify-on-reuse passes (the canary is intact) and the
+        // object is re-filled with the alloc pattern.
+        let r = a.malloc(64);
+        assert_eq!(r, p, "freed slot reused");
+        // SAFETY: `r == p` is live again with 64 usable bytes.
+        let rbytes = unsafe { core::slice::from_raw_parts(r, 64) };
+        assert!(
+            rbytes.iter().all(|&b| b == ALLOC_PATTERN),
+            "re-fill on reuse"
+        );
+
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, r), FreeOutcome::Freed);
+    }
+
+    /// W18-5 (§29.6): a write-after-free corrupts the canary, and the next time the
+    /// slot is handed out `verify_free_pattern` (verify-on-reuse) detects it and
+    /// aborts — proving the check is live, not decorative. `should_panic` because
+    /// the detection is a loud, allocation-free abort (the §2.4-safe response).
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    #[should_panic(expected = "use-after-free")]
+    fn junk_fill_verify_on_reuse_catches_a_write_after_free() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        let _q = a.malloc(64); // keep the span live so `p`'s backing stays mapped
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // A stray write after free — the bug the canary exists to catch.
+        // SAFETY: `p`'s slab is still mapped (the span has the live `_q`).
+        unsafe { p.write(0x00) };
+        // Reusing the slot must trip verify-on-reuse and abort.
+        let _ = a.malloc(64);
     }
 
     #[test]
@@ -3962,6 +4534,295 @@ mod tests {
         assert!(!q.is_null());
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
         assert_eq!(tfree(&a, keep), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-6 (§36.12 scrub-before-downgrade / §36.16 label test): a **non-PUBLIC**
+    /// arena's dirty backing is scrubbed before it is recycled, so its bytes cannot
+    /// later be reused by a lower-label arena while still carrying the high-domain
+    /// secret. This is the §36.12 information-flow MUST and runs in **every** build —
+    /// it keys on the label, not a feature. The runtime image of the Lean
+    /// `scrub_before_downgrade` theorem (a frame is scrubbed before it can be reused
+    /// at a lower label). Covers the *forced* retire (the object is never individually
+    /// freed, so only the teardown scrub can clear it).
+    #[test]
+    fn scrub_before_downgrade_zeroes_a_non_public_arena_on_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let high = a
+            .arena_create(&ArenaPolicy::explicit().with_label(crate::ids::Label(7)))
+            .unwrap();
+        // A small object and a large one — both backings must be scrubbed.
+        let p = a.allocate_in(high, 64, MIN_ALIGN, RequestFlags::NONE);
+        let big = a.allocate_in(high, SMALL_MAX + 1, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null() && !big.is_null());
+        // High-domain "secrets".
+        // SAFETY: `p`/`big` are live with at least these many usable bytes.
+        unsafe {
+            ptr::write_bytes(p, 0xAB, 64);
+            ptr::write_bytes(big, 0xAB, SMALL_MAX + 1);
+        }
+
+        // Reset force-retires the arena's spans/larges; each backing is scrubbed
+        // before it returns to the shared pool (still mapped under the Retain policy).
+        let _ = treset(&a, high).expect("reset");
+        assert!(!a.owns(p) && !a.owns(big), "reset invalidated the objects");
+
+        // White-box: the (still-mapped) backings no longer hold the secret.
+        // SAFETY: the freed extents stay backed under Retain; we read raw bytes.
+        let small_bytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        // SAFETY: as above — `big`'s freed extent stays backed under Retain.
+        let large_bytes = unsafe { core::slice::from_raw_parts(big, SMALL_MAX + 1) };
+        assert!(
+            small_bytes.iter().all(|&b| b == 0),
+            "§36.12: a non-PUBLIC arena's small backing must be scrubbed before downgrade"
+        );
+        assert!(
+            large_bytes.iter().all(|&b| b == 0),
+            "§36.12: a non-PUBLIC arena's large backing must be scrubbed before downgrade"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// W18-3 (§29.4): the live quarantine delays reuse of freed objects, accounts
+    /// the held bytes separately, detects a double free of a held object, and an
+    /// over-budget admission evicts (really frees) the oldest. Invariants hold
+    /// throughout, and disabling drains everything back to circulation.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn quarantine_delays_reuse_accounts_separately_and_drains() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // A small object budget so reuse is delayed but eviction is observable.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 8,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let live_before = a.stats().live_bytes;
+        assert!(live_before > 0);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Held: accounted separately (§29.4); the app-facing free dropped `live`.
+        assert!(
+            a.quarantine_bytes() >= 64,
+            "held bytes accounted separately"
+        );
+        assert_eq!(a.quarantine_objects(), 1);
+        assert!(
+            a.stats().live_bytes < live_before,
+            "a quarantined object is freed from the app's view (not live)"
+        );
+        assert!(a.check_invariants(), "invariants hold with an object held");
+
+        // Reuse is delayed: the freed object is not handed straight back.
+        let q = a.malloc(64);
+        assert_ne!(q, p, "quarantine delays reuse of the freed object");
+
+        // Double free of the held object is a quarantine hit (§29.3).
+        // SAFETY: `p` is the (held) object's pointer; the free path rejects it.
+        assert_eq!(unsafe { a.free(p) }, FreeOutcome::DoubleFree);
+        assert_eq!(a.quarantine_objects(), 1, "the hit changed nothing");
+
+        // Push past the object budget so `p` is evicted (FIFO) and really freed.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let x = a.malloc(64);
+            assert!(!x.is_null());
+            held.push(x);
+        }
+        for x in &held {
+            assert_eq!(tfree(&a, *x), FreeOutcome::Freed);
+        }
+        assert!(a.quarantine_objects() <= 8, "object budget enforced");
+        assert!(a.check_invariants());
+
+        // Disabling drains everything; the separate accounting returns to zero and
+        // the engine's live/freed totals still reconcile.
+        a.set_quarantine_enabled(false);
+        assert_eq!(a.quarantine_bytes(), 0, "disable drains the quarantine");
+        assert_eq!(a.quarantine_objects(), 0);
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        let s = a.stats();
+        assert_eq!(
+            s.live_bytes,
+            s.allocated_bytes_total - s.freed_bytes_total,
+            "§8.6: live == allocated − freed after the quarantine drains"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// W18-3 (§29.4): an arena reset/destroy **drains the quarantine first**, so no
+    /// held object dangles into a span/extent the teardown retires. The held objects
+    /// return to circulation (or are discarded with the reset arena's spans), the
+    /// arena's accounting still reconciles, and invariants hold.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn quarantine_is_drained_before_an_arena_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        a.set_quarantine_enabled(true);
+
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        // Allocate and free a batch in the arena — each free is held in quarantine.
+        let mut ptrs = Vec::new();
+        for _ in 0..20 {
+            let p = a.allocate_in(id, 100, MIN_ALIGN, RequestFlags::NONE);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in &ptrs {
+            // SAFETY: each `p` is a live object of `id` we still own.
+            assert_eq!(unsafe { a.free(*p) }, FreeOutcome::Freed);
+        }
+        assert!(a.quarantine_objects() > 0, "the arena's frees are held");
+        // The arena's own bytes are already credited (app-facing free happened).
+        assert_eq!(a.arena_stats(id).unwrap().used, 0);
+
+        // Reset drains the quarantine before force-retiring the arena's spans.
+        let _ = treset(&a, id).expect("reset");
+        assert_eq!(
+            a.quarantine_objects(),
+            0,
+            "reset drained the quarantine (no dangling held object)"
+        );
+        assert_eq!(a.quarantine_bytes(), 0);
+        assert_eq!(
+            a.arena_stats(id).unwrap().used,
+            0,
+            "B.5: no live arena bytes"
+        );
+        let s = a.stats();
+        assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): an explicit `TOPO_GUARDED` request takes the guarded path — its
+    /// own pages bracketed by guard pages, with the object **right-aligned** against
+    /// the trailing guard so `usable_size` is *tight* (`align_up(size, align)`, not
+    /// page-rounded — the guard pages are overhead, not fragmentation). Here the
+    /// in-crate `HostProvider` has no page protection, so the guards are *advisory*
+    /// (the real `mprotect` trap is the POSIX integration test); this pins the
+    /// mechanism: a guarded object is a large descriptor with a tight usable size,
+    /// writable, owned, and frees cleanly. Invariants hold throughout.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_is_tight_writable_and_frees() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // A small request, forced guarded, becomes a *large descriptor* (not a slab
+        // object — distinguished by `live_large_count`), with a tight usable size.
+        let p = a.allocate_in(ArenaId::DEFAULT, 100, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        assert!(a.owns(p));
+        assert_eq!(a.live_large_count(), 1, "guarded ⇒ a large descriptor");
+        assert_eq!(
+            a.usable_size(p),
+            Some(align_up(100, MIN_ALIGN).unwrap()),
+            "tight usable, not page-rounded"
+        );
+        // The object ends exactly at the trailing guard page (right-aligned).
+        let usable = a.usable_size(p).unwrap();
+        assert_eq!(
+            (p as usize + usable) % PAGE_SIZE,
+            0,
+            "object end abuts the guard"
+        );
+        // Writable across the whole object.
+        // SAFETY: `p` has at least 100 usable bytes.
+        unsafe { ptr::write_bytes(p, 0x42, 100) };
+
+        // A multi-page guarded request: usable is still tight (to the alignment).
+        let big = a.allocate_in(ArenaId::DEFAULT, 3 * PAGE_SIZE + 1, MIN_ALIGN, guarded);
+        assert!(!big.is_null());
+        assert_eq!(
+            a.usable_size(big),
+            Some(align_up(3 * PAGE_SIZE + 1, MIN_ALIGN).unwrap())
+        );
+
+        // Both free cleanly (guard restore + extent recycle); invariants hold and the
+        // freed accounting reconciles.
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, big), FreeOutcome::Freed);
+        assert_eq!(a.live_large_count(), 0);
+        let s = a.stats();
+        assert_eq!(s.live_bytes, s.allocated_bytes_total - s.freed_bytes_total);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): the guarded-allocation **sampler** routes ordinary allocations
+    /// to the guarded page path at the configured rate (rate `1` guards every one);
+    /// rate `0` restores the normal path.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guard_sampling_routes_to_the_guarded_path() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // Off by default: a 64-byte allocation is a slab object (not a large descriptor).
+        assert_eq!(a.guard_sample_rate(), 0);
+        let unsampled = a.malloc(64);
+        assert_eq!(a.live_large_count(), 0, "slab object, not guarded");
+        assert_eq!(tfree(&a, unsampled), FreeOutcome::Freed);
+
+        // Rate 1 guards every allocation ⇒ even a 64-byte request becomes a guarded
+        // large descriptor (with a tight usable size, the object end abutting the guard).
+        a.set_guard_sample_rate(1);
+        assert_eq!(a.guard_sample_rate(), 1);
+        let sampled = a.malloc(64);
+        assert_eq!(
+            a.live_large_count(),
+            1,
+            "sampled ⇒ guarded large descriptor"
+        );
+        let usable = a.usable_size(sampled).unwrap();
+        assert_eq!(
+            (sampled as usize + usable) % PAGE_SIZE,
+            0,
+            "right-aligned to the guard"
+        );
+        assert_eq!(tfree(&a, sampled), FreeOutcome::Freed);
+
+        a.set_guard_sample_rate(0);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-6 defence-in-depth: with `secure-scrub` compiled in, **even a PUBLIC**
+    /// arena's backing is scrubbed on release — not only the non-PUBLIC arenas the
+    /// §36.12 MUST already covers.
+    #[cfg(feature = "secure-scrub")]
+    #[test]
+    fn secure_scrub_zeroes_even_a_public_arena_on_reset() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A PUBLIC-label arena (the default for `explicit()`).
+        let pub_arena = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        let p = a.allocate_in(pub_arena, 64, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!p.is_null());
+        // SAFETY: 64 usable bytes.
+        unsafe { ptr::write_bytes(p, 0xCD, 64) };
+        let _ = treset(&a, pub_arena).expect("reset");
+        // SAFETY: still mapped under Retain; raw read of the scrubbed backing.
+        let bytes = unsafe { core::slice::from_raw_parts(p, 64) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "secure-scrub zeroes a PUBLIC arena's backing too (defence-in-depth)"
+        );
         assert!(a.check_invariants());
     }
 

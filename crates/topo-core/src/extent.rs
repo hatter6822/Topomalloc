@@ -88,6 +88,21 @@ pub struct ExtentRef {
     pub generation: u32,
 }
 
+/// Provenance of a freshly-vended region's committed bytes — what the large path
+/// knows about the memory it is about to hand out. `calloc` zero-elision (W15-5,
+/// §26.2) and the W18-5 verify-on-reuse canary (§29.6) both key off this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RegionProvenance {
+    /// The region was freshly committed from an unbacked source by a **zeroing**
+    /// provider, so it reads as all-zero — `calloc` may elide its `memset`.
+    pub zeroed: bool,
+    /// The region was carved from a **retained, fully-committed, canary-filled**
+    /// (`Dirty`) extent, so in a `junk-fill` build it reads as the FREE-pattern
+    /// use-after-free canary over its whole length — verify-on-reuse is sound here.
+    /// Mutually exclusive with [`zeroed`](Self::zeroed) (a canary is non-zero).
+    pub canary: bool,
+}
+
 /// Physical-backing state of an extent (§18.2 `ExtentState` / §20.1). The
 /// invariant `committed_len ∈ {0, len}` couples the state to the backing:
 /// `Active`/`Dirty`/`Muzzy` are fully backed (`committed_len == len`),
@@ -432,6 +447,19 @@ struct Slot {
     free_next: u32,
     state: u8,
     occupied: u8,
+    /// W18-5 verify-on-reuse provenance (§29.6): `1` iff **every** committed byte of
+    /// this extent currently holds the junk-fill FREE-pattern canary and has not been
+    /// freshly committed, decommitted, or `MADV_FREE`'d since. Maintained as an
+    /// invariant: set only by a [`free_in_canary`](ExtentMap::free_in_canary) to
+    /// `Dirty` after the caller canary-filled the bytes; cleared on every transition
+    /// that breaks it (fresh commit, decommit, dirty→muzzy, grow-absorb); inherited by
+    /// a [`split`](ExtentMap::split_in) and **AND-joined** by a [`merge`](ExtentMap::merge_in).
+    /// So `canary == 1` ⟹ the extent is `Dirty`, fully committed, and reads as the
+    /// canary — which is exactly when verify-on-reuse is sound (a stale bit on a
+    /// muzzy/decommitted extent can never arise, so a correct program is never
+    /// false-aborted). Fits in the slot's tail padding (no size growth). A zeroed slot
+    /// has `canary == 0` (the safe default), preserving the "zeroed pool is valid".
+    canary: u8,
 }
 
 /// The size bin for a free extent of `pages` pages: `floor(log2(pages)) + 1`
@@ -559,6 +587,7 @@ impl ExtentMap {
         s.flags = ExtentFlags::NONE.0;
         s.state = ExtentState::Reserved as u8;
         s.occupied = 1;
+        s.canary = 0; // unbacked Reserved: holds no canary (W18-5)
         s.addr_prev = NIL;
         s.addr_next = NIL;
         map.put(id.0, s);
@@ -878,6 +907,10 @@ impl ExtentMap {
         let backed = parent.committed_len == parent.len;
         let right_base = parent.base + prefix_len;
 
+        // The parent's canary provenance (W18-5): a split of a uniformly
+        // canary-filled extent yields two canary-filled sub-ranges (the fill covered
+        // the whole parent), so both halves inherit it.
+        let parent_canary = self.get(id.0).canary;
         // Fully initialize the right half *before* it is linked anywhere
         // (install-before-publish, F1).
         let mut rs = self.get(right.0);
@@ -891,6 +924,7 @@ impl ExtentMap {
         rs.flags = parent.flags.0; // the right half inherits the parent's policy bits
         rs.state = parent.state as u8;
         rs.occupied = 1;
+        rs.canary = parent_canary; // W18-5: both halves cover the same canary bytes
         self.put(right.0, rs);
 
         // Shrink the parent (left half) and bump its generation.
@@ -959,6 +993,8 @@ impl ExtentMap {
         if left == right || !self.mergeable(&lv, &rv) {
             return false;
         }
+        // The right half's canary provenance, read before its slot is retired (W18-5).
+        let right_canary = self.get(right.0).canary;
         // Unlink both from their bins, and `right` from the address list.
         self.bin_remove(left.0);
         self.bin_remove(right.0);
@@ -968,6 +1004,9 @@ impl ExtentMap {
         ls.len = lv.len + rv.len;
         ls.committed_len = lv.committed_len + rv.committed_len;
         ls.split_gen = ls.split_gen.wrapping_add(1);
+        // W18-5: the merged range reads as the canary only if **both** halves did —
+        // a non-canary neighbour taints the join, so verify-on-reuse stays sound.
+        ls.canary &= right_canary;
         // The merged state is the conservative join: a backed merge is `Dirty`
         // ("may hold old data" subsumes muzzy/clean); an unbacked merge stays
         // `Released` (still needs a recommit, M-005).
@@ -1056,6 +1095,7 @@ impl ExtentMap {
         s.len += rlen;
         s.committed_len += rv.committed_len;
         s.split_gen = s.split_gen.wrapping_add(1);
+        s.canary = 0; // W18-5: a grown (Active) extent's range is mixed provenance
         self.put(id.0, s);
         self.free_bytes -= rlen;
         self.push_slot(next.0);
@@ -1204,6 +1244,23 @@ impl ExtentMap {
         new_state: ExtentState,
         notify: &dyn ExtentNotify,
     ) -> Option<ExtentId> {
+        self.free_in_canary(id, new_state, notify, false)
+    }
+
+    /// [`free_in`](Self::free_in), additionally recording whether the caller has
+    /// **canary-filled** the freed bytes (W18-5, §29.6): when `canary` and the
+    /// extent retains its backing (`Dirty`), the surviving extent is flagged so a
+    /// later reuse of these exact committed bytes can verify the use-after-free
+    /// canary. The flag is set **before** the coalesce so a merge AND-joins it with
+    /// the neighbours' (a non-canary neighbour correctly clears it). A `false`
+    /// `canary` (or a non-`Dirty` free) clears the flag — the conservative default.
+    pub fn free_in_canary(
+        &mut self,
+        id: ExtentId,
+        new_state: ExtentState,
+        notify: &dyn ExtentNotify,
+        canary: bool,
+    ) -> Option<ExtentId> {
         let e = self.view(id)?;
         debug_assert_eq!(e.state, ExtentState::Active, "freeing a non-Active extent");
         debug_assert!(
@@ -1212,6 +1269,10 @@ impl ExtentMap {
         );
         let mut s = self.get(id.0);
         s.state = new_state as u8;
+        // W18-5: only a retained (`Dirty`) extent whose bytes were just canary-filled
+        // is verify-on-reuse eligible; everything else (released/unmapped, or not
+        // filled) is conservatively non-canary.
+        s.canary = (canary && new_state == ExtentState::Dirty) as u8;
         self.put(id.0, s);
         self.free_bytes += e.len;
         self.bin_insert(id.0);
@@ -1227,6 +1288,11 @@ impl ExtentMap {
         let mut s = self.get(id.0);
         let newly = s.len - s.committed_len;
         s.committed_len = s.len;
+        // W18-5: freshly committed pages are OS-fresh (zero/garbage), not the canary,
+        // so a partial-commit carve is no longer uniformly canary-filled.
+        if newly > 0 {
+            s.canary = 0;
+        }
         // A free extent that was Released/Reserved becomes Dirty once backed again.
         let prev = ExtentState::from_u8(s.state);
         if prev.is_free() && !prev.is_backed() {
@@ -1248,6 +1314,7 @@ impl ExtentMap {
         let mut s = self.get(id.0);
         let was = s.committed_len;
         s.committed_len = 0;
+        s.canary = 0; // W18-5: decommitted bytes are zero-on-next-touch — no canary
         debug_assert!(
             ExtentState::from_u8(s.state).can_transition(new_state),
             "decommit: illegal §20.1 transition"
@@ -1270,9 +1337,21 @@ impl ExtentMap {
             ExtentState::from_u8(s.state).can_transition(new_state),
             "set_state: illegal §20.1 transition"
         );
+        // W18-5: leaving Dirty (e.g. dirty→muzzy on a lazy purge — the kernel may
+        // reclaim/zero `MADV_FREE`'d pages) makes the bytes no longer a reliable
+        // canary. Only a Dirty, fully-committed extent is verify-on-reuse eligible.
+        if new_state != ExtentState::Dirty {
+            s.canary = 0;
+        }
         s.state = new_state as u8;
         self.put(id.0, s);
         true
+    }
+
+    /// Whether extent `id` currently carries the W18-5 verify-on-reuse canary (its
+    /// committed bytes read as the junk-fill FREE pattern). See [`Slot::canary`].
+    fn extent_canary(&self, id: ExtentId) -> bool {
+        self.get(id.0).canary == 1
     }
 
     /// Set extent `id`'s §18.2 policy `flags` (caller pre-validated `id` is live).
@@ -1817,14 +1896,16 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     /// an **unbacked** source (Reserved or Released — `committed_len == 0`, no
     /// retained data) and then committed by a provider that
     /// [`committed_memory_is_zeroed`](TopoBackingProvider::committed_memory_is_zeroed).
-    /// A carve from a retained-dirty/muzzy extent keeps old data ⇒ `false`. The large
-    /// path uses this so `calloc` can skip the redundant `memset` on a fresh extent.
+    /// A carve from a retained-dirty/muzzy extent keeps old data ⇒ not zeroed. The
+    /// large path uses [`zeroed`](RegionProvenance::zeroed) so `calloc` can skip the
+    /// redundant `memset` on a fresh extent, and [`canary`](RegionProvenance::canary)
+    /// so a retained, canary-filled extent's reuse is verified (W18-5, §29.6).
     fn alloc_z(
         &self,
         size: usize,
         align: usize,
         fit: Fit,
-    ) -> Result<(ExtentRef, bool), ExtentError> {
+    ) -> Result<(ExtentRef, RegionProvenance), ExtentError> {
         if size == 0 || !align.is_power_of_two() {
             return Err(ExtentError::InvalidRequest);
         }
@@ -1865,7 +1946,20 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         debug_assert!(g.map.check_invariants());
         let generation = g.map.view(id).expect("just carved").generation;
         let zeroed = from_unbacked && self.provider.committed_memory_is_zeroed();
-        Ok((ExtentRef { id, generation }, zeroed))
+        // W18-5: the carved range reads as the verify-on-reuse canary iff it came from
+        // a retained, fully-committed, canary-filled source — `mark_committed` above
+        // has already cleared the flag if any fresh (non-canary) pages were committed,
+        // and `set_state`/`mark_decommitted` cleared it on any muzzy/released source,
+        // so the surviving flag is sound. `uncommitted == 0` is belt-and-suspenders.
+        let canary = uncommitted == 0 && g.map.extent_canary(id);
+        debug_assert!(
+            !(zeroed && canary),
+            "a region cannot be both zeroed and canary"
+        );
+        Ok((
+            ExtentRef { id, generation },
+            RegionProvenance { zeroed, canary },
+        ))
     }
 
     /// The large-allocation path (§18.5, W4-4): page-round `bytes` overflow-safely,
@@ -1876,11 +1970,14 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     /// [`ExtentRef`] (a cache-served region is owned by the cache, so its ref is
     /// `None`).
     ///
-    /// The third tuple element is whether the returned region is **freshly
-    /// OS-zeroed** (W15-5): `true` for an extent-served region carved fresh from
-    /// unbacked backing under a zeroing provider (so `calloc` may skip its `memset`),
-    /// `false` for a cache-served region (the region cache / hugepage filler may hand
-    /// back a reused page, so it is conservatively treated as possibly-non-zero).
+    /// The third tuple element is the region's [`RegionProvenance`] (W15-5 / W18-5):
+    /// `zeroed` for an extent-served region carved fresh from unbacked backing under a
+    /// zeroing provider (so `calloc` may skip its `memset`), and `canary` for a
+    /// retained, fully-committed, canary-filled extent (so the large path can verify
+    /// the use-after-free canary before reuse, §29.6). A **cache-served** region is
+    /// conservatively neither (the region cache / hugepage filler may hand back a
+    /// reused page whose provenance this layer cannot vouch for) — so `calloc` still
+    /// zeroes it and verify-on-reuse is skipped (never a false abort).
     ///
     /// SPEC-transition: `large_allocate` (§18.5)
     pub fn alloc_large(
@@ -1889,7 +1986,7 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         align: usize,
         hints: Hints,
         hook: &dyn RegionCacheHook,
-    ) -> Result<(Region, Option<ExtentRef>, bool), ExtentError> {
+    ) -> Result<(Region, Option<ExtentRef>, RegionProvenance), ExtentError> {
         if bytes == 0 || !align.is_power_of_two() {
             return Err(ExtentError::InvalidRequest);
         }
@@ -1902,12 +1999,13 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         // lifetime (§19.3/§19.5, W11).
         if let Some(region) = hook.try_alloc(rounded, align, hints) {
             // Cache-served: the cache may return a reused page — conservatively
-            // not-known-zero, so `calloc` still zeroes it (correct, just not elided).
-            return Ok((region, None, false));
+            // not-known-zero and not-known-canary, so `calloc` still zeroes it
+            // (correct, just not elided) and verify-on-reuse is skipped.
+            return Ok((region, None, RegionProvenance::default()));
         }
-        let (r, zeroed) = self.alloc_z(rounded, align, Fit::Best)?;
+        let (r, prov) = self.alloc_z(rounded, align, Fit::Best)?;
         let region = self.region_of(r).expect("just allocated");
-        Ok((region, Some(r), zeroed))
+        Ok((region, Some(r), prov))
     }
 
     /// Split the **live** ([`Active`](ExtentState::Active)) extent `r` at
@@ -2066,6 +2164,15 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     ///
     /// SPEC-transition: `extent free` (object `Live -> CentralFree`/`Dirty`, §7.2/§20.1)
     pub fn free(&self, r: ExtentRef) -> Result<(), ExtentError> {
+        self.free_canary(r, false)
+    }
+
+    /// [`free`](Self::free), recording whether the caller **canary-filled** the
+    /// freed bytes (W18-5, §29.6) so a later reuse of these exact retained,
+    /// fully-committed bytes can verify the use-after-free canary. The flag only
+    /// takes effect on the retain (`Dirty`) path — an eager unmap decommits the
+    /// bytes, so there is no canary to preserve.
+    pub fn free_canary(&self, r: ExtentRef, canary: bool) -> Result<(), ExtentError> {
         let notify = self.notifier();
         let g = self.lock();
         let e = g.map.resolve(r).ok_or(ExtentError::Stale)?;
@@ -2075,7 +2182,8 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         // Each free's coalesce dispatches its §23.2 merge(s) to the hook (W10).
         match self.retain {
             RetainPolicy::Retain => {
-                g.map.free_in(r.id, ExtentState::Dirty, &notify);
+                g.map
+                    .free_in_canary(r.id, ExtentState::Dirty, &notify, canary);
             }
             RetainPolicy::Unmap => {
                 let offset = self.sub_offset(e.base);
@@ -2084,9 +2192,11 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
                         g.map.mark_decommitted(r.id, ExtentState::Active);
                         g.map.free_in(r.id, ExtentState::Released, &notify);
                     }
-                    // Decommit failed: retain instead (still a valid free).
+                    // Decommit failed: retain instead (still a valid free) — the bytes
+                    // are still committed, so the canary (if filled) is preserved.
                     Err(_) => {
-                        g.map.free_in(r.id, ExtentState::Dirty, &notify);
+                        g.map
+                            .free_in_canary(r.id, ExtentState::Dirty, &notify, canary);
                     }
                 }
             }
@@ -2111,13 +2221,24 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
     ///
     /// SPEC-transition: provider `Unmapped -> Revoked` then recycle (§36.6)
     pub fn free_revoking(&self, r: ExtentRef, arena: ArenaId) -> Result<(), ExtentError> {
+        self.free_revoking_canary(r, arena, false)
+    }
+
+    /// [`free_revoking`](Self::free_revoking) carrying the W18-5 `canary` provenance
+    /// (§29.6) — as [`free_canary`](Self::free_canary), but revoke-before-recycle.
+    pub fn free_revoking_canary(
+        &self,
+        r: ExtentRef,
+        arena: ArenaId,
+        canary: bool,
+    ) -> Result<(), ExtentError> {
         // Resolve the extent's *sub-region* (the granularity revocation acts on),
         // not the whole managed region, so a per-arena extent is revoked precisely.
         let region = self.region_of(r).ok_or(ExtentError::Stale)?;
         self.provider
             .revoke_descendants(arena, region)
             .map_err(ExtentError::Backend)?;
-        self.free(r)
+        self.free_canary(r, canary)
     }
 
     /// Recommit a free extent's backing (M-005): a [`Released`](ExtentState::Released)
@@ -2163,6 +2284,24 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         }
         debug_assert!(g.map.check_invariants());
         Ok(())
+    }
+
+    /// W18-4 (§29.5): make the page-aligned sub-range `[addr, addr+len)`
+    /// **inaccessible** (a guard page, `accessible == false`) or restore it
+    /// read-write, via the provider's [`protect`](TopoBackingProvider::protect).
+    /// `addr` must lie in this manager's region. Best-effort: a provider without
+    /// page protection no-ops, so a guard is advisory (never load-bearing for
+    /// correctness, §2.4).
+    pub fn protect_range(
+        &self,
+        addr: usize,
+        len: usize,
+        accessible: bool,
+    ) -> Result<(), ExtentError> {
+        let offset = self.sub_offset(addr);
+        self.provider
+            .protect(self.region, offset, len, accessible)
+            .map_err(ExtentError::Backend)
     }
 
     /// Lazily purge a **free**, [`Dirty`](ExtentState::Dirty) extent (§20.4): mark
@@ -3021,16 +3160,90 @@ mod tests {
     fn alloc_large_rounds_and_bypasses_with_region_cache_hook() {
         let mgr = manager(64);
         // An "awkward" size (just over 2 pages) rounds up to whole pages, no wrap.
-        let (region, r, zeroed) = mgr
+        let (region, r, prov) = mgr
             .alloc_large(2 * PAGE + 1, PAGE, Hints::default(), &NoRegionCache)
             .expect("large");
         assert_eq!(region.len, 3 * PAGE, "rounded up to whole pages");
         assert!(r.is_some(), "served from the extent manager (no cache)");
         // The host test provider does not promise zeroed commits, so the extent is
-        // conservatively reported not-known-zero (calloc would memset it).
+        // conservatively reported not-known-zero (calloc would memset it). A fresh
+        // carve from an unbacked source holds no canary either.
         assert!(
-            !zeroed,
+            !prov.zeroed,
             "default test provider does not opt into committed_memory_is_zeroed"
+        );
+        assert!(!prov.canary, "a fresh (never-freed) extent holds no canary");
+        assert!(mgr.check_invariants());
+    }
+
+    // --- W18-5 verify-on-reuse provenance (the `canary` flag invariant) ---------
+
+    #[test]
+    fn retained_canary_extent_reports_canary_provenance() {
+        // A canary-filled free-to-Dirty extent, reused, reports `canary` provenance —
+        // the signal the large path uses to verify the use-after-free canary (§29.6).
+        let mgr = manager(8); // Retain policy: free keeps the extent Dirty
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free_canary(r, true).unwrap();
+        let (_r2, prov) = mgr.alloc_z(4 * PAGE, PAGE, Fit::First).unwrap();
+        assert!(
+            prov.canary,
+            "a retained, canary-filled extent is reuse-verifiable"
+        );
+        assert!(!prov.zeroed, "a canary region is never reported zeroed");
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn free_without_canary_is_not_reuse_verifiable() {
+        // The default (un-filled) free path never claims the canary, so a reuse is
+        // never (falsely) verified — the conservative default that keeps a correct
+        // program from being aborted.
+        let mgr = manager(8);
+        let r = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free(r).unwrap(); // canary = false
+        let (_r2, prov) = mgr.alloc_z(4 * PAGE, PAGE, Fit::First).unwrap();
+        assert!(
+            !prov.canary,
+            "an un-filled free is not verify-on-reuse eligible"
+        );
+    }
+
+    #[test]
+    fn purge_to_muzzy_clears_the_canary() {
+        // A lazy purge (dirty→muzzy, MADV_FREE) may let the kernel reclaim/zero the
+        // pages, so the canary is no longer reliable — the flag must clear, or a reuse
+        // would false-abort. This is the invalidation that makes a stale bit impossible.
+        // Fill the region (A then B) so freeing A coalesces with nothing and its ref
+        // stays valid for the purge.
+        let mgr = manager(8);
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        let _b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap();
+        mgr.free_canary(a, true).unwrap(); // a: Dirty + canary, no free neighbour
+        mgr.purge_lazy(a).unwrap(); // dirty → muzzy: clears the canary
+        let (_r2, prov) = mgr.alloc_z(4 * PAGE, PAGE, Fit::First).unwrap();
+        assert!(
+            !prov.canary,
+            "a muzzy (purged) extent is not reuse-verifiable"
+        );
+        assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn merge_with_a_noncanary_neighbour_clears_the_canary() {
+        // The AND-join on coalesce: a canary extent merged with a non-canary neighbour
+        // yields a non-canary range (the merged region is not uniformly the canary), so
+        // verify-on-reuse over the whole survivor is correctly skipped.
+        let mgr = manager(16);
+        let a = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap(); // low
+        let b = mgr.alloc(4 * PAGE, PAGE, Fit::First).unwrap(); // adjacent, higher
+        mgr.free_canary(a, true).unwrap(); // a: Dirty + canary (b still Active, no merge)
+        mgr.free(b).unwrap(); // b: Dirty, no canary → coalesces with a (AND-join → 0)
+                              // Reuse the merged 8-page extent: not uniformly canary ⇒ not verifiable.
+        let (_r, prov) = mgr.alloc_z(8 * PAGE, PAGE, Fit::First).unwrap();
+        assert!(
+            !prov.canary,
+            "a merge with a non-canary neighbour taints the canary join"
         );
         assert!(mgr.check_invariants());
     }

@@ -364,6 +364,28 @@ pub trait TopoBackingProvider {
         Ok(())
     }
 
+    /// Make `[offset, offset+len)` **inaccessible** (`accessible == false` — a guard
+    /// page that faults on any touch) or restore it read-write (`accessible == true`),
+    /// for the W18-4 guarded allocations (§29.5). On Linux this is
+    /// `mprotect(PROT_NONE)` / `mprotect(PROT_READ|WRITE)`.
+    ///
+    /// **Default: a no-op returning `Ok`** — a provider (or the seLe4n simulator)
+    /// without page-level protection treats guards as *advisory*, so a guarded
+    /// allocation still works (it just does not hardware-trap an overrun). The
+    /// allocator never relies on a guard for *correctness* (§2.4); the trap is a
+    /// best-effort debugging aid where the platform supports it. `offset`/`len` are
+    /// OS-page-aligned sub-ranges of `region`.
+    fn protect(
+        &self,
+        region: Region,
+        offset: usize,
+        len: usize,
+        accessible: bool,
+    ) -> Result<(), BackendError> {
+        let _ = (region, offset, len, accessible);
+        Ok(())
+    }
+
     /// Return `region` to the backend (§18.3 `extent_release` / §36.6 unmap +
     /// revoke + recycle). After this the region must not be used. Failure must
     /// leave both allocator and backend state well-formed (§36.6).

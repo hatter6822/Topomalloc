@@ -282,6 +282,68 @@ fn arena_lifecycle_is_co_equal_over_posix_and_sim() {
     assert_eq!(posix.last(), Some(&(true, 0)));
 }
 
+/// W18-6 (§36.12 scrub-before-downgrade / §36.16 label test) over a backend
+/// `mk` builds: a **non-PUBLIC** arena's dirty backing is scrubbed (zeroed) before
+/// it is recycled, so high-domain memory cannot be reused at a lower label. Returns
+/// whether the (still-mapped, under Retain) backing read back as all-zero after the
+/// arena reset. The mechanism is provider-agnostic — it must hold identically over
+/// POSIX and the seLe4n simulator (both back with host-readable memory here).
+#[cfg(feature = "sele4n-sim")]
+fn scrub_before_downgrade_zeroes_backing<P, F>(mk: F) -> bool
+where
+    P: TopoBackingProvider + Sync,
+    F: Fn(usize) -> P,
+{
+    use topo_core::{Label, MIN_ALIGN};
+    let cfg = AllocatorConfig::small();
+    let meta = MetaArena::reserve(mk(4 * 1024 * 1024), ArenaId::DEFAULT, 4 * 1024 * 1024)
+        .expect("meta arena");
+    let pagemap = PageMap::new();
+    let a = Allocator::new(
+        mk(cfg.span_region_bytes),
+        mk(cfg.large_region_bytes),
+        &meta,
+        &meta,
+        &pagemap,
+        ArenaId::DEFAULT,
+        cfg,
+    )
+    .expect("engine");
+
+    // A high-label arena, a live object holding a "secret".
+    let high = a
+        .arena_create(&ArenaPolicy::explicit().with_label(Label(7)))
+        .expect("high arena");
+    let p = a.allocate_in(high, 200, MIN_ALIGN, RequestFlags::NONE);
+    assert!(!p.is_null());
+    // SAFETY: `p` is a live object of at least 200 usable bytes.
+    unsafe { core::ptr::write_bytes(p, 0xAB, 200) };
+
+    // Reset force-retires the arena's span; its backing is scrubbed before recycle.
+    // SAFETY: the arena is quiesced (single-threaded test; no concurrent ops on it).
+    let _ = unsafe { a.arena_reset(high) }.expect("reset");
+    assert!(!a.owns(p), "reset invalidated the object");
+    // White-box: the still-mapped backing no longer holds the secret.
+    // SAFETY: the freed extent stays backed under Retain; we read its raw bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(p, 200) };
+    bytes.iter().all(|&b| b == 0)
+}
+
+/// W18-6 (§36.12): the scrub-before-downgrade MUST holds **identically** over POSIX
+/// and the seLe4n simulator — the §36.16 label test, run over both backends.
+#[cfg(feature = "sele4n-sim")]
+#[test]
+fn scrub_before_downgrade_is_co_equal_over_posix_and_sim() {
+    assert!(
+        scrub_before_downgrade_zeroes_backing(|_| PosixBackingProvider::new()),
+        "§36.12: a non-PUBLIC arena's backing must be scrubbed before downgrade (POSIX)"
+    );
+    assert!(
+        scrub_before_downgrade_zeroes_backing(Sele4nSim::new),
+        "§36.12: a non-PUBLIC arena's backing must be scrubbed before downgrade (Sim)"
+    );
+}
+
 /// W8 follow-up (self-audit): the *named selector's* simulator arm —
 /// `new_allocator_named("sele4n-sim")`, the construction the
 /// `TOPOMALLOC_BACKEND` env path runs — is executed, not merely compiled:
