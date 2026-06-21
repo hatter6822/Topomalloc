@@ -151,7 +151,7 @@ fn extent_alloc_installs_a_classifiable_large_region_and_retires_it() {
 fn large_path_rounds_overflow_safely_and_bypasses_small_path() {
     let mgr = manager(64, 4096);
     // §18.5 / §9.7: an awkward size rounds up to whole pages, never wrapping.
-    let (region, r, zeroed) = mgr
+    let (region, r, prov) = mgr
         .alloc_large(
             5 * PAGE + 7,
             PAGE,
@@ -163,7 +163,12 @@ fn large_path_rounds_overflow_safely_and_bypasses_small_path() {
     assert!(r.is_some());
     // Carved fresh from the unbacked region over a POSIX provider (mmap zero pages,
     // §26.2), so it is reported OS-zeroed — letting calloc skip the memset (W15-5).
-    assert!(zeroed, "a fresh POSIX-backed extent is reported zeroed");
+    assert!(
+        prov.zeroed,
+        "a fresh POSIX-backed extent is reported zeroed"
+    );
+    // A fresh (never-freed) extent carries no W18-5 verify-on-reuse canary.
+    assert!(!prov.canary, "a fresh extent holds no canary");
     // A size that would overflow the page rounding fails safely (null, not a wrap).
     assert_eq!(
         mgr.alloc_large(

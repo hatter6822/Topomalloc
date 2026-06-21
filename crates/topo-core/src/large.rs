@@ -356,10 +356,29 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         hints: Hints,
         hook: &dyn RegionCacheHook,
     ) -> *mut u8 {
-        let (region, backing, zeroed) = match self.extents.alloc_large(bytes, align, hints, hook) {
+        let (region, backing, prov) = match self.extents.alloc_large(bytes, align, hints, hook) {
             Ok(rb) => rb,
             Err(_) => return ptr::null_mut(),
         };
+
+        // W18-5 (§29.6) verify-on-reuse: when this region was carved from a retained,
+        // canary-filled extent (`prov.canary`, only ever true in a `junk-fill` build),
+        // its committed bytes must still read as the FREE-pattern canary. A mismatch is
+        // a use-after-free that corrupted the freed region between free and reuse —
+        // abort loudly rather than hand out a compromised allocation (§2.4). The region
+        // is exclusively ours from `alloc_large`, and this read precedes every write
+        // (the calloc memset / `fill_on_alloc` below), so the canary is intact here. A
+        // no-op without `junk-fill` (`prov.canary` is then always false). This is the
+        // large-object analogue of `hand_out_object`'s small-object check.
+        if prov.canary {
+            // SAFETY: `region` is `region.len` committed, exclusively-owned bytes.
+            if !unsafe { crate::harden::verify_free_pattern(region.base, region.len) } {
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected before reuse \
+                     (large-allocation junk-fill verify-on-reuse canary, §29.6)\n",
+                );
+            }
+        }
 
         self.lock.acquire();
         // SAFETY: lock held ⇒ exclusive access to the pool.
@@ -368,9 +387,10 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         let (idx, fresh) = match acquired {
             Some(v) => v,
             None => {
-                // Pool full: undo the extent/cache allocation and fail.
+                // Pool full: undo the extent/cache allocation and fail. The fresh
+                // region was never canary-filled, so it is not verify-on-reuse eligible.
                 self.lock.release();
-                self.return_backing(backing, region, hook, None);
+                self.return_backing(backing, region, hook, None, false);
                 return ptr::null_mut();
             }
         };
@@ -407,22 +427,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         if installed.is_err() {
             pool.release(idx);
             self.lock.release();
-            self.return_backing(backing, region, hook, None);
+            self.return_backing(backing, region, hook, None, false);
             return ptr::null_mut();
         }
         self.lock.release();
         // W15-5 calloc zeroing (§26.2/§26.3): a `TOPO_ZERO` request returns zeroed
         // memory. **Skip the redundant `memset` when the backing is freshly OS-zeroed**
-        // (a fresh extent under a zeroing provider — `alloc_large`'s `zeroed`); zero it
-        // otherwise (a reused/cache-served region). The skip rests on the provider's
-        // `committed_memory_is_zeroed` promise (§26.2); debug builds spot-check it so a
-        // lying provider is caught, never silently trusted.
-        if hints.zero && !zeroed {
+        // (a fresh extent under a zeroing provider — `alloc_large`'s `prov.zeroed`);
+        // zero it otherwise (a reused/cache-served region). The skip rests on the
+        // provider's `committed_memory_is_zeroed` promise (§26.2); debug builds
+        // spot-check it so a lying provider is caught, never silently trusted.
+        if hints.zero && !prov.zeroed {
             // SAFETY: `region` is `region.len` committed, owned bytes just vended.
             unsafe { ptr::write_bytes(region.base, 0, region.len) };
         }
         #[cfg(debug_assertions)]
-        if hints.zero && zeroed {
+        if hints.zero && prov.zeroed {
             let n = region.len;
             // SAFETY: `region` is `n` committed, owned bytes; the head slice is in bounds.
             let head_zero = unsafe { core::slice::from_raw_parts(region.base, n.min(PAGE_SIZE)) }
@@ -467,8 +487,19 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// is marked guarded so [`free`](Self::free) restores the guards' protection
     /// before recycling the extent.
     pub fn allocate_guarded(&self, arena: ArenaId, size: usize, align: usize) -> *mut u8 {
+        // Tight, alignment-rounded usable size. The object is **right-aligned**
+        // against the trailing guard so an overrun at `usable` traps immediately
+        // (Electric Fence's `PROTECT_BELOW=0` default — overruns dominate heap bugs),
+        // and `usable_size`/accounting stay tight (page padding is *not* counted as
+        // fragmentation). `usable` MUST equal the engine's charge `align_up(size,
+        // align)`; both use this exact formula. (Underruns are still caught by the
+        // leading guard, page-granularly.)
+        let want = size.max(1);
+        let Some(usable) = align_up(want, align.max(1)) else {
+            return ptr::null_mut();
+        };
         // Object pages + one guard page on each side.
-        let object_pages = size.max(1).div_ceil(PAGE_SIZE);
+        let object_pages = want.div_ceil(PAGE_SIZE);
         let Some(total_bytes) = object_pages
             .checked_add(2)
             .and_then(|p| p.checked_mul(PAGE_SIZE))
@@ -477,7 +508,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         };
         // Reserve through the extent manager with no region cache (guards need a real
         // extent to protect/restore).
-        let (region, backing, _zeroed) = match self.extents.alloc_large(
+        let (region, backing, _prov) = match self.extents.alloc_large(
             total_bytes,
             PAGE_SIZE,
             Hints::default(),
@@ -487,8 +518,12 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             Err(_) => return ptr::null_mut(),
         };
         let ext_base = region.base as usize;
-        let object_base = ext_base + PAGE_SIZE;
-        let usable = object_pages * PAGE_SIZE;
+        // `[object_base, object_base + usable)` ends exactly at the trailing guard page
+        // (`usable <= object_pages * PAGE`, so the object stays inside the object region);
+        // `object_base` is `align`-aligned (trailing_guard_start is page-aligned, `usable`
+        // is `align`-aligned, `align <= PAGE`).
+        let trailing_guard_start = ext_base + (object_pages + 1) * PAGE_SIZE;
+        let object_base = trailing_guard_start - usable;
         // Protect the leading and trailing guard pages (best-effort; a no-op host
         // fallback leaves them advisory).
         let _ = self.extents.protect_range(ext_base, PAGE_SIZE, false);
@@ -502,7 +537,8 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             let _ = me
                 .extents
                 .protect_range(object_base + usable, PAGE_SIZE, true);
-            me.return_backing(backing, region, &NO_REGION_CACHE, None);
+            // A guarded reservation being undone was never canary-filled (not eligible).
+            me.return_backing(backing, region, &NO_REGION_CACHE, None, false);
         };
 
         self.lock.acquire();
@@ -799,44 +835,54 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
 
         // W18-4 (§29.5): restore the leading and trailing guard pages to read-write
         // *before* the extent is recycled, so the recycled pages are fully usable for
-        // the next allocation. The guard geometry is derived from the object region:
-        // the object base is `region.base`, with one guard page immediately before it
-        // and one immediately after `region.len` (the `allocate_guarded` layout).
+        // the next allocation. The object is right-aligned: its end (`base + region.len`)
+        // is the page-aligned trailing guard, and the leading guard is the first page of
+        // the extent — `object_pages = ceil(usable/PAGE)` pages of object + 1 below it.
         // Best-effort: a host fallback with no page protection no-ops.
         if guarded {
             let object_base = region.base as usize;
+            let trailing_guard_start = object_base + region.len;
+            let object_pages = region.len.div_ceil(PAGE_SIZE);
+            let ext_base = trailing_guard_start.wrapping_sub((object_pages + 1) * PAGE_SIZE);
+            let _ = self.extents.protect_range(ext_base, PAGE_SIZE, true);
             let _ = self
                 .extents
-                .protect_range(object_base - PAGE_SIZE, PAGE_SIZE, true);
-            let _ = self
-                .extents
-                .protect_range(object_base + region.len, PAGE_SIZE, true);
+                .protect_range(trailing_guard_start, PAGE_SIZE, true);
         }
 
-        // Scrub the freed allocation's user bytes before the backing is returned
-        // (and possibly decommitted). Race-free and fault-free here: the pagemap
-        // entry is already retired and the slot released, so a concurrent double free
-        // re-reads `None` and never reaches this point, yet `return_backing` has not
-        // decommitted the region — it is committed and exclusively ours. A **zero**
-        // scrub (W18-6, §36.12) when `scrub_zero` is set — the caller's source arena
-        // is non-PUBLIC (reusable at a lower label) or `secure-scrub` is on; otherwise
-        // the junk-fill FREE pattern (W18-5, §29.6, no-op without that feature). Both
-        // destroy the freed contents; a large allocation has no verify-on-reuse, so
-        // zeroing it loses no canary. In both branches `region` is this allocation's
-        // committed user range (`base .. base + usable_size`); after retire + release
-        // we are its sole accessor.
-        if scrub_zero {
+        // Destroy the freed allocation's user bytes before the backing is returned
+        // (and possibly decommitted). Race-free and fault-free here: the pagemap entry
+        // is already retired and the slot released, so a concurrent double free re-reads
+        // `None` and never reaches this point, yet `return_backing` has not decommitted
+        // the region — it is committed and exclusively ours. Two mutually-exclusive
+        // ways to destroy the contents:
+        //   * a §36.12 label-downgrade **scrub** zeroes the bytes when `scrub_zero` is
+        //     set (the source arena is non-PUBLIC / `secure-scrub` is on) so a
+        //     lower-label reader cannot observe old data — the scrubbed bytes are
+        //     **zero** (matching the Lean `scrub_before_downgrade` model), so they are
+        //     deliberately **not** the canary and the extent is not verify-on-reuse
+        //     eligible (`did_fill = false`);
+        //   * otherwise the junk-fill **FREE-pattern canary** (W18-5, §29.6, no-op
+        //     without `junk-fill`), the last write, so a retained reuse of these exact
+        //     committed bytes can verify it (`did_fill` true iff the canary was written).
+        // A scrubbed (zeroed) extent reused later simply skips verify (its provenance
+        // carries no canary — never a false abort); the AND-join on coalesce keeps a
+        // mixed scrub/canary merge non-verifiable too. `region` is this allocation's
+        // committed user range; after retire + release we are its sole accessor.
+        let did_fill = if scrub_zero {
             // SAFETY: see above — sole accessor of the committed user range.
             unsafe { crate::harden::scrub(region.base, region.len) };
+            false
         } else {
             // SAFETY: see above — sole accessor of the committed user range.
             unsafe { crate::harden::fill_on_free(region.base, region.len) };
-        }
+            crate::harden::junk_fill_enabled()
+        };
 
         // Return the backing outside the pool lock (the provider call is the slow,
         // §27.2-lowest step). A failed extent free still leaves us well-formed;
         // a failed *revoke* (drain path) is reported so the caller quarantines.
-        let reclaimed = self.return_backing(backing, region, hook, revoke);
+        let reclaimed = self.return_backing(backing, region, hook, revoke, did_fill);
         (true, reclaimed)
     }
 
@@ -1211,19 +1257,28 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// fully reclaimed (no revoke requested, revoke succeeded, or cache-served);
     /// `false` only when a requested revoke failed (the extent then stays
     /// allocated and well-formed, the §36.13 partial-failure signal).
+    ///
+    /// `canary` records whether the caller canary-filled the region's bytes as their
+    /// last write (W18-5, §29.6) — only a freed-and-retained extent so marked is
+    /// verify-on-reuse eligible. A rollback of an un-filled fresh allocation passes
+    /// `false`, so its reuse is never (falsely) verified.
     fn return_backing(
         &self,
         backing: Option<ExtentRef>,
         region: Region,
         hook: &dyn RegionCacheHook,
         revoke: Option<ArenaId>,
+        canary: bool,
     ) -> bool {
         match backing {
             Some(ext) => match revoke {
-                Some(arena) => self.extents.free_revoking(ext, arena).is_ok(),
+                Some(arena) => self
+                    .extents
+                    .free_revoking_canary(ext, arena, canary)
+                    .is_ok(),
                 // a failed free still leaves us well-formed (W4-5)
                 None => {
-                    let _ = self.extents.free(ext);
+                    let _ = self.extents.free_canary(ext, canary);
                     true
                 }
             },
@@ -1936,6 +1991,33 @@ mod tests {
             "cache-served free returns to the cache"
         );
         assert_eq!(la.live_count(), 0);
+        assert!(la.check_invariants());
+    }
+
+    /// W18-5 (§29.6): a large allocation freed and then **reused** from its retained
+    /// extent passes verify-on-reuse — the free wrote the FREE-pattern canary as its
+    /// last write, and nothing touched the bytes before reuse, so the check does
+    /// **not** false-abort a correct program. Exercises the whole provenance→verify
+    /// plumbing end to end (only meaningful with the canary actually written, so it is
+    /// gated on `junk-fill`; the default test build under the retain policy reuses the
+    /// same extent, so verify genuinely runs here).
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn large_reuse_passes_verify_on_reuse_without_false_abort() {
+        let la = large(64, 8);
+        // Allocate, scribble user data, then free (canary-filled last).
+        let p1 = la.allocate(8 * PAGE, PAGE);
+        assert!(!p1.is_null());
+        // SAFETY: `p1` is a live 8-page allocation, exclusively ours.
+        unsafe { core::ptr::write_bytes(p1, 0x42, 8 * PAGE) };
+        // SAFETY: `p1` is a live large of this allocator.
+        assert!(unsafe { la.free(p1) });
+        // Reuse the same size: the retained, canary-filled extent is carved again and
+        // verify-on-reuse runs. A spurious failure would have aborted before this line.
+        let p2 = la.allocate(8 * PAGE, PAGE);
+        assert!(!p2.is_null(), "reuse of the retained extent succeeds");
+        // SAFETY: `p2` is a live large of this allocator.
+        assert!(unsafe { la.free(p2) });
         assert!(la.check_invariants());
     }
 }

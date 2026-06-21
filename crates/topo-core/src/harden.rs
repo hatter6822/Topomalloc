@@ -151,6 +151,30 @@ pub unsafe fn fill_fresh_slab(ptr: *mut u8, len: usize) {
     unsafe { fill_on_free(ptr, len) }
 }
 
+/// Report a detected memory-safety violation and **terminate** (W18). A detected
+/// corruption — a verify-on-reuse canary mismatch, say — means the heap is already
+/// inconsistent, so the §2.4-safe response is to stop *now* rather than hand out a
+/// compromised object. In the real artifact this **aborts** (no unwinding back
+/// through the allocator, which a `panic!` risks); in `topo-core`'s own test build
+/// it `panic!`s so a `#[should_panic]` test can observe the detection. Allocation-
+/// free (a `&'static str`); diverges, so it is sound on any path. `#[cold]`/
+/// `#[inline(never)]` keeps it off the hot path.
+#[cold]
+#[inline(never)]
+pub fn corruption_abort(msg: &str) -> ! {
+    #[cfg(all(feature = "std", not(test)))]
+    {
+        use std::io::Write as _;
+        // Best-effort note to stderr (allocation-free), then an immediate abort.
+        let _ = std::io::stderr().write_all(msg.as_bytes());
+        std::process::abort()
+    }
+    #[cfg(not(all(feature = "std", not(test))))]
+    {
+        panic!("{}", msg)
+    }
+}
+
 /// Verify that a central-free object still holds [`FREE_PATTERN`] (§29.6, W18-5) —
 /// the **verify-on-reuse** check, run on the allocation path *before* the object
 /// is overwritten (filled or zeroed). Returns `true` when the canary is intact (or
@@ -261,7 +285,7 @@ pub struct QuarantineEntry {
     /// The owning arena (routes the deferred free's accounting).
     pub arena: ArenaId,
     /// Usable bytes held (the separate quarantine byte accounting, §29.4).
-    pub bytes: u32,
+    pub bytes: u64,
 }
 
 impl QuarantineEntry {
@@ -587,7 +611,7 @@ impl Quarantine {
         }
         let max_bytes = self.max_bytes.load(Ordering::Relaxed);
         let max_objects = self.max_objects.load(Ordering::Relaxed) as usize;
-        let bytes = entry.bytes as u64;
+        let bytes = entry.bytes;
         // Decline (free immediately) when: sampling skipped it, the object alone
         // exceeds the whole budget (it could never fit), or it would push its arena
         // past the per-arena ceiling.
@@ -689,10 +713,10 @@ impl Quarantine {
     /// or drained). Caller holds the lock.
     #[inline]
     fn release_accounting(&self, e: &QuarantineEntry) {
-        self.bytes.fetch_sub(e.bytes as u64, Ordering::Relaxed);
+        self.bytes.fetch_sub(e.bytes, Ordering::Relaxed);
         self.count.fetch_sub(1, Ordering::Relaxed);
         if let Some(a) = self.per_arena.get(e.arena.0 as usize) {
-            a.fetch_sub(e.bytes as u64, Ordering::Relaxed);
+            a.fetch_sub(e.bytes, Ordering::Relaxed);
         }
     }
 
@@ -720,12 +744,22 @@ impl Default for Quarantine {
 
 /// Decides which allocations receive guard pages (W18-4, §29.5). A `TOPO_GUARDED`
 /// request is always honoured by the engine; this governs the *sampled* fraction of
-/// ordinary allocations: ~1 in `rate` (rate `0` ⇒ explicit requests only — the
-/// default, so the `hardened` build does not pay the ≥3-pages-per-object cost
-/// unasked). Lock-free: one relaxed load on the common (rate 0) path.
+/// ordinary allocations: each allocation is guarded independently with probability
+/// ~1/`rate` (rate `0` ⇒ explicit requests only — the default, so the `hardened`
+/// build does not pay the ≥3-pages-per-object cost unasked). Lock-free: one relaxed
+/// load on the common (rate 0) path.
+///
+/// Sampling is **randomized**, not a fixed 1-in-`rate` stride: a deterministic stride
+/// is predictable (an attacker who learns `rate` can avoid the guarded slots by
+/// counting allocations), defeating the probabilistic detection W18-4 is for. An
+/// independent per-allocation coin (GWP-ASan style) is unpredictable and still yields
+/// the same expected ~1/`rate` density.
 pub struct GuardSampler {
     rate: AtomicU64,
-    counter: AtomicU64,
+    /// xorshift64 state — a fast, decorrelated stream for the per-allocation coin.
+    /// Seeded non-zero (xorshift64 never leaves the non-zero orbit), distinct from
+    /// the quarantine's seed so the two samplers are uncorrelated.
+    rng: AtomicU64,
 }
 
 impl GuardSampler {
@@ -734,7 +768,7 @@ impl GuardSampler {
     pub const fn new() -> GuardSampler {
         GuardSampler {
             rate: AtomicU64::new(0),
-            counter: AtomicU64::new(0),
+            rng: AtomicU64::new(0xD1B5_4A32_D192_ED03),
         }
     }
 
@@ -751,8 +785,22 @@ impl GuardSampler {
         self.rate.load(Ordering::Relaxed)
     }
 
+    /// Next xorshift value — a relaxed read-modify-write (a fast, decorrelated
+    /// stream is all sampling needs, not a strict sequence; a lost update under a
+    /// race merely re-uses a value, never biasing toward guarding).
+    #[inline]
+    fn next_rng(&self) -> u64 {
+        let mut x = self.rng.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng.store(x, Ordering::Relaxed);
+        x
+    }
+
     /// Whether to guard the next allocation **by sampling** (an explicit request is
-    /// decided by the caller). `false` immediately when sampling is off.
+    /// decided by the caller). `false` immediately when sampling is off. Each call is
+    /// an independent ~1/`rate` coin, so the guarded slots are unpredictable.
     #[inline]
     #[must_use]
     pub fn sampled(&self) -> bool {
@@ -760,9 +808,10 @@ impl GuardSampler {
         if rate == 0 {
             return false;
         }
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(rate)
+        if rate == 1 {
+            return true; // guard everything (degenerate rate)
+        }
+        self.next_rng().is_multiple_of(rate)
     }
 }
 
@@ -845,7 +894,7 @@ mod tests {
     // --- W18-3 quarantine (the data structure; exercised with opaque pointers it
     // never dereferences) ---
 
-    fn small_entry(addr: usize, bytes: u32) -> QuarantineEntry {
+    fn small_entry(addr: usize, bytes: u64) -> QuarantineEntry {
         // A small-object entry; the quarantine treats `span` as opaque (non-null ⇒
         // small) and `user_ptr` as the membership key — it dereferences neither.
         QuarantineEntry {
@@ -993,5 +1042,68 @@ mod tests {
         assert_eq!(drained, 100, "drain returns every held object exactly once");
         assert_eq!(q.held_bytes(), 0);
         assert_eq!(q.held_objects(), 0);
+    }
+
+    // --- W18-4 guarded-allocation sampler ---
+
+    #[test]
+    fn guard_sampler_off_and_full_are_exact() {
+        let s = GuardSampler::new();
+        // Off by default: never samples, regardless of how many times asked.
+        assert_eq!(s.rate(), 0);
+        for _ in 0..1000 {
+            assert!(!s.sampled());
+        }
+        // Rate 1 is the degenerate "guard everything".
+        s.set_rate(1);
+        for _ in 0..1000 {
+            assert!(s.sampled());
+        }
+    }
+
+    #[test]
+    fn guard_sampler_density_is_about_one_in_rate() {
+        // Over a large run the *density* of guarded allocations tracks ~1/rate, even
+        // though each decision is an independent randomized coin (not a fixed stride).
+        let s = GuardSampler::new();
+        const RATE: u64 = 16;
+        const N: u64 = 200_000;
+        s.set_rate(RATE);
+        let hits = (0..N).filter(|_| s.sampled()).count() as u64;
+        let expected = N / RATE;
+        // A generous ±35% band: the point is order-of-magnitude correctness and
+        // determinism-of-the-test, not a tight statistical bound (which would flake).
+        let lo = expected - expected * 35 / 100;
+        let hi = expected + expected * 35 / 100;
+        assert!(
+            (lo..=hi).contains(&hits),
+            "guard density {hits} outside [{lo}, {hi}] for rate {RATE} over {N}"
+        );
+    }
+
+    #[test]
+    fn guard_sampler_is_not_a_fixed_stride() {
+        // A deterministic 1-in-rate stride would guard exactly the indices
+        // {rate-1, 2*rate-1, …} with a constant gap; the randomized sampler must not.
+        // Collect the gaps between consecutive hits and assert they are not all equal.
+        let s = GuardSampler::new();
+        const RATE: u64 = 8;
+        s.set_rate(RATE);
+        let mut gaps = Vec::new();
+        let mut last_hit: Option<u64> = None;
+        for i in 0..4000u64 {
+            if s.sampled() {
+                if let Some(prev) = last_hit {
+                    gaps.push(i - prev);
+                }
+                last_hit = Some(i);
+            }
+        }
+        assert!(gaps.len() > 20, "expected many hits to compare gaps");
+        let first = gaps[0];
+        assert!(
+            gaps.iter().any(|&g| g != first),
+            "randomized sampling must produce varying gaps, not a constant stride"
+        );
     }
 }

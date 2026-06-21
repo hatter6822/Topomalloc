@@ -1026,11 +1026,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // regardless of size class. A true `false` without the `guard-pages` feature.
         let guarded = self.want_guarded(flags, req.align);
         // The byte count charged to the arena and recorded — the class's usable
-        // size, or the page-rounded extent length. A guarded object is page-based
-        // whatever its size class. Compute it (and fail on any medium/large rounding
-        // overflow) *before* any state change.
+        // size, or the page-rounded extent length. A **guarded** object is right-aligned
+        // against its trailing guard, so its usable is *tight* (`align_up(size, align)`,
+        // matching `LargeAllocator::allocate_guarded`) — the guard pages are allocator
+        // overhead, not charged to the arena, and not counted as fragmentation. Compute
+        // it (failing on any rounding overflow) *before* any state change.
         let usable = if guarded {
-            match medium_large_usable(size) {
+            match crate::overflow::align_up(size.max(1), req.align.max(1)) {
                 Some(bytes) => bytes,
                 None => return ptr::null_mut(),
             }
@@ -1281,12 +1283,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             let usable = size_class::usable_size(span.size_class());
             // SAFETY: `p` points at `usable` readable bytes of the just-removed
             // object (its class object size); it is exclusively ours until returned.
-            let intact = unsafe { crate::harden::verify_free_pattern(p, usable) };
-            assert!(
-                intact,
-                "use-after-free: a freed object was written before reuse \
-                 (junk-fill verify-on-reuse canary, §29.6)"
-            );
+            if !unsafe { crate::harden::verify_free_pattern(p, usable) } {
+                // A write-after-free corrupted the canary: abort rather than hand out a
+                // compromised object (§2.4). A true no-op when `junk-fill` is off
+                // (`verify_free_pattern` is always `true`, so this is never reached).
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected before reuse \
+                     (junk-fill verify-on-reuse canary, §29.6)\n",
+                );
+            }
         }
         p
     }
@@ -1736,7 +1741,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span: span as *const SpanDescriptor,
             index: idx,
             arena,
-            bytes: usable.min(u32::MAX as usize) as u32,
+            bytes: usable as u64,
         };
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
@@ -1782,7 +1787,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             span: ptr::null(),
             index: 0,
             arena,
-            bytes: usable.min(u32::MAX as usize) as u32,
+            bytes: usable as u64,
         };
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
@@ -4641,37 +4646,50 @@ mod tests {
         assert!(a.check_invariants());
     }
 
-    /// W18-4 (§29.5): an explicit `TOPO_GUARDED` request takes the guarded page path
-    /// — its own pages bracketed by guard pages — regardless of size class. Here the
+    /// W18-4 (§29.5): an explicit `TOPO_GUARDED` request takes the guarded path — its
+    /// own pages bracketed by guard pages, with the object **right-aligned** against
+    /// the trailing guard so `usable_size` is *tight* (`align_up(size, align)`, not
+    /// page-rounded — the guard pages are overhead, not fragmentation). Here the
     /// in-crate `HostProvider` has no page protection, so the guards are *advisory*
-    /// (the real `mprotect` trap is exercised in the POSIX integration tests); this
-    /// pins the mechanism: a guarded object is page-based, writable, owned, and frees
-    /// cleanly (restoring the guards before recycling). Invariants hold throughout.
+    /// (the real `mprotect` trap is the POSIX integration test); this pins the
+    /// mechanism: a guarded object is a large descriptor with a tight usable size,
+    /// writable, owned, and frees cleanly. Invariants hold throughout.
     #[cfg(feature = "guard-pages")]
     #[test]
-    fn guarded_allocation_is_page_based_writable_and_frees() {
+    fn guarded_allocation_is_tight_writable_and_frees() {
         let m = meta(16 * 1024 * 1024);
         let pm = PageMap::new();
         let a = small_allocator(&m, &pm);
         let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
 
-        // A small request, forced guarded, becomes a page-based guarded allocation
-        // (not a slab object): usable is page-rounded and it is a large descriptor.
+        // A small request, forced guarded, becomes a *large descriptor* (not a slab
+        // object — distinguished by `live_large_count`), with a tight usable size.
         let p = a.allocate_in(ArenaId::DEFAULT, 100, MIN_ALIGN, guarded);
         assert!(!p.is_null());
         assert!(a.owns(p));
-        assert_eq!(a.usable_size(p), Some(PAGE_SIZE), "one object page");
         assert_eq!(a.live_large_count(), 1, "guarded ⇒ a large descriptor");
+        assert_eq!(
+            a.usable_size(p),
+            Some(align_up(100, MIN_ALIGN).unwrap()),
+            "tight usable, not page-rounded"
+        );
+        // The object ends exactly at the trailing guard page (right-aligned).
+        let usable = a.usable_size(p).unwrap();
+        assert_eq!(
+            (p as usize + usable) % PAGE_SIZE,
+            0,
+            "object end abuts the guard"
+        );
         // Writable across the whole object.
         // SAFETY: `p` has at least 100 usable bytes.
         unsafe { ptr::write_bytes(p, 0x42, 100) };
 
-        // A multi-page guarded request.
+        // A multi-page guarded request: usable is still tight (to the alignment).
         let big = a.allocate_in(ArenaId::DEFAULT, 3 * PAGE_SIZE + 1, MIN_ALIGN, guarded);
         assert!(!big.is_null());
         assert_eq!(
             a.usable_size(big),
-            Some(align_up(3 * PAGE_SIZE + 1, PAGE_SIZE).unwrap())
+            Some(align_up(3 * PAGE_SIZE + 1, MIN_ALIGN).unwrap())
         );
 
         // Both free cleanly (guard restore + extent recycle); invariants hold and the
@@ -4694,20 +4712,27 @@ mod tests {
         let pm = PageMap::new();
         let a = small_allocator(&m, &pm);
 
-        // Off by default: a small allocation is a slab object (not page-based).
+        // Off by default: a 64-byte allocation is a slab object (not a large descriptor).
         assert_eq!(a.guard_sample_rate(), 0);
         let unsampled = a.malloc(64);
-        assert!(a.usable_size(unsampled).unwrap() < PAGE_SIZE, "slab object");
+        assert_eq!(a.live_large_count(), 0, "slab object, not guarded");
         assert_eq!(tfree(&a, unsampled), FreeOutcome::Freed);
 
-        // Rate 1 guards every allocation ⇒ even a 64-byte request is page-based.
+        // Rate 1 guards every allocation ⇒ even a 64-byte request becomes a guarded
+        // large descriptor (with a tight usable size, the object end abutting the guard).
         a.set_guard_sample_rate(1);
         assert_eq!(a.guard_sample_rate(), 1);
         let sampled = a.malloc(64);
         assert_eq!(
-            a.usable_size(sampled),
-            Some(PAGE_SIZE),
-            "guarded ⇒ one page"
+            a.live_large_count(),
+            1,
+            "sampled ⇒ guarded large descriptor"
+        );
+        let usable = a.usable_size(sampled).unwrap();
+        assert_eq!(
+            (sampled as usize + usable) % PAGE_SIZE,
+            0,
+            "right-aligned to the guard"
         );
         assert_eq!(tfree(&a, sampled), FreeOutcome::Freed);
 

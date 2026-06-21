@@ -27,7 +27,7 @@ hardened = ["topo-abi/hardened", "guard-pages", "quarantine", "secure-scrub", "j
 guard-pages = ["topo-abi/guard-pages"]
 quarantine = ["topo-abi/quarantine"]
 secure-scrub = ["topo-abi/secure-scrub", "topo-core/secure-scrub"]
-junk-fill = ["topo-abi/junk-fill"]
+junk-fill = ["topo-abi/junk-fill", "topo-core/junk-fill"]
 
 [dependencies]
 # `std` so the integration tests exercise topo-core's thread-local safety
