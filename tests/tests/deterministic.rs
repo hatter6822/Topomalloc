@@ -249,7 +249,6 @@ fn trace_emission_is_reproducible_under_deterministic_ids() {
     // reproducibility the differential runner (W21-2) rides on. (W19-3 supplies the
     // id source + the emitters; wiring live per-op emission into the allocator is
     // W21-2a's job, which now has everything it needs.)
-    use std::fmt::Write as _;
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let emit_run = || -> String {

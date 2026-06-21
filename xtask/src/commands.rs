@@ -836,6 +836,25 @@ fn asan_steps(r: &mut Runner<'_>) {
             "--lib",
         ],
     );
+    // The public C ABI (malloc/free/realloc/aligned/calloc) over the **real POSIX
+    // backend** (mmap/madvise) — the backend glue the lib tests (which use
+    // in-process metadata) never reach. This `abi` integration target installs no
+    // `#[global_allocator]`, so ASan's own allocator does not conflict.
+    r.run(
+        "asan: C ABI over POSIX (topo-tests abi)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-tests",
+            "--test",
+            "abi",
+        ],
+    );
     std::env::remove_var("ASAN_OPTIONS");
     std::env::remove_var("RUSTFLAGS");
 }
