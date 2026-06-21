@@ -506,6 +506,52 @@ impl Quarantine {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// Appendix-B invariant check (W18-3): the lock-free accounting atomics agree
+    /// with the ring contents — `count` is the ring length, `bytes` is the exact sum
+    /// of held entry bytes, the per-arena tallies partition `bytes`, the ring indices
+    /// are in range, and the membership filter contains every held entry (so the
+    /// O(1) double-free negative is never a false *negative*). Acquires the lock; for
+    /// external/test use (the hot paths assert the locked form in debug). Always
+    /// `true` is not assumed — a regression in the accounting trips it.
+    #[must_use]
+    pub fn check_invariants(&self) -> bool {
+        self.lock.acquire();
+        // SAFETY: the lock is held ⇒ exclusive ring access.
+        let ok = self.check_invariants_locked(unsafe { &*self.ring.get() });
+        self.lock.release();
+        ok
+    }
+
+    /// [`check_invariants`](Self::check_invariants) with the lock already held — the
+    /// form the hot paths `debug_assert!` before releasing the lock.
+    fn check_invariants_locked(&self, r: &QRing) -> bool {
+        if r.len > QUARANTINE_CAP || (r.len > 0 && r.head >= QUARANTINE_CAP) {
+            return false;
+        }
+        if self.count.load(Ordering::Relaxed) as usize != r.len {
+            return false;
+        }
+        let mut sum: u64 = 0;
+        let mut per_arena = [0u64; crate::arena::MAX_ARENAS];
+        for k in 0..r.len {
+            let i = (r.head + k) % QUARANTINE_CAP;
+            let e = &r.slots[i];
+            sum += e.bytes;
+            if let Some(slot) = per_arena.get_mut(e.arena.0 as usize) {
+                *slot += e.bytes;
+            }
+            // Every held entry must be in the membership filter (no false negative).
+            if !self.bloom.maybe_contains(e.user_ptr as usize) {
+                return false;
+            }
+        }
+        if self.bytes.load(Ordering::Relaxed) != sum {
+            return false;
+        }
+        (0..crate::arena::MAX_ARENAS)
+            .all(|a| self.per_arena[a].load(Ordering::Relaxed) == per_arena[a])
+    }
+
     /// Whether the runtime master switch is on (and the feature is compiled in).
     #[inline]
     #[must_use]
@@ -672,6 +718,7 @@ impl Quarantine {
             // batch bound stopped eviction): decline rather than drop the entry, so
             // the caller frees it now (never leaked). Any evictions already collected
             // are still in `evicted` for the caller to drain.
+            debug_assert!(self.check_invariants_locked(r));
             self.lock.release();
             return if evicted.len > 0 {
                 Offer::Held
@@ -679,6 +726,7 @@ impl Quarantine {
                 Offer::Declined
             };
         }
+        debug_assert!(self.check_invariants_locked(r));
         self.lock.release();
         Offer::Held
     }
@@ -705,6 +753,7 @@ impl Quarantine {
             self.bloom.reset();
             r.inserts_since_rebuild = 0;
         }
+        debug_assert!(self.check_invariants_locked(r));
         self.lock.release();
         out
     }
@@ -1041,6 +1090,103 @@ mod tests {
         }
         assert_eq!(drained, 100, "drain returns every held object exactly once");
         assert_eq!(q.held_bytes(), 0);
+        assert_eq!(q.held_objects(), 0);
+    }
+
+    #[test]
+    fn quarantine_randomized_offers_and_drains_preserve_every_invariant() {
+        // A dependency-free property test (the topo-core supply chain has no proptest):
+        // a long random sequence of offers (distinct keys) and drains must keep the
+        // Appendix-B invariant, respect both budgets, and conserve bytes — every offered
+        // entry is exactly one of held / evicted-now / declined, never lost or
+        // double-counted.
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 4096,
+            max_objects: 24,
+            random_evict: true,
+            ..QuarantinePolicy::DEFAULT
+        });
+        // A tiny deterministic xorshift so the run is reproducible.
+        let mut rng: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut key: usize = 0x10_0000;
+        // Conservation tallies over the whole run.
+        let mut offered_bytes: u64 = 0;
+        let mut freed_bytes: u64 = 0; // declined + evicted + drained (caller really frees)
+        for _ in 0..20_000 {
+            assert!(q.check_invariants(), "invariant holds before each step");
+            if next() % 3 == 0 {
+                // Drain one batch; the caller frees the returned entries.
+                let batch = q.drain_batch();
+                for e in batch.as_slice() {
+                    freed_bytes += e.bytes;
+                }
+            } else {
+                // Offer a fresh (never-before-seen) key so there is no double-offer.
+                key += 0x40;
+                let bytes = 16 + (next() % 8) * 16; // 16..=128, a multiple of 16
+                offered_bytes += bytes;
+                let mut ev = EvictBatch::new();
+                match q.offer(small_entry(key, bytes as u64), &mut ev) {
+                    Offer::Declined => freed_bytes += bytes, // not held ⇒ caller frees now
+                    Offer::Held | Offer::AlreadyQuarantined => {}
+                }
+                for e in ev.as_slice() {
+                    freed_bytes += e.bytes; // evicted ⇒ caller frees now
+                }
+            }
+            // Budgets are never exceeded after a settled step.
+            assert!(q.held_bytes() <= 4096, "byte budget respected");
+            assert!(q.held_objects() <= 24, "object budget respected");
+        }
+        // Drain the remainder and check exact conservation: everything offered was
+        // either freed along the way or is still held (then drained).
+        loop {
+            let b = q.drain_batch();
+            if b.as_slice().is_empty() {
+                break;
+            }
+            for e in b.as_slice() {
+                freed_bytes += e.bytes;
+            }
+        }
+        assert_eq!(q.held_bytes(), 0);
+        assert_eq!(q.held_objects(), 0);
+        assert_eq!(
+            offered_bytes, freed_bytes,
+            "byte conservation: every offered entry is freed exactly once"
+        );
+    }
+
+    #[test]
+    fn quarantine_check_invariants_tracks_the_ring() {
+        // The Appendix-B checker holds across offers, an eviction, and drains — the
+        // accounting atomics stay exactly in step with the ring contents.
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 10 * 64,
+            max_objects: 8,
+            ..QuarantinePolicy::DEFAULT
+        });
+        assert!(q.check_invariants(), "empty quarantine is well-formed");
+        for k in 0..6 {
+            let _ = offer(&q, small_entry(0x1000 + k * 0x40, 64));
+            assert!(q.check_invariants(), "well-formed after each offer");
+        }
+        // Force an eviction by overflowing the byte budget, then re-check.
+        let _ = offer(&q, small_entry(0x9000, 64));
+        assert!(q.check_invariants(), "well-formed after an eviction");
+        // Drain in batches; the invariant holds at every step down to empty.
+        while !q.drain_batch().as_slice().is_empty() {
+            assert!(q.check_invariants());
+        }
+        assert!(q.check_invariants());
         assert_eq!(q.held_objects(), 0);
     }
 

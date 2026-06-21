@@ -87,5 +87,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "quarantine"
+path = "fuzz_targets/quarantine.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]
