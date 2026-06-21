@@ -162,6 +162,34 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > pinned by the fixed-wall tests (`guard_sampler_is_reproducible_given_a_seed`,
 > `quarantine_random_evict_is_reproducible_given_a_seed`, the integration force-flag
 > tests).
+>
+> **Optimal-completion pass (W19).** A self-audit closed every "present-but-inert" gap.
+> The cheap **B.3 span checker now runs as a `debug_assert!` at every central
+> transition** (`remove_batch`/`insert_batch`/`activate_span`/`deactivate_span{,_forced}`,
+> under the held span guard — the "first-class runtime code" property DD-2 specifies and
+> the extent/huge checkers already had); the O(state) sweeps (B.1 reachability, full B.2
+> distinctness, B.5) run **on demand** via `Allocator::check_invariants` and the new C
+> `topomalloc_debug_check_now()` / `topomalloc_debug_checks_enabled()` surface (the
+> `topo.debug.check_now` the conventions referenced but had not implemented), kept off the
+> hot path per DD-2 failure-mode F1. Every checker gained a **negative test** (central
+> accounting-drift + span-count miscount, per-CPU over-capacity + duplicate, thread
+> duplicate, arena stale-generation reuse). **B.2 distinctness** extended to the per-CPU
+> and thread caches (a duplicate is a double-free, caught at the cache with exact slot
+> context). **B.5** gained the **hook-install referential check** (a live hooked backend's
+> owning arena is registered and still names its slot — the install-order witness with the
+> per-backend extent-tiling walk). **W19-2** gained a load-bearing **asm-disable regression
+> test** (`topo_arch::asm_disabled_for_sanitizer()`, asserted under the ASan/MSan core-lib
+> run) and an **ASan pass over the live C ABI** (malloc/free/realloc over the real POSIX
+> backend, the `topo-tests abi` target — no `#[global_allocator]` conflict). **W19-3**
+> `force_slow_path` now also bypasses the transfer cache in the front-end refill, the §33.7
+> trace-id source is shown to emit byte-identical traces run-to-run, the across-caches
+> empty-detection is exercised with every non-central term, and the strict-LIFO refill
+> order is pinned. A `debug_checks` **fuzz target** drives the B.2 cache checkers (the
+> central B.1/B.3 checkers are already fuzzed by `malloc_api`). The only deliberate
+> boundaries left are genuinely **W21**: live per-op trace *emission* (W21-2a, which W19-3
+> now fully readies) and Lean executable-model *replay* (W21-2b); deterministic *replay* is
+> single-threaded by design (matching the differential runner), so multi-threaded sampling
+> reproducibility is out of scope, not a gap.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|

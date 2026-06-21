@@ -31,7 +31,7 @@ strict rule keyed to the cost and the consequence of the check:
 |-------|--------------|---------|
 | `assert!` | **all** profiles | Cheap, load-bearing safety checks whose failure means corruption is imminent (e.g. an overflow guard that must never wrap, §9.7). |
 | `debug_assert!` | `debug` profile (and tests) | The Appendix-B invariant checklist and any check too expensive for the hot path (e.g. full free-list scan, bitmap/span reconciliation). |
-| `debug-checks` feature | when enabled (implied by `debug`/`hardened` as configured) | Opt-in invariant checkers callable from tests and from the control plane (`topo.debug.check_now`). |
+| `debug-checks` feature | when enabled (implied by `debug`/`hardened` as configured) | Opt-in invariant checkers callable from tests and on demand from the control plane (`topomalloc_debug_check_now` / `topo.debug.check_now`). |
 
 Never gate a *memory-safety* invariant behind `debug_assert!` if violating it in
 `performance` would corrupt memory silently — promote it to `assert!` or to a
@@ -43,10 +43,13 @@ side-effect-free `check_invariants` method per type, landing with the state it c
 (`SpanDescriptor`/`CentralCache` for B.3/B.1, the `CpuCache`/`TransferCache`/`ThreadCache`
 trio for B.2, `HugePageFiller` for B.4, `ArenaTable` for B.5), gathered and documented by
 invariant group in the `crate::debug` module (the B.1–B.5 → code map, the `check_b2_cache`
-group callable, the `Group` enum). `Allocator::check_invariants` aggregates the
-engine-owned groups; the cache group is checked on its own (standalone at M1). A WU that
-adds state adds its checker (DoD addendum), with a **negative** test proving the checker
-catches a real violation.
+group callable, the `Group` enum). The **cheap per-span B.3 check runs as a
+`debug_assert!` at every central transition** (the extent/huge pattern); the **O(state)
+sweeps** (B.1 central reachability, full B.2 distinctness, B.5) run on demand — from
+`Allocator::check_invariants` (the engine aggregate, which the C `topomalloc_debug_check_now`
+exposes) and from tests — kept off the per-transition hot path (DD-2 failure-mode F1). A WU
+that adds state adds its checker (DoD addendum), with a **negative** test proving the
+checker catches a real violation.
 
 Corollary (Appendix F): error logging and profiling callbacks **must not**
 allocate through TopoMalloc (no recursion); assertion-failure paths must be

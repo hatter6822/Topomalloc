@@ -425,14 +425,19 @@ the POSIX profile).
   `topo-core` library (default + hardened); the RSEQ asm disables itself under ASan/MSan
   (`cfg(topo_sanitize_no_asm)`), so there are no asm false positives
 - Appendix-B invariant checks (W19-1, DD-2): one callable checker per group (B.1 global /
-  B.2 cache / B.3 span / B.4 hugepage / B.5 arena) gathered in `crate::debug`, run as
-  `debug_assert!`s under `debug-checks` and as the G-core/G-conc/G-mem/G-arena test oracles
+  B.2 cache / B.3 span / B.4 hugepage / B.5 arena) gathered in `crate::debug`. The cheap
+  per-span B.3 check runs as a `debug_assert!` at **every central transition**; the
+  O(state) sweeps (B.1 reachability, full B.2 distinctness, B.5 incl. the hook-install +
+  stale-generation guards) run on demand from `Allocator::check_invariants` (the C
+  `topomalloc_debug_check_now`) and as the G-core/G-conc/G-mem/G-arena oracles — each with a
+  **negative** test proving it catches a real violation; the B.2 layer also fuzzed
+  (`debug_checks`)
 - Deterministic mode (W19-3, §30.4): `crate::deterministic` (seeded randomness via
   `domain_seed`, force-slow-path / force-purge, monotonic trace ids), the
   `topomalloc_deterministic_*` C surface, and a serialized `tests/tests/deterministic.rs`
 - Lean: 85 build jobs including proof-checking every module (`lake build`) + 8 executable gates (`lake exe check`)
 - C/C++ ABI: smoke harness (`cargo xtask abi-test`)
-- Fuzzing: 11 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, `placement`, `quarantine`, and `stats_render`)
+- Fuzzing: 12 targets (`fuzz/fuzz_targets/`, incl. `arena_api`, `extent_hooks`, `huge_filler`, `topology`, `placement`, `quarantine`, `stats_render`, and `debug_checks` — the W19-1b B.2 cache checkers)
 
 **Lean gates (`lake exe check`):**
 - G-table: size-class table OK (72 classes, small_max=32768, huge_threshold=2097152, max_align=16384 — each class records its natural alignment so over-aligned small requests are slab-served, W15-4)

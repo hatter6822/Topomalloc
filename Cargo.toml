@@ -118,7 +118,10 @@ exclude = ["fuzz", "vendor/sele4n"]
 # large verify-on-reuse, randomized/tight guards, quarantine invariant-checker + fuzz + convergence.
 # 0.1.26 — W19 debug/sanitization: Appendix-B checkers as runtime code (crate::debug, B.1–B.5),
 # ASan/MSan integration + RSEQ-asm self-disable under sanitizers, deterministic test mode.
-version = "0.1.26"
+# 0.1.27 — W19 optimal-completion: per-transition B.3 debug_asserts, on-demand check_now
+# (topomalloc_debug_*), negative tests per checker, B.5 hook-install + per-CPU/thread
+# distinctness, asm-disable regression test, ASan over the C ABI, a B.2 cache fuzz target.
+version = "0.1.27"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
