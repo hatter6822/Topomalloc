@@ -90,8 +90,15 @@ pub fn refill(
     let batch_size = size_class::batch(sc);
     let mut buf = [0usize; MAX_BATCH_LEN];
 
-    // Step 1: try the transfer cache (lock rank 3, released before step 3).
-    let popped = transfer.try_pop_batch(arena, sc, &mut buf, batch_size, meta);
+    // §30.4 (W19-3): deterministic mode can force the slow path — skip the transfer
+    // cache and refill straight from the central free list, so the slower central
+    // path is exercised every time. Off by default (one relaxed load).
+    let popped = if crate::deterministic::force_slow_path() {
+        0
+    } else {
+        // Step 1: try the transfer cache (lock rank 3, released before step 3).
+        transfer.try_pop_batch(arena, sc, &mut buf, batch_size, meta)
+    };
 
     if popped > 0 {
         // Step 2: push into CPU cache slot (per-CPU lock, released on return).

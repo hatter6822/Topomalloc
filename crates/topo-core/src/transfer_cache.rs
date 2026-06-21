@@ -373,6 +373,27 @@ mod tests {
     }
 
     #[test]
+    fn pop_order_is_deterministic_lifo() {
+        // §30.4 (W19-3) "deterministic cache refill order": the transfer cache pops
+        // strictly LIFO — the most recently pushed objects first, no hashing,
+        // address-order, or randomization — so a refill reproduces identically
+        // run-to-run (the differential runner's prerequisite, no seed needed).
+        let run = || -> Vec<usize> {
+            let m = meta(1024 * 1024);
+            let tc = TransferCache::new();
+            let sc = SizeClassId::new(0);
+            tc.try_push_batch(A, sc, &[10, 20, 30, 40, 50], &m);
+            let mut out = [0usize; 3];
+            let n = tc.try_pop_batch(A, sc, &mut out, 3, &m); // a partial pop
+            out[..n].to_vec()
+        };
+        let a = run();
+        assert_eq!(a, run(), "the refill order is reproducible run-to-run");
+        // A partial pop takes the top of the stack (the most recently pushed).
+        assert_eq!(a, vec![30, 40, 50], "the pop takes the stack top (LIFO)");
+    }
+
+    #[test]
     fn empty_cache_returns_zero() {
         let m = meta(1024 * 1024);
         let tc = TransferCache::new();

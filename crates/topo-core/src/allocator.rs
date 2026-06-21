@@ -2964,7 +2964,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             for i in 0..MAX_HOOK_BACKENDS {
                 // SAFETY: registry lock held; per-element borrow of slot `i` only.
                 if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
-                    ok = ok && b.span_extents.check_invariants() && b.large.check_invariants();
+                    ok = ok
+                        && b.span_extents.check_invariants()
+                        && b.large.check_invariants()
+                        // B.5 (W19-1d) "extent hooks installed before hook-owned
+                        // extents exist": this live backend's owning arena is
+                        // registered and still names *this* slot (no orphan backend,
+                        // no dangling/stale slot reference). Combined with the
+                        // per-backend extent-tiling walk above (every hooked extent
+                        // lies within the installed region, never outside it), this
+                        // is the static witness for the install-order clause.
+                        && self.arenas.is_registered(b.arena)
+                        && self.arenas.hook_slot_of(b.arena) as usize == i + 1;
                 }
             }
             self.hooks.lock.release();

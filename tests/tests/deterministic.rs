@@ -17,8 +17,9 @@ use std::sync::Mutex;
 use topo_backend_posix::PosixBackingProvider;
 use topo_core::deterministic;
 use topo_core::{
-    ArenaId, BumpArena, CentralCache, ExtentManager, Fit, Label, NodeId, PageMap, RemoveResult,
-    RetainPolicy, SizeClassId, SpanDescriptor, SpanId, ANY_PLACE_CLASS,
+    refill, ArenaId, BumpArena, CentralCache, CoreId, CpuCache, ExtentManager, Fit, Label, NodeId,
+    PageMap, RemoveResult, RetainPolicy, SizeClassId, SpanDescriptor, SpanId, TransferCache,
+    ANY_PLACE_CLASS,
 };
 
 /// Serializes the tests in this binary: they flip process-global flags read on
@@ -139,6 +140,67 @@ fn force_slow_path_declines_empty_span_cache_reuse() {
 }
 
 #[test]
+fn force_slow_path_bypasses_the_transfer_cache_in_refill() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    deterministic::set_force_slow_path(false); // clean baseline
+
+    let m = meta(4 * 1024 * 1024);
+    let pm = PageMap::new();
+    let cpu = CpuCache::new();
+    cpu.set_active_cpus(1);
+    let transfer = TransferCache::new();
+    let central = CentralCache::new();
+    let sc = SizeClassId::new(3);
+    let core = CoreId::DEFAULT;
+    cpu.init_slot(core, sc, m, topo_core::size_class::batch(sc) as u32);
+
+    // Activate a span in central so a forced refill has somewhere to pull from.
+    let row = topo_core::size_class::row(sc);
+    let span = SpanDescriptor::new(
+        SpanId(1),
+        ArenaId::DEFAULT,
+        sc,
+        0x4000_0000,
+        row.slab_pages,
+        row.objects_per_slab,
+        0,
+        m,
+    )
+    .unwrap();
+    central.activate_span(&span, &pm, m).unwrap();
+
+    // Populate the transfer cache with dummy objects (the fast-path source).
+    transfer.try_push_batch(ArenaId::DEFAULT, sc, &[111, 222, 333], m);
+    let before = transfer.bin(sc).unwrap().len();
+    assert!(before > 0);
+
+    // Forced slow path: refill pulls from *central*, leaving the transfer cache
+    // untouched (the fast-path source is bypassed).
+    deterministic::set_force_slow_path(true);
+    let r = refill(
+        core,
+        NodeId::DEFAULT,
+        ArenaId::DEFAULT,
+        Label::PUBLIC,
+        sc,
+        &cpu,
+        &transfer,
+        &central,
+        &pm,
+        m,
+    );
+    assert!(r.filled > 0, "the forced refill pulled from central");
+    assert!(!r.need_span);
+    assert_eq!(
+        transfer.bin(sc).unwrap().len(),
+        before,
+        "force_slow_path leaves the transfer cache untouched (bypassed)"
+    );
+
+    deterministic::set_force_slow_path(false); // leave the global clean
+}
+
+#[test]
 fn force_purge_releases_freed_backing_eagerly() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     deterministic::set_force_purge(false); // clean baseline
@@ -178,6 +240,56 @@ fn force_purge_releases_freed_backing_eagerly() {
     assert!(mgr.check_invariants());
 
     deterministic::set_force_purge(false); // leave the global clean
+}
+
+#[test]
+fn trace_emission_is_reproducible_under_deterministic_ids() {
+    // §30.4 / §33.7 (W19-3): with the deterministic monotonic trace-id source, the
+    // trace grammar an operation sequence emits is byte-identical run-to-run — the
+    // reproducibility the differential runner (W21-2) rides on. (W19-3 supplies the
+    // id source + the emitters; wiring live per-op emission into the allocator is
+    // W21-2a's job, which now has everything it needs.)
+    use std::fmt::Write as _;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let emit_run = || -> String {
+        deterministic::reset_trace_ids();
+        let mut buf = String::new();
+        // A fixed op sequence, each line stamped with the next deterministic id.
+        for (size, align) in [(24usize, 16usize), (64, 16), (100_000, 16)] {
+            let id = deterministic::next_trace_id();
+            // A deterministic (id-derived) pointer stands in for the real address,
+            // which is not itself reproducible (ASLR) — the model replay compares
+            // abstract outcomes, and the *trace* is what must reproduce here.
+            topo_core::trace::emit_alloc(
+                &mut buf,
+                id,
+                size,
+                align,
+                0,
+                0,
+                0x1_0000 * id as usize,
+                size,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        buf
+    };
+
+    let first = emit_run();
+    assert_eq!(
+        first,
+        emit_run(),
+        "the §33.7 trace replays byte-identically"
+    );
+    // The ids are the reproducible 1, 2, 3 sequence (re-based by reset).
+    assert!(first.starts_with("ALLOC 1 24 16 "));
+    assert!(first.contains("\nALLOC 2 64 16 "));
+    assert!(first.contains("\nALLOC 3 100000 16 "));
+
+    deterministic::reset_trace_ids(); // leave the global clean
 }
 
 #[test]

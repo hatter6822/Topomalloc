@@ -165,4 +165,20 @@ mod tests {
     fn version_is_nonempty() {
         assert!(!super::VERSION.is_empty());
     }
+
+    #[test]
+    fn rseq_asm_is_disabled_under_sanitizers() {
+        // W19-2 (§30.3) regression: under AddressSanitizer/MemorySanitizer — which
+        // CI runs over this library — `topo-arch`'s `build.rs` sets
+        // `cfg(topo_sanitize_no_asm)`, so the hand-written RSEQ sequences disable
+        // themselves and the locked baseline runs (no asm false positives). This is
+        // vacuous in a normal build and load-bearing under a sanitizer build, so a
+        // regression that re-enabled the asm under a sanitizer would fail CI here.
+        if topo_arch::asm_disabled_for_sanitizer() {
+            assert!(
+                !topo_arch::rseq_available(),
+                "the RSEQ asm must be disabled under a sanitizer build"
+            );
+        }
+    }
 }

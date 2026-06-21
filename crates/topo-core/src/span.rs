@@ -1925,6 +1925,66 @@ mod tests {
     }
 
     #[test]
+    fn empty_detection_accounts_for_every_non_central_cache_term() {
+        // B.3 (W19-1c) "empty-span detection accounts for local, transfer, central,
+        // and quarantine states": a span with objects held in *any* cache term is
+        // not empty (returning it would recycle live memory), and the §16.4
+        // partition reconciles for each term independently and combined. This is
+        // the across-caches clause exercised with synthetic non-central terms (the
+        // live cache layer that supplies them lands at M2; the reasoning is proven
+        // here regardless).
+        let m = meta(64 * 1024);
+        let s = span(8, &m);
+        {
+            let g = s.lock();
+            for i in 0..5 {
+                assert!(g.central_insert(i)); // 5 central-free
+            }
+            g.set_live_count(0);
+        }
+        // 5 central-free + 3 held across the cache terms = the 8 objects.
+        let combos = [
+            NonCentralResidency {
+                local_cached: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                transfer_cached: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                quarantined: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                local_cached: 1,
+                transfer_cached: 1,
+                quarantined: 1,
+            },
+        ];
+        for nc in combos {
+            assert!(
+                !s.is_empty(nc),
+                "a span with cached objects ({nc:?}) is not empty"
+            );
+            assert!(
+                s.conservation_holds(nc),
+                "the §16.4 partition reconciles with the cache terms ({nc:?})"
+            );
+        }
+        // With *no* cached objects, the same span is empty only once every object
+        // is central-free (the central-only relaxation the M1 checker uses).
+        {
+            let g = s.lock();
+            for i in 5..8 {
+                assert!(g.central_insert(i));
+            }
+        }
+        assert!(s.is_empty(NonCentralResidency::NONE));
+        assert!(s.is_empty_central_only());
+    }
+
+    #[test]
     fn object0_base_is_base_for_page_aligned_span() {
         let m = meta(64 * 1024);
         let s = span(64, &m);

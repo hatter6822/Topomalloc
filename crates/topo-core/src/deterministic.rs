@@ -12,13 +12,20 @@
 //!   runs with the same seed make the same choices;
 //! * **use a deterministic cache refill order** — the front-end caches are already
 //!   strict LIFO (no hashing/address-order), reproducible by construction;
-//! * **use reproducible sampling** — the heap sampler's per-thread seed is derived
-//!   from [`domain_seed`] in deterministic mode;
-//! * **optionally force slow paths** — [`force_slow_path`] makes the central layer
-//!   bypass its empty-span cache reuse, exercising the backend/activation slow
-//!   path every time;
+//! * **use reproducible sampling** — the heap sampler's per-thread seed base is
+//!   derived from [`domain_seed`] in deterministic mode, so a **single-threaded**
+//!   run (the differential runner replays a captured trace single-threaded against
+//!   the model — DD-1) draws a reproducible sampling stream. Across *multiple*
+//!   concurrent threads the per-thread seeds still depend on thread-creation order,
+//!   which is inherently non-deterministic — that is the deliberate boundary, not a
+//!   gap: replay is single-threaded;
+//! * **optionally force slow paths** — [`force_slow_path`] makes the front-end
+//!   refill bypass the transfer cache *and* the central layer skip its empty-span
+//!   cache reuse, exercising the backend/activation slow path every time;
 //! * **optionally force frequent purging** — [`force_purge`] makes the extent
-//!   backend decommit (release) freed backing eagerly instead of retaining it;
+//!   backend decommit (release) freed backing eagerly instead of retaining it (the
+//!   per-free RSS decision; the host-driven W12 release controller takes its decay/
+//!   pressure inputs explicitly, preserving its purity, so it is not coupled here);
 //! * **expose trace ids for model replay** — [`next_trace_id`] is the canonical
 //!   monotonic request-id source for the §33.7 trace grammar; [`reset_trace_ids`]
 //!   re-bases it so a fresh run reproduces the same ids.

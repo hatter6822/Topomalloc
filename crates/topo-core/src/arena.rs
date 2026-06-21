@@ -2036,7 +2036,10 @@ mod tests {
         // arena back to generation 0 must fail the checker.
         let t = ArenaTable::new();
         let id = t.create(&ArenaPolicy::explicit().with_quota(1000)).unwrap();
-        assert!(t.check_invariants(), "a freshly-created registry is well-formed");
+        assert!(
+            t.check_invariants(),
+            "a freshly-created registry is well-formed"
+        );
         t.corrupt_generation_for_test(id, 0);
         assert!(
             !t.check_invariants(),

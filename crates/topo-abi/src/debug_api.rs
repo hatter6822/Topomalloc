@@ -47,14 +47,22 @@ mod tests {
         // The freshly-constructed (or in-use) global allocator is well-formed, so a
         // check returns OK. This also exercises the full B.1/B.3/B.4/B.5 walk over
         // the live engine through the C boundary.
-        assert_eq!(topomalloc_debug_check_now(), 1, "the live allocator must be well-formed");
+        assert_eq!(
+            topomalloc_debug_check_now(),
+            1,
+            "the live allocator must be well-formed"
+        );
         // Do some allocation traffic, then re-check: still well-formed.
         let p = crate::topomalloc_malloc(64);
         if !p.is_null() {
             // SAFETY: `p` came from `topomalloc_malloc(64)`; freeing it is valid.
             unsafe { crate::topomalloc_free(p) };
         }
-        assert_eq!(topomalloc_debug_check_now(), 1, "still well-formed after a malloc/free");
+        assert_eq!(
+            topomalloc_debug_check_now(),
+            1,
+            "still well-formed after a malloc/free"
+        );
     }
 
     #[test]
