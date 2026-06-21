@@ -95,6 +95,17 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > * **MTE / pointer authentication.** Hardware tagging (AArch64 MTE, PAC) is a platform *MAY*; the
 >   `protect`/canary/quarantine mechanisms are the portable baseline and the seam is ready for a tagging
 >   provider later.
+> * **Quarantine double-free detection is best-effort in the eviction window.** A double free of a *held*
+>   object is caught precisely (`AlreadyQuarantined`). One narrow concurrency-only gap remains: because the
+>   quarantine lock is the §27.2 leaf, an evicted object is physically freed by the caller *after* the lock
+>   is released, so in the brief [removed-from-ring, inserted-to-central] interval a concurrent double free
+>   of that same object (with the opt-in quarantine enabled — itself UB in the program) is missed by both the
+>   ring scan and `is_central_free`. Closing it fully needs an authoritative per-object `quarantined` bitmap
+>   state (the §16.4/§17.5 scaffolding), set under the span lock at hold time and transitioned atomically on
+>   drain — a span-metadata change deferred as disproportionate. A lock-free address-keyed "draining set" is
+>   **not** a sound fix (it races address reuse, falsely rejecting a re-vended object's valid free — strictly
+>   worse), and was rejected after evaluation. Documented on `harden::Quarantine`; consistent with §29.4's
+>   best-effort framing (a correct program is never affected).
 
 ---
 

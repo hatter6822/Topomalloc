@@ -441,6 +441,28 @@ struct QRing {
 /// mis-classify its still-live objects). They remain defined and tested for that
 /// distinct use; the two are complementary, not redundant.
 ///
+/// ## Double-free detection is best-effort in the eviction window (§29.4)
+///
+/// Double-free detection of a *held* object is **best-effort**, exactly as the §29.4
+/// hardening framing intends. The common case is caught precisely: re-freeing an
+/// object still in the ring resolves to [`AlreadyQuarantined`](Offer::AlreadyQuarantined).
+/// There is one narrow, concurrency-only gap: because the quarantine lock is the §27.2
+/// **leaf** (rank [`LockRank::QUARANTINE`]), an evicted object is removed from the ring
+/// here and only *then* physically freed by the caller **after the lock is released**
+/// (the drain cannot run under this lock — it needs the lower-ranked span/backend lock).
+/// In the brief interval between "removed from the ring" and "inserted into the central
+/// free list", a concurrent double free of *that same object* is missed by both the
+/// ring scan (already evicted) and the engine's `is_central_free` check (not yet
+/// central). This requires the opt-in quarantine to be enabled **and** a genuine
+/// concurrent double free (itself UB) racing the eviction — it never affects a correct
+/// program. Closing it completely needs an **authoritative per-object `quarantined`
+/// bitmap state** (the §16.4/§17.5 scaffolding above), set under the span lock at hold
+/// time and transitioned to central-free atomically on drain — a span-metadata change
+/// deferred as disproportionate to this narrow window. A purely lock-free "draining
+/// set" cannot close it soundly: keyed on address, it races address **reuse** (a
+/// re-vended object would be falsely rejected), trading a missed double free for a
+/// rejected *valid* free — strictly worse.
+///
 /// ## Sampling independence
 ///
 /// `sample_shift` (a fraction of frees are held, to cap quarantine RSS/latency) is an
