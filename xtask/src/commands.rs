@@ -132,7 +132,7 @@ pub fn gen(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `test [--kind unit|prop|diff|fuzz|loom|tsan|rseq] [--target T]` — run the test suites.
+/// `test [--kind unit|prop|diff|fuzz|loom|tsan|asan|msan|rseq] [--target T]` — run the test suites.
 ///
 /// With `--target` (used by the AArch64 CI job), tests are built for that target
 /// and run via the `.cargo/config.toml` runner (`qemu-aarch64`). Without it, the
@@ -214,6 +214,12 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("tsan") => {
             tsan_steps(&mut r);
         }
+        Some("asan") => {
+            asan_steps(&mut r);
+        }
+        Some("msan") => {
+            msan_steps(&mut r);
+        }
         Some("rseq") => {
             // The W7 RSEQ / pinned-core battery (also part of the default
             // `--workspace` run; this is the focused subset, G-fast).
@@ -245,7 +251,10 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
             );
         }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|tsan|rseq)");
+            eprintln!(
+                "xtask: unknown --kind '{other}' \
+                 (use unit|prop|diff|fuzz|loom|tsan|asan|msan|rseq)"
+            );
             r.record("unknown test kind", false);
         }
         None => {
@@ -762,6 +771,97 @@ fn tsan_steps(r: &mut Runner<'_>) {
             "--features",
             "hardened",
             "--lib",
+        ],
+    );
+    std::env::remove_var("RUSTFLAGS");
+}
+
+/// AddressSanitizer over the `topo-core` library (W19-2, §30.3). ASan catches
+/// out-of-bounds, use-after-free, and other spatial/temporal memory errors in the
+/// crate's intricate `unsafe` metadata/descriptor/bitmap code. Needs the nightly
+/// toolchain (`-Zsanitizer=address` + `-Zbuild-std`, both nightly-only); a missing
+/// nightly is noted and skipped, not a failure.
+///
+/// **RSEQ asm:** the hand-written restartable sequences disable themselves under
+/// ASan (`build.rs` → `cfg(topo_sanitize_no_asm)` → [`topo_arch::rseq::enable`]
+/// returns `false`), so the locked baseline runs and there are no asm false
+/// positives. **Leaks:** the lib tests intentionally leak their metadata arenas
+/// (`Box::into_raw`, the `MetadataAlloc` monotonic-metadata model), so the
+/// integrated LeakSanitizer is disabled (`ASAN_OPTIONS=detect_leaks=0`) — ASan
+/// here vets spatial/temporal safety, not leaks. The C/global-allocator paths are
+/// **not** run under ASan: ASan provides its own allocator and would conflict with
+/// the `#[global_allocator]` interposition.
+fn asan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping ASan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    std::env::set_var("RUSTFLAGS", "-Zsanitizer=address");
+    // The metadata arenas are deliberately leaked (monotonic metadata); LSan would
+    // otherwise report them. ASan still checks every spatial/temporal access.
+    std::env::set_var("ASAN_OPTIONS", "detect_leaks=0");
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "asan: core memory safety (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly", "test", "-Zbuild-std", "--target", T, "-p", "topo-core", "--lib",
+        ],
+    );
+    // The hardening code (junk fill, quarantine, guard pages, scrub) carries the
+    // densest `unsafe`; vet it under ASan with the composed profile on.
+    r.run(
+        "asan: hardening memory safety (topo-core lib, hardened)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--features",
+            "hardened",
+            "--lib",
+        ],
+    );
+    std::env::remove_var("ASAN_OPTIONS");
+    std::env::remove_var("RUSTFLAGS");
+}
+
+/// MemorySanitizer over the `topo-core` library (W19-2, §30.3). MSan catches reads
+/// of uninitialized memory — the strictest sanitizer. It is scoped to the
+/// `no_std`-capable core, whose hot paths take **no** libc calls (all OS access is
+/// behind the [`TopoBackingProvider`](topo_core::TopoBackingProvider) seam, mocked
+/// with in-process metadata in the lib tests); running MSan over code that calls an
+/// **uninstrumented** libc (the POSIX backend's `mmap`/`madvise`) would false-
+/// positive, so those crates are intentionally excluded (§30.3 "where practical").
+/// `-Zbuild-std` instruments `std`; the RSEQ asm disables itself under MSan exactly
+/// as under ASan. Needs nightly; a missing nightly is noted and skipped.
+fn msan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping MSan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    // `-Zsanitizer-memory-track-origins` makes a report name the allocation an
+    // uninitialized value originated from (worth the extra cost in CI triage).
+    std::env::set_var(
+        "RUSTFLAGS",
+        "-Zsanitizer=memory -Zsanitizer-memory-track-origins",
+    );
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "msan: core uninitialized-read safety (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly", "test", "-Zbuild-std", "--target", T, "-p", "topo-core", "--lib",
         ],
     );
     std::env::remove_var("RUSTFLAGS");

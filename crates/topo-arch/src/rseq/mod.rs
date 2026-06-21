@@ -88,38 +88,62 @@ pub enum Mode {
 /// Enable RSEQ mode for the process (idempotent, W7-1). Detects the registration
 /// model and the non-owner fence (W7-4). Returns whether the fast path is usable;
 /// when `false`, the caller stays on the locked baseline (P-003).
+///
+/// **Sanitizers (W19-2, §30.3):** under Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`,
+/// set by `build.rs`) this returns `false` unconditionally, so the hand-written
+/// restartable sequences — which those sanitizers cannot instrument — are never
+/// executed and the always-correct locked baseline is used instead. TSan is
+/// excluded (it ignores asm and the equivalence battery runs under it on purpose).
 #[inline]
 pub fn enable() -> bool {
+    #[cfg(topo_sanitize_no_asm)]
+    {
+        false
+    }
     #[cfg(all(
+        not(topo_sanitize_no_asm),
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
         imp_linux::enable()
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
+    #[cfg(all(
+        not(topo_sanitize_no_asm),
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    ))]
     {
         false
     }
 }
 
-/// Whether the RSEQ fast path is usable (after [`enable`]).
+/// Whether the RSEQ fast path is usable (after [`enable`]). Always `false` under
+/// Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`, W19-2/§30.3), matching
+/// [`enable`].
 #[inline]
 pub fn available() -> bool {
+    #[cfg(topo_sanitize_no_asm)]
+    {
+        false
+    }
     #[cfg(all(
+        not(topo_sanitize_no_asm),
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
         imp_linux::available()
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
+    #[cfg(all(
+        not(topo_sanitize_no_asm),
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    ))]
     {
         false
     }
