@@ -643,6 +643,16 @@ impl Quarantine {
         }
     }
 
+    /// Reseed the sampling / random-eviction RNG (§30.4, W19-3): deterministic
+    /// mode seeds this from [`deterministic::domain_seed`](crate::deterministic::domain_seed)
+    /// so sampled holds and random evictions are *reproducible* run-to-run. A `0`
+    /// seed is coerced to a non-zero state (xorshift64 requires a non-zero orbit).
+    #[inline]
+    pub fn set_seed(&self, seed: u64) {
+        self.rng
+            .store(if seed == 0 { 0x1 } else { seed }, Ordering::Relaxed);
+    }
+
     /// Next xorshift value (for sampling / random eviction).
     #[inline]
     fn next_rng(&self) -> u64 {
@@ -919,6 +929,16 @@ impl GuardSampler {
     #[must_use]
     pub fn rate(&self) -> u64 {
         self.rate.load(Ordering::Relaxed)
+    }
+
+    /// Reseed the per-allocation coin's RNG (§30.4, W19-3): deterministic mode
+    /// seeds this from [`deterministic::domain_seed`](crate::deterministic::domain_seed)
+    /// so the guarded slots are *reproducible* run-to-run. A `0` seed is coerced
+    /// to a non-zero state (xorshift64 never leaves the non-zero orbit).
+    #[inline]
+    pub fn set_seed(&self, seed: u64) {
+        self.rng
+            .store(if seed == 0 { 0x1 } else { seed }, Ordering::Relaxed);
     }
 
     /// Next xorshift value — a relaxed read-modify-write (a fast, decorrelated
@@ -1458,6 +1478,77 @@ mod tests {
         assert!(
             gaps.iter().any(|&g| g != first),
             "randomized sampling must produce varying gaps, not a constant stride"
+        );
+    }
+
+    #[test]
+    fn guard_sampler_is_reproducible_given_a_seed() {
+        // §30.4 (W19-3): "disable randomization unless seeded" — two samplers
+        // reseeded to the same value produce *identical* guard decisions, and a
+        // different seed diverges. This is the determinism the differential runner
+        // relies on (W21-2). A pure test — no global state.
+        let decisions = |seed: u64| -> Vec<bool> {
+            let s = GuardSampler::new();
+            s.set_rate(8);
+            s.set_seed(seed);
+            (0..2000).map(|_| s.sampled()).collect()
+        };
+        let a = decisions(0xDEAD_BEEF_0000_0001);
+        let b = decisions(0xDEAD_BEEF_0000_0001);
+        assert_eq!(a, b, "same seed ⇒ identical guard decisions (reproducible)");
+        let c = decisions(0x1234_5678_9ABC_DEF0);
+        assert_ne!(a, c, "a different seed ⇒ a different decision stream");
+        // The reproducible stream is still a real ~1/8 sample (not all-off/all-on).
+        let hits = a.iter().filter(|&&h| h).count();
+        assert!(
+            hits > 0 && hits < a.len(),
+            "seeded stream still samples ~1/rate"
+        );
+    }
+
+    #[test]
+    fn quarantine_random_evict_is_reproducible_given_a_seed() {
+        // §30.4 (W19-3): the quarantine's random-eviction RNG is likewise seedable,
+        // so a hardened deterministic run evicts the same victims each time. Two
+        // quarantines seeded alike, driven by the same offers, evict the same
+        // objects in the same order; a different seed diverges. Pure — no globals.
+        let run = |seed: u64| -> u64 {
+            let q = Quarantine::new();
+            q.set_policy(QuarantinePolicy {
+                max_objects: 4,
+                random_evict: true,
+                ..QuarantinePolicy::DEFAULT
+            });
+            q.set_seed(seed);
+            let mut fingerprint = 0u64;
+            let mut step = 0u64;
+            // Offer more than the object budget so random eviction fires repeatedly.
+            for i in 1..=32u64 {
+                let entry = QuarantineEntry {
+                    user_ptr: ((i as usize) * 64) as *mut u8,
+                    span: core::ptr::null(),
+                    index: 0,
+                    arena: crate::ids::ArenaId::DEFAULT,
+                    bytes: 64,
+                };
+                let mut batch = EvictBatch::new();
+                let _ = q.offer(entry, &mut batch);
+                for e in batch.as_slice() {
+                    step += 1;
+                    fingerprint = fingerprint.wrapping_add((e.user_ptr as u64).wrapping_mul(step));
+                }
+            }
+            fingerprint
+        };
+        assert_eq!(
+            run(0xABCD_0001),
+            run(0xABCD_0001),
+            "same seed ⇒ same evictions"
+        );
+        assert_ne!(
+            run(0xABCD_0001),
+            run(0x1357_9BDF),
+            "a different seed ⇒ a different eviction order"
         );
     }
 }

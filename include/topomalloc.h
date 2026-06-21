@@ -404,6 +404,31 @@ void topomalloc_guard_set_sample_rate(uint64_t rate);
 uint64_t topomalloc_guard_sample_rate(void);
 
 /* ------------------------------------------------------------------------
+ * Deterministic test mode (Section 30.4, plan 08 W19-3)
+ *
+ * Make a run reproducible so a captured Section 33.7 trace replays identically
+ * (the differential runner's prerequisite). Off by default; the flags are read
+ * on cold/slow paths, so the performance build pays nothing. Setting the seed or
+ * enabling reseeds the live randomized samplers (guard pages, quarantine, heap
+ * sampler) so the new seed takes effect immediately. Also honoured at startup
+ * via $TOPOMALLOC_DETERMINISTIC_SEED.
+ * --------------------------------------------------------------------- */
+
+/* Turn deterministic mode on/off (reseeds the live samplers). */
+void topomalloc_deterministic_set_enabled(int on);
+/* 1 if deterministic mode is active, else 0. */
+int topomalloc_deterministic_enabled(void);
+/* Set / read the global seed every randomized decision derives from. */
+void topomalloc_deterministic_set_seed(uint64_t seed);
+uint64_t topomalloc_deterministic_seed(void);
+/* Force the front-end/central layer to bypass its fast-path cache reuse. */
+void topomalloc_deterministic_set_force_slow_path(int on);
+/* Force the extent backend to release freed backing to the OS eagerly. */
+void topomalloc_deterministic_set_force_purge(int on);
+/* The next Section 33.7 trace/request id (a monotonic counter). */
+uint64_t topomalloc_deterministic_next_trace_id(void);
+
+/* ------------------------------------------------------------------------
  * Statistics & observability (Section 31, plan 07 W17)
  *
  * "Where is the memory?" in machine-readable, epoch-consistent form (Section

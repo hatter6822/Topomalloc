@@ -1724,6 +1724,26 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
+    /// §30.4 (W19-3): if deterministic mode is active, reseed the randomized
+    /// security samplers — the guard-page sampler and the quarantine evictor —
+    /// from the global deterministic seed (via distinct
+    /// [`domain_seed`](crate::deterministic::domain_seed) salts), so their choices
+    /// are reproducible run-to-run ("disable randomization unless seeded"). A no-op
+    /// when deterministic mode is off or the relevant hardening feature is not
+    /// compiled in. Idempotent — called at startup and whenever the seed changes.
+    pub fn apply_deterministic_seed(&self) {
+        if crate::deterministic::is_deterministic() {
+            #[cfg(feature = "guard-pages")]
+            self.guard.set_seed(crate::deterministic::domain_seed(
+                crate::deterministic::salt::GUARD,
+            ));
+            #[cfg(feature = "quarantine")]
+            self.quarantine.set_seed(crate::deterministic::domain_seed(
+                crate::deterministic::salt::QUARANTINE,
+            ));
+        }
+    }
+
     /// The current guarded-allocation sampling rate (`0` = off). `0` without the
     /// `guard-pages` feature.
     #[inline]

@@ -808,7 +808,14 @@ fn asan_steps(r: &mut Runner<'_>) {
         "asan: core memory safety (topo-core lib)",
         "cargo",
         &[
-            "+nightly", "test", "-Zbuild-std", "--target", T, "-p", "topo-core", "--lib",
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--lib",
         ],
     );
     // The hardening code (junk fill, quarantine, guard pages, scrub) carries the
@@ -861,7 +868,14 @@ fn msan_steps(r: &mut Runner<'_>) {
         "msan: core uninitialized-read safety (topo-core lib)",
         "cargo",
         &[
-            "+nightly", "test", "-Zbuild-std", "--target", T, "-p", "topo-core", "--lib",
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--lib",
         ],
     );
     std::env::remove_var("RUSTFLAGS");

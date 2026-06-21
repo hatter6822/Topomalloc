@@ -15,6 +15,16 @@ use alloc::string::{String, ToString};
 use topo_core::VERSION;
 use topo_stats::{Profile, Stats};
 
+/// Render a boolean control value as the stable `"true"`/`"false"` strings.
+#[inline]
+const fn bool_str(b: bool) -> &'static str {
+    if b {
+        "true"
+    } else {
+        "false"
+    }
+}
+
 /// The control plane (§32). Holds the active profile and the latest stats
 /// snapshot, and answers reads against the Appendix-E namespace.
 pub struct Control {
@@ -77,6 +87,22 @@ impl Control {
             // allocation entry points actually do. Writable via the mutating
             // control surface when plan 07 W20 lands it.
             "topo.compat.zero_size" => Some(topo_core::zero_size_policy().as_str().to_string()),
+            // Deterministic test mode (§30.4, plan 08 W19-3, Appendix E
+            // `deterministic.*`): read from the core's process-wide control block,
+            // so this agrees with what the allocator actually does. Writable via the
+            // `topomalloc_deterministic_*` C control surface (§10.5).
+            "topo.deterministic.enabled" => {
+                Some(bool_str(topo_core::is_deterministic()).to_string())
+            }
+            "topo.deterministic.seed" => {
+                Some(topo_core::deterministic::seed().to_string())
+            }
+            "topo.deterministic.force_slow_path" => {
+                Some(bool_str(topo_core::force_slow_path()).to_string())
+            }
+            "topo.deterministic.force_purge" => {
+                Some(bool_str(topo_core::force_purge()).to_string())
+            }
             // Arena summary (§22/§36.4, plan 06 W9): the number of registered
             // arenas and the cumulative NUMA binding-failure count (§15.5), read
             // from the latest stats snapshot. Per-arena introspection and the
@@ -314,6 +340,42 @@ mod tests {
         // No profiling enabled ⇒ "0".
         let d = Control::new(Profile::Performance);
         assert_eq!(d.get("topo.placement.sites_tracked").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn reads_the_deterministic_mode_keys() {
+        // Plan 08 W19-3: the §30.4 deterministic-mode state surfaces in the control
+        // namespace, sourced from the core's process-wide control block. The seed
+        // and force flags follow runtime changes (restored afterwards: process-global).
+        let c = Control::new(Profile::Performance);
+        // Seed reads back what the core surface set.
+        topo_core::set_deterministic_seed(0x1234_5678);
+        assert_eq!(
+            c.get("topo.deterministic.seed").as_deref(),
+            Some("305419896") // 0x1234_5678
+        );
+        // The force flags default false and reflect runtime toggles.
+        assert_eq!(
+            c.get("topo.deterministic.force_slow_path").as_deref(),
+            Some("false")
+        );
+        topo_core::deterministic::set_force_slow_path(true);
+        assert_eq!(
+            c.get("topo.deterministic.force_slow_path").as_deref(),
+            Some("true")
+        );
+        topo_core::deterministic::set_force_slow_path(false);
+        // `enabled` is a real read that never panics and matches the module.
+        assert_eq!(
+            c.get("topo.deterministic.enabled").as_deref(),
+            Some(if topo_core::is_deterministic() {
+                "true"
+            } else {
+                "false"
+            })
+        );
+        // Restore the default seed so the process-global state does not leak.
+        topo_core::set_deterministic_seed(topo_core::deterministic::DEFAULT_SEED);
     }
 
     #[test]

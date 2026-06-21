@@ -264,8 +264,17 @@ mod tests {
 
     fn fresh_span(object_count: u32, m: &BumpArena) -> SpanDescriptor {
         // A page-aligned base inside a plausible address window.
-        SpanDescriptor::new(SpanId(1), A, SizeClassId::new(0), 0x4000_0000, 1, object_count, 0, m)
-            .expect("bitmap")
+        SpanDescriptor::new(
+            SpanId(1),
+            A,
+            SizeClassId::new(0),
+            0x4000_0000,
+            1,
+            object_count,
+            0,
+            m,
+        )
+        .expect("bitmap")
     }
 
     #[test]

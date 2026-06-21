@@ -622,6 +622,14 @@ impl CentralCache {
 
         // --- step 2: if no partial match, try the empty cache ----------------
         let span_ptr = if span_ptr.is_null() {
+            // §30.4 (W19-3): deterministic mode can force the slow path — decline
+            // the empty-span cache reuse so the allocation takes the full
+            // backend/activation round-trip (a `NeedSpan` to the caller). The
+            // empty span stays cached and correctly accounted; only *this*
+            // request skips the fast reuse. Off by default (one relaxed load).
+            if crate::deterministic::force_slow_path() {
+                return RemoveResult::NeedSpan;
+            }
             let empty = bin.pop_empty();
             if empty.is_null() {
                 return RemoveResult::NeedSpan;
