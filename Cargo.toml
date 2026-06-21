@@ -116,7 +116,9 @@ exclude = ["fuzz", "vendor/sele4n"]
 # large use-after-free SIGABRT death test (verify-on-reuse over a per-extent canary provenance),
 # and a POSIX/Sim scrub-before-downgrade co-equality test (G-sim). 0.1.25 — W18 optimal-completion:
 # large verify-on-reuse, randomized/tight guards, quarantine invariant-checker + fuzz + convergence.
-version = "0.1.25"
+# 0.1.26 — W19 debug/sanitization: Appendix-B checkers as runtime code (crate::debug, B.1–B.5),
+# ASan/MSan integration + RSEQ-asm self-disable under sanitizers, deterministic test mode.
+version = "0.1.26"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
