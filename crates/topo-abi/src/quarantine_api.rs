@@ -64,6 +64,45 @@ pub extern "C" fn topomalloc_quarantine_set_limits(max_bytes: u64, max_objects: 
     }
 }
 
+/// `uint64_t topomalloc_quarantine_max_bytes(void)` — the current byte budget
+/// (§10.5 `topo.quarantine.max_bytes`). `0` without the feature.
+#[no_mangle]
+pub extern "C" fn topomalloc_quarantine_max_bytes() -> u64 {
+    #[cfg(feature = "quarantine")]
+    {
+        global().map_or(0, |a| a.quarantine_policy().max_bytes)
+    }
+    #[cfg(not(feature = "quarantine"))]
+    {
+        0
+    }
+}
+
+/// `uint64_t topomalloc_quarantine_max_objects(void)` — the current object budget
+/// (§10.5 `topo.quarantine.max_objects`). `0` without the feature.
+#[no_mangle]
+pub extern "C" fn topomalloc_quarantine_max_objects() -> u64 {
+    #[cfg(feature = "quarantine")]
+    {
+        global().map_or(0, |a| u64::from(a.quarantine_policy().max_objects))
+    }
+    #[cfg(not(feature = "quarantine"))]
+    {
+        0
+    }
+}
+
+/// `void topomalloc_quarantine_converge(void)` (§10.5 W18-3 background convergence):
+/// really free any held objects beyond the current budget — used after lowering the
+/// budget on a quiescent heap (no allocation traffic to converge it incrementally).
+/// Idempotent; a no-op when already within budget or without the `quarantine` feature.
+#[no_mangle]
+pub extern "C" fn topomalloc_quarantine_converge() {
+    if let Some(a) = global() {
+        a.converge_quarantine();
+    }
+}
+
 /// `void topomalloc_guard_set_sample_rate(uint64_t rate)` (§10.5 W18-4, §29.5):
 /// guard ~1 in `rate` ordinary allocations with inaccessible pages (`0` = explicit
 /// `TOPO_GUARDED` only). A no-op without the `guard-pages` feature.
@@ -135,5 +174,19 @@ mod tests {
         assert!(topomalloc_quarantine_bytes() < u64::MAX); // a real read, never panics
         topomalloc_quarantine_set_enabled(0);
         assert_eq!(topomalloc_quarantine_enabled(), 0);
+    }
+
+    #[test]
+    fn limits_and_converge_are_safe_from_c() {
+        // The limit readers and the convergence trigger are safe no-ops without the
+        // feature, and consistent with `set_limits` when compiled in. `converge`
+        // never panics and leaves held bytes within the budget.
+        topomalloc_quarantine_set_limits(4096, 16);
+        if cfg!(feature = "quarantine") {
+            assert_eq!(topomalloc_quarantine_max_bytes(), 4096);
+            assert_eq!(topomalloc_quarantine_max_objects(), 16);
+        }
+        topomalloc_quarantine_converge(); // never panics; idempotent
+        assert!(topomalloc_quarantine_bytes() <= topomalloc_quarantine_max_bytes().max(1));
     }
 }

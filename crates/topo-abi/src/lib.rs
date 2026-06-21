@@ -81,7 +81,8 @@ pub use profile_api::{
 };
 pub use quarantine_api::{
     topomalloc_guard_sample_rate, topomalloc_guard_set_sample_rate, topomalloc_quarantine_bytes,
-    topomalloc_quarantine_enabled, topomalloc_quarantine_objects,
+    topomalloc_quarantine_converge, topomalloc_quarantine_enabled, topomalloc_quarantine_max_bytes,
+    topomalloc_quarantine_max_objects, topomalloc_quarantine_objects,
     topomalloc_quarantine_set_enabled, topomalloc_quarantine_set_limits,
 };
 pub use stats_api::{
@@ -298,6 +299,13 @@ impl AnyAllocator {
     #[cfg(feature = "quarantine")]
     pub fn quarantine_policy(&self) -> topo_core::QuarantinePolicy {
         dispatch!(self, a => a.quarantine_policy())
+    }
+
+    /// Background convergence (§29.4, W18-3): really free any held objects beyond the
+    /// current budget. Idempotent; a no-op without the `quarantine` feature.
+    pub fn converge_quarantine(&self) {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.converge_quarantine())
     }
 
     /// Set the W18-4 guarded-allocation sampling rate (§29.5): ~1 in `rate`

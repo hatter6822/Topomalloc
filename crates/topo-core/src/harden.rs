@@ -779,6 +779,42 @@ impl Quarantine {
         }
         r.inserts_since_rebuild = 0;
     }
+
+    /// **Background convergence** (§29.4, W18-3): pop the oldest held entries (a
+    /// bounded batch) until the held set is within the *current* budget, returning
+    /// them for the caller to really free (the drain protocol). The [`offer`](Self::offer)
+    /// path converges incrementally as new frees arrive, but after a runtime budget
+    /// reduction ([`set_policy`](Self::set_policy) with a smaller `max_bytes`/
+    /// `max_objects`) a quiescent heap (no allocation traffic) would otherwise hold
+    /// the now-excess bytes indefinitely; a host calls this to bring the quarantine
+    /// down to budget promptly. Returns an empty batch when already within budget;
+    /// loop until empty (each batch freed outside the lock). FIFO (oldest-first), so
+    /// convergence is deterministic regardless of the eviction policy.
+    pub fn drain_excess(&self) -> EvictBatch {
+        let mut out = EvictBatch::new();
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        let max_objects = self.max_objects.load(Ordering::Relaxed) as usize;
+        self.lock.acquire();
+        // SAFETY: the lock is held ⇒ exclusive ring access.
+        let r = unsafe { &mut *self.ring.get() };
+        while (self.bytes.load(Ordering::Relaxed) > max_bytes || r.len > max_objects)
+            && r.len > 0
+            && !out.is_full()
+        {
+            let e = r.slots[r.head];
+            r.head = (r.head + 1) % QUARANTINE_CAP;
+            r.len -= 1;
+            self.release_accounting(&e);
+            out.push(e);
+        }
+        if r.len == 0 {
+            self.bloom.reset();
+            r.inserts_since_rebuild = 0;
+        }
+        debug_assert!(self.check_invariants_locked(r));
+        self.lock.release();
+        out
+    }
 }
 
 impl Default for Quarantine {
@@ -1162,6 +1198,45 @@ mod tests {
             offered_bytes, freed_bytes,
             "byte conservation: every offered entry is freed exactly once"
         );
+    }
+
+    #[test]
+    fn quarantine_drain_excess_converges_to_a_lowered_budget() {
+        // Hold a full quarantine, then lower the budget at runtime: `drain_excess`
+        // brings the held set down to the new budget (oldest-first), and never below.
+        let q = Quarantine::new();
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 64 * 20,
+            max_objects: 20,
+            ..QuarantinePolicy::DEFAULT
+        });
+        for k in 0..20 {
+            assert!(matches!(
+                offer(&q, small_entry(0x1000 + k * 0x40, 64)).0,
+                Offer::Held
+            ));
+        }
+        assert_eq!(q.held_objects(), 20);
+        // Lower the object budget to 5; nothing drains until we converge.
+        q.set_policy(QuarantinePolicy {
+            max_bytes: 64 * 20,
+            max_objects: 5,
+            ..QuarantinePolicy::DEFAULT
+        });
+        assert_eq!(q.held_objects(), 20, "set_policy alone does not drain");
+        let mut freed = 0;
+        loop {
+            let b = q.drain_excess();
+            if b.as_slice().is_empty() {
+                break;
+            }
+            freed += b.as_slice().len();
+            assert!(q.check_invariants());
+        }
+        assert_eq!(q.held_objects(), 5, "converged exactly to the new budget");
+        assert_eq!(freed, 15, "freed exactly the excess");
+        // Already within budget ⇒ a further converge is a no-op.
+        assert!(q.drain_excess().as_slice().is_empty());
     }
 
     #[test]

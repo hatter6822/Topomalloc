@@ -1653,11 +1653,39 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
-    /// Install a new quarantine policy (§29.4 knobs). A no-op without the feature.
+    /// Install a new quarantine policy (§29.4 knobs), then **converge** to it: if the
+    /// new budget is smaller than the held set, the now-excess oldest objects are
+    /// really freed at once (rather than waiting for incremental eviction on the next
+    /// frees). A no-op without the feature.
     #[cfg(feature = "quarantine")]
     pub fn set_quarantine_policy(&self, policy: crate::harden::QuarantinePolicy) {
         self.quarantine.set_policy(policy);
+        self.converge_quarantine();
     }
+
+    /// **Background convergence** (§29.4, W18-3): really free any held objects beyond
+    /// the current quarantine budget (after a runtime budget reduction), bringing
+    /// `quarantine.bytes`/objects down to budget. Host-driven (the allocator spawns
+    /// no threads); idempotent — a no-op when already within budget or without the
+    /// `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    pub fn converge_quarantine(&self) {
+        loop {
+            let batch = self.quarantine.drain_excess();
+            let entries = batch.as_slice();
+            if entries.is_empty() {
+                break;
+            }
+            for e in entries {
+                self.drain_one(e);
+            }
+        }
+    }
+
+    /// Without the `quarantine` feature, convergence is a no-op.
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    pub fn converge_quarantine(&self) {}
 
     /// The current quarantine policy (§29.4).
     #[cfg(feature = "quarantine")]

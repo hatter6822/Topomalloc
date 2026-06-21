@@ -391,6 +391,11 @@ int topomalloc_quarantine_enabled(void);
 uint64_t topomalloc_quarantine_bytes(void);
 uint64_t topomalloc_quarantine_objects(void);
 void topomalloc_quarantine_set_limits(uint64_t max_bytes, uint64_t max_objects);
+uint64_t topomalloc_quarantine_max_bytes(void);
+uint64_t topomalloc_quarantine_max_objects(void);
+/* Background convergence: after lowering the budget on a quiescent heap, really
+ * free any held objects beyond the new budget (idempotent; no-op within budget). */
+void topomalloc_quarantine_converge(void);
 
 /* W18-4 guarded allocations (Section 29.5): bracket a sampled object with
  * inaccessible guard pages so an overrun/underrun faults. Guard ~1 in `rate`
