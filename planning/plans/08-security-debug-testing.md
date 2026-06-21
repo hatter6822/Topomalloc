@@ -28,11 +28,32 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > quarantine (`quarantine` feature; accounted as `quarantine.bytes`, budgets + random-
 > evict + sampling + drain, `topomalloc_quarantine_*` control, off by default).
 > **W18-4** guarded allocations (`guard-pages` feature; the new `TopoBackingProvider::protect`
-> seam + `LargeAllocator::allocate_guarded` + `GuardSampler`; a real `mprotect` SIGSEGV
-> trap, proven by a POSIX death test). **W18-5** junk filling (`junk-fill` feature).
+> seam + `LargeAllocator::allocate_guarded` + `GuardSampler`; **tight right-aligned** guards
+> so a one-past-`usable` overrun faults, **randomized** GWP-ASan-style sampling, a real
+> `mprotect` SIGSEGV trap, proven by a POSIX death test). **W18-5** junk filling (`junk-fill`
+> feature; fill-on-alloc/free + verify-on-reuse for **small *and* large** objects — the large
+> path carries a sound per-extent canary provenance, proven by a forked UAF death test).
 > **W18-6** scrub-before-downgrade (`secure-scrub` feature; the non-PUBLIC scrub is
 > unconditional, the runtime image of the Lean `scrub_before_downgrade` theorem; a
 > POSIX/Sim co-equality test is the §36.16 label test).
+>
+> **Optimal-completion pass.** A self-audit hardened every "present-but-inert" piece:
+> **W18-5** verify-on-reuse now covers large allocations soundly — a per-`Slot` `canary`
+> provenance bit (set only on a canary-filled free-to-`Dirty`, cleared on every commit/
+> decommit/muzzy/grow transition, split-inherited, merge-AND-joined) means a stale bit on a
+> decommitted extent can never arise, so a correct program is never false-aborted
+> (`extent::tests::{retained_canary,…}` + the `large_use_after_free_aborts_on_reuse` death
+> test). **W18-3** the quarantine gained an Appendix-B invariant checker (asserted on the
+> offer/drain hot paths), a randomized property test + a `quarantine` fuzz target (invariant
+> + budgets + exact byte conservation), background convergence (`drain_excess` /
+> `topomalloc_quarantine_converge`, so lowering the budget on a quiescent heap converges
+> promptly), the §8.6 reconciliation proven under concurrent load with the quarantine on, and
+> budget readers (`topomalloc_quarantine_max_bytes`/`_max_objects`). **W18** `corruption_abort`
+> is the single allocation-free abort path (Appendix F). A latent bug was fixed: `topo-abi`'s
+> `hardened`/`debug` composed only `topo-core/hardened`, leaving topo-abi's own feature gates
+> off — so `topomalloc_quarantine_set_limits` silently compiled to a no-op in the hardened
+> artifact; the profiles now compose the granular units. CI tests each hardening feature
+> **alone**, not only the composed profile (principle 8).
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|
@@ -50,6 +71,30 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > pointer classifier in plan 03 W3-4b both call) and W18-6 (scrub-before-downgrade, which plan 06's revocation
 > W9-6c invokes and plan 02's `scrub_before_downgrade` theorem certifies). Encoded freelist pointers (W18-1b)
 > matter because the SPEC forbids storing critical metadata only in user-writable memory (Appendix F).
+
+> **▸ Scoped deferrals (with rationale).** A few refinements are deliberately deferred; each is a
+> *narrowing*, not a safety gap (§2.4 holds throughout), and is recorded here so the scope is explicit:
+>
+> * **Slab red-zones (per-small-object guard bytes).** The generated size-class table fixes each class's
+>   geometry (DD-1, never hand-edited); inserting inter-object red-zone bytes would change that geometry and
+>   the proven §9.4/§9.5 packing. Small-object overrun detection is instead served by the **verify-on-reuse
+>   canary** (a write-after-free into a free object is caught at reuse) and, for objects that need true
+>   bracketing, the **sampled guard-page path** (`TOPO_GUARDED` promotes any size to a guarded large).
+> * **Metadata guard pages (W18-1b "optional").** Metadata lives in a densely bump-packed `MetaArena` accessed
+>   on every hot-path op; bracketing individual pools/pagemap nodes with `PROT_NONE` pages would fragment that
+>   arena and add a syscall per structure, while metadata integrity is *already* covered structurally
+>   (out-of-line storage — no critical metadata in user-writable memory) plus generation/integrity tags
+>   (W18-1a). Deferred as a low-value/high-cost refinement, not a correctness gap.
+> * **Over-scrub conservatism.** `secure-scrub` scrubs on release for *every* non-PUBLIC arena (and, under the
+>   feature, even PUBLIC) rather than computing the minimal must-scrub set; this is conservative-by-design
+>   (it can only scrub *more*, never less, than §36.12 requires) and upholds the Lean `scrub_before_downgrade`
+>   obligation.
+> * **Flush-time double-free detection (W18-2).** The same-cache/flush-time check lands with the M2 front-end
+>   caches (no per-CPU cache exists yet to flush); the always-on bitmap double-free + quarantine-hit checks
+>   cover the M1 paths.
+> * **MTE / pointer authentication.** Hardware tagging (AArch64 MTE, PAC) is a platform *MAY*; the
+>   `protect`/canary/quarantine mechanisms are the portable baseline and the seam is ready for a tagging
+>   provider later.
 
 ---
 

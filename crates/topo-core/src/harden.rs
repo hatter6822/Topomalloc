@@ -419,6 +419,34 @@ struct QRing {
 /// **separately** — held bytes are reported as `quarantine.bytes`, never as live
 /// or central-free. A decoupled leaf: an eviction is *returned* and really freed
 /// by the caller after the quarantine lock is released (rank [`LockRank::QUARANTINE`]).
+///
+/// ## Accounting model (and its relationship to the §16.4/§17.5 scaffolding)
+///
+/// This is a **per-object** quarantine. A held object is accounted as **app-freed**
+/// (`freed_bytes += usable`, so it leaves `live_bytes = allocated − freed`) and,
+/// separately, as `quarantine.bytes`; the owning span's `live_count` stays raised so
+/// the slab cannot be recycled while a held object's address is still reserved. Those
+/// are two independent ledgers — the app byte stats key off `allocated/freed`, the
+/// span `live_count` only governs slab recycling — so there is **no double count**
+/// (verified by `tests/tests/stats.rs::reconciliation_holds_with_quarantine_*`). A
+/// double free of a held object is caught here by the membership filter
+/// ([`offer`](Self::offer) returns [`AlreadyQuarantined`](Offer::AlreadyQuarantined)),
+/// O(1) on the common non-member path.
+///
+/// The SPEC's per-**span** `QUARANTINED` flag (`SpanDescriptor::set_quarantined` →
+/// [`PointerClass::Quarantined`](crate::ptr_class::PointerClass) →
+/// `InvalidFree::DoubleFreeQuarantined`) and the §16.4 `NonCentralResidency.quarantined`
+/// residency term are a **different granularity** — whole-span quarantine — that this
+/// per-object mechanism deliberately does not drive (flagging a whole span would
+/// mis-classify its still-live objects). They remain defined and tested for that
+/// distinct use; the two are complementary, not redundant.
+///
+/// ## Sampling independence
+///
+/// `sample_shift` (a fraction of frees are held, to cap quarantine RSS/latency) is an
+/// **independent** randomized coin, not tied to the W17-3 heap sampler: profiling
+/// state must never gate a *safety* protection (a non-sampled object must still be
+/// quarantine-eligible), so the two samplers are deliberately decoupled.
 pub struct Quarantine {
     lock: RankedLock<{ LockRank::QUARANTINE }>,
     ring: UnsafeCell<QRing>,
@@ -1169,7 +1197,7 @@ mod tests {
                 let bytes = 16 + (next() % 8) * 16; // 16..=128, a multiple of 16
                 offered_bytes += bytes;
                 let mut ev = EvictBatch::new();
-                match q.offer(small_entry(key, bytes as u64), &mut ev) {
+                match q.offer(small_entry(key, bytes), &mut ev) {
                     Offer::Declined => freed_bytes += bytes, // not held ⇒ caller frees now
                     Offer::Held | Offer::AlreadyQuarantined => {}
                 }

@@ -112,9 +112,11 @@ exclude = ["fuzz", "vendor/sele4n"]
 # (§36.12, a lock-free per-arena `label` + the engine scrubs a non-PUBLIC arena's backing before
 # recycle, runtime image of the Lean `scrub_before_downgrade` theorem). Performance pays nothing
 # (every protection's field/entry point is `#[cfg]`-gated to a no-op). Mechanisms/policy, not new
-# §33.4 transitions; pinned by fixed-wall tests incl. a POSIX guard-page SIGSEGV death test and a
-# POSIX/Sim scrub-before-downgrade co-equality test (G-sim).
-version = "0.1.24"
+# §33.4 transitions; pinned by fixed-wall tests incl. a POSIX guard-page SIGSEGV death test, a
+# large use-after-free SIGABRT death test (verify-on-reuse over a per-extent canary provenance),
+# and a POSIX/Sim scrub-before-downgrade co-equality test (G-sim). 0.1.25 — W18 optimal-completion:
+# large verify-on-reuse, randomized/tight guards, quarantine invariant-checker + fuzz + convergence.
+version = "0.1.25"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
