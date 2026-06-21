@@ -441,6 +441,19 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "hardened"],
     );
+    // W18 (#26): each hardening unit must build **and test alone**, not only inside the
+    // composed `hardened` profile. A feature that secretly leans on a sibling (a symbol
+    // or code path only compiled under another feature) would pass the composed run yet
+    // break a deployment that opts into just one protection — exactly the "features, not
+    // forks" composition `profiles/README.md` (principle 8) promises. Each single-feature
+    // run also exercises that protection's own `#[cfg(feature = "…")]` tests in isolation.
+    for feat in ["junk-fill", "quarantine", "guard-pages", "secure-scrub"] {
+        r.run(
+            &format!("test W18 feature alone: {feat}"),
+            "cargo",
+            &["test", "-p", "topo-core", "--features", feat, "--lib"],
+        );
+    }
     // The W18 hardening integration tests over the **real POSIX provider**: the
     // guarded-allocation `mprotect` death test (overrun/underrun ⇒ SIGSEGV) and the
     // live quarantine control surface, which the in-crate `HostProvider` cannot.
