@@ -449,13 +449,20 @@ mod tests {
         m: &BumpArena,
     ) -> SpanDescriptor {
         let row = size_class::row(sc);
+        // A non-zero header shifts object0 forward and shrinks the usable region,
+        // so the geometrically-valid object count is the header-adjusted fit
+        // (B.3 "object ranges fit within span") — exactly what the real span-
+        // creation path derives via `SlabLayout`. Using `objects_per_slab` here
+        // would over-claim the count past what fits.
+        let object_count = SlabLayout::compute(sc, base, slab_header as usize)
+            .map_or(row.objects_per_slab, |l| l.object_count as u32);
         SpanDescriptor::new(
             SpanId(id),
             ArenaId::DEFAULT,
             sc,
             base,
             row.slab_pages,
-            row.objects_per_slab,
+            object_count,
             slab_header,
             m,
         )

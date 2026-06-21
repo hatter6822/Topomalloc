@@ -244,6 +244,59 @@ mod tests {
     }
 
     #[test]
+    fn b2_cpu_checker_catches_an_over_capacity_slot() {
+        // B.2 (W19-1b) negative test: the per-CPU capacity bound (`len <=
+        // hard_capacity`, §11.5) must be enforced, not just documented. Force a
+        // slot past its ceiling and confirm the checker rejects it.
+        let m = meta(4 * 1024 * 1024);
+        let cpu = CpuCache::new();
+        cpu.set_active_cpus(1);
+        let sc = SizeClassId::new(0);
+        let batch = size_class::batch(sc) as u32;
+        cpu.init_slot(CoreId(0), sc, &m, batch);
+        assert!(cpu.check_invariants());
+
+        let slot = cpu.per_cpu(CoreId(0)).unwrap().slot(sc).unwrap();
+        slot.corrupt_len_for_test(slot.hard_capacity() + 1);
+        assert!(
+            !cpu.check_invariants(),
+            "len past the hard capacity must fail the per-CPU checker"
+        );
+    }
+
+    #[test]
+    fn b2_cpu_checker_catches_a_duplicate_entry() {
+        // B.2 (W19-1b) negative test: a duplicate in a per-CPU slot is a
+        // double-freed object; the distinctness check must reject it.
+        let m = meta(4 * 1024 * 1024);
+        let cpu = CpuCache::new();
+        cpu.set_active_cpus(1);
+        let sc = SizeClassId::new(0);
+        cpu.init_slot(CoreId(0), sc, &m, size_class::batch(sc) as u32);
+        cpu.fe_push(CoreId(0), A, sc, 0x1000, &m);
+        cpu.fe_push(CoreId(0), A, sc, 0x1000, &m); // the same object freed twice
+        assert!(
+            !cpu.check_invariants(),
+            "a duplicate per-CPU entry must fail the distinctness check"
+        );
+    }
+
+    #[test]
+    fn b2_thread_checker_catches_a_duplicate_entry() {
+        // B.2 (W19-1b) negative test: a duplicate in a thread slot is a
+        // double-freed object; the distinctness check must reject it.
+        let mut thread = ThreadCache::with_default_budget();
+        let sc = SizeClassId::new(0);
+        assert!(thread.push(sc, 0x2000));
+        assert!(thread.push(sc, 0x2000)); // the same object freed twice
+        assert!(
+            !thread.check_invariants(),
+            "a duplicate thread-cache entry must fail the distinctness check"
+        );
+        thread.flush_all(|_, _| {}); // drain before drop
+    }
+
+    #[test]
     fn b2_thread_checker_catches_a_count_drift() {
         // A well-formed thread cache reconciles; a forced over-budget does not.
         let mut thread = ThreadCache::new(4);

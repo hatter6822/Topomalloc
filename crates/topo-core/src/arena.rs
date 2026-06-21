@@ -1827,6 +1827,18 @@ impl ArenaTable {
         self.destroyed_count.load(Ordering::Relaxed)
     }
 
+    /// Test-only: force an arena slot's incarnation generation, to construct a
+    /// deliberately-inconsistent registry (a non-`Destroyed` arena at the
+    /// never-used sentinel generation `0`) and prove the B.5 stale-reuse guard in
+    /// [`check_invariants`](Self::check_invariants) catches it (W19-1d negative
+    /// test). Never compiled into a shipping build.
+    #[cfg(test)]
+    pub(crate) fn corrupt_generation_for_test(&self, arena: ArenaId, generation: u32) {
+        self.atomics[arena.0 as usize]
+            .generation
+            .store(generation, Ordering::Relaxed);
+    }
+
     /// Whether the table is well-formed (Appendix B.5 — the debug/test oracle):
     ///
     /// * the default arena is always registered and never `Destroyed` (it is the
@@ -2014,6 +2026,22 @@ mod tests {
         assert_eq!(&s.name[..7], b"scratch");
         assert!(s.generation.0 > 0, "a fresh arena has a nonzero generation");
         assert_eq!(t.live_count(), 2);
+    }
+
+    #[test]
+    fn check_invariants_catches_a_stale_generation_reuse() {
+        // B.5 (W19-1d) negative test: a non-`Destroyed` arena must carry a nonzero
+        // incarnation generation (the stale-reuse guard — a re-vended id always
+        // bumps the generation off the never-used sentinel 0). Forcing an Active
+        // arena back to generation 0 must fail the checker.
+        let t = ArenaTable::new();
+        let id = t.create(&ArenaPolicy::explicit().with_quota(1000)).unwrap();
+        assert!(t.check_invariants(), "a freshly-created registry is well-formed");
+        t.corrupt_generation_for_test(id, 0);
+        assert!(
+            !t.check_invariants(),
+            "an Active arena at the sentinel generation 0 must fail the B.5 guard"
+        );
     }
 
     #[test]

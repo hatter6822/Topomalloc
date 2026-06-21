@@ -38,6 +38,7 @@ use topo_core::{
 
 mod arena_api;
 mod c_api;
+mod debug_api;
 mod deterministic_api;
 mod errno_shim;
 mod extended;
@@ -62,6 +63,7 @@ pub use c_api::{
     topomalloc_pvalloc, topomalloc_realloc, topomalloc_reallocarray, topomalloc_valloc,
     topomalloc_version,
 };
+pub use debug_api::{topomalloc_debug_check_now, topomalloc_debug_checks_enabled};
 pub use deterministic_api::{
     topomalloc_deterministic_enabled, topomalloc_deterministic_next_trace_id,
     topomalloc_deterministic_seed, topomalloc_deterministic_set_enabled,
@@ -333,6 +335,20 @@ impl AnyAllocator {
     /// deterministic mode is off or the hardening feature is not compiled in.
     pub fn apply_deterministic_seed(&self) {
         dispatch!(self, a => a.apply_deterministic_seed())
+    }
+
+    /// Run the **full Appendix-B invariant check** over the live engine on demand
+    /// (W19-1, §30.2, DD-2): the shared span/large back-ends and every hooked
+    /// backing (B.1/B.4), the central free-list layer and its spans (B.1/B.3), and
+    /// the arena registry (B.5). Returns `true` if every invariant holds. This is
+    /// the operator/test-triggered home for the O(state) sweeps that DD-2 keeps
+    /// off the per-transition hot path (failure-mode F1); the cheap per-span B.3
+    /// check already runs as a `debug_assert!` at every central transition. Wrapped
+    /// in the fork operation guard like every public op; read-only and lock-safe
+    /// (it walks under the §27.2 lock order).
+    pub fn check_invariants(&self) -> bool {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.check_invariants())
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`

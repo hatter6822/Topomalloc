@@ -222,6 +222,47 @@ impl CpuSlot {
     fn buf_ptr(&self) -> *mut usize {
         self.buf.load(Ordering::Acquire) as *mut usize
     }
+
+    /// Appendix B.2 (W19-1b) distinctness: the `len` cached addresses are pairwise
+    /// **distinct** and non-null. A duplicate is a double-listed (double-freed)
+    /// object (§29.3, S-009); catching it here pins the corruption to the exact
+    /// CPU/slot, earlier than the central double-insert check at flush time.
+    ///
+    /// # Safety
+    /// The caller MUST hold the owning per-CPU lock (so this thread is the sole
+    /// accessor of `buf`/`len`). O(len²); `len <= hard_capacity`, debug-cadence.
+    unsafe fn entries_distinct(&self) -> bool {
+        if !self.is_initialized() {
+            return true;
+        }
+        let len = self.len() as usize;
+        let buf = self.buf_ptr();
+        for i in 0..len {
+            // SAFETY: `i < len <= hard_capacity`; `buf` is a valid array of
+            // `hard_capacity` `usize` from `MetadataAlloc` (never freed); the
+            // per-CPU lock is held by the caller, so there is no concurrent writer.
+            let a = unsafe { *buf.add(i) };
+            if a == 0 {
+                return false;
+            }
+            for j in (i + 1)..len {
+                // SAFETY: `j < len <= hard_capacity`, as above.
+                if a == unsafe { *buf.add(j) } {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Test-only: force `len` past the capacity bound, to construct a
+    /// deliberately-inconsistent slot and prove
+    /// [`check_invariants`](Self::check_invariants) catches it (W19-1 negative
+    /// test). Never compiled into a shipping build.
+    #[cfg(test)]
+    pub(crate) fn corrupt_len_for_test(&self, n: u32) {
+        self.len.store(n, Ordering::Relaxed);
+    }
 }
 
 /// Per-CPU state: a spinlock and per-size-class slots.
@@ -480,12 +521,21 @@ impl CpuCache {
     /// bounded by `len × object_size <= hard_capacity × object_size`).
     ///
     /// Iterates **all** `MAX_CPUS`, not just the active count, so a slot
-    /// initialized on a core that later went offline is still checked. Reads are
-    /// lock-free relaxed snapshots, exact when the cache is quiescent.
+    /// initialized on a core that later went offline is still checked. Acquires
+    /// each per-CPU lock (rank `FRONT_END`, the outermost, so taking it first from
+    /// an unlocked context respects the §27.2 order) for a consistent snapshot of
+    /// the slot buffers, then is read-only — total + side-effect-free. The
+    /// capacity bounds plus the per-slot **distinctness** check (a duplicate is a
+    /// double-freed object, §29.3) are the B.2 per-CPU clauses.
     pub fn check_invariants(&self) -> bool {
         for cpu in self.cpus.iter() {
+            let _g = cpu.lock();
             for (sc_idx, slot) in cpu.slots.iter().enumerate() {
                 if !slot.check_invariants(SizeClassId::new(sc_idx)) {
+                    return false;
+                }
+                // SAFETY: the per-CPU lock (`_g`) is held for this CPU's slots.
+                if !unsafe { slot.entries_distinct() } {
                     return false;
                 }
             }

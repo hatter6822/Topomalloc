@@ -219,7 +219,10 @@ mod imp {
         ///   budget is in objects, bounding bytes by `Σ len × object_size`);
         /// * every slot's `len <= capacity` (the per-class ceiling);
         /// * `Σ slot.len == total_cached` — the running counter (decremented on
-        ///   pop, incremented on push) never drifts from the authoritative slots.
+        ///   pop, incremented on push) never drifts from the authoritative slots;
+        /// * each slot's addresses are pairwise **distinct** and non-null — a
+        ///   duplicate is a double-freed object (§29.3, the cache being
+        ///   single-owner needs no lock). O(len²); thread slots are small.
         pub fn check_invariants(&self) -> bool {
             if self.total_cached > self.budget {
                 return false;
@@ -228,6 +231,11 @@ mod imp {
             for slot in &self.slots {
                 if slot.addrs.len() > slot.capacity {
                     return false;
+                }
+                for (i, &a) in slot.addrs.iter().enumerate() {
+                    if a == 0 || slot.addrs[i + 1..].contains(&a) {
+                        return false;
+                    }
                 }
                 sum += slot.addrs.len();
             }

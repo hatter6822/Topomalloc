@@ -429,6 +429,22 @@ void topomalloc_deterministic_set_force_purge(int on);
 uint64_t topomalloc_deterministic_next_trace_id(void);
 
 /* ------------------------------------------------------------------------
+ * Debug invariant checks (Section 30.2, plan 08 W19-1)
+ *
+ * Run the Appendix-B invariant checklist over the live allocator on demand —
+ * the operator/test-triggered home for the O(state) sweeps (the cheap per-span
+ * checks already run as debug assertions at every transition). For diagnostics
+ * and tests, not a hot path.
+ * --------------------------------------------------------------------- */
+
+/* Run the full Appendix-B check now; 1 = every invariant holds, 0 = a violation
+ * (1 vacuously when no allocator exists yet). */
+int topomalloc_debug_check_now(void);
+/* 1 if the Appendix-B checks are wired into runtime assertions in this build (the
+ * debug-checks feature, implied by debug/hardened), else 0. */
+int topomalloc_debug_checks_enabled(void);
+
+/* ------------------------------------------------------------------------
  * Statistics & observability (Section 31, plan 07 W17)
  *
  * "Where is the memory?" in machine-readable, epoch-consistent form (Section

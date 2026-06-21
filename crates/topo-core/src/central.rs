@@ -415,6 +415,15 @@ impl CentralBin {
         self.total_central_free.load(Ordering::Relaxed)
     }
 
+    /// Test-only: force the tracked `span_count` to an arbitrary value, to
+    /// construct a deliberately-inconsistent bin and prove
+    /// [`check_invariants`](Self::check_invariants) catches the miscount (W19-1
+    /// negative test). Never compiled into a shipping build.
+    #[cfg(test)]
+    pub(crate) fn corrupt_span_count_for_test(&self, n: u32) {
+        self.span_count.store(n, Ordering::Relaxed);
+    }
+
     /// Appendix B.1/B.3 (free-structure reachability + empty-detection across
     /// caches, W19-1a/c): this bin's span lists are well-formed and its accounting
     /// reconciles. Acquires the bin lock for a consistent snapshot; for each
@@ -683,7 +692,12 @@ impl CentralCache {
         );
         sg.set_live_count(old_live + removed_u32);
 
-        debug_assert!(sg.central_count_matches_bitmap());
+        // B.3 (W19-1c): the span is internally well-formed after the carve —
+        // `central_free == popcount(bitmap)`, the §16.4 partition bound, the slab
+        // geometry, and (hardened) the integrity tag. Run as a runtime assertion at
+        // this transition (debug/`debug-checks`), under the held span lock so it
+        // neither re-locks nor races (the extent/huge-checker pattern).
+        debug_assert!(span.check_invariants_locked(&sg));
 
         if sg.central_free_count() == 0 {
             drop(sg);
@@ -919,7 +933,9 @@ impl CentralCache {
                 .fetch_add(inserted as u64, Ordering::Relaxed);
         }
 
-        debug_assert!(sg.central_count_matches_bitmap());
+        // B.3 (W19-1c): the span is well-formed after the central insert (see
+        // `remove_batch`); a runtime assertion at this transition, under the lock.
+        debug_assert!(span.check_invariants_locked(&sg));
 
         // W5-3e trigger: was this span exhausted (not in the partial list)?
         // If it now has central-free objects, add it back.
@@ -1005,8 +1021,12 @@ impl CentralCache {
                 sg.central_free_count()
             );
             sg.activate(object_count);
-            // M2 action: replace NONE with actual cache residency (plan 05).
-            debug_assert!(sg.conservation_holds(NonCentralResidency::NONE));
+            // B.3 (W19-1c): the freshly-activated span is well-formed (full bitmap,
+            // `central_free == object_count`, geometry fits). A runtime assertion at
+            // this transition, under the held lock. Subsumes the §16.4 conservation
+            // (M2 action: pass `span.reconstruct_non_central_residency()` once caches
+            // track per-span residency).
+            debug_assert!(span.check_invariants_locked(&sg));
         }
 
         // Step 2: install in pagemap (W3-6).
@@ -1068,6 +1088,9 @@ impl CentralCache {
                 sg.central_free_count(),
                 span.object_count()
             );
+            // B.3 (W19-1c): the empty span is internally well-formed before its
+            // bitmap is torn down — a runtime assertion at this transition.
+            debug_assert!(span.check_invariants_locked(&sg));
             let free = sg.central_free_count();
             sg.deactivate();
             free
@@ -1126,6 +1149,9 @@ impl CentralCache {
 
         let (free_before, live_before) = {
             let sg = span.lock();
+            // B.3 (W19-1c): the still-Active span is well-formed before this forced
+            // teardown clears its bitmap — a runtime assertion at the transition.
+            debug_assert!(span.check_invariants_locked(&sg));
             let free = sg.central_free_count();
             let live = sg.live_count();
             sg.deactivate();
@@ -2094,15 +2120,20 @@ mod tests {
         let sc = SizeClassId::new(3);
         let row = size_class::row(sc);
 
+        let base = 0x4000_0000usize;
         let span = {
             let slab_header = 128u32;
+            // The header-adjusted object count keeps the span geometrically valid
+            // (B.3 "object ranges fit"); `objects_per_slab` assumes a zero header.
+            let object_count = SlabLayout::compute(sc, base, slab_header as usize)
+                .map_or(row.objects_per_slab, |l| l.object_count as u32);
             SpanDescriptor::new(
                 SpanId(1),
                 ArenaId::DEFAULT,
                 sc,
-                0x4000_0000,
+                base,
                 row.slab_pages,
-                row.objects_per_slab,
+                object_count,
                 slab_header,
                 &m,
             )
@@ -2426,5 +2457,55 @@ mod tests {
         // Return object 0 twice: the second insert's bit is already set.
         cache.insert_batch(&span, &[all[0]], 1);
         cache.insert_batch(&span, &[all[0]], 1);
+    }
+
+    #[test]
+    fn central_checker_catches_accounting_drift() {
+        // B.1 (W19-1a) negative test: the reachability/accounting law
+        // (Σ central_free over the reachable lists == the bin aggregate) must be
+        // *enforced*, not merely asserted. We desync it deliberately and confirm
+        // the checker rejects the bin.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        cache.activate_span(&span, &pm, &m).unwrap();
+        assert!(cache.check_invariants(), "an activated bin reconciles");
+
+        // Remove one object straight from the span's bitmap, bypassing the bin
+        // accounting that `remove_batch` maintains — so the span now reports one
+        // fewer central-free object than the bin's `total_central_free` claims.
+        {
+            let sg = span.lock();
+            let mut idx = [0u16; 1];
+            assert_eq!(sg.central_remove_batch(&mut idx, 1), 1);
+        }
+        assert!(
+            !cache.check_invariants(),
+            "the checker must catch Σ central_free != total_central_free"
+        );
+    }
+
+    #[test]
+    fn central_checker_catches_a_span_count_miscount() {
+        // B.1 (W19-1a) negative test: the list lengths must never exceed the
+        // tracked span count (partial_count + empty_count <= span_count). Force a
+        // miscount and confirm the checker rejects it.
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+        let cache = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let span = make_span(1, sc, 0x4000_0000, &m);
+        cache.activate_span(&span, &pm, &m).unwrap();
+        assert!(cache.check_invariants());
+
+        // The bin tracks one span (partial_count == 1, span_count == 1). Drop
+        // span_count to 0 so the partial list is "longer" than the count admits.
+        cache.bin(sc).unwrap().corrupt_span_count_for_test(0);
+        assert!(
+            !cache.check_invariants(),
+            "the checker must catch partial_count + empty_count > span_count"
+        );
     }
 }
