@@ -160,6 +160,16 @@ pub fn in_sampler() -> bool {
 // Enable / configure (§32.1 env + runtime control; §31.3 "profile.start")
 // ---------------------------------------------------------------------------
 
+/// Reset the per-thread sampler **seed base** (§30.4, W19-3 deterministic mode):
+/// threads built after this draw their independent sampling streams from the new
+/// origin, so a deterministic run produces reproducible sampling. A single-threaded
+/// replay (one `next_seed` draw) is then fully reproducible. Existing threads'
+/// samplers re-sync lazily on the next rate change; for a fresh deterministic run
+/// set the seed before arming sampling.
+pub fn set_base_seed(seed: u64) {
+    SEED.store(seed, Ordering::Relaxed);
+}
+
 /// Set the mean sample interval in bytes (`0` disables). Enabling warms up the unwinder
 /// once (outside any sampled allocation) and initializes the sampled state, so the slow
 /// path is allocation-free thereafter. Runtime-safe: a change re-syncs every thread's

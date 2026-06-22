@@ -2179,8 +2179,18 @@ impl<P: TopoBackingProvider> ExtentManager<P> {
         if e.state != ExtentState::Active {
             return Err(ExtentError::NotFree); // double free / not an allocation
         }
+        // §30.4 (W19-3): deterministic mode can force frequent purging — release
+        // freed backing to the OS eagerly (the `Unmap` path) regardless of the
+        // configured retain policy. `Unmap` is always correct (it only decommits
+        // earlier), so this changes RSS behaviour, never safety. Off by default
+        // (one relaxed load).
+        let effective_retain = if crate::deterministic::force_purge() {
+            RetainPolicy::Unmap
+        } else {
+            self.retain
+        };
         // Each free's coalesce dispatches its §23.2 merge(s) to the hook (W10).
-        match self.retain {
+        match effective_retain {
             RetainPolicy::Retain => {
                 g.map
                     .free_in_canary(r.id, ExtentState::Dirty, &notify, canary);

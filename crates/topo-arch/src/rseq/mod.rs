@@ -88,6 +88,14 @@ pub enum Mode {
 /// Enable RSEQ mode for the process (idempotent, W7-1). Detects the registration
 /// model and the non-owner fence (W7-4). Returns whether the fast path is usable;
 /// when `false`, the caller stays on the locked baseline (P-003).
+///
+/// **Sanitizers (W19-2, §30.3):** the `imp_linux` implementation returns `false`
+/// under Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`, set by `build.rs`),
+/// so the hand-written restartable sequences — which those sanitizers cannot
+/// instrument — are never executed and the always-correct locked baseline is used.
+/// The disable lives there, beside the asm it governs, so the detection code stays
+/// referenced (no dead code). TSan is excluded (it ignores asm and the equivalence
+/// battery runs under it on purpose).
 #[inline]
 pub fn enable() -> bool {
     #[cfg(all(
@@ -106,7 +114,9 @@ pub fn enable() -> bool {
     }
 }
 
-/// Whether the RSEQ fast path is usable (after [`enable`]).
+/// Whether the RSEQ fast path is usable (after [`enable`]). Always `false` under
+/// Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`, W19-2/§30.3), matching
+/// [`enable`].
 #[inline]
 pub fn available() -> bool {
     #[cfg(all(

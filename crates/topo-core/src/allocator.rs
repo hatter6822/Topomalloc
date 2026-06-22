@@ -1724,6 +1724,26 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
+    /// §30.4 (W19-3): if deterministic mode is active, reseed the randomized
+    /// security samplers — the guard-page sampler and the quarantine evictor —
+    /// from the global deterministic seed (via distinct
+    /// [`domain_seed`](crate::deterministic::domain_seed) salts), so their choices
+    /// are reproducible run-to-run ("disable randomization unless seeded"). A no-op
+    /// when deterministic mode is off or the relevant hardening feature is not
+    /// compiled in. Idempotent — called at startup and whenever the seed changes.
+    pub fn apply_deterministic_seed(&self) {
+        if crate::deterministic::is_deterministic() {
+            #[cfg(feature = "guard-pages")]
+            self.guard.set_seed(crate::deterministic::domain_seed(
+                crate::deterministic::salt::GUARD,
+            ));
+            #[cfg(feature = "quarantine")]
+            self.quarantine.set_seed(crate::deterministic::domain_seed(
+                crate::deterministic::salt::QUARANTINE,
+            ));
+        }
+    }
+
     /// The current guarded-allocation sampling rate (`0` = off). `0` without the
     /// `guard-pages` feature.
     #[inline]
@@ -2926,18 +2946,46 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         self.span_extents.committed_bytes()
     }
 
-    /// Whether both shared back-ends, **every per-arena hooked backing**, and the
-    /// arena registry are well-formed (W4-5 + B.5 oracle; debug/tests).
+    /// Whether the whole live allocator is well-formed — the Appendix B oracle for
+    /// the engine (W19-1, DD-2): the shared span/large back-ends and **every
+    /// per-arena hooked backing** (B.1/B.4), the central free-list layer and its
+    /// spans (B.1/B.3), and the arena registry (B.5). Total + side-effect-free;
+    /// run from `debug_assert!` at engine transitions and as the G-core/G-mem/
+    /// G-arena test oracle. The per-CPU/thread/transfer cache layer (B.2) is
+    /// checked separately by its own [`check_invariants`](crate::CpuCache::check_invariants)
+    /// methods (those structures are not owned by the engine at M1).
     pub fn check_invariants(&self) -> bool {
         let mut ok = self.span_extents.check_invariants()
             && self.large.check_invariants()
-            && self.arenas.check_invariants();
+            && self.central.check_invariants()
+            && self.arenas.check_invariants()
+            // B.1 (W19-1a, §30.2 "pagemap agrees with spans"): every owned page in
+            // the shared pagemap names a descriptor whose range covers it. One call
+            // covers the engine and every hooked backend (they share this pagemap).
+            && self.pagemap.check_invariants()
+            // §30.2 "redzones are intact" (W19-1c): under junk-fill, every
+            // central-free small object still reads as FREE_PATTERN (§29.6). Reads
+            // object backing — sound here because every central span of a live
+            // engine is committed; a no-op when junk-fill is compiled out. (Large
+            // objects carry the W18 per-extent verify-on-reuse canary instead.)
+            && self.central.verify_free_patterns();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {
                 // SAFETY: registry lock held; per-element borrow of slot `i` only.
                 if let Some(b) = unsafe { (*self.hook_slot(i)).as_ref() } {
-                    ok = ok && b.span_extents.check_invariants() && b.large.check_invariants();
+                    ok = ok
+                        && b.span_extents.check_invariants()
+                        && b.large.check_invariants()
+                        // B.5 (W19-1d) "extent hooks installed before hook-owned
+                        // extents exist": this live backend's owning arena is
+                        // registered and still names *this* slot (no orphan backend,
+                        // no dangling/stale slot reference). Combined with the
+                        // per-backend extent-tiling walk above (every hooked extent
+                        // lies within the installed region, never outside it), this
+                        // is the static witness for the install-order clause.
+                        && self.arenas.is_registered(b.arena)
+                        && self.arenas.hook_slot_of(b.arena) as usize == i + 1;
                 }
             }
             self.hooks.lock.release();

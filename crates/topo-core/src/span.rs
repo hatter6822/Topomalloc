@@ -53,6 +53,7 @@ use crate::ids::{ArenaId, Generation, LargeId, SizeClassId, SpanId};
 use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
 use crate::size_class;
+use crate::slab::SlabLayout;
 
 /// Largest `objects_per_slab` over every size class in the generated table — the
 /// number of bits the widest slab's bitmap must cover. Computed from the table (a
@@ -957,6 +958,122 @@ impl SpanDescriptor {
     pub fn reconstruct_non_central_residency(&self) -> NonCentralResidency {
         NonCentralResidency::NONE
     }
+
+    /// Appendix B.3 (span invariants, W19-1c): this span descriptor is internally
+    /// well-formed. Acquires the span lock for a consistent snapshot of the
+    /// accounting, then checks the §16.2/§16.4 clauses; total + side-effect-free.
+    /// See [`check_invariants_locked`](Self::check_invariants_locked) for the
+    /// clause list. The single span lock (rank `SPAN`) is the only lock taken, so
+    /// calling this from a context that holds a lower-ranked lock (e.g. the central
+    /// bin lock, rank `CENTRAL`) respects the §27.2 order.
+    pub fn check_invariants(&self) -> bool {
+        let g = self.lock();
+        self.check_invariants_locked(&g)
+    }
+
+    /// Appendix B.3 (span invariants, W19-1c) under an already-held span lock —
+    /// for a caller composing the check with other locked work (e.g. the central
+    /// list walk). Total + side-effect-free. The clauses, mapped to Appendix B.3:
+    ///
+    /// * **size class valid + ranges fit** — the span's size class indexes a real
+    ///   generated row, the carved `object_count` does not exceed what the §16.3
+    ///   slab geometry ([`SlabLayout`]) admits at this base/header, **and** the last
+    ///   object's end (`object0 + object_count × object_size`) lies within the
+    ///   span's *actual* page extent (`base + page_count × PAGE_SIZE`, checked
+    ///   arithmetic — robust even if `page_count != slab_pages`). So every object
+    ///   range lies within the span (disjointness then holds by construction:
+    ///   `size` is a multiple of `align`, no inter-object padding);
+    /// * **free count == authoritative representation** — `central_free_count ==
+    ///   popcount(free_bitmap)` (§8.5), the cached aggregate never drifts from the
+    ///   bitmap;
+    /// * **partition bound (§16.4)** — `live + central_free <= object_count`; the
+    ///   implementation's `live_count` already subsumes the per-CPU/transfer/thread
+    ///   cache *and* quarantine residency (an object removed from central but not
+    ///   yet returned stays counted as live), so this is the exact law (an equality
+    ///   once the span is fully activated), with the cache/quarantine terms folded
+    ///   into `live`, never double-counted;
+    /// * **quarantine exclusivity (W18-3)** — in a `quarantine` build, the held set
+    ///   is a subset of `live` (`quarantined <= live`) and an object is never
+    ///   simultaneously central-free and quarantined (the two bitmaps are
+    ///   disjoint), so the authoritative double-free marker can never alias a
+    ///   re-vendable object;
+    /// * **generation integrity** — under `debug-checks`, the §17.3 integrity tag
+    ///   (which covers the `generation` field, the §16.6/§27.5 stale-reuse guard)
+    ///   still validates, so a corrupted descriptor header is caught.
+    pub fn check_invariants_locked(&self, g: &SpanGuard<'_>) -> bool {
+        let sc = self.size_class();
+        // Size class must index a real generated row.
+        if size_class::checked_row(sc).is_none() {
+            return false;
+        }
+        let object_count = self.object_count() as usize;
+        // The carved object count must fit the slab geometry at this base/header
+        // (B.3 "object ranges fit within span"; disjointness is then structural).
+        let layout = match SlabLayout::compute(sc, self.base(), self.slab_header() as usize) {
+            Some(l) if object_count <= l.object_count => l,
+            _ => return false,
+        };
+        // Verify the ranges fit within the span's **actual** page extent — not just
+        // the table's `slab_pages` that `SlabLayout` assumes. The last object's end
+        // (`object0 + object_count × object_size`) must not exceed
+        // `base + page_count × PAGE_SIZE`. Robust even if `page_count != slab_pages`;
+        // all arithmetic is checked, so an overflow fails the check (never wraps).
+        let span_end = match (self.page_count() as usize)
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| self.base().checked_add(bytes))
+        {
+            Some(end) => end,
+            None => return false,
+        };
+        let last_obj_end = match object_count
+            .checked_mul(layout.object_size)
+            .and_then(|span| layout.object0.checked_add(span))
+        {
+            Some(end) => end,
+            None => return false,
+        };
+        if last_obj_end > span_end {
+            return false;
+        }
+        // B.3: free count equals the authoritative bitmap popcount.
+        if !g.central_count_matches_bitmap() {
+            return false;
+        }
+        // B.3 / §16.4: the tracked terms never over-fill the span. `live_count`
+        // is the implementation's "removed from central" aggregate — it already
+        // subsumes the per-CPU/transfer/thread *and* quarantine residency (a held
+        // object keeps `live_count` incremented so its slab cannot recycle, W18-3),
+        // so the exact law is `live + central_free <= object_count` (equality once
+        // the span is fully activated; the cache/quarantine terms are *inside*
+        // `live`, never added again).
+        let live = g.live_count() as usize;
+        let central_free = g.central_free_count() as usize;
+        if live + central_free > object_count {
+            return false;
+        }
+        // W18-3: the quarantine state is a subset of `live` (a held object stays
+        // counted as live), and central-free and quarantined are mutually
+        // exclusive per object (the authoritative double-free marker can never
+        // alias a re-vendable, central-resident object).
+        #[cfg(feature = "quarantine")]
+        {
+            if g.quarantined_count() > live {
+                return false;
+            }
+            for i in 0..object_count {
+                if g.central_resident(i) && g.is_object_quarantined(i) {
+                    return false;
+                }
+            }
+        }
+        // B.3 (generation): the §17.3 integrity tag covers `generation`, so a
+        // validating tag witnesses an un-corrupted stale-reuse guard.
+        #[cfg(feature = "debug-checks")]
+        if !self.validate_integrity() {
+            return false;
+        }
+        true
+    }
 }
 
 /// A held [`SpanDescriptor`] span lock (§27.2 / §8.5). While alive, the accounting
@@ -1073,6 +1190,66 @@ impl SpanGuard<'_> {
     #[inline]
     pub fn central_resident(&self, i: usize) -> bool {
         self.span.free_bitmap.contains(i)
+    }
+
+    /// Appendix B (§30.2 *"redzones are intact"*, W19-1c): under junk-fill, every
+    /// **central-free** object in this span still reads as [`crate::harden::FREE_PATTERN`]
+    /// (the §29.6 invariant "every central-free object — fresh or recycled — reads
+    /// as `FREE_PATTERN`"). Total + side-effect-free; a no-op returning `true` when
+    /// junk-fill is compiled out (no memory is touched).
+    ///
+    /// It iterates the **free bitmap**, so it inspects only central-resident
+    /// objects — a live object (user data) or a cache-resident object (removed from
+    /// the bitmap, already verified at reuse) is never read. The on-demand,
+    /// O(objects) companion to the W18 verify-on-reuse: a stale write-after-free a
+    /// program left in a still-central-free object is caught here even before that
+    /// object is handed back out.
+    ///
+    /// # Safety / preconditions
+    /// **Reads the span's object backing**, so it is sound only over a span whose
+    /// slab is committed — which the engine guarantees (every central span is
+    /// backed). It is reached only from
+    /// [`Allocator::check_invariants`](crate::Allocator::check_invariants) via the
+    /// central walk, never from a synthetic fake-base span checker (those never
+    /// touch object memory). The read is otherwise safe: each central-free object's
+    /// `[addr, addr + object_size)` lies within the slab (B.3 verifies the geometry
+    /// fits), and the span lock makes the bitmap and backing a consistent snapshot.
+    pub fn verify_free_patterns(&self) -> bool {
+        if !crate::harden::junk_fill_enabled() {
+            return true; // junk-fill off: nothing is filled, nothing to verify
+        }
+        let span = self.span;
+        let layout = match SlabLayout::compute(
+            span.size_class(),
+            span.base(),
+            span.slab_header() as usize,
+        ) {
+            Some(l) => l,
+            // A span whose geometry will not compute is already malformed; the
+            // B.3 checker reports it. Fail here too rather than read blind.
+            None => return false,
+        };
+        let object_count = (span.object_count() as usize).min(layout.object_count);
+        for i in 0..object_count {
+            if !self.central_resident(i) {
+                continue; // live or cache-resident — not a central-free object
+            }
+            let addr = match i
+                .checked_mul(layout.object_size)
+                .and_then(|off| layout.object0.checked_add(off))
+            {
+                Some(a) => a,
+                None => return false,
+            };
+            // SAFETY: object `i` is central-free, hence committed and (§29.6) filled
+            // with FREE_PATTERN; `[addr, addr + object_size)` lies within the slab
+            // (B.3 geometry). The span lock pins the bitmap/backing for the read.
+            if !unsafe { crate::harden::verify_free_pattern(addr as *const u8, layout.object_size) }
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// `popcount(free_bitmap)` (consistent under the lock).
@@ -1830,6 +2007,179 @@ mod tests {
         };
         assert!(!s.is_empty(cached));
         assert!(s.conservation_holds(cached)); // 0 + 0 + 1 + 7 + 0 == 8 ✓
+    }
+
+    #[test]
+    fn empty_detection_accounts_for_every_non_central_cache_term() {
+        // B.3 (W19-1c) "empty-span detection accounts for local, transfer, central,
+        // and quarantine states": a span with objects held in *any* cache term is
+        // not empty (returning it would recycle live memory), and the §16.4
+        // partition reconciles for each term independently and combined. This is
+        // the across-caches clause exercised with synthetic non-central terms (the
+        // live cache layer that supplies them lands at M2; the reasoning is proven
+        // here regardless).
+        let m = meta(64 * 1024);
+        let s = span(8, &m);
+        {
+            let g = s.lock();
+            for i in 0..5 {
+                assert!(g.central_insert(i)); // 5 central-free
+            }
+            g.set_live_count(0);
+        }
+        // 5 central-free + 3 held across the cache terms = the 8 objects.
+        let combos = [
+            NonCentralResidency {
+                local_cached: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                transfer_cached: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                quarantined: 3,
+                ..NonCentralResidency::NONE
+            },
+            NonCentralResidency {
+                local_cached: 1,
+                transfer_cached: 1,
+                quarantined: 1,
+            },
+        ];
+        for nc in combos {
+            assert!(
+                !s.is_empty(nc),
+                "a span with cached objects ({nc:?}) is not empty"
+            );
+            assert!(
+                s.conservation_holds(nc),
+                "the §16.4 partition reconciles with the cache terms ({nc:?})"
+            );
+        }
+        // With *no* cached objects, the same span is empty only once every object
+        // is central-free (the central-only relaxation the M1 checker uses).
+        {
+            let g = s.lock();
+            for i in 5..8 {
+                assert!(g.central_insert(i));
+            }
+        }
+        assert!(s.is_empty(NonCentralResidency::NONE));
+        assert!(s.is_empty_central_only());
+    }
+
+    #[test]
+    fn check_invariants_rejects_object_count_over_slab_geometry() {
+        // B.3 (W19-1c) negative test, clause 1: a span claiming more objects than
+        // the slab geometry admits (over the table's `objects_per_slab`) must fail
+        // the geometry check. sc=0 packs 1024 × 16 B into one 16 KiB page; 1025
+        // over-claims.
+        let m = meta(64 * 1024);
+        let bad = SpanDescriptor::new(
+            SpanId(1),
+            ArenaId::DEFAULT,
+            SizeClassId::new(0),
+            0x4000_0000,
+            1,
+            1025,
+            0,
+            &m,
+        )
+        .expect("bitmap");
+        assert!(
+            !bad.check_invariants(),
+            "object_count past the slab geometry must fail B.3"
+        );
+    }
+
+    #[test]
+    fn check_invariants_rejects_objects_past_the_actual_page_extent() {
+        // B.3 (W19-1c) negative test, clause 2 (the actual-extent check): a single
+        // sc=64 object is 18432 B and needs two 16 KiB pages, but this span is given
+        // only one. The object count (1) is within what the *table* geometry admits,
+        // so clause 1 passes — clause 2 (last object's end vs `base + page_count ×
+        // PAGE_SIZE`) is what must catch the overflow.
+        let m = meta(64 * 1024);
+        let big = SpanDescriptor::new(
+            SpanId(2),
+            ArenaId::DEFAULT,
+            SizeClassId::new(64),
+            0x4000_0000,
+            1, // one page, but the object needs two
+            1,
+            0,
+            &m,
+        )
+        .expect("bitmap");
+        assert!(
+            !big.check_invariants(),
+            "an object overflowing the span's actual page extent must fail B.3"
+        );
+    }
+
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn verify_free_patterns_holds_then_catches_a_corrupted_free_object() {
+        // §30.2 "redzones are intact" (W19-1c): under junk-fill, every central-free
+        // object must read as FREE_PATTERN. Uses *real* page-aligned backing (the
+        // sweep reads object memory). sc=0 packs 1024 × 16 B with a zero header, so
+        // object0 == base and the slab is a single page.
+        use crate::harden::{fill_fresh_slab, FREE_PATTERN};
+        use std::alloc::{alloc, dealloc, Layout};
+
+        let sc = SizeClassId::new(0);
+        let row = crate::size_class::checked_row(sc).unwrap();
+        let slab_bytes = row.slab_pages as usize * PAGE_SIZE;
+        let backing = Layout::from_size_align(slab_bytes, PAGE_SIZE).unwrap();
+        // SAFETY: `backing` has nonzero size.
+        let buf = unsafe { alloc(backing) };
+        assert!(!buf.is_null());
+        let base = buf as usize;
+
+        let m = meta(256 * 1024);
+        let span = SpanDescriptor::new(
+            SpanId(1),
+            ArenaId::DEFAULT,
+            sc,
+            base,
+            row.slab_pages,
+            row.objects_per_slab,
+            0,
+            &m,
+        )
+        .expect("span");
+        // Establish the FREE_PATTERN invariant over the slab (what activation does),
+        // then mark every object central-free.
+        // SAFETY: `buf` is a fresh, exclusively-owned `slab_bytes`-byte allocation.
+        unsafe { fill_fresh_slab(buf, slab_bytes) };
+        {
+            let g = span.lock();
+            g.set_live_count(0);
+            for i in 0..row.objects_per_slab as usize {
+                assert!(g.central_insert(i));
+            }
+            assert!(
+                g.verify_free_patterns(),
+                "a freshly filled slab's free objects all read as FREE_PATTERN"
+            );
+        }
+
+        // Corrupt one central-free object (a stale write-after-free) — caught.
+        let layout = SlabLayout::compute(sc, base, 0).unwrap();
+        let victim = layout.object0 + 3 * layout.object_size; // object #3
+                                                              // SAFETY: `victim` lies within the slab backing.
+        unsafe { *(victim as *mut u8) = !FREE_PATTERN };
+        {
+            let g = span.lock();
+            assert!(
+                !g.verify_free_patterns(),
+                "a corrupted central-free object must fail the redzone sweep"
+            );
+        }
+
+        // SAFETY: `buf`/`backing` came from `alloc` above and are no longer aliased.
+        unsafe { dealloc(buf, backing) };
     }
 
     #[test]

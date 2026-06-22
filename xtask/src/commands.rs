@@ -132,7 +132,7 @@ pub fn gen(root: &Path, args: &[String]) -> Outcome {
     r.finish()
 }
 
-/// `test [--kind unit|prop|diff|fuzz|loom|tsan|rseq] [--target T]` — run the test suites.
+/// `test [--kind unit|prop|diff|fuzz|loom|tsan|asan|msan|rseq] [--target T]` — run the test suites.
 ///
 /// With `--target` (used by the AArch64 CI job), tests are built for that target
 /// and run via the `.cargo/config.toml` runner (`qemu-aarch64`). Without it, the
@@ -214,6 +214,12 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
         Some("tsan") => {
             tsan_steps(&mut r);
         }
+        Some("asan") => {
+            asan_steps(&mut r);
+        }
+        Some("msan") => {
+            msan_steps(&mut r);
+        }
         Some("rseq") => {
             // The W7 RSEQ / pinned-core battery (also part of the default
             // `--workspace` run; this is the focused subset, G-fast).
@@ -245,7 +251,10 @@ pub fn test(root: &Path, args: &[String]) -> Outcome {
             );
         }
         Some(other) => {
-            eprintln!("xtask: unknown --kind '{other}' (use unit|prop|diff|fuzz|loom|tsan|rseq)");
+            eprintln!(
+                "xtask: unknown --kind '{other}' \
+                 (use unit|prop|diff|fuzz|loom|tsan|asan|msan|rseq)"
+            );
             r.record("unknown test kind", false);
         }
         None => {
@@ -431,6 +440,16 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "test hardened (debug-checks)",
         "cargo",
         &["test", "-p", "topo-core", "--features", "debug-checks"],
+    );
+    // W19-1a (G-core): run the cross-crate **integration** suite with the Appendix-B
+    // runtime assertions live, so the engine on-demand sweeps
+    // (`Allocator::check_invariants` — incl. the W19-1a pagemap↔descriptor and
+    // W19-1c redzone checks) are exercised over real end-to-end malloc/free/realloc
+    // sequences in CI, not only topo-core's own unit tests ("runs in debug CI").
+    r.run(
+        "test integration (debug-checks)",
+        "cargo",
+        &["test", "-p", "topo-tests", "--features", "debug-checks"],
     );
     // W18 hardened profile (plan 08): the full hardening composition — junk-fill +
     // quarantine + guard-pages + secure-scrub on top of debug-checks. Runs the core
@@ -761,6 +780,149 @@ fn tsan_steps(r: &mut Runner<'_>) {
             "topo-core",
             "--features",
             "hardened",
+            "--lib",
+        ],
+    );
+    std::env::remove_var("RUSTFLAGS");
+}
+
+/// AddressSanitizer over the `topo-core` library (W19-2, §30.3). ASan catches
+/// out-of-bounds, use-after-free, and other spatial/temporal memory errors in the
+/// crate's intricate `unsafe` metadata/descriptor/bitmap code. Needs the nightly
+/// toolchain (`-Zsanitizer=address` + `-Zbuild-std`, both nightly-only); a missing
+/// nightly is noted and skipped, not a failure.
+///
+/// **RSEQ asm:** the hand-written restartable sequences disable themselves under
+/// ASan (`build.rs` → `cfg(topo_sanitize_no_asm)` → `topo_arch::rseq::enable`
+/// returns `false`), so the locked baseline runs and there are no asm false
+/// positives. **Leaks (W19-2 #4):** LeakSanitizer is **on for the real-allocator C
+/// ABI pass** (`topo-tests --test abi`, `detect_leaks=1`), where the harness frees
+/// everything and the allocator's monotonic metadata is mmap-backed (untracked) —
+/// so a genuine leak fails CI, with `lsan-suppressions.txt` the documented
+/// mechanism for by-design monotonic metadata. The lib passes keep
+/// `detect_leaks=0`: they `Box::leak` their metadata arenas (`meta()` helpers) and
+/// many tests never drop their allocators, so the harness leaks by design,
+/// pervasively (§30.3 "where practical") — ASan still vets every spatial/temporal
+/// access there. The C/global-allocator `malloc` interposition paths are **not**
+/// run under ASan: ASan provides its own allocator and would conflict with the
+/// `#[global_allocator]` interposition.
+fn asan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping ASan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    std::env::set_var("RUSTFLAGS", "-Zsanitizer=address");
+    // Lib tests: leaks are **off** — they `Box::leak` their metadata arenas
+    // (`meta()` helpers) and many short-lived tests never drop their constructed
+    // allocators, so the test harness leaks by design, pervasively and
+    // indistinguishably from a real leak. ASan still checks every spatial/temporal
+    // access; the leak check rides on the ABI path below (§30.3 "where practical").
+    std::env::set_var("ASAN_OPTIONS", "detect_leaks=0");
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "asan: core memory safety (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--lib",
+        ],
+    );
+    // The hardening code (junk fill, quarantine, guard pages, scrub) carries the
+    // densest `unsafe`; vet it under ASan with the composed profile on.
+    r.run(
+        "asan: hardening memory safety (topo-core lib, hardened)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
+            "--features",
+            "hardened",
+            "--lib",
+        ],
+    );
+    // W19-2 (#4): the public C ABI (malloc/free/realloc/aligned/calloc) over the
+    // **real POSIX backend** (mmap/madvise) — the backend glue the lib tests (which
+    // use in-process metadata) never reach. This `abi` integration target installs
+    // no `#[global_allocator]`, so ASan's own allocator does not conflict.
+    //
+    // **LeakSanitizer is ON here** (`detect_leaks=1`): this is the real-allocator C
+    // path, where the harness frees everything and the allocator's monotonic
+    // metadata is mmap-backed (which LSan does not track), so the pass is clean and
+    // a genuine leak — an object the program freed that the allocator lost — fails
+    // CI. The suppression file is the documented mechanism for by-design monotonic
+    // metadata, should a build ever source it from a tracked allocator.
+    const LSAN_SUPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/lsan-suppressions.txt");
+    std::env::set_var("ASAN_OPTIONS", "detect_leaks=1");
+    std::env::set_var("LSAN_OPTIONS", format!("suppressions={LSAN_SUPP}"));
+    r.run(
+        "asan+lsan: C ABI over POSIX (topo-tests abi)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-tests",
+            "--test",
+            "abi",
+        ],
+    );
+    std::env::remove_var("LSAN_OPTIONS");
+    std::env::remove_var("ASAN_OPTIONS");
+    std::env::remove_var("RUSTFLAGS");
+}
+
+/// MemorySanitizer over the `topo-core` library (W19-2, §30.3). MSan catches reads
+/// of uninitialized memory — the strictest sanitizer. It is scoped to the
+/// `no_std`-capable core, whose hot paths take **no** libc calls (all OS access is
+/// behind the `TopoBackingProvider` seam, mocked
+/// with in-process metadata in the lib tests); running MSan over code that calls an
+/// **uninstrumented** libc (the POSIX backend's `mmap`/`madvise`) would false-
+/// positive, so those crates are intentionally excluded (§30.3 "where practical").
+/// `-Zbuild-std` instruments `std`; the RSEQ asm disables itself under MSan exactly
+/// as under ASan. Needs nightly; a missing nightly is noted and skipped.
+fn msan_steps(r: &mut Runner<'_>) {
+    if !nightly_available() {
+        r.note(
+            "nightly toolchain not found; skipping MSan. Install: \
+             rustup toolchain install nightly && rustup +nightly component add rust-src. CI runs it.",
+        );
+        return;
+    }
+    // `-Zsanitizer-memory-track-origins` makes a report name the allocation an
+    // uninitialized value originated from (worth the extra cost in CI triage).
+    std::env::set_var(
+        "RUSTFLAGS",
+        "-Zsanitizer=memory -Zsanitizer-memory-track-origins",
+    );
+    const T: &str = "x86_64-unknown-linux-gnu";
+    r.run(
+        "msan: core uninitialized-read safety (topo-core lib)",
+        "cargo",
+        &[
+            "+nightly",
+            "test",
+            "-Zbuild-std",
+            "--target",
+            T,
+            "-p",
+            "topo-core",
             "--lib",
         ],
     );

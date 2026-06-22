@@ -209,6 +209,39 @@ mod imp {
             self.budget = budget;
         }
 
+        /// Appendix B.2 (cache invariants, W19-1b): this thread cache is within
+        /// its budget and its count accounting reconciles. Total + side-effect-free
+        /// (a `&self` read), the `debug-checks`/test oracle for the per-thread
+        /// front-end:
+        ///
+        /// * `total_cached <= budget` — the §11.5 per-thread hard budget (the
+        ///   Appendix-B "thread cache bytes do not exceed hard budget" clause; the
+        ///   budget is in objects, bounding bytes by `Σ len × object_size`);
+        /// * every slot's `len <= capacity` (the per-class ceiling);
+        /// * `Σ slot.len == total_cached` — the running counter (decremented on
+        ///   pop, incremented on push) never drifts from the authoritative slots;
+        /// * each slot's addresses are pairwise **distinct** and non-null — a
+        ///   duplicate is a double-freed object (§29.3, the cache being
+        ///   single-owner needs no lock). O(len²); thread slots are small.
+        pub fn check_invariants(&self) -> bool {
+            if self.total_cached > self.budget {
+                return false;
+            }
+            let mut sum = 0usize;
+            for slot in &self.slots {
+                if slot.addrs.len() > slot.capacity {
+                    return false;
+                }
+                for (i, &a) in slot.addrs.iter().enumerate() {
+                    if a == 0 || slot.addrs[i + 1..].contains(&a) {
+                        return false;
+                    }
+                }
+                sum += slot.addrs.len();
+            }
+            sum == self.total_cached
+        }
+
         /// The slot for a size class.
         #[inline]
         pub fn slot(&self, sc: SizeClassId) -> Option<&ThreadCacheSlot> {
@@ -436,6 +469,13 @@ mod imp {
         /// No-op.
         #[inline]
         pub fn set_budget(&mut self, _budget: usize) {}
+
+        /// Appendix B.2 (W19-1b): the no-op stub holds nothing, so it is
+        /// vacuously well-formed. Always `true`.
+        #[inline]
+        pub fn check_invariants(&self) -> bool {
+            true
+        }
 
         /// Always returns `None` (no slots in no_std stub).
         #[inline]

@@ -94,5 +94,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "debug_checks"
+path = "fuzz_targets/debug_checks.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so cargo-fuzz does not inherit the parent workspace.
 [workspace]

@@ -20,6 +20,13 @@ path = "src/lib.rs"
 [features]
 default = []
 sele4n-sim = ["dep:topo-backend-sele4n", "topo-abi/sele4n-sim"]
+# Run the integration suite's engine sweeps — `Allocator::check_invariants`, now
+# including the W19-1a pagemap↔descriptor and W19-1c redzone checks — with the
+# Appendix-B runtime assertions live (the §17.3 integrity tag, the per-transition
+# B.3 `debug_assert!`s). This exercises the on-demand B.1/B.3/B.5 oracles across
+# real end-to-end malloc/free/realloc sequences in CI (W19-1a "runs in debug CI"),
+# not only topo-core's own unit tests.
+debug-checks = ["topo-core/debug-checks"]
 # W18 hardening profiles, so the integration suite can exercise the live guarded
 # allocations (real `mprotect` trap), quarantine, scrub, and junk fill over the
 # POSIX / seLe4n providers (plan 08).

@@ -76,6 +76,18 @@ pub fn rseq_available() -> bool {
     rseq::enable()
 }
 
+/// Whether the hand-written RSEQ assembly is **disabled for a sanitizer build**
+/// (W19-2, §30.3): `true` exactly when this crate was compiled under
+/// AddressSanitizer or MemorySanitizer (the `build.rs`-set `cfg(topo_sanitize_no_asm)`),
+/// in which case [`rseq_available`]/[`rseq::enable`] always report `false` and the
+/// always-correct locked baseline runs — those sanitizers cannot instrument inline
+/// asm, so the asm is never executed. A runtime reflector so a dependent crate (or
+/// CI test) can assert the disable holds without itself needing the per-crate cfg.
+/// `false` in a normal build.
+pub const fn asm_disabled_for_sanitizer() -> bool {
+    cfg!(topo_sanitize_no_asm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +110,23 @@ mod tests {
     fn rseq_available_is_consistent_with_the_module() {
         // The convenience probe agrees with the rseq module's own detection.
         assert_eq!(rseq_available(), rseq::available());
+    }
+
+    #[test]
+    fn sanitizer_asm_disable_is_consistent() {
+        // W19-2 (§30.3): when this crate is built under ASan/MSan, the asm is
+        // disabled and RSEQ is therefore unavailable. Vacuous in a normal build;
+        // load-bearing under a sanitizer build (verifying the build.rs cfg + the
+        // `enable()` short-circuit actually take effect). The dependent
+        // `topo-core` lib suite runs under the sanitizers in CI and re-asserts
+        // this through `asm_disabled_for_sanitizer()`.
+        if asm_disabled_for_sanitizer() {
+            assert!(
+                !rseq_available(),
+                "asm disabled for the sanitizer ⇒ rseq unavailable"
+            );
+            assert!(!rseq::available());
+            assert!(!rseq::enable());
+        }
     }
 }

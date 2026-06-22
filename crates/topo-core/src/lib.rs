@@ -23,6 +23,8 @@ pub mod central;
 pub mod classify;
 pub mod compat;
 pub mod cpu_cache;
+pub mod debug;
+pub mod deterministic;
 pub mod error;
 pub mod extent;
 pub mod fe;
@@ -79,6 +81,11 @@ pub use central::{
 };
 pub use classify::{classify, Request, RequestKind};
 pub use compat::{set_zero_size_policy, zero_size_policy, ZeroSizePolicy};
+pub use debug::{check_b2_cache, runtime_checks_enabled, Group as BCheckGroup};
+pub use deterministic::{
+    domain_seed, force_purge, force_slow_path, is_deterministic, next_trace_id, set_deterministic,
+    set_seed as set_deterministic_seed,
+};
 pub use error::BackendError;
 pub use extent::{
     Extent, ExtentBacking, ExtentError, ExtentFlags, ExtentId, ExtentManager, ExtentMap,
@@ -157,5 +164,21 @@ mod tests {
     #[test]
     fn version_is_nonempty() {
         assert!(!super::VERSION.is_empty());
+    }
+
+    #[test]
+    fn rseq_asm_is_disabled_under_sanitizers() {
+        // W19-2 (§30.3) regression: under AddressSanitizer/MemorySanitizer — which
+        // CI runs over this library — `topo-arch`'s `build.rs` sets
+        // `cfg(topo_sanitize_no_asm)`, so the hand-written RSEQ sequences disable
+        // themselves and the locked baseline runs (no asm false positives). This is
+        // vacuous in a normal build and load-bearing under a sanitizer build, so a
+        // regression that re-enabled the asm under a sanitizer would fail CI here.
+        if topo_arch::asm_disabled_for_sanitizer() {
+            assert!(
+                !topo_arch::rseq_available(),
+                "the RSEQ asm must be disabled under a sanitizer build"
+            );
+        }
     }
 }

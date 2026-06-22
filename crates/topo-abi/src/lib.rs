@@ -38,6 +38,8 @@ use topo_core::{
 
 mod arena_api;
 mod c_api;
+mod debug_api;
+mod deterministic_api;
 mod errno_shim;
 mod extended;
 mod fork_api;
@@ -60,6 +62,13 @@ pub use c_api::{
     topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
     topomalloc_pvalloc, topomalloc_realloc, topomalloc_reallocarray, topomalloc_valloc,
     topomalloc_version,
+};
+pub use debug_api::{topomalloc_debug_check_now, topomalloc_debug_checks_enabled};
+pub use deterministic_api::{
+    topomalloc_deterministic_enabled, topomalloc_deterministic_next_trace_id,
+    topomalloc_deterministic_seed, topomalloc_deterministic_set_enabled,
+    topomalloc_deterministic_set_force_purge, topomalloc_deterministic_set_force_slow_path,
+    topomalloc_deterministic_set_seed,
 };
 pub use extended::{
     topo_align_lg, topo_arena, topo_dallocx, topo_hot, topo_mallocx, topo_nallocx, topo_rallocx,
@@ -318,6 +327,28 @@ impl AnyAllocator {
     /// The current guarded-allocation sampling rate (`0` = off).
     pub fn guard_sample_rate(&self) -> u64 {
         dispatch!(self, a => a.guard_sample_rate())
+    }
+
+    /// §30.4 (W19-3): if deterministic mode is active, reseed the randomized
+    /// security samplers (guard-page sampler, quarantine evictor) from the global
+    /// deterministic seed so their choices are reproducible. A no-op when
+    /// deterministic mode is off or the hardening feature is not compiled in.
+    pub fn apply_deterministic_seed(&self) {
+        dispatch!(self, a => a.apply_deterministic_seed())
+    }
+
+    /// Run the **full Appendix-B invariant check** over the live engine on demand
+    /// (W19-1, §30.2, DD-2): the shared span/large back-ends and every hooked
+    /// backing (B.1/B.4), the central free-list layer and its spans (B.1/B.3), and
+    /// the arena registry (B.5). Returns `true` if every invariant holds. This is
+    /// the operator/test-triggered home for the O(state) sweeps that DD-2 keeps
+    /// off the per-transition hot path (failure-mode F1); the cheap per-span B.3
+    /// check already runs as a `debug_assert!` at every central transition. Wrapped
+    /// in the fork operation guard like every public op; read-only and lock-safe
+    /// (it walks under the §27.2 lock order).
+    pub fn check_invariants(&self) -> bool {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.check_invariants())
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
@@ -697,6 +728,11 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // unless the env var requests it (and the `quarantine` feature is built).
                 crate::quarantine_api::init_from_env();
                 crate::quarantine_api::guard_init_from_env();
+                // W19-3 (§30.4): honour `$TOPOMALLOC_DETERMINISTIC_SEED` (§32.1) under
+                // the same guard, so a deterministic run seeds its randomized samplers
+                // before the first real allocation. Off unless requested (or the
+                // `deterministic-test` profile is built).
+                crate::deterministic_api::init_from_env();
                 INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
                 // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);

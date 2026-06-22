@@ -1827,6 +1827,18 @@ impl ArenaTable {
         self.destroyed_count.load(Ordering::Relaxed)
     }
 
+    /// Test-only: force an arena slot's incarnation generation, to construct a
+    /// deliberately-inconsistent registry (a non-`Destroyed` arena at the
+    /// never-used sentinel generation `0`) and prove the B.5 stale-reuse guard in
+    /// [`check_invariants`](Self::check_invariants) catches it (W19-1d negative
+    /// test). Never compiled into a shipping build.
+    #[cfg(test)]
+    pub(crate) fn corrupt_generation_for_test(&self, arena: ArenaId, generation: u32) {
+        self.atomics[arena.0 as usize]
+            .generation
+            .store(generation, Ordering::Relaxed);
+    }
+
     /// Whether the table is well-formed (Appendix B.5 — the debug/test oracle):
     ///
     /// * the default arena is always registered and never `Destroyed` (it is the
@@ -1838,7 +1850,11 @@ impl ArenaTable {
     ///   A quarantine is reached only after the drain has retired every object
     ///   (the partial failure is leaked *backing*, not surviving objects), so its
     ///   live-byte accounting is exact too, and `Σ arena.used == live_bytes` keeps
-    ///   reconciling even across a quarantine (§8.6/§36.17).
+    ///   reconciling even across a quarantine (§8.6/§36.17);
+    /// * a non-`Destroyed` arena carries a nonzero incarnation generation — the
+    ///   B.5 "destroyed ids are not reused while stale references can exist" guard
+    ///   (a reuse always bumps the generation off the never-used sentinel `0`);
+    /// * the high-water mark stays within the table capacity.
     pub fn check_invariants(&self) -> bool {
         self.lock.acquire();
         // SAFETY: lock held.
@@ -1848,12 +1864,17 @@ impl ArenaTable {
         if !self.is_registered(ArenaId::DEFAULT) {
             return false;
         }
+        // The high-water mark never exceeds the table capacity.
+        if hw > MAX_ARENAS {
+            return false;
+        }
         for i in 0..hw {
             let a = &self.atomics[i];
             let st = ArenaState::from_u8(a.state.load(Ordering::Acquire));
             let committed = a.committed.load(Ordering::Relaxed);
             let reserved = a.reserved.load(Ordering::Relaxed);
             let limit = a.quota_limit.load(Ordering::Relaxed);
+            let generation = a.generation.load(Ordering::Relaxed);
             // The gate invariant: committed (own bytes + reserved child quota)
             // never exceeds the quota (§36.4). Every committing op checks this
             // before its compare-exchange, so it holds even mid-update.
@@ -1865,6 +1886,18 @@ impl ArenaTable {
             // Destroyed/ErrorQuarantined. A quarantined arena's reservations
             // persist (it is not destroyed), so we check own-live, not committed.
             if st.is_terminal() && committed.saturating_sub(reserved) != 0 {
+                return false;
+            }
+            // B.5 "destroyed arena ids are not reused while stale references can
+            // exist": only `create`/`finish_destroy` move the incarnation
+            // generation, each bumping it by one off the never-used sentinel `0`
+            // (§36.13). So a slot that is **not** `Destroyed` (Active/Resetting/
+            // Draining/Initializing/ErrorQuarantined) has been created at least
+            // once and therefore carries a nonzero generation — a re-vended id is
+            // never observable at the sentinel generation a stale reference would
+            // have captured. (A `Destroyed` slot may be the unused sentinel,
+            // generation `0`, or a torn-down incarnation, generation `> 0`.)
+            if !matches!(st, ArenaState::Destroyed) && generation == 0 {
                 return false;
             }
         }
@@ -1993,6 +2026,25 @@ mod tests {
         assert_eq!(&s.name[..7], b"scratch");
         assert!(s.generation.0 > 0, "a fresh arena has a nonzero generation");
         assert_eq!(t.live_count(), 2);
+    }
+
+    #[test]
+    fn check_invariants_catches_a_stale_generation_reuse() {
+        // B.5 (W19-1d) negative test: a non-`Destroyed` arena must carry a nonzero
+        // incarnation generation (the stale-reuse guard — a re-vended id always
+        // bumps the generation off the never-used sentinel 0). Forcing an Active
+        // arena back to generation 0 must fail the checker.
+        let t = ArenaTable::new();
+        let id = t.create(&ArenaPolicy::explicit().with_quota(1000)).unwrap();
+        assert!(
+            t.check_invariants(),
+            "a freshly-created registry is well-formed"
+        );
+        t.corrupt_generation_for_test(id, 0);
+        assert!(
+            !t.check_invariants(),
+            "an Active arena at the sentinel generation 0 must fail the B.5 guard"
+        );
     }
 
     #[test]

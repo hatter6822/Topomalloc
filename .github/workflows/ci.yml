@@ -172,6 +172,48 @@ jobs:
           key: tsan
       - run: cargo xtask test --kind tsan
 
+  # G-hard (ASan + LSan): AddressSanitizer over the topo-core library catches
+  # spatial / temporal memory errors in the crate's intricate `unsafe` metadata/
+  # descriptor/bitmap code, default + hardened (W19-2, §30.3). The RSEQ asm disables
+  # itself under the sanitizer (build.rs -> topo_sanitize_no_asm), so there are no
+  # asm false positives. LeakSanitizer runs on the real-allocator C ABI pass
+  # (detect_leaks=1, mmap-backed metadata untracked + harness frees everything, so a
+  # genuine leak fails CI; lsan-suppressions.txt covers by-design monotonic
+  # metadata); the lib passes keep detect_leaks=0 (they Box::leak metadata arenas by
+  # design). Nightly, opt-in like TSan.
+  asan:
+    name: asan (memory safety)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install nightly + rust-src (for the sanitizer)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+      - run: cargo xtask test --kind asan
+
+  # G-hard (MSan): MemorySanitizer over the topo-core library catches reads of
+  # uninitialized memory — the strictest sanitizer. Scoped to the no_std-capable
+  # core (its hot paths take no libc calls, so an uninstrumented libc cannot
+  # false-positive); the POSIX/ABI crates are excluded by design (§30.3 "where
+  # practical"). The RSEQ asm disables itself under MSan as under ASan. Nightly.
+  msan:
+    name: msan (uninitialized reads)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install nightly + rust-src (for the sanitizer)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msan
+      - run: cargo xtask test --kind msan
+
   # ABI compatibility (§34.1): compile + link + run the C harness against the
   # generated header and the staticlib.
   abi-test:
