@@ -230,12 +230,18 @@ impl CpuSlot {
     ///
     /// # Safety
     /// The caller MUST hold the owning per-CPU lock (so this thread is the sole
-    /// accessor of `buf`/`len`). O(len²); `len <= hard_capacity`, debug-cadence.
+    /// accessor of `buf`/`len`). O(len²), debug-cadence. The scan is bounded by the
+    /// **buffer capacity**, not the (possibly-corrupted) `len`, so it can never read
+    /// past the `hard_capacity`-sized buffer even if `len` has been corrupted past
+    /// it — the capacity overshoot is caught separately by [`check_invariants`].
     unsafe fn entries_distinct(&self) -> bool {
         if !self.is_initialized() {
             return true;
         }
-        let len = self.len() as usize;
+        // Defensive bound: never index past the allocated buffer (`hard_capacity`
+        // elements), regardless of what `len` claims. In the well-formed case
+        // `len <= hard_capacity`, so this scans every resident object.
+        let len = (self.len() as usize).min(self.hard_capacity() as usize);
         let buf = self.buf_ptr();
         for i in 0..len {
             // SAFETY: `i < len <= hard_capacity`; `buf` is a valid array of

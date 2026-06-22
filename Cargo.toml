@@ -121,7 +121,14 @@ exclude = ["fuzz", "vendor/sele4n"]
 # 0.1.27 — W19 optimal-completion: per-transition B.3 debug_asserts, on-demand check_now
 # (topomalloc_debug_*), negative tests per checker, B.5 hook-install + per-CPU/thread
 # distinctness, asm-disable regression test, ASan over the C ABI, a B.2 cache fuzz target.
-version = "0.1.27"
+# 0.1.28 — W19 audit pass: the B.3 span checker also verifies objects fit the span's
+# *actual* page extent (base + page_count × PAGE_SIZE, checked) — not only the table's
+# slab_pages — caught by two negative tests (count-over-geometry + one-page overflow); the
+# B.2 per-CPU distinctness scan bounds its loop by hard_capacity so a corrupted len can
+# never read past the buffer; and the W19-2 sanitizer asm-disable moved into imp_linux as a
+# runtime cfg! guard (the mode-detection stays referenced — no dead-code warnings under the
+# sanitizer cfg, identical disable behavior).
+version = "0.1.28"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

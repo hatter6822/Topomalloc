@@ -976,10 +976,13 @@ impl SpanDescriptor {
     /// list walk). Total + side-effect-free. The clauses, mapped to Appendix B.3:
     ///
     /// * **size class valid + ranges fit** — the span's size class indexes a real
-    ///   generated row, and the carved `object_count` does not exceed what the
-    ///   §16.3 slab geometry ([`SlabLayout`]) admits at this base/header, so every
-    ///   object range lies within the span (disjointness then holds by
-    ///   construction: `size` is a multiple of `align`, no inter-object padding);
+    ///   generated row, the carved `object_count` does not exceed what the §16.3
+    ///   slab geometry ([`SlabLayout`]) admits at this base/header, **and** the last
+    ///   object's end (`object0 + object_count × object_size`) lies within the
+    ///   span's *actual* page extent (`base + page_count × PAGE_SIZE`, checked
+    ///   arithmetic — robust even if `page_count != slab_pages`). So every object
+    ///   range lies within the span (disjointness then holds by construction:
+    ///   `size` is a multiple of `align`, no inter-object padding);
     /// * **free count == authoritative representation** — `central_free_count ==
     ///   popcount(free_bitmap)` (§8.5), the cached aggregate never drifts from the
     ///   bitmap;
@@ -1006,9 +1009,31 @@ impl SpanDescriptor {
         let object_count = self.object_count() as usize;
         // The carved object count must fit the slab geometry at this base/header
         // (B.3 "object ranges fit within span"; disjointness is then structural).
-        match SlabLayout::compute(sc, self.base(), self.slab_header() as usize) {
-            Some(layout) if object_count <= layout.object_count => {}
+        let layout = match SlabLayout::compute(sc, self.base(), self.slab_header() as usize) {
+            Some(l) if object_count <= l.object_count => l,
             _ => return false,
+        };
+        // Verify the ranges fit within the span's **actual** page extent — not just
+        // the table's `slab_pages` that `SlabLayout` assumes. The last object's end
+        // (`object0 + object_count × object_size`) must not exceed
+        // `base + page_count × PAGE_SIZE`. Robust even if `page_count != slab_pages`;
+        // all arithmetic is checked, so an overflow fails the check (never wraps).
+        let span_end = match (self.page_count() as usize)
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| self.base().checked_add(bytes))
+        {
+            Some(end) => end,
+            None => return false,
+        };
+        let last_obj_end = match object_count
+            .checked_mul(layout.object_size)
+            .and_then(|span| layout.object0.checked_add(span))
+        {
+            Some(end) => end,
+            None => return false,
+        };
+        if last_obj_end > span_end {
+            return false;
         }
         // B.3: free count equals the authoritative bitmap popcount.
         if !g.central_count_matches_bitmap() {
@@ -1982,6 +2007,55 @@ mod tests {
         }
         assert!(s.is_empty(NonCentralResidency::NONE));
         assert!(s.is_empty_central_only());
+    }
+
+    #[test]
+    fn check_invariants_rejects_object_count_over_slab_geometry() {
+        // B.3 (W19-1c) negative test, clause 1: a span claiming more objects than
+        // the slab geometry admits (over the table's `objects_per_slab`) must fail
+        // the geometry check. sc=0 packs 1024 × 16 B into one 16 KiB page; 1025
+        // over-claims.
+        let m = meta(64 * 1024);
+        let bad = SpanDescriptor::new(
+            SpanId(1),
+            ArenaId::DEFAULT,
+            SizeClassId::new(0),
+            0x4000_0000,
+            1,
+            1025,
+            0,
+            &m,
+        )
+        .expect("bitmap");
+        assert!(
+            !bad.check_invariants(),
+            "object_count past the slab geometry must fail B.3"
+        );
+    }
+
+    #[test]
+    fn check_invariants_rejects_objects_past_the_actual_page_extent() {
+        // B.3 (W19-1c) negative test, clause 2 (the actual-extent check): a single
+        // sc=64 object is 18432 B and needs two 16 KiB pages, but this span is given
+        // only one. The object count (1) is within what the *table* geometry admits,
+        // so clause 1 passes — clause 2 (last object's end vs `base + page_count ×
+        // PAGE_SIZE`) is what must catch the overflow.
+        let m = meta(64 * 1024);
+        let big = SpanDescriptor::new(
+            SpanId(2),
+            ArenaId::DEFAULT,
+            SizeClassId::new(64),
+            0x4000_0000,
+            1, // one page, but the object needs two
+            1,
+            0,
+            &m,
+        )
+        .expect("bitmap");
+        assert!(
+            !big.check_invariants(),
+            "an object overflowing the span's actual page extent must fail B.3"
+        );
     }
 
     #[test]

@@ -120,7 +120,8 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > **W19-1 (Appendix B as runtime code, DD-2).** One callable, *total*,
 > side-effect-free checker per invariant group, each landing with the state it checks
 > and gathered/documented in the new `crate::debug` module. **B.1 global / B.3 span /
-> B.1-reachability** — `SpanDescriptor::check_invariants{,_locked}` (slab-geometry fit,
+> B.1-reachability** — `SpanDescriptor::check_invariants{,_locked}` (slab-geometry fit —
+> object ranges within both the table geometry **and** the span's *actual* page extent,
 > sc validity, `central_free == popcount(free_bitmap)`, the exact §16.4 partition bound
 > `live + central_free ≤ object_count` with `quarantined ⊆ live`, quarantine
 > exclusivity, the §17.3 integrity tag) and `CentralCache::check_invariants` (acyclic
@@ -144,8 +145,8 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > Address/MemorySanitizer, so `rseq::enable()` returns `false` and the hand-written
 > restartable sequences (which those sanitizers cannot instrument) are never executed —
 > the locked baseline runs instead. TSan is excluded (it ignores asm and runs the RSEQ
-> equivalence battery on purpose). Validated green: ASan 530 + 544 hardened, MSan 530,
-> zero sanitizer reports.
+> equivalence battery on purpose). Validated green: ASan 546 + 560 hardened + 15 over the
+> live C ABI, MSan 546, zero sanitizer reports.
 >
 > **W19-3 (deterministic mode, §30.4).** A pure, `no_std`, process-global `deterministic`
 > control block: an enabled flag (auto-on under `deterministic-test`), a seed with a
@@ -190,6 +191,22 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > now fully readies) and Lean executable-model *replay* (W21-2b); deterministic *replay* is
 > single-threaded by design (matching the differential runner), so multi-threaded sampling
 > reproducibility is out of scope, not a gap.
+>
+> **Audit pass (W19).** A deep audit (trusting the code over the prose) hardened three
+> spots. The **B.3 span checker** now also verifies the carved objects fit the span's
+> *actual* page extent — `last_object_end = object0 + object_count × object_size ≤ base +
+> page_count × PAGE_SIZE`, all checked arithmetic — not only the table's `slab_pages` that
+> `SlabLayout` assumes; so a span whose `page_count` falls short of its size class's slab
+> footprint is caught even when the object count is within the table geometry (two negative
+> tests pin both clauses: count-over-`objects_per_slab`, and a single object overflowing a
+> one-page span). The **B.2 per-CPU distinctness scan** bounds its loop by the buffer
+> capacity (`min(len, hard_capacity)`) so a corrupted `len` can never read past the
+> `hard_capacity`-sized array — the overshoot itself is still caught by the capacity clause,
+> which runs first. The **W19-2 sanitizer asm-disable** moved into `imp_linux` as a runtime
+> `cfg!(topo_sanitize_no_asm)` guard (the public `rseq::enable`/`available` delegate to it),
+> so the mode-detection code stays referenced under the sanitizer cfg — eliminating five
+> dead-code warnings the prior `#[cfg]`-gated form produced in the ASan/MSan build, with
+> identical disable behavior.
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|

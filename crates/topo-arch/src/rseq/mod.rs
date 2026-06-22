@@ -89,32 +89,26 @@ pub enum Mode {
 /// model and the non-owner fence (W7-4). Returns whether the fast path is usable;
 /// when `false`, the caller stays on the locked baseline (P-003).
 ///
-/// **Sanitizers (W19-2, §30.3):** under Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`,
-/// set by `build.rs`) this returns `false` unconditionally, so the hand-written
-/// restartable sequences — which those sanitizers cannot instrument — are never
-/// executed and the always-correct locked baseline is used instead. TSan is
-/// excluded (it ignores asm and the equivalence battery runs under it on purpose).
+/// **Sanitizers (W19-2, §30.3):** the `imp_linux` implementation returns `false`
+/// under Address/MemorySanitizer (`cfg(topo_sanitize_no_asm)`, set by `build.rs`),
+/// so the hand-written restartable sequences — which those sanitizers cannot
+/// instrument — are never executed and the always-correct locked baseline is used.
+/// The disable lives there, beside the asm it governs, so the detection code stays
+/// referenced (no dead code). TSan is excluded (it ignores asm and the equivalence
+/// battery runs under it on purpose).
 #[inline]
 pub fn enable() -> bool {
-    #[cfg(topo_sanitize_no_asm)]
-    {
-        false
-    }
     #[cfg(all(
-        not(topo_sanitize_no_asm),
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
         imp_linux::enable()
     }
-    #[cfg(all(
-        not(topo_sanitize_no_asm),
-        not(all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))
-    ))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         false
     }
@@ -125,25 +119,17 @@ pub fn enable() -> bool {
 /// [`enable`].
 #[inline]
 pub fn available() -> bool {
-    #[cfg(topo_sanitize_no_asm)]
-    {
-        false
-    }
     #[cfg(all(
-        not(topo_sanitize_no_asm),
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
         imp_linux::available()
     }
-    #[cfg(all(
-        not(topo_sanitize_no_asm),
-        not(all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))
-    ))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         false
     }

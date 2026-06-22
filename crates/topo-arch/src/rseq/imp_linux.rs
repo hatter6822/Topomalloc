@@ -267,13 +267,29 @@ pub(super) fn mode() -> Mode {
 
 /// Whether the RSEQ fast path is usable (after [`enable`]).
 pub(super) fn available() -> bool {
+    // W19-2 (§30.3): never usable under Address/MemorySanitizer — the restartable
+    // sequences are disabled (see [`enable`]). A `cfg!` (not a `#[cfg]`) so the
+    // state read below stays referenced (no dead code) in a normal build.
+    if cfg!(topo_sanitize_no_asm) {
+        return false;
+    }
     matches!(MODE.load(Ordering::Acquire), MODE_GLIBC | MODE_SELFREG)
 }
 
 /// Enable RSEQ mode for the process (idempotent, W7-1). Detects the registration
 /// model and registers the membarrier intent the non-owner fence needs (W7-4).
 /// Returns whether the fast path is usable.
+///
+/// **Sanitizers (W19-2, §30.3):** returns `false` under Address/MemorySanitizer
+/// (`cfg(topo_sanitize_no_asm)`, set by `build.rs`) **before** any detection or
+/// registration, so the hand-written sequences — which those sanitizers cannot
+/// instrument — are never executed; the locked baseline runs. The check is a
+/// runtime `cfg!`, so `decide_mode` and the membarrier constants stay referenced
+/// (no dead code) in a normal build. TSan is excluded (it ignores asm).
 pub(super) fn enable() -> bool {
+    if cfg!(topo_sanitize_no_asm) {
+        return false;
+    }
     let cur = MODE.load(Ordering::Acquire);
     if cur != MODE_UNKNOWN {
         return matches!(cur, MODE_GLIBC | MODE_SELFREG);
