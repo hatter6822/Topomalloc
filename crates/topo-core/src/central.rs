@@ -529,6 +529,56 @@ impl CentralBin {
         // B.1: Σ central_free over the reachable lists equals the bin aggregate.
         sum_free == total_free
     }
+
+    /// Appendix B (§30.2 *"redzones are intact"*, W19-1c): under junk-fill, every
+    /// central-free object in **every span of this bin** still reads as
+    /// `harden::FREE_PATTERN` (§29.6). Total + side-effect-free; a no-op returning
+    /// `true` when junk-fill is compiled out (no span lock taken, no memory read).
+    ///
+    /// **Reads object backing**, so it is reached only from
+    /// [`Allocator::check_invariants`](crate::Allocator::check_invariants) — where
+    /// every central span is backed — never from a synthetic fake-base span test,
+    /// which is why it is deliberately *not* folded into
+    /// [`check_invariants`](Self::check_invariants) (that runs on fake-base spans).
+    /// Walks the partial and empty lists (both can hold central-free objects); the
+    /// per-list count bounds the walk (cycle/miscount safe, as in `check_invariants`).
+    pub fn verify_free_patterns(&self) -> bool {
+        if !crate::harden::junk_fill_enabled() {
+            return true;
+        }
+        let _guard = self.lock();
+        for (head, count) in [
+            (
+                self.partial_head.load(Ordering::Relaxed),
+                self.partial_count.load(Ordering::Relaxed) as usize,
+            ),
+            (
+                self.empty_head.load(Ordering::Relaxed),
+                self.empty_count.load(Ordering::Relaxed) as usize,
+            ),
+        ] {
+            let mut p = head;
+            let mut seen = 0usize;
+            while !p.is_null() {
+                if seen >= count {
+                    return false; // a cycle/miscount (also caught by check_invariants)
+                }
+                // SAFETY: list pointers reach valid `&SpanDescriptor` in monotonic
+                // metadata (never freed, §27.5); the bin lock pins membership.
+                let span = unsafe { &*p };
+                let next = span.central_next_ptr();
+                let g = span.lock();
+                let ok = g.verify_free_patterns();
+                drop(g);
+                if !ok {
+                    return false;
+                }
+                p = next;
+                seen += 1;
+            }
+        }
+        true
+    }
 }
 
 // SAFETY: all shared state is behind atomics or the spinlock; the raw pointers
@@ -580,6 +630,15 @@ impl CentralCache {
             .iter()
             .enumerate()
             .all(|(i, bin)| bin.check_invariants(SizeClassId::new(i)))
+    }
+
+    /// Appendix B (§30.2 "redzones are intact", W19-1c): the free-pattern sweep over
+    /// every bin — under junk-fill, every central-free object reads as
+    /// `harden::FREE_PATTERN`. See [`CentralBin::verify_free_patterns`]. A no-op when
+    /// junk-fill is off. Reads object backing, so call only over a backed engine
+    /// (from [`Allocator::check_invariants`](crate::Allocator::check_invariants)).
+    pub fn verify_free_patterns(&self) -> bool {
+        self.bins.iter().all(|bin| bin.verify_free_patterns())
     }
 
     // --- remove batch (W5-4b) ------------------------------------------------

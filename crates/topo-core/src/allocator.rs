@@ -2958,7 +2958,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let mut ok = self.span_extents.check_invariants()
             && self.large.check_invariants()
             && self.central.check_invariants()
-            && self.arenas.check_invariants();
+            && self.arenas.check_invariants()
+            // B.1 (W19-1a, §30.2 "pagemap agrees with spans"): every owned page in
+            // the shared pagemap names a descriptor whose range covers it. One call
+            // covers the engine and every hooked backend (they share this pagemap).
+            && self.pagemap.check_invariants()
+            // §30.2 "redzones are intact" (W19-1c): under junk-fill, every
+            // central-free small object still reads as FREE_PATTERN (§29.6). Reads
+            // object backing — sound here because every central span of a live
+            // engine is committed; a no-op when junk-fill is compiled out. (Large
+            // objects carry the W18 per-extent verify-on-reuse canary instead.)
+            && self.central.verify_free_patterns();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {

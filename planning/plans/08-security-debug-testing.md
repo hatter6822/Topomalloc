@@ -128,7 +128,16 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > partial/empty span lists walked under the central→span lock order, per-span
 > well-formedness, and `Σ central_free == bin aggregate` — the free-structure
 > reachability law); `Allocator::check_invariants` now also walks the central layer, so
-> the engine oracle covers B.1/B.3/B.4/B.5. **B.2 cache** — `CpuCache`, `TransferCache`
+> the engine oracle covers B.1/B.3/B.4/B.5. **B.1 pagemap↔descriptor** (§30.2 "pagemap
+> agrees with spans") — `PageMap::check_invariants` walks the radix and verifies every
+> populated entry names a descriptor whose owned range covers that page (catching a
+> stale entry after a descriptor recycle the descriptor-level oracles cannot see), the
+> runtime counterpart to the Lean §17.2 pagemap differential, wired into the engine
+> oracle. **§30.2 "redzones intact"** — `SpanGuard::verify_free_patterns` (swept per bin
+> by `CentralCache::verify_free_patterns`, called from the engine oracle) checks that,
+> under `junk-fill`, every central-free object still reads as `FREE_PATTERN` (§29.6) —
+> the on-demand companion to W18 verify-on-reuse (large objects carry the W18 per-extent
+> canary). **B.2 cache** — `CpuCache`, `TransferCache`
 > (object distinctness + non-null, the safety-critical double-free witness), and
 > `ThreadCache` `check_invariants`, plus the `debug::check_b2_cache` group callable and
 > flush/refill count-preservation assertions at the `cache_ops` transition sites.
@@ -137,16 +146,23 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > generation) and the high-water bound. Each checker has positive **and** negative
 > tests (a deliberately corrupted state is shown to fail it).
 >
-> **W19-2 (sanitizers, §30.3).** ASan and MSan join the existing TSan support:
-> `cargo xtask test --kind asan|msan` run the `topo-core` library (ASan: default +
-> hardened, `detect_leaks=0` for the leaked-metadata model; MSan: the no_std-capable
-> core, where the hot paths take no libc) under `-Zsanitizer=address|memory`, with CI
-> jobs mirroring `tsan`. A `topo-arch` `build.rs` sets `cfg(topo_sanitize_no_asm)` under
-> Address/MemorySanitizer, so `rseq::enable()` returns `false` and the hand-written
-> restartable sequences (which those sanitizers cannot instrument) are never executed —
-> the locked baseline runs instead. TSan is excluded (it ignores asm and runs the RSEQ
-> equivalence battery on purpose). Validated green: ASan 546 + 560 hardened + 15 over the
-> live C ABI, MSan 546, zero sanitizer reports.
+> **W19-2 (sanitizers, §30.3).** ASan, MSan, **and LeakSanitizer** join the existing
+> TSan support: `cargo xtask test --kind asan|msan` run the `topo-core` library (ASan:
+> default + hardened; MSan: the no_std-capable core, where the hot paths take no libc)
+> under `-Zsanitizer=address|memory`, with CI jobs mirroring `tsan`. A `topo-arch`
+> `build.rs` sets `cfg(topo_sanitize_no_asm)` under Address/MemorySanitizer, so
+> `rseq::enable()` returns `false` and the hand-written restartable sequences (which
+> those sanitizers cannot instrument) are never executed — the locked baseline runs
+> instead. TSan is excluded (it ignores asm and runs the RSEQ equivalence battery on
+> purpose). **LeakSanitizer is on for the real-allocator C-ABI pass** (`--test abi`,
+> `detect_leaks=1`): the harness frees everything and the allocator's monotonic
+> metadata is mmap-backed (untracked), so a genuine leak — an object the program freed
+> that the allocator lost — fails CI, with `xtask/lsan-suppressions.txt` the documented
+> mechanism for by-design monotonic metadata. The lib passes keep `detect_leaks=0`
+> (their `meta()` helpers `Box::leak` metadata arenas and tests rarely drop their
+> allocators — pervasive by-design harness leaks, §30.3 "where practical"). Validated
+> green: ASan 546 + 560 hardened + 15 over the live C ABI (leak-checked), MSan 546, zero
+> sanitizer reports.
 >
 > **W19-3 (deterministic mode, §30.4).** A pure, `no_std`, process-global `deterministic`
 > control block: an enabled flag (auto-on under `deterministic-test`), a seed with a
@@ -187,10 +203,12 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > empty-detection is exercised with every non-central term, and the strict-LIFO refill
 > order is pinned. A `debug_checks` **fuzz target** drives the B.2 cache checkers (the
 > central B.1/B.3 checkers are already fuzzed by `malloc_api`). The only deliberate
-> boundaries left are genuinely **W21**: live per-op trace *emission* (W21-2a, which W19-3
-> now fully readies) and Lean executable-model *replay* (W21-2b); deterministic *replay* is
-> single-threaded by design (matching the differential runner), so multi-threaded sampling
-> reproducibility is out of scope, not a gap.
+> boundaries left are genuinely **W21**: live per-op trace *emission* into the allocator
+> hot path (W21-2a, which W19-3 now fully readies) and the Lean executable-model
+> *differential replay* (W21-2b) — the **self-consistency** replay (a captured seeded
+> trace replays byte-identically) is now demonstrated in W19-3 itself (see the gap-closure
+> pass). Deterministic *replay* is single-threaded by design (matching the differential
+> runner), so multi-threaded sampling reproducibility is out of scope, not a gap.
 >
 > **Audit pass (W19).** A deep audit (trusting the code over the prose) hardened three
 > spots. The **B.3 span checker** now also verifies the carved objects fit the span's
@@ -207,6 +225,30 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > so the mode-detection code stays referenced under the sanitizer cfg — eliminating five
 > dead-code warnings the prior `#[cfg]`-gated form produced in the ASan/MSan build, with
 > identical disable behavior.
+>
+> **Gap-closure pass (W19).** A second honest audit ("what is *not* optimally complete")
+> found five gaps against §30.2/§30.4 and the WU acceptance rows; all are now closed.
+> **(1) Pagemap↔descriptor (B.1, the substantive one).** §30.2 lists "pagemap agrees
+> with spans" and W19-1a lists "page↔descriptor", but no runtime checker verified the
+> pagemap *structure* — only the Lean differential did. New `PageMap::check_invariants`
+> walks the radix and verifies every populated entry's page lies within the descriptor
+> it names (catching stale-after-recycle / wrong-pointer / malformed entries), wired into
+> `Allocator::check_invariants` and `crate::debug` B.1, with positive + negative tests.
+> **(2) "Redzones intact" (§30.2).** New `SpanGuard::verify_free_patterns` /
+> `CentralCache::verify_free_patterns` sweep every central-free object for `FREE_PATTERN`
+> under `junk-fill` (the on-demand companion to W18 verify-on-reuse), wired into the
+> engine oracle, with a real-backing positive+negative test. **(3) Self-consistency
+> replay (W19-3 acceptance).** A new `deterministic.rs` test captures a fixed op script
+> as a §33.7 trace whose fields are reproducible projections (deterministic id + the real
+> `classify` outcome + a `domain_seed`-driven draw), proving same-seed byte-identical
+> replay *and* that a different seed changes it — closing "a trace replays identically"
+> with W19-3 machinery (the Lean executable-model differential stays W21-2b). **(4)
+> LeakSanitizer.** Enabled on the real-allocator C-ABI pass (`detect_leaks=1`), green,
+> with `xtask/lsan-suppressions.txt` for by-design monotonic metadata. **(5) debug-checks
+> in CI.** A new `xtask` step + `topo-tests` `debug-checks` feature run the cross-crate
+> integration suite with the Appendix-B assertions live, so the engine on-demand sweeps
+> (now including the pagemap + redzone checks) are exercised over real end-to-end
+> sequences in CI — not only topo-core's unit tests ("runs in debug CI").
 
 | WU | Description | Size | ∥ | Acceptance |
 |---|---|---|---|---|

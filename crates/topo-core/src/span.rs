@@ -1192,6 +1192,66 @@ impl SpanGuard<'_> {
         self.span.free_bitmap.contains(i)
     }
 
+    /// Appendix B (§30.2 *"redzones are intact"*, W19-1c): under junk-fill, every
+    /// **central-free** object in this span still reads as [`harden::FREE_PATTERN`]
+    /// (the §29.6 invariant "every central-free object — fresh or recycled — reads
+    /// as `FREE_PATTERN`"). Total + side-effect-free; a no-op returning `true` when
+    /// junk-fill is compiled out (no memory is touched).
+    ///
+    /// It iterates the **free bitmap**, so it inspects only central-resident
+    /// objects — a live object (user data) or a cache-resident object (removed from
+    /// the bitmap, already verified at reuse) is never read. The on-demand,
+    /// O(objects) companion to the W18 verify-on-reuse: a stale write-after-free a
+    /// program left in a still-central-free object is caught here even before that
+    /// object is handed back out.
+    ///
+    /// # Safety / preconditions
+    /// **Reads the span's object backing**, so it is sound only over a span whose
+    /// slab is committed — which the engine guarantees (every central span is
+    /// backed). It is reached only from
+    /// [`Allocator::check_invariants`](crate::Allocator::check_invariants) via the
+    /// central walk, never from a synthetic fake-base span checker (those never
+    /// touch object memory). The read is otherwise safe: each central-free object's
+    /// `[addr, addr + object_size)` lies within the slab (B.3 verifies the geometry
+    /// fits), and the span lock makes the bitmap and backing a consistent snapshot.
+    pub fn verify_free_patterns(&self) -> bool {
+        if !crate::harden::junk_fill_enabled() {
+            return true; // junk-fill off: nothing is filled, nothing to verify
+        }
+        let span = self.span;
+        let layout = match SlabLayout::compute(
+            span.size_class(),
+            span.base(),
+            span.slab_header() as usize,
+        ) {
+            Some(l) => l,
+            // A span whose geometry will not compute is already malformed; the
+            // B.3 checker reports it. Fail here too rather than read blind.
+            None => return false,
+        };
+        let object_count = (span.object_count() as usize).min(layout.object_count);
+        for i in 0..object_count {
+            if !self.central_resident(i) {
+                continue; // live or cache-resident — not a central-free object
+            }
+            let addr = match i
+                .checked_mul(layout.object_size)
+                .and_then(|off| layout.object0.checked_add(off))
+            {
+                Some(a) => a,
+                None => return false,
+            };
+            // SAFETY: object `i` is central-free, hence committed and (§29.6) filled
+            // with FREE_PATTERN; `[addr, addr + object_size)` lies within the slab
+            // (B.3 geometry). The span lock pins the bitmap/backing for the read.
+            if !unsafe { crate::harden::verify_free_pattern(addr as *const u8, layout.object_size) }
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// `popcount(free_bitmap)` (consistent under the lock).
     #[inline]
     pub fn bitmap_popcount(&self) -> usize {
@@ -2056,6 +2116,70 @@ mod tests {
             !big.check_invariants(),
             "an object overflowing the span's actual page extent must fail B.3"
         );
+    }
+
+    #[cfg(feature = "junk-fill")]
+    #[test]
+    fn verify_free_patterns_holds_then_catches_a_corrupted_free_object() {
+        // §30.2 "redzones are intact" (W19-1c): under junk-fill, every central-free
+        // object must read as FREE_PATTERN. Uses *real* page-aligned backing (the
+        // sweep reads object memory). sc=0 packs 1024 × 16 B with a zero header, so
+        // object0 == base and the slab is a single page.
+        use crate::harden::{fill_fresh_slab, FREE_PATTERN};
+        use std::alloc::{alloc, dealloc, Layout};
+
+        let sc = SizeClassId::new(0);
+        let row = crate::size_class::checked_row(sc).unwrap();
+        let slab_bytes = row.slab_pages as usize * PAGE_SIZE;
+        let backing = Layout::from_size_align(slab_bytes, PAGE_SIZE).unwrap();
+        // SAFETY: `backing` has nonzero size.
+        let buf = unsafe { alloc(backing) };
+        assert!(!buf.is_null());
+        let base = buf as usize;
+
+        let m = meta(256 * 1024);
+        let span = SpanDescriptor::new(
+            SpanId(1),
+            ArenaId::DEFAULT,
+            sc,
+            base,
+            row.slab_pages,
+            row.objects_per_slab,
+            0,
+            &m,
+        )
+        .expect("span");
+        // Establish the FREE_PATTERN invariant over the slab (what activation does),
+        // then mark every object central-free.
+        // SAFETY: `buf` is a fresh, exclusively-owned `slab_bytes`-byte allocation.
+        unsafe { fill_fresh_slab(buf, slab_bytes) };
+        {
+            let g = span.lock();
+            g.set_live_count(0);
+            for i in 0..row.objects_per_slab as usize {
+                assert!(g.central_insert(i));
+            }
+            assert!(
+                g.verify_free_patterns(),
+                "a freshly filled slab's free objects all read as FREE_PATTERN"
+            );
+        }
+
+        // Corrupt one central-free object (a stale write-after-free) — caught.
+        let layout = SlabLayout::compute(sc, base, 0).unwrap();
+        let victim = layout.object0 + 3 * layout.object_size; // object #3
+                                                              // SAFETY: `victim` lies within the slab backing.
+        unsafe { *(victim as *mut u8) = !FREE_PATTERN };
+        {
+            let g = span.lock();
+            assert!(
+                !g.verify_free_patterns(),
+                "a corrupted central-free object must fail the redzone sweep"
+            );
+        }
+
+        // SAFETY: `buf`/`backing` came from `alloc` above and are no longer aliased.
+        unsafe { dealloc(buf, backing) };
     }
 
     #[test]

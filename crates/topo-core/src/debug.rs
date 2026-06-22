@@ -28,6 +28,12 @@
 //!   ([`ExtentManager::check_invariants`](crate::ExtentManager::check_invariants))
 //!   for the large path, the slab geometry ([`SlabLayout`](crate::SlabLayout),
 //!   verified per span in B.3) for the small path;
+//! * *the pagemap agrees with the descriptors* (§30.2 "pagemap agrees with spans")
+//!   — every populated pagemap entry names a descriptor whose owned range covers
+//!   that page ([`PageMap::check_invariants`](crate::PageMap::check_invariants), the
+//!   runtime counterpart to the Lean §17.2 pagemap differential), catching a stale
+//!   entry after a descriptor recycle that the descriptor-level oracles above —
+//!   which reason about descriptors, not the pagemap structure — cannot see;
 //! * *every span/extent belongs to exactly one arena* — the per-arena `used`
 //!   accounting and quota gate ([`ArenaTable::check_invariants`]);
 //! * *released ranges contain no live objects* — the extent state↔backing coupling
@@ -59,7 +65,15 @@
 //!   residency — an object removed from central but not yet returned stays counted
 //!   as live — so those terms are folded into `live`, with `quarantined ≤ live`);
 //! * *generation prevents stale descriptor reuse* — the §17.3 integrity tag (which
-//!   covers `generation`) validates under `debug-checks`.
+//!   covers `generation`) validates under `debug-checks`;
+//! * *redzones / free-fill intact* (§30.2 "redzones are intact") — under
+//!   `junk-fill`, every central-free object still reads as `harden::FREE_PATTERN`
+//!   (the §29.6 invariant), swept on demand by
+//!   [`SpanGuard::verify_free_patterns`](crate::SpanGuard::verify_free_patterns) and
+//!   per bin by [`CentralCache::verify_free_patterns`](crate::CentralCache::verify_free_patterns)
+//!   from [`Allocator::check_invariants`](crate::Allocator::check_invariants) — the
+//!   on-demand companion to W18 verify-on-reuse (large objects carry the W18
+//!   per-extent canary instead). A no-op when `junk-fill` is compiled out.
 //!
 //! ### B.4 Hugepage ([`HugePageFiller::check_invariants`](crate::HugePageFiller::check_invariants))
 //! * *bins match occupancy / live bytes equal sum / empty has no live / partial

@@ -559,6 +559,58 @@ impl PageMap {
         self.node_bytes.fetch_add(size, Ordering::Relaxed);
         Ok(node.as_ptr())
     }
+
+    // --- invariant check (W19-1a, Appendix B.1 "pagemap agrees with spans") -----
+
+    /// Appendix B.1 (W19-1a, §30.2 *"pagemap agrees with spans"*): every populated
+    /// pagemap entry **agrees with the descriptor it names** — the mapped page lies
+    /// within that descriptor's owned page range (P-Map-001/003/004/005), and a span
+    /// entry's size class indexes a real generated row. Total (a bounded walk over
+    /// the lazily-populated radix — each node visited once) and side-effect-free
+    /// (acquire loads only; descriptors are read, never mutated).
+    ///
+    /// This is the **runtime** counterpart to the Lean §17.2 pagemap differential
+    /// (W3-3d): it catches a **stale entry after a descriptor recycle** (the
+    /// recycled descriptor's new range no longer covers the old page), a wrong or
+    /// corrupted descriptor pointer, and a malformed entry word — none of which the
+    /// extent-tiling / slab-geometry oracles (which reason about *descriptors*, not
+    /// the pagemap structure) can observe.
+    ///
+    /// **Soundness precondition (quiescence).** Like
+    /// [`Allocator::check_invariants`](crate::Allocator::check_invariants) (which
+    /// calls it), it is exact at a quiescent point — no concurrent span
+    /// split/merge/lifecycle, the only mutations that move a descriptor's range.
+    /// Run on demand (`topomalloc_debug_check_now`) or as a test/CI oracle, never on
+    /// the hot path.
+    pub fn check_invariants(&self) -> bool {
+        let root = self.root.load(Ordering::Acquire);
+        if root.is_null() {
+            return true; // nothing installed — vacuously consistent
+        }
+        // SAFETY: a non-null root is a published `Interior`; the walk only acquire-
+        // loads slots (monotonic, never freed) and reads descriptors (live for the
+        // allocator's life, §27.5).
+        unsafe { check_subtree(root.cast::<u8>(), LEVELS - 1, 0) }
+    }
+
+    /// Test-only: forcibly publish a `Small(span)` entry at `addr`'s page even
+    /// though `span` does not own that page, to construct a pagemap that disagrees
+    /// with its descriptors and prove [`check_invariants`](Self::check_invariants)
+    /// catches it (W19-1a negative test). Never compiled into a shipping build.
+    #[cfg(test)]
+    pub(crate) fn corrupt_entry_for_test(
+        &self,
+        meta: &dyn MetadataAlloc,
+        addr: usize,
+        span: &SpanDescriptor,
+    ) {
+        let p = page_of(addr);
+        self.leaf_or_create(meta, p).expect("test metadata");
+        let leaf = self.find_leaf(p).expect("leaf just created");
+        let entry = PageEntry::Small(span as *const SpanDescriptor).encode();
+        // SAFETY: `find_leaf` returned a valid, published `Leaf`; test-only, single-threaded.
+        unsafe { (*leaf).entries[p & SLOT_MASK].store(entry, Ordering::Release) };
+    }
 }
 
 impl Default for PageMap {
@@ -600,6 +652,73 @@ fn page_range(base: usize, stop: usize) -> core::ops::RangeInclusive<usize> {
         return 1..=0; // an empty byte range covers no pages
     }
     page_of(base)..=page_of(stop - 1)
+}
+
+// --- invariant-check helpers (W19-1a, B.1) ----------------------------------
+
+/// Recursively verify the radix subtree rooted at `node` — an `Interior` when
+/// `level >= 1`, a `Leaf` when `level == 0`. `prefix` is the page-number bits
+/// already resolved by the ancestors; combined with the per-level slot index it
+/// reconstructs each leaf entry's full page number. Returns whether every populated
+/// descendant entry agrees with its descriptor. Bounded depth ([`LEVELS`]). A free
+/// function (it needs nothing from [`PageMap`]).
+///
+/// # Safety
+/// `node` must be a valid, published radix node of the kind implied by `level`.
+unsafe fn check_subtree(node: *mut u8, level: u32, prefix: usize) -> bool {
+    if level == 0 {
+        let leaf = node.cast::<Leaf>();
+        for j in 0..SLOTS {
+            // SAFETY: `leaf` is a published `Leaf`; each entry is an atomic word.
+            let bits = unsafe { (*leaf).entries[j].load(Ordering::Acquire) };
+            if bits != TAG_EMPTY && !entry_agrees(bits, prefix | j) {
+                return false;
+            }
+        }
+        true
+    } else {
+        let interior = node.cast::<Interior>();
+        for idx in 0..SLOTS {
+            // SAFETY: `interior` is a published `Interior`; each slot is atomic.
+            let child = unsafe { (*interior).slots[idx].load(Ordering::Acquire) };
+            if child.is_null() {
+                continue;
+            }
+            let child_prefix = prefix | (idx << (level * RADIX_BITS));
+            // SAFETY: a non-null child of a level-`level` interior is a published
+            // node one level down (`Interior` for `level > 1`, `Leaf` for `level ==
+            // 1`) — exactly the kind the recursive call dereferences.
+            if !unsafe { check_subtree(child, level - 1, child_prefix) } {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Whether a **populated** leaf word `bits` (the caller has already excluded the
+/// all-zero `Empty` word) at page number `p` agrees with the descriptor it encodes:
+/// the page lies within the descriptor's owned page range, and a span entry's size
+/// class indexes a real generated row. Used only by [`PageMap::check_invariants`].
+fn entry_agrees(bits: usize, p: usize) -> bool {
+    match PageEntry::decode(bits) {
+        // A non-empty word that decodes to `Empty` has a zero tag but non-zero
+        // pointer bits — a malformed entry the encode path never produces.
+        PageEntry::Empty => false,
+        PageEntry::Small(sp) | PageEntry::Released(sp) => {
+            // SAFETY: a pagemap span pointer is into monotonic metadata, valid for
+            // the allocator's lifetime (§27.5); this is a read-only borrow.
+            let span = unsafe { &*sp };
+            let (base, stop) = span.range();
+            page_range(base, stop).contains(&p)
+                && crate::size_class::checked_row(span.size_class()).is_some()
+        }
+        PageEntry::Large(lp) => {
+            // SAFETY: a pagemap large pointer is into monotonic metadata, as above.
+            let large = unsafe { &*lp };
+            page_range(large.base(), large.end()).contains(&p)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -966,5 +1085,73 @@ mod tests {
         assert_eq!(page_range(0, 1).count(), 1);
         assert_eq!(page_range(0, PAGE_SIZE).count(), 1);
         assert_eq!(page_range(0, PAGE_SIZE + 1).count(), 2);
+    }
+
+    // --- B.1 (W19-1a) pagemap<->descriptor agreement: positive + negative -------
+
+    #[test]
+    fn check_invariants_holds_for_consistent_installs() {
+        // A multi-span + large pagemap, plus the release/retire transitions, all keep
+        // every entry within the range of the descriptor it names (B.1, §30.2).
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        assert!(
+            pm.check_invariants(),
+            "an empty pagemap is vacuously consistent"
+        );
+
+        let a = small_span(1, 0x4000_0000, 2, 64, &m); // a 2-page span
+        let b = small_span(2, 0x8000_0000, 1, 64, &m); // far away
+        pm.install_span(&m, &a).unwrap();
+        pm.install_span(&m, &b).unwrap();
+        let d = LargeDescriptor::new(LargeId(1), ArenaId::DEFAULT, 0x1_0000_0000, 3_000_000, 4096);
+        pm.install_large(&m, &d).unwrap();
+        assert!(
+            pm.check_invariants(),
+            "a consistently-installed pagemap must pass B.1"
+        );
+
+        // Released keeps the entry pointing at the (in-range) span; retire clears it.
+        a.set_state(SpanState::Released);
+        pm.release_span(&a);
+        assert!(
+            pm.check_invariants(),
+            "a Released entry still lies within its span's range"
+        );
+        pm.retire_span(&a);
+        assert!(
+            pm.check_invariants(),
+            "retired pages are Empty, so they are skipped"
+        );
+    }
+
+    #[test]
+    fn check_invariants_catches_an_entry_outside_its_spans_range() {
+        // W19-1a negative test: an entry mapping a page to a span that does not own
+        // it — the shape of a stale-after-recycle or corrupted mapping — must fail
+        // B.1. `s` owns exactly one page at 0x4000_0000; we force a Small(s) entry at
+        // a far page it does not cover, and the range check rejects it.
+        let m = meta(2 * 1024 * 1024);
+        let pm = PageMap::new();
+        let s = small_span(1, 0x4000_0000, 1, 64, &m);
+        pm.install_span(&m, &s).unwrap();
+        assert!(pm.check_invariants());
+
+        pm.corrupt_entry_for_test(&m, 0x8000_0000, &s);
+        assert!(
+            !pm.check_invariants(),
+            "an entry mapping a page outside the span's range must fail B.1"
+        );
+    }
+
+    #[test]
+    fn entry_agrees_rejects_a_malformed_nonempty_word() {
+        // A non-empty word whose tag bits are 0 (so it decodes to Empty despite
+        // non-null pointer bits) is malformed — the encode path never produces it —
+        // and `entry_agrees` (called only for populated words) must reject it.
+        let malformed = 0x4000_0000usize; // non-zero, but `& TAG_MASK == 0`
+        assert_eq!(malformed & TAG_MASK, TAG_EMPTY);
+        assert_ne!(malformed, TAG_EMPTY);
+        assert!(!entry_agrees(malformed, page_of(malformed)));
     }
 }

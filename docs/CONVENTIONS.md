@@ -40,16 +40,23 @@ sweep on the `performance` hot path.
 
 The Appendix-B checklist (W19-1, DD-2) is **first-class runtime code**: one *total*,
 side-effect-free `check_invariants` method per type, landing with the state it checks
-(`SpanDescriptor`/`CentralCache` for B.3/B.1, the `CpuCache`/`TransferCache`/`ThreadCache`
-trio for B.2, `HugePageFiller` for B.4, `ArenaTable` for B.5), gathered and documented by
-invariant group in the `crate::debug` module (the B.1–B.5 → code map, the `check_b2_cache`
-group callable, the `Group` enum). The **cheap per-span B.3 check runs as a
-`debug_assert!` at every central transition** (the extent/huge pattern); the **O(state)
-sweeps** (B.1 central reachability, full B.2 distinctness, B.5) run on demand — from
-`Allocator::check_invariants` (the engine aggregate, which the C `topomalloc_debug_check_now`
-exposes) and from tests — kept off the per-transition hot path (DD-2 failure-mode F1). A WU
-that adds state adds its checker (DoD addendum), with a **negative** test proving the
-checker catches a real violation.
+(`SpanDescriptor`/`CentralCache` for B.3/B.1, `PageMap` for the B.1 pagemap↔descriptor
+agreement, the `CpuCache`/`TransferCache`/`ThreadCache` trio for B.2, `HugePageFiller` for
+B.4, `ArenaTable` for B.5), gathered and documented by invariant group in the `crate::debug`
+module (the B.1–B.5 → code map, the `check_b2_cache` group callable, the `Group` enum). The
+**cheap per-span B.3 check runs as a `debug_assert!` at every central transition** (the
+extent/huge pattern); the **O(state) sweeps** (B.1 central reachability + the pagemap walk,
+full B.2 distinctness, B.5, and the §30.2 redzone free-pattern sweep
+`verify_free_patterns` under `junk-fill`) run on demand — from `Allocator::check_invariants`
+(the engine aggregate, which the C `topomalloc_debug_check_now` exposes) and from tests —
+kept off the per-transition hot path (DD-2 failure-mode F1). A sweep that **reads object
+backing** (the redzone free-pattern check) is wired only into the engine aggregate, never
+into a per-span/central checker that also runs on synthetic fake-base spans in unit tests.
+The engine aggregate runs in CI under `debug-checks` over both the `topo-core` unit tests
+*and* the cross-crate integration suite (`topo-tests --features debug-checks`), so the
+on-demand sweeps are exercised over real end-to-end sequences. A WU that adds state adds its
+checker (DoD addendum), with a **negative** test proving the checker catches a real
+violation.
 
 Corollary (Appendix F): error logging and profiling callbacks **must not**
 allocate through TopoMalloc (no recursion); assertion-failure paths must be

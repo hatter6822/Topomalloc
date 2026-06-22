@@ -29,6 +29,16 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const PAGE: usize = 16 * 1024;
 
+/// A SplitMix64 step — a local copy of the `deterministic` module's mixer (which is
+/// private), used to advance a reproducible per-run RNG stream in the replay test
+/// below, standing in for the seed-driven decisions the guard/heap samplers make.
+fn splitmix_step(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 fn meta(bytes: usize) -> &'static BumpArena {
     let buf = vec![0u8; bytes].into_boxed_slice();
     let len = buf.len();
@@ -316,4 +326,107 @@ fn deterministic_seed_and_trace_ids_are_reproducible() {
     assert_eq!(deterministic::next_trace_id(), 1);
 
     deterministic::set_seed(deterministic::DEFAULT_SEED); // leave the global clean
+}
+
+#[test]
+fn a_seeded_op_trace_captures_and_replays_identically() {
+    // §30.4 / W19-3 acceptance ("a trace replays identically; the differential
+    // runner rides on it"): an end-to-end self-consistency replay over the *whole*
+    // deterministic pipeline. A fixed op script is captured as a §33.7 trace whose
+    // every field is a reproducible projection — the deterministic trace id, the
+    // **real classifier outcome** (size class / extent bytes, from `classify`), and
+    // a seed-derived placement draw (the same `domain_seed` stream the guard/heap
+    // samplers draw from). With the same seed the capture replays byte-for-byte;
+    // with a *different* seed it changes — so the seed genuinely drives the
+    // randomized part (not a constant masquerading as reproducible). The Lean
+    // executable-model differential is W21-2b; this proves the W19-3 prerequisite
+    // with only W19-3 machinery.
+    use topo_core::classify::{classify, RequestKind};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // A fixed op script: (size, align). Spans the small, medium, and large paths.
+    const SCRIPT: [(usize, usize); 6] = [
+        (1, 16),
+        (24, 16),
+        (64, 64),
+        (4096, 16),
+        (100_000, 16),
+        (2_500_000, 16),
+    ];
+
+    // The §33.7 trace a run with `seed` emits — the reproducible projection of each
+    // op's real outcome, one line per op.
+    let capture = |seed: u64| -> String {
+        deterministic::set_deterministic(true);
+        deterministic::set_seed(seed);
+        deterministic::reset_trace_ids();
+        // The per-run RNG stream a randomized placement/sampling decision draws from,
+        // derived from the just-reset global seed — reproducible per seed.
+        let mut rng = deterministic::domain_seed(deterministic::salt::SAMPLER);
+        let mut buf = String::new();
+        for (size, align) in SCRIPT {
+            let id = deterministic::next_trace_id();
+            let req = classify(size, align, 0).expect("valid request");
+            let (usable, sc) = match req.kind {
+                RequestKind::Small { sc, usable } => (usable, Some(sc.index() as u64)),
+                RequestKind::Medium { bytes } | RequestKind::Large { bytes } => (bytes, None),
+            };
+            // Advance the seeded stream — the randomized decision — so its value
+            // rides in the captured trace and the seed participates in the replay.
+            rng = splitmix_step(rng);
+            // A real address is not reproducible (ASLR); the model replay compares
+            // abstract outcomes (§33.7), so the captured pointer mixes the
+            // deterministic id with the seeded draw — reproducible per seed.
+            let pseudo_addr = (0x1_0000usize.wrapping_mul(id as usize)) ^ (rng as usize & 0xfff);
+            topo_core::trace::emit_alloc(
+                &mut buf,
+                id,
+                size,
+                align,
+                0, // flags=0 ⇒ the default arena for every op
+                0,
+                pseudo_addr,
+                usable,
+                sc,
+                None,
+            )
+            .expect("emit");
+        }
+        buf
+    };
+
+    const SEED: u64 = 0x7E57_5EED_1234_ABCD;
+    let first = capture(SEED);
+    assert_eq!(
+        first,
+        capture(SEED),
+        "the seeded op-trace replays byte-identically under the same seed"
+    );
+    assert_ne!(
+        first,
+        capture(SEED ^ u64::MAX),
+        "a different seed must change the trace (the seed genuinely drives the replay)"
+    );
+    // The real classifier outcomes are captured (trace line:
+    // `ALLOC id size align arena flags -> ptr usable sc span`, `sc`/`span` "-" when
+    // absent): the 1-byte request is small — class 0, usable 16 — and the 2.5 MB
+    // request takes the large path (no size class).
+    assert!(
+        first.contains("ALLOC 1 1 16 0 0 -> "),
+        "op 1 present with id 1, arena 0"
+    );
+    assert!(
+        first.lines().next().unwrap().ends_with(" 16 0 -"),
+        "the 1-byte request records class 0 (usable 16) in the trace's sc field"
+    );
+    assert!(
+        first.lines().last().unwrap().ends_with(" - -"),
+        "the 2.5 MB request takes the large path — no size class recorded"
+    );
+
+    // Leave every global clean for the rest of the binary.
+    deterministic::set_seed(deterministic::DEFAULT_SEED);
+    deterministic::reset_trace_ids();
+    deterministic::set_deterministic(false);
 }

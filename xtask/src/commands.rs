@@ -441,6 +441,16 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         "cargo",
         &["test", "-p", "topo-core", "--features", "debug-checks"],
     );
+    // W19-1a (G-core): run the cross-crate **integration** suite with the Appendix-B
+    // runtime assertions live, so the engine on-demand sweeps
+    // (`Allocator::check_invariants` — incl. the W19-1a pagemap↔descriptor and
+    // W19-1c redzone checks) are exercised over real end-to-end malloc/free/realloc
+    // sequences in CI, not only topo-core's own unit tests ("runs in debug CI").
+    r.run(
+        "test integration (debug-checks)",
+        "cargo",
+        &["test", "-p", "topo-tests", "--features", "debug-checks"],
+    );
     // W18 hardened profile (plan 08): the full hardening composition — junk-fill +
     // quarantine + guard-pages + secure-scrub on top of debug-checks. Runs the core
     // suite so every protection's wiring + accounting is exercised *together* (the
@@ -785,12 +795,17 @@ fn tsan_steps(r: &mut Runner<'_>) {
 /// **RSEQ asm:** the hand-written restartable sequences disable themselves under
 /// ASan (`build.rs` → `cfg(topo_sanitize_no_asm)` → `topo_arch::rseq::enable`
 /// returns `false`), so the locked baseline runs and there are no asm false
-/// positives. **Leaks:** the lib tests intentionally leak their metadata arenas
-/// (`Box::into_raw`, the `MetadataAlloc` monotonic-metadata model), so the
-/// integrated LeakSanitizer is disabled (`ASAN_OPTIONS=detect_leaks=0`) — ASan
-/// here vets spatial/temporal safety, not leaks. The C/global-allocator paths are
-/// **not** run under ASan: ASan provides its own allocator and would conflict with
-/// the `#[global_allocator]` interposition.
+/// positives. **Leaks (W19-2 #4):** LeakSanitizer is **on for the real-allocator C
+/// ABI pass** (`topo-tests --test abi`, `detect_leaks=1`), where the harness frees
+/// everything and the allocator's monotonic metadata is mmap-backed (untracked) —
+/// so a genuine leak fails CI, with `lsan-suppressions.txt` the documented
+/// mechanism for by-design monotonic metadata. The lib passes keep
+/// `detect_leaks=0`: they `Box::leak` their metadata arenas (`meta()` helpers) and
+/// many tests never drop their allocators, so the harness leaks by design,
+/// pervasively (§30.3 "where practical") — ASan still vets every spatial/temporal
+/// access there. The C/global-allocator `malloc` interposition paths are **not**
+/// run under ASan: ASan provides its own allocator and would conflict with the
+/// `#[global_allocator]` interposition.
 fn asan_steps(r: &mut Runner<'_>) {
     if !nightly_available() {
         r.note(
@@ -800,8 +815,11 @@ fn asan_steps(r: &mut Runner<'_>) {
         return;
     }
     std::env::set_var("RUSTFLAGS", "-Zsanitizer=address");
-    // The metadata arenas are deliberately leaked (monotonic metadata); LSan would
-    // otherwise report them. ASan still checks every spatial/temporal access.
+    // Lib tests: leaks are **off** — they `Box::leak` their metadata arenas
+    // (`meta()` helpers) and many short-lived tests never drop their constructed
+    // allocators, so the test harness leaks by design, pervasively and
+    // indistinguishably from a real leak. ASan still checks every spatial/temporal
+    // access; the leak check rides on the ABI path below (§30.3 "where practical").
     std::env::set_var("ASAN_OPTIONS", "detect_leaks=0");
     const T: &str = "x86_64-unknown-linux-gnu";
     r.run(
@@ -836,12 +854,22 @@ fn asan_steps(r: &mut Runner<'_>) {
             "--lib",
         ],
     );
-    // The public C ABI (malloc/free/realloc/aligned/calloc) over the **real POSIX
-    // backend** (mmap/madvise) — the backend glue the lib tests (which use
-    // in-process metadata) never reach. This `abi` integration target installs no
-    // `#[global_allocator]`, so ASan's own allocator does not conflict.
+    // W19-2 (#4): the public C ABI (malloc/free/realloc/aligned/calloc) over the
+    // **real POSIX backend** (mmap/madvise) — the backend glue the lib tests (which
+    // use in-process metadata) never reach. This `abi` integration target installs
+    // no `#[global_allocator]`, so ASan's own allocator does not conflict.
+    //
+    // **LeakSanitizer is ON here** (`detect_leaks=1`): this is the real-allocator C
+    // path, where the harness frees everything and the allocator's monotonic
+    // metadata is mmap-backed (which LSan does not track), so the pass is clean and
+    // a genuine leak — an object the program freed that the allocator lost — fails
+    // CI. The suppression file is the documented mechanism for by-design monotonic
+    // metadata, should a build ever source it from a tracked allocator.
+    const LSAN_SUPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/lsan-suppressions.txt");
+    std::env::set_var("ASAN_OPTIONS", "detect_leaks=1");
+    std::env::set_var("LSAN_OPTIONS", format!("suppressions={LSAN_SUPP}"));
     r.run(
-        "asan: C ABI over POSIX (topo-tests abi)",
+        "asan+lsan: C ABI over POSIX (topo-tests abi)",
         "cargo",
         &[
             "+nightly",
@@ -855,6 +883,7 @@ fn asan_steps(r: &mut Runner<'_>) {
             "abi",
         ],
     );
+    std::env::remove_var("LSAN_OPTIONS");
     std::env::remove_var("ASAN_OPTIONS");
     std::env::remove_var("RUSTFLAGS");
 }

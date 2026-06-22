@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+#
+# LeakSanitizer suppressions for TopoMalloc (W19-2, §30.3).
+#
+# Scope. The leak pass runs over the **real-allocator C ABI** path
+# (`topo-tests --test abi`, malloc/free/realloc/calloc/aligned over the POSIX
+# backend), where LeakSanitizer adds genuine value: it confirms the C surface
+# round-trips without leaking host memory. A real leak — an object the program
+# freed that the allocator lost, or any malloc-family block the runtime drops —
+# is still reported and fails CI.
+#
+# Why suppressions exist. TopoMalloc's metadata (span/large descriptors, free
+# bitmaps, pagemap radix nodes, the arena registry) is **monotonic** (§27.5,
+# W3-5): allocated once from the backing-provider seam and never freed for the
+# allocator's lifetime. On POSIX that metadata is mmap-backed, which LSan does
+# not track, so the ABI pass is clean with no suppressions matched today. These
+# entries are the documented mechanism for a build that ever sources the
+# monotonic metadata from a malloc-family allocator the sanitizer *does* track
+# (e.g. a heap-backed bootstrap arena), so a deliberately-never-freed metadata
+# block is not misreported as a leak. Each is a substring matched against any
+# frame of the allocation stack.
+#
+# The topo-core *unit*-test binaries are intentionally NOT leak-checked: their
+# `meta()` helpers `Box::leak` their metadata arenas and many short-lived tests
+# never drop their constructed allocators, so the test harness itself leaks by
+# design — pervasively and indistinguishably from a real leak. ASan still vets
+# every spatial/temporal access there (`detect_leaks=0`); the leak check lives on
+# the ABI path, which has no such harness leaks (§30.3 "where practical").
+
+# The bootstrap metadata arena (the monotonic metadata source, §17.4 / §35.4).
+leak:topo_core::bootstrap
+
+# The pagemap radix nodes (lazily allocated, never freed — §17.4, W3-3a).
+leak:topo_core::pagemap::PageMap::alloc_node
