@@ -1193,7 +1193,7 @@ impl SpanGuard<'_> {
     }
 
     /// Appendix B (§30.2 *"redzones are intact"*, W19-1c): under junk-fill, every
-    /// **central-free** object in this span still reads as [`harden::FREE_PATTERN`]
+    /// **central-free** object in this span still reads as [`crate::harden::FREE_PATTERN`]
     /// (the §29.6 invariant "every central-free object — fresh or recycled — reads
     /// as `FREE_PATTERN`"). Total + side-effect-free; a no-op returning `true` when
     /// junk-fill is compiled out (no memory is touched).
