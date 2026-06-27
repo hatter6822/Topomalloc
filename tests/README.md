@@ -1,24 +1,17 @@
 <!-- SPDX-License-Identifier: MIT -->
 # `tests/` — cross-crate integration tests
 
-The `topo-tests` crate holds tests that exercise several crates together (the
-per-crate unit tests live inside each crate). Integration tests are in
-`tests/tests/`:
+The `topo-tests` crate exercises behavior that spans crates. Per-crate unit tests
+remain next to their implementations.
 
-| File | Covers |
-|------|--------|
-| `abi.rs` | the full prefixed C ABI (plan 06 W8): core/aligned/C23/extended entry points, recycle-on-free, usable-size ↔ `nallocx` coherence, errno discipline, realloc contract, concurrent use |
-| `walking_skeleton.rs` | the M0 vertical slice — classify → allocate through the seam → emit §33.7 trace → parse → replay against the executable model (W0-14) |
-| `property.rs` | property tests (`proptest`, §34.3): request classification soundness, alignment, no duplicate live pointer, calloc overflow/zeroing, **realloc content-preservation + failure-safety** (W8/W15 DoD), and an engine allocate/free stream replayed against the `LiveModel` ownership oracle |
-| `dual_backend.rs` | the G-sim gate — identical abstract behaviour over POSIX and `Sele4nSim`, for the M0 skeleton **and** the M1 engine, plus the executed `new_allocator_named("sele4n-sim")` selector arm. Compiled only with `--features sele4n-sim` (GPL test binary) |
-| `zero_size_policy.rs` | the W8-4 zero-size policy matrix (unique/null across every allocation entry) in its **own process**, so flipping the process-global policy never races other binaries |
+| Area | Coverage |
+|------|----------|
+| ABI smoke and integration | Prefixed C API, aligned/POSIX allocation, C23 sized frees, `topo_*x`, errno rules, usable-size coherence, stats/control surfaces, and concurrent use. |
+| Properties | Classification, alignment, calloc overflow/zeroing, realloc content/failure safety, allocation-stream ownership, release accounting, and placement invariants. |
+| Dual backend | POSIX and `Sele4nSim` equivalence for allocator-visible behavior; enabled with the GPL `sele4n-sim` feature. |
+| Runtime modes | Zero-size policy isolation, deterministic replay, debug invariant sweeps, hardening behavior, fork/TLS/concurrency paths, and sanitizer-oriented harnesses. |
+| C/C++ harnesses | `tests/c/abi_smoke.c` and `tests/cpp/abi_smoke.cpp`, compiled and run by `cargo xtask abi-test`. |
 
-C/C++ ABI harnesses live next door: `tests/c/abi_smoke.c` (C11) and
-`tests/cpp/abi_smoke.cpp` (C++17, including the opt-in operator new/delete
-header) — compiled, linked against the staticlib, and run by
-`cargo xtask abi-test`, which also cross-checks the exported symbol set
-against `include/topomalloc.h` (W8-8).
-
-The default build is MIT/POSIX-only; `--features sele4n-sim` additionally links
-the GPL seLe4n backend. This directory will also grow concurrency, fork, and
-fuzz-corpus tests (plan 08).
+Use `cargo xtask test` for the full suite or `cargo xtask test --kind <kind>` for
+focused runs. The default build is MIT/POSIX-only; enabling `sele4n-sim` links the
+GPL seLe4n backend into the test binary.

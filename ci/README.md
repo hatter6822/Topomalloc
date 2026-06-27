@@ -15,7 +15,7 @@ subcommand, and `cargo xtask ci` runs the whole sequence end to end.
 | `lean` | `xtask lean` (`lake build` + `lake exe check`) | G-build → G-model |
 | `test` | `xtask test` on both arches | G-core |
 | `gen-golden-diff` | `xtask gen --check` | G-table |
-| `docs` | `mdbook build docs` | non-gating until plan 10 |
+| `docs` | `mdbook build docs` | documentation build |
 
 Toolchains are cached; AArch64 uses a cross toolchain + `qemu-user`. Making a red
 job *block merge* is a one-time repository setting — see "Required status checks"
@@ -43,7 +43,4 @@ checks (the job names from `ci.yml`):
 - `abi-test`
 - `doc`
 
-Do **not** require `docs (non-gating)` — the mdbook job is informational until
-plan 10. A check name appears in the picker only after it has run once on the
-repo (it already has). Also tick *Require branches to be up to date before
-merging* so checks always reflect the merged result.
+A check name appears in the picker only after it has run once on the repo. Also tick *Require branches to be up to date before merging* so checks always reflect the merged result.

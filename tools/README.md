@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: MIT -->
 # `tools/` — build-time and validation tools
 
-Host tools driven by `cargo xtask`. They are not part of the allocator runtime.
+These host tools are driven by `cargo xtask` and are not allocator runtime code.
 
-| Tool | Charter |
+| Tool | Purpose |
 |------|---------|
-| `size-class-gen` | **THE** size-class generator (DD-1) — the single source of truth. Reads the committed golden `size-classes.json`, validates every §9.3/§9.5 invariant, and emits the Rust table, the C header, and the Lean table. CI golden-diffs the output (G-table); nothing is ever hand-edited. |
-| `trace-replay` | Executable-model replay / differential runner (§33.7). Parses a trace in the SPEC grammar and replays it against the host executable model, checking well-formedness at each boundary. The Lean executable model becomes the proof-grade oracle later (plan 02). |
+| `size-class-gen` | Single source of truth for size classes. It validates the golden JSON and emits Rust, C, and Lean tables; CI fails on generated-output drift. |
+| `trace-replay` | Parses SPEC traces and replays them against the executable model/differential harness, checking ownership and well-formedness boundaries. |

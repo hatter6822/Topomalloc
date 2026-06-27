@@ -3,295 +3,168 @@
 <h1 align="center">TopoMalloc</h1>
 
 <p align="center">
-  A safety-first, formally-grounded, capability-aware general-purpose memory allocator.
+  A safety-first, formally grounded, topology-aware memory allocator.
 </p>
 
 <p align="center">
   <a href="https://github.com/hatter6822/topomalloc/actions/workflows/ci.yml">
     <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/hatter6822/topomalloc/ci.yml?branch=main&label=CI" />
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.1.0-blue" />
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.94.1-dea584" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.2.0-blue" />
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.94-dea584" />
   <img alt="Lean" src="https://img.shields.io/badge/Lean-4.28.0-10b981" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-informational" />
 </p>
 
-Rust core (`no_std`-capable hot path) + per-arch assembly + a Lean 4 formal
-model, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n)
-capability microkernel co-equal behind one backing-provider seam.
+TopoMalloc is a Rust allocator workspace with a C/C++ ABI, POSIX and seLe4n-backed
+providers, generated size-class tables, and a Lean 4 model that tracks the Rust
+implementation. The default build is MIT-licensed and does not link GPL code;
+seLe4n integration is isolated behind explicit GPL-3.0-or-later artifacts.
 
-## What TopoMalloc provides
-
-- **Per-CPU caching** with RSEQ restartable sequences (x86-64, AArch64) and locked/pinned-core fallbacks.
-- **Topology-aware transfer layers** and jemalloc-style policy arenas.
-- **Temeraire-style hugepage-aware backing** with dirty/muzzy/released extent tracking.
-- **A Lean 4 formal model** — 14-clause `WellFormed` predicate, sorry-free theorems, executable trace oracle — in lockstep with the Rust implementation.
-- **seLe4n microkernel integration** — capability-backed arenas, exact-byte quota accounting, SMP non-interference proofs, coupled alloc/free simulation.
-- **Full C/C++/Rust ABI** — standard `malloc`/`free`, C23 sized frees, extended `topo_*x` API, opt-in C++ `operator new`/`delete`, Rust `GlobalAlloc` adapter.
-- **Split licensing** — the core is MIT; the seLe4n integration is GPL-3.0-or-later. The default artifact links no GPL code.
-
-## Current state
+## Status at a glance
 
 | Attribute | Value |
 |-----------|-------|
-| Version | `v0.1.0` |
-| Rust toolchain | `1.94.1` stable (pinned in `rust-toolchain.toml`) |
-| Lean toolchain | `v4.28.0` (pinned in `lean-toolchain`) |
-| Milestone | M0 closed; **M1 (central-path allocator) under way** |
-| Cross targets | x86-64 + AArch64 (co-primary in CI) |
-| Lean model | sorry-free; single-core + SMP theorem sets complete |
+| Project version | `0.2.0` |
+| Rust toolchain | `1.94` stable, pinned by `rust-toolchain.toml` |
+| Lean toolchain | `v4.28.0`, pinned by `lean-toolchain` |
+| Primary platforms | x86-64 and AArch64 |
+| Default artifact | MIT POSIX allocator (`libtopomalloc`) |
+| Optional GPL artifact | seLe4n simulator / real ABI integration |
 
-The public API runs over the real central-path allocator: classify → central
-free lists / extent-backed large path, with genuine `free`/`realloc`/`malloc_usable_size`,
-errno semantics, C23 sized frees, the extended `topo_*x` API, opt-in C++
-operators, and the Rust `GlobalAlloc` adapter — identical over POSIX and the
-seLe4n simulator (G-sim). The full reallocation surface (W15) is complete: the
-§25 move path (failure preserves the original), in-place grow, and in-place
-**shrink** that returns a medium/large allocation's tail pages to the backend,
-plus aligned-allocation validation and overflow-safe calloc zeroing.
+The current tree contains the central allocator path, extended C ABI, arena and
+extent-hook surfaces, hugepage-aware backing, topology routing, observability,
+hardening features, deterministic/debug modes, and sanitizer/test harnesses. The
+formal model and generated tables are part of the normal development workflow,
+not after-the-fact documentation.
 
-The **concurrency foundation (W16) is landed**: a ranked lock hierarchy (§27.2)
-with a debug lock-order checker (every lock is a `RankedLock`, any out-of-order
-acquire fails CI — the G-conc gate, active across the lib + integration + ABI
-suites); `fork()` safety via a **per-CPU sharded, re-entrancy-aware** quiesce gate
-(`loom`-verified, no `membarrier`; a nested entry nests on a per-thread depth
-instead of parking, so it never deadlocks the drain) + `pthread_atfork` handlers
-(the child allocates safely with no inherited held lock — fork-in-multithread +
-concurrent-forker tested); the initial-exec TLS model (no `malloc` re-entry on a
-thread's first access — proven by allocation depth, and via `dlopen`); the §35.4
-initialization phases; graceful extent-hook re-entrancy handling (a re-entrant
-hook's `malloc`/`free`/`realloc` is declined before any lock, never deadlocked);
-and a lock-free, allocation-free crash summary (`topomalloc_crash_summary`, §28.4).
+## What is implemented
 
-**Observability (W17) is landed**: an epoch-stamped, machine-readable snapshot
-that answers "where is the memory?" (§31.1) — every byte class (app live + **peak**
-high-water, caches, central, the §20.1 backend split active/retained/dirty/muzzy/
-released, metadata, quarantine, hugepage coverage, per-arena, destroyed-arena count)
-plus §31.5 fragmentation (**exact** for medium/large, sampled for small) — over the
-C `topomalloc_stats_json` / `_print` / `_snapshot` API with the §31.2 selection
-flags (a real `CONSISTENT_SNAPSHOT` read-twice-coherent mode, `RESET_PEAKS`,
-`BY_ARENA`/`BY_SIZE_CLASS`/`BY_NUMA`/…; unknown bits strictly rejected), additive
-JSON (§35.3), a `topomalloc_explain_memory()` that reads the **real RSS** and
-attributes it (§31.6), and §36.12 label-scoped redaction that scopes the *whole*
-view a low domain receives (the Rust analogue of the proved
-`stats_observation_noninterference`). The §8.6 reconciliation identities
-(`virtual == active + pageheap_free`, `pageheap_free == retained + dirty + muzzy +
-released`) are a fixed-wall test, live and under concurrency. The minimal
-heap-sampling slice (W17-3, off by default) feeds the lifetime/hotness placement
-policy (W14) from real traffic.
-
-**Security & hardening (W18) is landed**: each §29 protection is its own opt-in,
-profile-composed Cargo feature (`crate::harden`), so `performance` pays nothing and
-`hardened`/`debug` compose them. **Junk filling** (§29.6 `junk-fill`): fill-on-alloc
-/ fill-on-free + a sound use-after-free **verify-on-reuse canary** (the bitmap design
-stores no metadata in user bytes, §16.4). **Quarantine** (§29.4 `quarantine`):
-delayed reuse of freed objects, accounted separately as `quarantine.bytes`, with
-byte/object/per-arena budgets, random-evict + sampling, a drain protocol, and the
-`topomalloc_quarantine_*` control surface — off by default. **Guarded allocations**
-(§29.5 `guard-pages`): sampled (or `TOPO_GUARDED`) objects bracketed by inaccessible
-guard pages — a real `mprotect(PROT_NONE)` trap (the new `TopoBackingProvider::protect`
-seam), proven by a POSIX overrun/underrun **SIGSEGV death test**. **Scrub-before-
-downgrade** (§36.12 `secure-scrub`): a non-PUBLIC arena's backing is scrubbed before
-recycle (the §36.12 MUST, feature-independent), the runtime image of the Lean
-`scrub_before_downgrade` theorem, co-equal over POSIX and the seLe4n simulator.
-Out-of-line large metadata + generation/integrity tags (W18-1) and double/invalid-free
-detection (W18-2) are always-on.
-
-**Debugging & sanitization modes (W19) are landed**: the **Appendix-B invariant
-checklist as first-class runtime code** (§30.2, DD-2) — one *total*, side-effect-free
-callable per group (B.1 global / B.2 cache / B.3 span / B.4 hugepage / B.5 arena),
-gathered in `crate::debug`, run as `debug_assert!`s under the `debug-checks` feature and
-as the G-core/G-conc/G-mem/G-arena test oracles, so `performance` pays nothing. B.1 now
-includes the §30.2 **pagemap↔descriptor** check (`PageMap::check_invariants` — every
-owned page names a descriptor whose range covers it, catching a stale-after-recycle
-entry) and a **redzone** sweep (`verify_free_patterns` — every central-free object reads
-as `FREE_PATTERN` under junk-fill); both ride the engine oracle and run in CI under
-`debug-checks` over the cross-crate integration suite, not just the unit tests.
-**Sanitizers** (§30.3): `cargo xtask test --kind tsan|asan|msan` runs ThreadSanitizer
-over the concurrency + hardening paths and **AddressSanitizer / MemorySanitizer** over the
-`topo-core` library (default + hardened); the hand-written RSEQ assembly disables itself
-under ASan/MSan (which cannot instrument it) via a `build.rs`-set `cfg(topo_sanitize_no_asm)`,
-so the locked baseline runs and there are no asm false positives. **LeakSanitizer** runs on
-the real-allocator C-ABI pass (mmap-backed metadata is untracked and the harness frees
-everything, so a genuine leak fails CI; `xtask/lsan-suppressions.txt` covers by-design
-monotonic metadata). **Deterministic test mode** (§30.4, `crate::deterministic`): a
-process-global control block with seeded randomization (one `domain_seed` derivation feeds
-the guard-page, quarantine, and heap samplers), strict-LIFO refill, optional
-force-slow-path / force-frequent-purge, and a monotonic trace-id source — exposed through
-the `topomalloc_deterministic_*` C surface and `$TOPOMALLOC_DETERMINISTIC_SEED` — with a
-**self-consistency replay** proving a captured §33.7 trace replays byte-identically under
-the same seed (the differential runner's prerequisite; the Lean executable-model
-differential is W21-2b).
+- **Allocator core:** request classification, generated size classes, central
+  free lists, extent-backed large allocations, `free`, `realloc`, aligned
+  allocation, usable-size queries, and zero-size/errno semantics.
+- **Public ABI:** prefixed C symbols (`topomalloc_*`, `topo_*`), C23 sized frees,
+  `topo_*x` flags, opt-in C++ `operator new`/`delete`, and a Rust `GlobalAlloc`
+  adapter.
+- **Backing providers:** a POSIX `mmap`/`madvise`/`mprotect` provider and an
+  optional seLe4n provider/simulator sharing the same `TopoBackingProvider` seam.
+- **Arenas and placement:** capability-aware arenas, custom extent hooks,
+  topology-aware routing, NUMA controls, hugepage bins, release control, and
+  lifetime/hotness placement inputs.
+- **Observability:** additive stats JSON, fixed C snapshot struct, memory
+  explanation output, peak/reset controls, fragmentation metrics, sampling, and
+  label-scoped redaction.
+- **Hardening and debug modes:** junk fill, quarantine, sampled guard pages,
+  scrub-before-downgrade, double/invalid-free detection, Appendix-B invariant
+  checkers, deterministic replay controls, and sanitizer integrations.
+- **Formal checks:** a Lean 4 model with generated-table gates, trace/provider/
+  extent/arena differentials, WellFormed preservation theorems, and seLe4n
+  refinement/non-interference proofs.
 
 ## Quick start
 
 ```sh
-cargo xtask setup     # install the pinned Rust + Lean toolchains and cross targets
-cargo xtask ci        # build (x86-64 + AArch64), lint, gen-check, test, Lean
+cargo xtask setup     # install or verify pinned Rust, Lean, and cross targets
+cargo xtask ci        # run the same build, lint, generated-table, test, and Lean gates as CI
 ```
 
-A fresh clone is green with just `cargo xtask setup && cargo xtask ci`.
+For focused work, use the narrower commands below:
 
-`cargo xtask` is the single entry point developers and CI both use, so a build
-is never "Rust only". See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full
-command list and the Definition of Done.
+```sh
+cargo xtask fmt --check
+cargo xtask gen --check
+cargo xtask lint
+cargo xtask test --kind unit
+cargo xtask abi-test
+cargo xtask lean --check
+cargo xtask bench      # non-gating micro-benchmarks
+```
+
+`cargo xtask` is the single supported entry point for automation. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and [`xtask/README.md`](xtask/README.md) for
+command details.
 
 ## Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────┐
-│ Public API:  C ABI (malloc/free/…) + Rust GlobalAlloc            │  topo-abi
-├──────────────────────────────────────────────────────────────────┤
-│ Request classifier: size class, alignment, arena, label, hints   │  topo-core
-├──────────────────────────────────────────────────────────────────┤
-│ Front-end: per-CPU (RSEQ / pinned-core) or thread cache          │  topo-core + topo-arch
-├──────────────────────────────────────────────────────────────────┤
-│ Middle-end: transfer caches + central free lists                 │  topo-core
-├──────────────────────────────────────────────────────────────────┤
-│ Back-end: extent manager, pagemap, hugepage-aware backing        │  topo-core
-├──────────────────────────────────────────────────────────────────┤
-│            TopoBackingProvider seam (the central abstraction)     │
-├─────────────────────────┬────────────────────────────────────────┤
-│ PosixBackingProvider    │ Sele4nSim / SeLe4nBackingProvider      │
-│ mmap / madvise / mprotect│ capability-typed frames + quotas       │
-│ (MIT)                   │ (GPL-3.0-or-later)                     │
-└─────────────────────────┴────────────────────────────────────────┘
-          ↕ differential lockstep ↕
-┌──────────────────────────────────────────────────────────────────┐
-│ Lean 4 formal model: State, WellFormed, Transitions, Theorems    │
-│ + seLe4n bridge: coupled simulation, SMP non-interference        │
-└──────────────────────────────────────────────────────────────────┘
+Public API
+  C ABI + C++ header + Rust GlobalAlloc                         topo-abi, include/
+        │
+        ▼
+Allocator engine
+  classification, arenas, stats, hardening, extents, pagemap     topo-core
+        │
+        ▼
+Provider seam
+  TopoBackingProvider: allocate, release, purge, protect, stats   topo-core
+        │
+        ├── POSIX mmap/madvise/mprotect                           topo-backend-posix
+        └── seLe4n capability-backed frames                        topo-backend-sele4n
+
+Formal and verification sidecars
+  Lean model, generated table checks, trace replay, fuzz/loom/sanitizers
 ```
 
-Everything hangs off one interface — `TopoBackingProvider`. POSIX and seLe4n
-are co-equal behind it from M1, so the core allocator is OS-agnostic and
-`no_std`-capable.
+The important boundary is `TopoBackingProvider`: allocator policy and metadata do
+not call platform APIs directly. That keeps the core portable, makes POSIX and
+seLe4n comparable in tests, and lets the Lean model reason about provider state
+explicitly.
 
-## Workspace
+## Workspace guide
 
-| Crate | Role | License |
-|-------|------|---------|
-| `topo-core` | classifier, size classes, seam, metadata, pagemap, extents, central-path allocator, capability-backed arena registry | MIT |
-| `topo-abi` | C/C++/Rust ABI surface (malloc, free, GlobalAlloc, C23, `topo_*x`, the `topomalloc_stats_*` / `explain_memory` observability surface, sampling control) | MIT |
-| `topo-backend-posix` | POSIX backend — mmap/madvise/mprotect | MIT |
-| `topo-backend-sele4n` | seLe4n simulator + (M1) real seLe4n ABI backend | GPL-3.0-or-later |
-| `topo-arch` | per-arch RSEQ assembly (x86-64, AArch64), fast-path mode selector | MIT |
-| `topo-stats` | statistics snapshot + flags, additive Appendix-D JSON, `explain` / label-scoped redaction, version wiring | MIT |
-| `topo-control` | configuration sources, control namespace | MIT |
-| `topo-test-support` | trace grammar, `LiveModel` oracle, deterministic PRNG | MIT |
+| Path | Purpose |
+|------|---------|
+| `crates/topo-core` | allocator engine, generated tables, metadata, extents, arenas, hardening/debug modules |
+| `crates/topo-abi` | exported C ABI, Rust `GlobalAlloc`, and C-facing control/stat surfaces |
+| `crates/topo-backend-posix` | default MIT POSIX backing provider |
+| `crates/topo-backend-sele4n` | optional GPL seLe4n simulator / ABI backend |
+| `crates/topo-arch` | architecture-specific RSEQ and fast-path selection support |
+| `crates/topo-stats` | snapshots, additive JSON, explanations, redaction helpers |
+| `crates/topo-control` | configuration and control namespace plumbing |
+| `crates/topo-test-support` | trace grammar, deterministic PRNG, live-model test support |
+| `include/` | public C/C++ headers and generated size-class header |
+| `lean/` | Lean model and seLe4n proof bridge |
+| `tests/` | cross-crate Rust/C/C++ integration tests |
+| `tools/` | size-class generator and trace replay utility |
+| `xtask/` | build, lint, codegen, test, and CI driver |
+| `docs/` | conventions, ABI policy, decisions, and mdBook sources |
+| `planning/` | long-form specification and roadmap plans |
 
-Supporting crates: `xtask` (build driver), `tools/size-class-gen` (single
-source of truth for size-class tables), `tools/trace-replay` (§33.7 trace
-replay), `tests` (cross-crate integration tests), `fuzz` (cargo-fuzz targets,
-nightly-only).
+## Documentation map
 
-## Lean formal model
+- [`docs/ABI.md`](docs/ABI.md) — stable C ABI, versioning policy, symbol/header checks.
+- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — coding, safety, profile, and generated-file conventions.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — ratified architecture decisions and audit notes.
+- [`docs/src/`](docs/src/) — mdBook operator/contributor guide.
+- [`planning/SPEC.md`](planning/SPEC.md) — full design specification.
+- [`planning/plans/README.md`](planning/plans/README.md) — implementation plan index.
 
-The Lean 4 model defines the allocator's abstract states, the 14-clause
-`WellFormed` predicate, all transitions as total functions, and the theorem
-families — it is not on the production hot path. It is built with `lake` and
-driven by `cargo xtask lean`.
+## Testing and verification
 
-**Soundness:** No `sorry`, no `admit`, no `native_decide`. The only postulated
-axioms are the four §33.5 RSEQ primitives. Every theorem rests only on Lean's
-standard axioms (`propext`/`Quot.sound`/`Classical.choice`).
+`cargo xtask ci` is the recommended pre-PR gate. It composes formatting,
+generated-table drift checks, lints, workspace builds, integration tests, ABI
+harnesses, and Lean checks. Additional targeted gates include fuzzing, loom,
+TSan/ASan/MSan/LSan modes, RSEQ equivalence, differential trace replay, and
+non-gating Criterion benchmarks.
 
-**Lean gates (`lake exe check`):**
-- Size-class table gate (72 classes, `small_max` = 32 KiB, `huge_threshold` = 2 MiB)
-- Trace oracle gate (§33.7 replay + injected-violation detection)
-- Pagemap differential (Lean model ↔ Rust radix)
-- Provider state machine differential (§36.6)
-- Extent state machine differential (§20.1)
-- Arena lifecycle differential (§22.3/§36.13 transitions + revocation chain)
-- Extent-hook contract differential (§23.3 alignment/size/sub-range checks)
-- Hugepage-bin differential (§19.4 `classifyBin` ↔ Rust `classify_bin`)
+Generated files are checked rather than trusted. Do not hand-edit
+`crates/topo-core/src/generated/tables.rs`, `include/topomalloc_tables.h`, or
+`lean/TopoMalloc/Generated/SizeClasses.lean`; edit the golden input and run
+`cargo xtask gen`.
 
-**Selected headline theorems:**
+## Licensing
 
-| Property | Module |
-|----------|--------|
-| Size-class table covers all small requests | `Theorems/SizeClass.lean` |
-| 14-clause WellFormed preservation (per transition) | `Theorems/*.lean` |
-| Partial subrelease never strands a live object (H-005) | `HugePageFiller.lean` |
-| Arena lifecycle: alloc only in Active; partial failure never Destroyed | `ArenaLifecycle.lean` |
-| Capability delegation is attenuation-only (`DelegatesFrom`) | `SeLe4n/CapBackedArena.lean` |
-| Delegated subtree's live bytes stay within the root quota (`subtree_used_le_quota`) | `SeLe4n/CapBackedArena.lean` |
-| Coupled alloc/free preserves combined invariants | `SeLe4n/Refinement.lean` |
-| Exact byte accounting (`ArenaQuotaExact`) | `SeLe4n/Refinement.lean` |
-| SMP correctness (every interleaving) | `SeLe4n/SMP.lean` |
-| RSEQ abort safety | `SeLe4n/ClientRuntime.lean` |
-| Stats non-interference | `SeLe4n/InformationFlow.lean` |
-| Bundle inhabitation (non-vacuity) | `SeLe4n/Refinement.lean` |
+TopoMalloc is split-licensed:
 
-See [`lean/README.md`](lean/README.md) for the full model charter and the
-seLe4n bridge details.
+- The standalone allocator core and default POSIX artifact are **MIT**.
+- The seLe4n integration layer is **GPL-3.0-or-later** because it links/models
+  the GPL seLe4n ABI.
 
-## Testing
+See [`LICENSE`](LICENSE), [`sele4n/LICENSE`](sele4n/LICENSE), and [`NOTICE`](NOTICE)
+for the precise SPDX policy.
 
-```sh
-cargo xtask test                           # all test kinds
-cargo xtask test --kind unit               # per-crate unit tests
-cargo xtask test --kind prop               # proptest (property-based)
-cargo xtask test --kind diff               # differential: trace replay vs Lean oracle
-cargo xtask test --kind fuzz               # cargo-fuzz (nightly)
-cargo xtask test --kind loom               # loom model-checking (nightly)
-cargo xtask test --kind tsan               # ThreadSanitizer (nightly)
-cargo xtask test --kind rseq               # RSEQ equivalence (native arm64)
-cargo xtask abi-test                       # C/C++ ABI harness
-cargo xtask lean                           # lake build + lake exe check
-cargo xtask bench                          # criterion micro-benchmarks (non-gating)
-```
+## Contributing and security
 
-Cross-crate integration tests cover the full C ABI, C23 sized frees, the
-extended API, errno discipline, property-based classification/alignment,
-`LiveModel` stream checking, the G-sim dual-backend gate, and the zero-size
-policy matrix.
-
-## Repository layout
-
-```text
-crates/          the Rust workspace (core, ABI, backends, arch, stats, control, test-support)
-xtask/           the build/codegen/CI driver (dependency-free)
-tools/           size-class-gen (the single source of truth) + trace-replay
-lean/            the Lean 4 formal model + the seLe4n bridge (GPL-3.0-or-later)
-tests/           cross-crate integration tests + C/C++ ABI harness
-fuzz/            cargo-fuzz targets (nightly, standalone workspace)
-include/         public + generated C/C++ headers
-vendor/sele4n/   pinned seLe4n ABI mirror (GPL-3.0-or-later)
-sele4n/          the seLe4n resource-server component (GPL-3.0-or-later)
-bench/           benchmark config + results schema
-profiles/        profile definitions (features, not forks)
-docs/            CONVENTIONS.md, DECISIONS.md, ABI.md, mdbook
-planning/        SPEC.md + 10 domain plans (24 workstreams, milestones M0–M9)
-scripts/         setup_lean.sh, vendor_sele4n.sh
-```
-
-Each top-level directory carries a one-paragraph charter README.
-
-## Licensing (D5)
-
-Split-licensed. The standalone allocator **core is MIT** (see [`LICENSE`](LICENSE));
-the **seLe4n-integration layer is GPL-3.0-or-later** (see [`sele4n/LICENSE`](sele4n/LICENSE)),
-because it links/models the GPLv3 seLe4n ABI. The default `libtopomalloc`
-artifact links no GPL code and is MIT; building with the `sele4n-sim` feature
-produces a GPL combined work. The full split and SPDX policy are in
-[`NOTICE`](NOTICE).
-
-## Contributing
-
-1. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md) first.
-2. A fresh clone is green with `cargo xtask setup && cargo xtask ci`.
-3. Every change must pass the [Definition of Done](CONTRIBUTING.md#definition-of-done-every-change) checklist.
-4. Run `cargo xtask ci` before opening a PR — it is the exact sequence CI runs.
-
-## Planning & design
-
-- **Specification:** [`planning/SPEC.md`](planning/SPEC.md) — the full design spec (~100 sections).
-- **Implementation plan:** [`planning/plans/README.md`](planning/plans/README.md) — overview + ten domain plans (24 workstreams, M0–M9).
-- **Decisions, conventions, ABI:** [`docs/`](docs/)
-
-## Security
-
-TopoMalloc is pre-1.0 and under active development. See [`SECURITY.md`](SECURITY.md)
-for the vulnerability reporting policy, scope, hardening profiles, and
-security-review cadence.
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before changing code. Security scope,
+supported versions, hardening profiles, and reporting instructions are in
+[`SECURITY.md`](SECURITY.md).

@@ -34,4 +34,4 @@ installed, the Lean steps are skipped locally with a notice; CI always runs them
 The CI matrix builds and tests on **x86-64** and **AArch64** (the seLe4n /
 Raspberry Pi 5 target), the latter via a cross toolchain + `qemu-user`. Locally,
 `xtask` compile-checks AArch64 with `cargo check` when no cross-linker is
-present. AArch64 is co-primary from M0, never deferred.
+present. AArch64 is a co-primary target, not a deferred port.

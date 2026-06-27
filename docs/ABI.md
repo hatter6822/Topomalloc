@@ -78,7 +78,7 @@ unit), never exported symbols.
 |--------|-----------|
 | `topo_mallocx(size, flags)` | allocate with flags; invalid flag word → null + `EINVAL`, deterministically |
 | `topo_rallocx(ptr, size, flags)` | realloc with flags; result alignment from `TOPO_ALIGN_LG`; `TOPO_ZERO` zeroes bytes beyond the preserved prefix |
-| `topo_xallocx(ptr, size, extra, flags)` | in-place-only resize; returns the real usable size (success ⇔ `result >= size`); cannot grow at M1 (extent-merge growth is M5) |
+| `topo_xallocx(ptr, size, extra, flags)` | in-place-only resize; returns the real usable size (success ⇔ `result >= size`); grows in place when the extent path can satisfy it |
 | `topo_dallocx(ptr, flags)` | free with (validated, advisory) flags |
 | `topo_sdallocx(ptr, size, flags)` | sized free with flags (same cross-checks as the C23 family) |
 | `topo_nallocx(size, flags)` | the usable size `topo_mallocx` would return; pure; `0` on error |
