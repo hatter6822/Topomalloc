@@ -6,7 +6,7 @@
 # The default MIT TopoMalloc artifact never links this crate.
 [package]
 name = "topo-backend-sele4n"
-description = "Sele4nSim + (at M1) Sele4nBackingProvider over the real seLe4n ABI. Separately licensed (GPL-3.0-or-later)."
+description = "Sele4nSim + Sele4nBackingProvider over the real seLe4n ABI. Separately licensed (GPL-3.0-or-later)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +20,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.1.0" }
+topo-core = { path = "../topo-core", version = "0.2.0" }
 
 # D8 — the real seLe4n ABI, pinned to the reviewed SHA (vendor/sele4n/PINNED_SHA) and
 # vendored under `vendor/sele4n/` by `scripts/vendor_sele4n.sh` (GPL-3.0-or-later, on
@@ -36,7 +36,7 @@ sele4n-abi = { path = "../../vendor/sele4n/sele4n-abi", version = "0.31.50", opt
 [features]
 default = []
 # Compile the provider against the pinned, vendored real seLe4n ABI (D8, plan 09
-# W22-0). At M0 this links the `KernelError -> BackendError` bridge (the seam that
+# W22-0). This links the `KernelError -> BackendError` bridge (the seam that
 # type-checks vs the pinned upstream, W4-1); the full `Sele4nBackingProvider` over
 # real frame/untyped capabilities grows here in plan 09.
 real-abi = ["dep:sele4n-types", "dep:sele4n-abi"]

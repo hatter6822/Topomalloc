@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: MIT -->
-# `include/` — generated and public C headers
+# `include/` — public C/C++ headers
 
-C clients of TopoMalloc include these headers (§10, plan 06).
+C and C++ clients include headers from this directory. The exported symbol set is
+checked by `cargo xtask abi-test` against these declarations.
 
-| Header | Charter |
+| Header | Purpose |
 |--------|---------|
-| `topomalloc.h` | The public C API surface (plan 06 W8): the prefixed standard core (`topomalloc_malloc/free/calloc/realloc/…`), aligned/POSIX entries, C23 sized frees, and the extended `topo_*x` API with the `TOPO_*` flag macros. Machine-verified against the exported symbols and compiled as C11 **and** C++17 by `cargo xtask abi-test` (W8-8). The seLe4n-specific `topomalloc_sele4n.h` arrives with plan 09. |
-| `topomalloc_new_delete.hpp` | **Opt-in** C++ global `operator new`/`delete` replacements over the C API (W8-5): include it in exactly one translation unit. Scalar/array, nothrow, sized (C++14), and over-aligned (C++17) forms, with the conforming `new_handler` loop. Never linked implicitly — the library exports no operator symbols (the plan 10 override artifact owns interposition). |
-| `topomalloc_tables.h` | **Generated** size-class constants and table (DO NOT EDIT). Emitted by `tools/size-class-gen` from the golden; byte-for-byte consistent with the Rust and Lean tables (DD-1). |
+| `topomalloc.h` | Main C API: prefixed allocation functions, aligned/POSIX forms, C23 sized frees, `topo_*x` extensions, arena/extent-hook controls, stats, profiling, hardening, deterministic/debug, and NUMA controls. |
+| `topomalloc_new_delete.hpp` | Opt-in C++ global `operator new`/`delete` replacements. Include it in exactly one translation unit; the library does not interpose C++ operators implicitly. |
+| `topomalloc_tables.h` | Generated size-class constants and table. Do not edit directly; regenerate with `cargo xtask gen`. |

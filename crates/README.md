@@ -1,22 +1,21 @@
 <!-- SPDX-License-Identifier: MIT -->
-# `crates/` — the Rust workspace
+# `crates/` — Rust workspace crates
 
-The allocator, split into focused crates along the central seam. `topo-core` is
-`no_std`-capable and OS-agnostic — it never calls `mmap`/`retype`; all backing
-memory comes through the `TopoBackingProvider` trait it defines. Everything else
-either implements that seam (the backends), exposes the allocator (the ABI), or
-supports it (arch, stats, control, test-support).
+The workspace is organized around a small allocator core plus adapters for ABI,
+backing providers, architecture support, stats/control plumbing, and tests.
+`topo-core` is the owner of allocator policy and metadata; platform memory comes
+through `TopoBackingProvider` implementations instead of direct OS calls.
 
-| Crate | Role | License | Plan |
-|-------|------|---------|------|
-| `topo-core` | classifier, size classes, the seam, metadata/pagemap/bootstrap + pointer classification, the back-end extent manager, the **M1 central-path allocator** (`Allocator`), the M0 skeleton (test fixture) | MIT | 03, 04, 05, 06 |
-| `topo-abi` | the full prefixed C API (§10.1–§10.4: core, aligned/POSIX, C23 sized free, `topo_*x` + flags), errno protocol, zero-size policy, Rust `GlobalAlloc` adapter | MIT | 06 |
-| `topo-backend-posix` | `PosixBackingProvider` (single-authority case) | MIT | 04 |
-| `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` | GPL-3.0-or-later | 09 |
-| `topo-arch` | per-arch RSEQ / restartable sections | MIT | 05 |
-| `topo-stats` | stats / profiling / explain | MIT | 07 |
-| `topo-control` | config + control namespace | MIT | 07 |
-| `topo-test-support` | trace grammar, deterministic harness, generators | MIT | 08 |
+| Crate | Role | License |
+|-------|------|---------|
+| `topo-core` | classifier, generated size classes, metadata, pagemap, extents, central allocator path, arenas, hardening/debug modules | MIT |
+| `topo-abi` | exported C ABI, Rust `GlobalAlloc`, C-facing controls, stats, profiling, hardening, and deterministic/debug entry points | MIT |
+| `topo-backend-posix` | default POSIX provider over `mmap`, `madvise`, and `mprotect` | MIT |
+| `topo-backend-sele4n` | seLe4n simulator and optional real ABI provider | GPL-3.0-or-later |
+| `topo-arch` | architecture-specific fast-path/RSEQ support and fallback selection | MIT |
+| `topo-stats` | snapshot structs, additive JSON rendering, memory explanations, and redaction helpers | MIT |
+| `topo-control` | configuration sources and control namespace plumbing | MIT |
+| `topo-test-support` | trace grammar, deterministic PRNG, live model, and test generators | MIT |
 
-`topo-backend-sele4n` is the one crate here that is GPL-3.0-or-later (D5); the
-default MIT artifact never links it. See [`../NOTICE`](../NOTICE).
+The default MIT artifact does not link `topo-backend-sele4n`. See
+[`../NOTICE`](../NOTICE) for the split-license policy.

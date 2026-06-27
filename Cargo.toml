@@ -102,7 +102,7 @@ exclude = ["fuzz", "vendor/sele4n"]
 # excludes medium/large (counted exactly elsewhere — no double-count); and `CONSISTENT_SNAPSHOT`
 # compares the whole `AllocatorStats` for stability, not just the cumulative totals. In a 0.x
 # series new backwards-compatible functionality is a patch bump (the 0.x minor is the breaking
-# axis), keeping `^0.1.0` inter-crate reqs satisfied. 0.1.24: W18 (plan 08) — security &
+# axis), keeping `^0.2.0` inter-crate reqs satisfied. 0.1.24: W18 (plan 08) — security &
 # hardening: the `crate::harden` module + granular profile-composed features (`junk-fill`,
 # `quarantine`, `guard-pages`, `secure-scrub`). Junk filling (fill-on-alloc/free +
 # verify-on-reuse, §29.6); the delayed-reuse quarantine (§29.4, accounted as `quarantine.bytes`,
@@ -138,7 +138,7 @@ exclude = ["fuzz", "vendor/sele4n"]
 # acceptance; (4) LeakSanitizer on the real-allocator C-ABI pass + xtask/lsan-suppressions.txt;
 # (5) a debug-checks pass over the integration suite (topo-tests debug-checks feature) so the
 # engine sweeps run in CI over real sequences. Patch bump (0.x: new back-compat work).
-version = "0.1.29"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"
