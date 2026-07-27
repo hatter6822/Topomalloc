@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** workspace version `0.2.0`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
+**Current Status:** workspace version `0.3.0`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
 
 ## Essential Build Commands
 
@@ -87,7 +87,7 @@ Background agents run concurrently and may finish after foreground modifications
 - **Lean theorems/lemmas:** `snake_case` (e.g., `malloc_preserves_wf`, `size_class_table_covers_all_small_requests`)
 - **Lean structures/types:** `CamelCase` (e.g., `State`, `WellFormed`, `SizeClassRow`)
 - **Lean state variables:** `s`, `s'`; hypotheses: `h`-prefixed (`hpre`, `hwf`)
-- **Lean namespaces:** `TopoMalloc`, `TopoMalloc.Theorems`, `TopoMalloc.SeLe4n`
+- **Lean namespaces:** `TopoMalloc` (including everything under `TopoMalloc/Theorems/`, which is a *directory*, not a namespace), `TopoMalloc.SeLe4n`, `TopoMalloc.Huge`, `TopoMalloc.ExtentHooks`
 - **Lean proof style:** Prefer tactic mode (`by …`) for non-trivial proofs; use `calc` for equational chains
 - **Crate names:** `topo-<domain>` (e.g., `topo-core`, `topo-abi`, `topo-backend-posix`)
 - **IDs:** typed newtype wrappers: `ArenaId`, `SizeClassId`, `SpanId`, `LargeId`, `Label`, `Generation`
@@ -116,7 +116,7 @@ Each pull request bumps the patch component (semver) unless explicitly stated ot
 
 ```toml
 # Cargo.toml [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 ```
 
 Mechanics: use patch (default) for bug fixes / refactors / tests; minor for new backwards-compatible functionality; major for breaking changes.
@@ -415,8 +415,77 @@ bounded-skew convention cover operational debugging today) and the seLe4n resour
 backend/cache *partitioning* (the per-arena + whole-summary redaction is the complete Rust-side mechanism for
 the POSIX profile).
 
+**Full-tree audit pass.** A sweep across every crate, the Lean model, the tests and the docs
+fixed the following; each is pinned by a regression test that fails without the fix.
+
+*Memory safety / correctness.* A **guarded** allocation (W18-4) is right-aligned *inside* a
+larger extent, so `desc.base() != extent.base` — but `LargeAllocator::{shrink,grow}` measured
+the resize from the **extent** base. An in-place `realloc`/`xallocx` of one therefore freed
+live bytes into the reusable extent pool (shrink) or advertised memory past the extent's end
+(grow); the debug build tripped a page-alignment assert, the performance build corrupted
+silently. Both now decline for a guarded allocation (an in-place resize cannot re-base an
+object against its guard), and `allocate_guarded` rejects an over-aligned request rather than
+underflowing its base. `cache_ops::refill` dropped objects it had already removed from the
+central free list when the transfer cache declined the return (a permanent leak — the
+regression test loses 30 objects without the fix); the remainder now falls through to central.
+`refill`/`flush` are total on an out-of-range size class, and `ExtentMap::free_in_canary`
+rejects a non-`Active` extent at runtime rather than only under `debug_assert` (a second free
+otherwise cycled a size-bin list and hung `find_fit` under the backend lock; `find_fit` also
+gained a step bound).
+
+*Availability.* Setting **`TOPOMALLOC_QUARANTINE=1`** (or any other startup env var) hung the
+process at its first `malloc`: the init hooks called `global()` from inside
+`GLOBAL.get_or_init`, re-entering the still-running `OnceLock`. They now take the engine by
+reference. The **fork gate** deadlocked the forking thread itself — an allocation from any
+`pthread_atfork` handler ordered between our `prefork` and `postfork_*` parked on a bit only
+that thread could clear — so `prefork` now exempts it for the window.
+
+*Concurrency.* The RSEQ-mode locked fallback (`fe_pop_locked`/`fe_push_locked`, plus
+`init_slot`/`check_invariants`) omitted the W7-4 non-owner fence, so a thread that migrated
+between sampling its CPU and taking that CPU's lock could race an in-flight RSEQ sequence and
+double-vend an object.
+
+*Security.* The randomized security samplers (guard-page coin, quarantine evictor) used
+**fixed compile-time seeds**, making the "unpredictable" guarded slots identical and
+publicly computable in every process; they are now seeded from per-process OS entropy through
+a `no_std`-preserving seam (`harden::set_process_entropy`), with deterministic mode still
+overriding. A guard-page `mprotect` refusal was silently ignored, vending an object marked
+guarded with two ordinary read-write pages; the geometry marker and the *armed* marker are now
+distinct and refusals are counted (`AllocatorStats::guard_protect_failures`). A quarantined
+object's bytes were left intact for the whole hold, so freed secrets stayed readable and the
+delayed-reuse window armed no canary — the fill/scrub now happens on entry and the drain
+*verifies* it. Environment-derived configuration is skipped under `AT_SECURE`/setuid, as glibc
+does for `MALLOC_*`. The POSIX provider's physical-state ops validated only the sub-range, not
+region ownership, so safe code could `madvise`/`mprotect` memory it did not own. Label
+redaction keyed the "show the raw summary" shortcut on which arenas happened to exist, letting
+a high domain modulate the low view by creating and destroying an arena; it is now keyed on the
+observer's label alone. A guarded free marked the whole extent canary-filled while filling only
+its object, so reuse `corruption_abort`ed a correct program under `junk-fill,guard-pages` — a
+composition CI did not build, now covered by a feature-pair pass.
+
+*Accounting / policy.* Destroying an intermediate delegated arena returned its whole
+reservation to its parent while its own children stayed allocatable, letting a subtree exceed
+the root quota; a destroy with live children is refused. `release_empty_excess` treated a
+hugepage's committed **popcount** as a contiguous prefix (so a hugepage with a committed hole
+never had its RSS reclaimed) and skipped partially-subreleased empties whose bytes it kept
+reporting as reclaimable supply (a plan that never converged). `rate_budget` granted a full
+second of allowance on every zero-length interval, bypassing the §20.2 cap by orders of
+magnitude. `NodeRouter::rebalance_tick` converted a byte reserve into a hugepage count,
+releasing far more than the planned move. `nallocx` over-reported a guarded request's usable
+size (walking a caller into the guard page), and a **failed** `realloc` retired the still-live
+object from the heap sampler.
+
+*Hygiene.* Removed `overflow::{is_aligned, hugepage_round}` and `sampling::refresh_bloom`
+(zero call sites) and the duplicate `Allocator::large_backing`; corrected the §9.7 overflow-map,
+the extent-hook `release` failure contract, the `no_std` hook-reentrancy limitation, and the
+public header's `xallocx`/stats-flag documentation. Two vacuous tests were made real, and CI
+gained passes for the `deterministic-test` profile and the `junk-fill,guard-pages` /
+`junk-fill,quarantine` feature pairs, plus a dedicated **loom** workflow job — the fork-quiesce
+models are cited as that gate's proof but no job ran them.
+
 **Test counts:**
-- Rust: ~870 tests across 12 crates (`cargo test --workspace`); the W18 `hardened`
+- Rust: ~950 `#[test]` functions across the 8 library crates plus the integration, tool and
+  xtask crates (`cargo test --workspace`); the W18 `hardened`
   profile, each hardening feature **alone**, and the POSIX/Sim hardening integration suite
   (guard-page SIGSEGV death test, large use-after-free SIGABRT death test, live quarantine
   control) run as dedicated `cargo xtask test` passes
@@ -525,14 +594,14 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | 14-clause `WellFormed` preservation | per-transition preservers | `Theorems/*.lean` |
 | Coupled alloc preserves invariants | `allocStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Coupled free preserves invariants | `freeStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
-| Exact byte accounting | `ArenaQuotaExact` | `SeLe4n/Refinement.lean` |
+| Exact byte accounting | `ArenaQuotaExact` (a `WellFormed` clause, discharged by the coupled step theorems) | `SeLe4n/Bridge.lean` |
 | Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Hooks preserve disjointness (given §23.3) | `alloc_preserves_disjoint` | `ExtentHooks.lean` |
 | Per-arena hooked regions isolate (§22.7) | `perArena_disjoint_regions_isolate` | `ExtentHooks.lean` |
 | Partial subrelease preserves live backing (H-005) | `subrelease_preserves_live_backing` | `HugePageFiller.lean` |
 | Hugepage bin matches occupancy (H-003) | `partialSubreleased_iff_subreleased` | `HugePageFiller.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
-| SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
+| SMP correctness | `runSmp_conserves` / `runSmp_core_isolation` / `runSmp_low_equivalence` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |
 | Stats non-interference | `stats_observation_noninterference` | `SeLe4n/InformationFlow.lean` |
 

@@ -596,12 +596,6 @@ impl AllocationSiteProfile {
         &self.lifetimes
     }
 
-    /// The size-class distribution (§24.4).
-    #[inline]
-    pub fn size_distribution(&self) -> &SizeClassDist {
-        &self.size_dist
-    }
-
     /// Sampled live bytes attributed to this site (§24.4).
     #[inline]
     pub fn sampled_live_bytes(&self) -> u64 {

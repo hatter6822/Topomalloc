@@ -83,6 +83,11 @@ fn sampled_path_makes_no_heap_allocations() {
     // the loop body) or the sampler re-entering — which must not happen.
     COUNTING_ARMED.store(true, Ordering::Relaxed);
     let before = ALLOC_COUNT.load(Ordering::Relaxed);
+    // Sample count *before* the measured loop, so the anti-vacuity check below is a
+    // genuine delta. `alloc_samples` is cumulative and the 2000-iteration warm-up above
+    // already drove it well past zero, so a `> 0` test on the absolute value would pass
+    // even if the measured loop sampled nothing at all — the very vacuity it guards.
+    let samples_before = topo_abi::sampling::placement_stats().alloc_samples;
     let mut fired_guard_ok = true;
     for _ in 0..50_000 {
         let p = topomalloc_malloc(512);
@@ -109,10 +114,14 @@ fn sampled_path_makes_no_heap_allocations() {
          (§31.4 / Appendix F)",
         after - before
     );
-    // Confirm sampling actually fired during the measured loop (else the test is vacuous).
+    // Confirm sampling actually fired *during the measured loop* (else the test is vacuous).
+    let fired = topo_abi::sampling::placement_stats()
+        .alloc_samples
+        .saturating_sub(samples_before);
     assert!(
-        topo_abi::sampling::placement_stats().alloc_samples > 0,
-        "sampling did not fire — the no-alloc assertion would be vacuous"
+        fired > 0,
+        "sampling did not fire during the measured loop ({fired} new samples) — \
+         the no-alloc assertion would be vacuous"
     );
 
     topomalloc_profile_set_rate(0);

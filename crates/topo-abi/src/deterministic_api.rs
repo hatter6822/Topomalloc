@@ -24,7 +24,14 @@ use crate::global;
 /// whenever the seed or the enabled flag changes, so randomization becomes
 /// seed-derived from that point on.
 fn reseed_live() {
-    if let Some(a) = global() {
+    reseed_live_with(global());
+}
+
+/// [`reseed_live`] against an explicitly supplied engine — used by the startup path,
+/// which runs *inside* `GLOBAL.get_or_init` where calling [`global`] would re-enter the
+/// still-running `OnceLock` and park the thread on its own initialization.
+fn reseed_live_with(engine: Option<&crate::AnyAllocator>) {
+    if let Some(a) = engine {
         a.apply_deterministic_seed();
     }
     // The heap sampler (topo-abi side): rebase its per-thread seed source so
@@ -95,17 +102,21 @@ pub extern "C" fn topomalloc_deterministic_next_trace_id() -> u64 {
 /// build default (deterministic only under the `deterministic-test` profile).
 /// Called under the bootstrap guard so any one-time setup is served by the system
 /// allocator.
-pub(crate) fn init_from_env() {
+///
+/// Takes the engine by reference: it runs inside `GLOBAL.get_or_init`, so calling
+/// [`global`] here would re-enter the still-running `OnceLock` and hang the process on
+/// its first allocation.
+pub(crate) fn init_from_env(a: &crate::AnyAllocator) {
     if let Ok(raw) = std::env::var("TOPOMALLOC_DETERMINISTIC_SEED") {
         if let Ok(seed) = raw.trim().parse::<u64>() {
             deterministic::set_deterministic(true);
             deterministic::set_seed(seed);
-            reseed_live();
+            reseed_live_with(Some(a));
         }
     } else if deterministic::is_deterministic() {
         // Built under the `deterministic-test` profile with no explicit seed: still
         // apply the default seed to the live samplers so the run is reproducible.
-        reseed_live();
+        reseed_live_with(Some(a));
     }
 }
 

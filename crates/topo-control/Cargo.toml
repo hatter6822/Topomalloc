@@ -10,8 +10,8 @@ authors.workspace = true
 license = "MIT"
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.2.0" }
-topo-stats = { path = "../topo-stats", version = "0.2.0" }
+topo-core = { path = "../topo-core", version = "0.3.0" }
+topo-stats = { path = "../topo-stats", version = "0.3.0" }
 
 [lints]
 workspace = true

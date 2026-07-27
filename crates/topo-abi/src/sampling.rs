@@ -175,6 +175,14 @@ pub fn set_base_seed(seed: u64) {
 /// path is allocation-free thereafter. Runtime-safe: a change re-syncs every thread's
 /// sampler lazily via a generation counter.
 pub fn set_rate(rate_bytes: u64) {
+    set_rate_with(rate_bytes, crate::global());
+}
+
+/// [`set_rate`] against an explicitly supplied engine. The startup path runs inside
+/// `GLOBAL.get_or_init`, where calling the crate's private `global()` would re-enter the
+/// still-running `OnceLock` and park the thread on its own initialization — a hang at
+/// the process's first allocation. Public entry points pass `crate::global()`.
+pub fn set_rate_with(rate_bytes: u64, engine: Option<&crate::AnyAllocator>) {
     if rate_bytes != 0 {
         // Initialize the state and warm the unwinder *before* arming, so the first sample
         // never triggers a first-use allocation inside the guarded slow path.
@@ -190,7 +198,7 @@ pub fn set_rate(rate_bytes: u64) {
         // Disabling reverts the allocation path to default placement: drop the learned
         // hints so the engine stops applying them (the default path is then byte-for-byte
         // unchanged).
-        if let Some(eng) = crate::global() {
+        if let Some(eng) = engine {
             eng.clear_learned_hints();
         }
     }
@@ -199,10 +207,13 @@ pub fn set_rate(rate_bytes: u64) {
 /// Read `$TOPOMALLOC_SAMPLE_RATE` (mean bytes between samples) at startup and enable
 /// sampling if it is a non-zero integer (§32.1 env config). Called once during global
 /// allocator init (under the bootstrap guard, so any setup allocation is safe).
-pub fn init_from_env() {
+///
+/// Takes the engine by reference (see [`set_rate_with`]): the startup path runs inside
+/// `GLOBAL.get_or_init`, so a nested `global()` would deadlock.
+pub fn init_from_env(engine: &crate::AnyAllocator) {
     if let Ok(v) = std::env::var("TOPOMALLOC_SAMPLE_RATE") {
         if let Ok(rate) = v.trim().parse::<u64>() {
-            set_rate(rate);
+            set_rate_with(rate, Some(engine));
         }
     }
 }
@@ -521,18 +532,6 @@ pub fn fold_censored() {
             let age = now.saturating_sub(rec.alloc_ms);
             profiles.record_censored(rec.stack_id, age);
         });
-    }
-}
-
-/// Reset the membership filter and re-prime it from the live sampled set, bounding the
-/// false-positive rate over a long run (the host may call this periodically). No-op when
-/// disabled.
-pub fn refresh_bloom() {
-    if let Some(m) = STATE.get() {
-        let g = m.lock().unwrap_or_else(|e| e.into_inner());
-        BLOOM.reset();
-        // Re-prime from the live sampled addresses so no in-flight sampled free is lost.
-        g.objects.for_each_addr(|addr| BLOOM.insert(addr));
     }
 }
 

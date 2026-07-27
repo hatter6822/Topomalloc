@@ -83,12 +83,6 @@ impl CacheBudget {
         self.global_budget
     }
 
-    /// Set the global budget.
-    #[inline]
-    pub fn set_global_budget(&mut self, budget: usize) {
-        self.global_budget = budget;
-    }
-
     /// The miss threshold (misses above this trigger a grow).
     #[inline]
     pub fn miss_threshold(&self) -> u64 {

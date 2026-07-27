@@ -40,6 +40,7 @@ mod arena_api;
 mod c_api;
 mod debug_api;
 mod deterministic_api;
+mod entropy;
 mod errno_shim;
 mod extended;
 mod fork_api;
@@ -213,12 +214,21 @@ impl AnyAllocator {
         flags: RequestFlags,
     ) -> *mut u8 {
         let _op = topo_core::fork::operation_guard();
-        // W17-3: realloc retires the old object and (on success) creates a new one. Resolve
-        // the old lifetime first; sample the result as a fresh allocation. No-op when off.
-        crate::sampling::on_free(ptr);
         // SAFETY: the caller upholds this method's identical contract.
         let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
-        crate::sampling::on_alloc(p, new_size, min_align, flags);
+        // W17-3: realloc retires the old object and creates a new one — but **only on
+        // success**. A failed realloc leaves the original live (§25.1), so retiring its
+        // sampled record here would fold a bogus completed lifetime into the site's
+        // histogram, drop a still-live object from `sampled_live_bytes` /
+        // `internal_sampled_bytes` permanently, and (via the W14 learn→place loop) steer
+        // real placement from corrupted data. Resolving the old address *after* the call
+        // is still correct: the sampled set is keyed by address, and a freed or moved
+        // address is no longer reachable — an in-place resize re-inserts the same address
+        // through `on_alloc` below. No-op when sampling is off.
+        if !p.is_null() {
+            crate::sampling::on_free(ptr);
+            crate::sampling::on_alloc(p, new_size, min_align, flags);
+        }
         p
     }
 
@@ -335,6 +345,15 @@ impl AnyAllocator {
     /// deterministic mode is off or the hardening feature is not compiled in.
     pub fn apply_deterministic_seed(&self) {
         dispatch!(self, a => a.apply_deterministic_seed())
+    }
+
+    /// W18 (§29.4/§29.5): re-seed the randomized **security** samplers from the process
+    /// entropy the crate installs at start-up (`entropy::install_process_entropy`), so the
+    /// guarded slots and the quarantine's eviction order are unpredictable rather than
+    /// the same publicly-computable sequence in every process of this binary. A no-op
+    /// when no entropy source answered or the hardening feature is not compiled in.
+    pub fn seed_security_samplers(&self) {
+        dispatch!(self, a => a.seed_security_samplers())
     }
 
     /// Run the **full Appendix-B invariant check** over the live engine on demand
@@ -718,21 +737,50 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // a safe no-op otherwise (single-shard).
                 topo_core::probe_and_set_sharding();
                 INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
+                // W18 (§29.4/§29.5): install real OS entropy for the randomized
+                // *security* samplers before anything can be sampled, so the guarded
+                // slots and the quarantine's eviction order are not the same
+                // publicly-computable sequence in every process of this binary. Runs
+                // under the bootstrap guard and allocates nothing (raw `libc` only).
+                // Deterministic mode re-seeds from the explicit seed just below, so a
+                // seeded replay still reproduces exactly.
+                crate::entropy::install_process_entropy();
+                if let Some(eng) = allocator.as_ref() {
+                    eng.seed_security_samplers();
+                }
                 // Phase 5: background threads + profiling. Honour `$TOPOMALLOC_SAMPLE_RATE`
                 // (§32.1) now, under the bootstrap guard, so the sampler's one-time setup
                 // allocations are served by the system allocator and the first real sample
                 // is already armed. Only arms when the engine built.
-                crate::sampling::init_from_env();
-                // W18-3 (§29.4): honour `$TOPOMALLOC_QUARANTINE` (§32.1) under the same
-                // guard, so an operator can arm the security quarantine at load. Off
-                // unless the env var requests it (and the `quarantine` feature is built).
-                crate::quarantine_api::init_from_env();
-                crate::quarantine_api::guard_init_from_env();
-                // W19-3 (§30.4): honour `$TOPOMALLOC_DETERMINISTIC_SEED` (§32.1) under
-                // the same guard, so a deterministic run seeds its randomized samplers
-                // before the first real allocation. Off unless requested (or the
-                // `deterministic-test` profile is built).
-                crate::deterministic_api::init_from_env();
+                // Environment-derived configuration is **skipped in a secure execution**
+                // (setuid/setgid or `AT_SECURE`): the environment belongs to whoever
+                // exec'd us, so honouring it in a privileged process would let an
+                // attacker pin the guard/quarantine RNG to a seed they compute offline,
+                // switch guard sampling off, or force stack unwinding on every
+                // allocation. Same rule glibc's malloc applies to `MALLOC_*`. The
+                // compiled-in defaults (and any explicit `topomalloc_*` API call by the
+                // program itself) still apply.
+                //
+                // Each hook takes the just-built engine **by reference**: they run inside
+                // `GLOBAL.get_or_init`, so a nested `global()` would re-enter the still
+                // -running `OnceLock` and park the thread on its own initialization — a
+                // hang at the process's very first allocation, triggered by nothing more
+                // than one of these environment variables being set.
+                if let Some(eng) = allocator.as_ref() {
+                    if !crate::entropy::is_secure_execution() {
+                        crate::sampling::init_from_env(eng);
+                        // W18-3 (§29.4): honour `$TOPOMALLOC_QUARANTINE` (§32.1) under the same
+                        // guard, so an operator can arm the security quarantine at load. Off
+                        // unless the env var requests it (and the `quarantine` feature is built).
+                        crate::quarantine_api::init_from_env(eng);
+                        crate::quarantine_api::guard_init_from_env(eng);
+                        // W19-3 (§30.4): honour `$TOPOMALLOC_DETERMINISTIC_SEED` (§32.1) under
+                        // the same guard, so a deterministic run seeds its randomized samplers
+                        // before the first real allocation. Off unless requested (or the
+                        // `deterministic-test` profile is built).
+                        crate::deterministic_api::init_from_env(eng);
+                    }
+                }
                 INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
                 // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);

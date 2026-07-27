@@ -20,7 +20,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.2.0" }
+topo-core = { path = "../topo-core", version = "0.3.0" }
 
 # D8 — the real seLe4n ABI, pinned to the reviewed SHA (vendor/sele4n/PINNED_SHA) and
 # vendored under `vendor/sele4n/` by `scripts/vendor_sele4n.sh` (GPL-3.0-or-later, on

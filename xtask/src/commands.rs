@@ -473,6 +473,36 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
             &["test", "-p", "topo-core", "--features", feat, "--lib"],
         );
     }
+    // W19-3 (§30.4): the `deterministic-test` profile flips deterministic mode ON at
+    // compile time (`ENABLED: AtomicBool::new(cfg!(feature = \"deterministic-test\"))`),
+    // which changes real behaviour — the force-slow-path / force-purge gates and the
+    // seeded security samplers. Every other profile feature has a build+test pass; this
+    // one had none, so a change that broke the always-on path would ship green.
+    r.run(
+        "test deterministic-test profile (W19-3)",
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "topo-core",
+            "--features",
+            "deterministic-test",
+            "--lib",
+        ],
+    );
+    // W18 feature **pairs** the single-feature and full-`hardened` runs both miss: a
+    // protection can interact with a sibling in a way the composed profile masks. The
+    // audited case is `junk-fill` + `guard-pages` *without* `secure-scrub`: a guarded
+    // free fills only its object subrange, so claiming the whole extent is canary-filled
+    // aborted a correct program on reuse — invisible under `hardened`, where
+    // `secure-scrub` scrubs (and so disarms the canary) on every large free.
+    for feats in ["junk-fill,guard-pages", "junk-fill,quarantine"] {
+        r.run(
+            &format!("test W18 feature pair: {feats}"),
+            "cargo",
+            &["test", "-p", "topo-core", "--features", feats, "--lib"],
+        );
+    }
     // The W18 hardening integration tests over the **real POSIX provider**: the
     // guarded-allocation `mprotect` death test (overrun/underrun ⇒ SIGSEGV) and the
     // live quarantine control surface, which the in-crate `HostProvider` cannot.

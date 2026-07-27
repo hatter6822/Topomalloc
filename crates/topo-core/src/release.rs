@@ -464,11 +464,6 @@ impl ReleaseController {
         self.config
     }
 
-    /// Replace the decay configuration (a control-plane write, plan 07 W20).
-    pub fn set_config(&mut self, config: DecayConfig) {
-        self.config = config;
-    }
-
     /// The current §21.5 pressure mode.
     pub fn mode(&self) -> PressureMode {
         self.mode
@@ -643,11 +638,16 @@ impl ReleaseController {
         // rate-capped persistent supply and let the backlog diverge far past the memory
         // that actually exists (e.g. ~16 MiB of dirty held under a 1 MiB/s cap would
         // accrue ~15 MiB of "owed" release *every* tick forever). `0` rate ⇒ unlimited.
-        let desired = plan.total_bytes().max(self.backlog_bytes);
+        let supply = plan.total_bytes();
+        let desired = supply.max(self.backlog_bytes);
         if self.config.release_rate_bytes_per_sec != 0 && self.mode != PressureMode::Emergency {
             // The budget is just this interval's allowance; the unmet remainder of
             // `desired` becomes the new backlog.
-            let budget = rate_budget(self.config.release_rate_bytes_per_sec, elapsed_ms);
+            let budget = rate_budget(
+                self.config.release_rate_bytes_per_sec,
+                elapsed_ms,
+                !self.started,
+            );
             let granted = budget.min(desired);
             scale_plan_to_budget(&mut plan, granted);
             // Credit only what was ACTUALLY planned this tick, not the full `granted`:
@@ -655,9 +655,15 @@ impl ReleaseController {
             // exists, so when `granted` exceeds the available work the plan totals less
             // than `granted`; crediting the full `granted` would silently forgive the
             // unplanned remainder (RSS stays high while the controller reports
-            // progress). The remainder stays owed as backlog, bounded by `desired` so it
-            // tracks the pending supply rather than accumulating without limit (§20.3).
-            self.backlog_bytes = desired.saturating_sub(plan.total_bytes());
+            // progress). The remainder stays owed as backlog — and is additionally capped
+            // by **this tick's observed supply** (`supply`, the uncapped ladder total),
+            // because a backlog is release work that still *exists*. Without that cap it
+            // latched: once the supply drained, `desired` fell back to the old backlog and
+            // the plan totalled `0`, so `desired − 0` reproduced the same number every
+            // tick — a fully-drained, idle allocator reporting megabytes of "owed" release
+            // forever, and the §21.4 anti-oscillation brake reading a debt that no memory
+            // backs (§20.3).
+            self.backlog_bytes = desired.saturating_sub(plan.total_bytes()).min(supply);
         } else {
             // Unlimited (or Emergency, which bypasses the cap): clear the backlog.
             self.backlog_bytes = 0;
@@ -835,13 +841,20 @@ fn rate_per_sec(delta_bytes: u64, elapsed_ms: u64) -> u64 {
     ((delta_bytes as u128 * 1_000) / elapsed_ms as u128).min(u64::MAX as u128) as u64
 }
 
-/// Bytes permitted by a per-second rate over an interval; a zero-length interval
-/// grants a single byte-rate-free *floor* of one window so the first tick can act.
-fn rate_budget(rate_bps: u64, elapsed_ms: u64) -> u64 {
-    let ms = if elapsed_ms == 0 {
-        RESERVE_WINDOW_MS
-    } else {
-        elapsed_ms
+/// Bytes permitted by a per-second rate over an interval.
+///
+/// `first` marks the very first tick, which has no interval to measure and is granted a
+/// one-window floor so the controller can act immediately. Every later zero-length
+/// interval grants **nothing**: two ticks in the same millisecond (or a backwards clock
+/// step, which `saturating_sub` also reports as `0`) must not each receive a full second
+/// of allowance — a host draining the backlog in a loop at, say, 10 kHz would otherwise
+/// be granted 10 000 × the configured §20.2 rate, and `tick`'s own contract
+/// ("re-ticking with the same time grants no new rate budget") would be false.
+fn rate_budget(rate_bps: u64, elapsed_ms: u64, first: bool) -> u64 {
+    let ms = match (elapsed_ms, first) {
+        (0, true) => RESERVE_WINDOW_MS,
+        (0, false) => return 0,
+        (ms, _) => ms,
     };
     ((rate_bps as u128 * ms as u128) / 1_000).min(u64::MAX as u128) as u64
 }
@@ -879,6 +892,52 @@ mod tests {
             cold_sparse_bytes: 4 * 1024 * 1024,
             ..ReleaseInputs::default()
         }
+    }
+
+    #[test]
+    fn a_repeated_tick_at_the_same_time_grants_no_new_rate_budget() {
+        // §20.2 rate cap + `tick`'s own contract ("re-ticking with the same time grants no
+        // new rate budget"). `elapsed_ms` is `0` for a second tick in the same millisecond
+        // *and* for a backwards clock step, and granting a full window each time let a
+        // host draining the backlog in a loop release orders of magnitude past the cap.
+        // Only the very first tick gets the bootstrap floor.
+        let cfg = DecayConfig {
+            release_rate_bytes_per_sec: 1024 * 1024, // 1 MiB/s
+            ..DecayConfig::low_rss()
+        };
+        let mut c = ReleaseController::new(cfg);
+        let inputs = ReleaseInputs {
+            cgroup_current: 95,
+            cgroup_max: 100,
+            ..base_inputs()
+        };
+
+        // First tick: the one-window floor lets the controller act immediately.
+        let first = c.tick(1_000, inputs);
+        assert!(
+            first.total_bytes() > 0,
+            "the first tick must be able to act"
+        );
+
+        // Same millisecond again: nothing new is granted.
+        let same = c.tick(1_000, inputs);
+        assert_eq!(
+            same.total_bytes(),
+            0,
+            "a same-millisecond re-tick granted {} bytes of fresh budget",
+            same.total_bytes()
+        );
+        // A backwards clock reads as a zero interval too — also no grant, no panic.
+        let back = c.tick(900, inputs);
+        assert_eq!(back.total_bytes(), 0, "a backwards clock granted budget");
+
+        // A real interval grants exactly its share (1 MiB/s over 500 ms = 512 KiB).
+        let later = c.tick(1_400, inputs);
+        assert!(
+            later.total_bytes() > 0 && later.total_bytes() <= 512 * 1024,
+            "500 ms at 1 MiB/s granted {} bytes",
+            later.total_bytes()
+        );
     }
 
     #[test]
@@ -1655,13 +1714,34 @@ mod tests {
         );
         let backlog = c.backlog_bytes();
         assert!(backlog > 0, "backlog accrued under the rate cap");
-        // A later tick with NO current work but a generous budget must NOT forgive it.
-        let plan = c.tick(100_000, ReleaseInputs::default());
-        assert_eq!(plan.total_bytes(), 0, "no current work to plan");
+        // A later tick whose *current* work is below the generous budget must not forgive
+        // the pending remainder: the credit is what was actually planned, not the grant.
+        let small = ReleaseInputs {
+            dirty_bytes: 4096,
+            cgroup_current: 95,
+            cgroup_max: 100,
+            ..ReleaseInputs::default()
+        };
+        let plan = c.tick(100_000, small);
+        assert!(
+            plan.total_bytes() > 0 && plan.total_bytes() < backlog,
+            "this tick plans some, but far less than the carried backlog"
+        );
+        assert!(
+            c.backlog_bytes() > 0,
+            "a well-budgeted tick with real remaining work must not forgive the backlog"
+        );
+
+        // But once the supply is genuinely gone, so is the debt: a backlog is release
+        // work that still *exists*. Leaving it latched made a fully-drained, idle
+        // allocator report megabytes of owed release forever (and fed the §21.4
+        // anti-oscillation brake a debt no memory backs).
+        let plan = c.tick(200_000, ReleaseInputs::default());
+        assert_eq!(plan.total_bytes(), 0, "no work exists any more");
         assert_eq!(
             c.backlog_bytes(),
-            backlog,
-            "the backlog is not forgiven by an idle, well-budgeted tick"
+            0,
+            "the backlog must drain with the supply, not latch at its high-water mark"
         );
     }
 

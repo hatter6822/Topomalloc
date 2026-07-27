@@ -62,7 +62,19 @@
 //! per-provider [`enter_hook`](HookProvider) flag rejects a re-entry that reaches
 //! the same provider, and the per-thread `hook_reentry` domain (set by
 //! `HookGuard`) lets the allocator entry decline a re-entrant allocation with a
-//! null *before* it can take the lock. (Full hardened-profile recursion diagnostics
+//! null *before* it can take the lock.
+//!
+//! **The second guard is hosted-only.** `hook_reentry` is a `reentry_flag!` domain,
+//! which needs a thread-local; without `std` (`topo-core`'s default, i.e. the
+//! kernel/seLe4n profile) its `active()` compiles to a constant `false`. In that
+//! configuration an extent hook that calls back into `malloc`/`free` is **not**
+//! declined — it reaches `ExtentManager` and blocks forever on the non-re-entrant
+//! backend lock its own caller already holds. The per-provider `in_hook` flag does not
+//! cover this: a re-entrant `malloc` arrives through the allocator entry, never through
+//! `enter_hook`. So a `no_std` embedder that installs [`ExtentHooks`] MUST guarantee its
+//! hooks do not allocate through TopoMalloc (the Appendix-F "no recursion" rule), rather
+//! than relying on the fail-safe. `topo-abi` and the test crates enable
+//! `topo-core/std`, so every hosted build has the guard. (Full hardened-profile recursion diagnostics
 //! — quarantine, stack capture — remain a plan-08 concern.)
 
 use core::cell::UnsafeCell;
@@ -405,13 +417,23 @@ pub struct HookProvider<H: ExtentHooks> {
     /// Count of advisory §23.2 `merge`-hook failures (see above).
     merge_hook_failures: AtomicU64,
     /// Count of whole-region `release` failures: a backing's `dealloc` refusing to
-    /// take a reserved region back. `release` is dispatched from the infallible
-    /// [`ExtentManager::drop`](crate::ExtentManager), so the error cannot propagate
-    /// to a caller (e.g. the arena-destroy result); it is **counted** here so a
-    /// backing that leaks region returns is observable rather than silent (§23.3
-    /// "reported"). It is never an allocator-visible fault — the region is gone from
-    /// the allocator's view, so a failed return is a leak in the user's backing, not
-    /// an aliasing/use-after-free.
+    /// take a reserved region back.
+    ///
+    /// `release` reaches the provider two ways, and only one of them can report:
+    ///
+    /// * from the explicit, fallible [`ExtentManager::teardown`](crate::ExtentManager)
+    ///   — the arena-destroy path. There the error **does** propagate:
+    ///   `Allocator::arena_destroy` turns it into a §36.13 `ErrorQuarantined` and
+    ///   answers `Err`, so `topo_arena_destroy` returns `-1` and the arena id is not
+    ///   recycled. A refusing `dealloc` is therefore an allocator-visible failure on
+    ///   this path, not a benign counter bump.
+    /// * from the infallible `ExtentManager::drop`, where there is no caller to answer.
+    ///
+    /// The counter exists for the second case — so a backing that leaks region returns
+    /// stays observable rather than silent (§23.3 "reported") — and is bumped on both
+    /// so the totals reconcile. Either way the failure is a leak in the *user's*
+    /// backing: the region is gone from the allocator's view, so it is never an
+    /// aliasing or use-after-free hazard.
     release_hook_failures: AtomicU64,
     /// The §23.3 live-reservation set: detects an `alloc` result overlapping a live
     /// reservation, and a `dealloc` of a region this backing never handed out.
@@ -929,11 +951,13 @@ mod tests {
     #[test]
     fn release_counts_a_dealloc_hook_failure() {
         // §23.3 "reported": a backing that refuses a whole-region release has the
-        // failure COUNTED for observability rather than silently swallowed — the
-        // release is dispatched from the infallible `ExtentManager::drop`, so the
-        // error cannot reach the destroy result. It is never an allocator-visible
-        // fault: the region is already out of the allocator's view, so a failed
-        // return is a leak in the user's backing, not an aliasing/use-after-free.
+        // failure COUNTED for observability as well as returned. The counter is what
+        // makes the *drop*-dispatched release (which has no caller to answer)
+        // observable; on the explicit `ExtentManager::teardown` path the error also
+        // propagates — `Allocator::arena_destroy` turns it into a §36.13
+        // `ErrorQuarantined` and a failed `topo_arena_destroy`. Either way the region
+        // is already out of the allocator's view, so a failed return is a leak in the
+        // user's backing, not an aliasing/use-after-free.
         let p = HookProvider::new(TestHooks::new());
         let r = p.reserve(ArenaId::DEFAULT, 4096, 64).expect("reserve");
         assert_eq!(p.release_hook_failures(), 0);

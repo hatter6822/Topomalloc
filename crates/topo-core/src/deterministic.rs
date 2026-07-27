@@ -108,12 +108,22 @@ const fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Mix a base seed with a domain salt into a decorrelated stream seed. Shared by
+/// [`domain_seed`] (deterministic mode's global seed) and
+/// [`harden::entropy_seed`](crate::harden::entropy_seed) (the process entropy the
+/// randomized security samplers use in ordinary builds), so both derive their
+/// per-domain streams the same proven way.
+#[inline]
+pub(crate) const fn mix_seed(base: u64, domain_salt: u64) -> u64 {
+    splitmix64(base ^ splitmix64(domain_salt))
+}
+
 /// A reproducible, non-zero seed for an RNG `domain` (see [`salt`]), derived from
 /// the global [`seed`]. Distinct salts yield decorrelated streams; the result is
 /// never `0` (xorshift/SplitMix64 RNGs require a non-zero state).
 #[inline]
 pub fn domain_seed(domain_salt: u64) -> u64 {
-    let mixed = splitmix64(seed() ^ splitmix64(domain_salt));
+    let mixed = mix_seed(seed(), domain_salt);
     if mixed == 0 {
         // Vanishingly unlikely, but a zero state would stall an xorshift RNG.
         0x1

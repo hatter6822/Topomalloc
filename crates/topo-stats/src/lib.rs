@@ -85,6 +85,15 @@ pub struct Stats {
     /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may be
     /// recycled (§36.13), so this is an event count, not `created − live`.
     pub arenas_destroyed: u64,
+    /// Arenas stuck in the terminal §36.13 `ErrorQuarantined` state — see
+    /// [`topo_core::AllocatorStats::arenas_quarantined`]. Normally `0`; a nonzero,
+    /// growing value means arena slots are leaking.
+    pub arenas_quarantined: u64,
+    /// Cumulative guard-page `mprotect` refusals (§29.5, W18-4) — see
+    /// [`topo_core::AllocatorStats::guard_protect_failures`]. `0` unless the
+    /// `guard-pages` protection is compiled in *and* the host refused a protection
+    /// change, which means guarded allocations are silently unprotected.
+    pub guard_protect_failures: u64,
     /// Cumulative NUMA binding failures across all arenas (§15.5).
     pub numa_bind_failures: u64,
     /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
@@ -306,6 +315,8 @@ impl Stats {
         self.quarantine_bytes = a.quarantine_bytes;
         self.live_arenas = a.live_arenas;
         self.arenas_destroyed = a.arenas_destroyed;
+        self.arenas_quarantined = a.arenas_quarantined;
+        self.guard_protect_failures = a.guard_protect_failures;
         self.numa_bind_failures = a.numa_bind_failures;
         self.hook_failures = a.hook_failures;
         let combined = topo_core::StateBytes {
@@ -431,6 +442,7 @@ impl Stats {
                 "  \"arenas\": {{\n",
                 "    \"count\": {live_arenas},\n",
                 "    \"destroyed\": {arenas_destroyed},\n",
+                "    \"quarantined\": {arenas_quarantined},\n",
                 "    \"numa_bind_failures\": {numa_bind_failures},\n",
                 "    \"hook_failures\": {{\n",
                 "      \"commit\": {hf_commit},\n",
@@ -451,6 +463,9 @@ impl Stats {
                 "  }},\n",
                 "  \"quarantine\": {{\n",
                 "    \"bytes\": {quarantine}\n",
+                "  }},\n",
+                "  \"hardening\": {{\n",
+                "    \"guard_protect_failures\": {guard_protect_failures}\n",
                 "  }},\n",
                 "  \"hugepage\": {{\n",
                 "    \"coverage_bytes\": {hp_coverage},\n",
@@ -516,6 +531,8 @@ impl Stats {
             central = self.central_free_bytes,
             live_arenas = self.live_arenas,
             arenas_destroyed = self.arenas_destroyed,
+            arenas_quarantined = self.arenas_quarantined,
+            guard_protect_failures = self.guard_protect_failures,
             numa_bind_failures = self.numa_bind_failures,
             hf_commit = self.hook_failures.commit,
             hf_release = self.hook_failures.release,
@@ -842,24 +859,37 @@ pub fn redact_arenas(arenas: &[ArenaLine], observer_label: u32) -> alloc::vec::V
         .collect()
 }
 
+/// The observer label that dominates **every** possible label, so it may see the raw
+/// summary. Kept as a property of the observer alone (see [`redact_summary`]).
+pub const OBSERVER_LABEL_TOP: u32 = u32::MAX;
+
 /// **Summary-level label redaction (§36.12, W17-6).** Produce the stats *summary* a low
 /// observer is authorized to see — the piece `redact_arenas` (which only filters the
-/// per-arena detail) leaves open. When `all_visible` is true (the observer dominates every
-/// arena — always the POSIX single-`PUBLIC`-label case), the full summary is returned
-/// unchanged (a `PUBLIC` observer legitimately sees everything). Otherwise every **cross-domain
-/// aggregate** — the global cumulative counters, the *shared* backend / cache / central /
-/// hugepage / release / placement / fragmentation state, the metadata, the peak — is redacted
-/// to zero (it mixes all domains' activity, so a low observer must not see it), and the
-/// observer-visible `live_bytes` is recomputed from the visible arenas' `used` (sound because
-/// `Σ arena.used == live_bytes`, §8.6/§36.17).
+/// per-arena detail) leaves open. Every **cross-domain aggregate** — the global cumulative
+/// counters, the *shared* backend / cache / central / hugepage / release / placement /
+/// fragmentation state, the metadata, the peak — is redacted to zero (it mixes all domains'
+/// activity, so a low observer must not see it), and the observer-visible `live_bytes` is
+/// recomputed from the visible arenas' `used` (sound because `Σ arena.used == live_bytes`,
+/// §8.6/§36.17).
 ///
 /// The result is a **pure function of `(full.epoch, full.profile, visible_arenas)`**, so —
 /// modulo the non-sensitive snapshot sequence number `epoch` — any higher-domain activity is
 /// invisible to a low observer: the summary analogue of `redact_arenas`. Together they make
 /// the JSON a low observer receives the Rust-side analogue of the proved Lean
 /// `stats_observation_noninterference`. Pure and total.
-pub fn redact_summary(full: &Stats, visible_arenas: &[ArenaLine], all_visible: bool) -> Stats {
-    if all_visible {
+///
+/// **Why there is no "the observer dominates every live arena" shortcut.** An earlier
+/// version returned the full summary when the visible arena set happened to equal the whole
+/// set. That predicate reads the *unredacted* state, so it is exactly a high-domain bit: a
+/// high domain could create a labelled arena and watch the low observer's JSON flip from the
+/// complete global summary to the all-zero redacted one, then destroy it to flip it back — a
+/// covert channel whose bandwidth is only the low observer's polling rate, and which
+/// discloses every cross-domain aggregate whenever no high arena happens to exist. Authority
+/// must be a property of the *observer*, so only [`OBSERVER_LABEL_TOP`] — which dominates
+/// every label there can ever be — reads the raw summary; a caller wanting the unrestricted
+/// view uses the unlabelled `topomalloc_stats_json` instead.
+pub fn redact_summary(full: &Stats, visible_arenas: &[ArenaLine], observer_label: u32) -> Stats {
+    if observer_label == OBSERVER_LABEL_TOP {
         return *full;
     }
     let visible_live: u64 = visible_arenas.iter().map(|a| a.used).sum();
@@ -1123,6 +1153,8 @@ mod tests {
                 merge: 15,
             },
             arenas_destroyed: 4,
+            arenas_quarantined: 0,
+            guard_protect_failures: 2,
             peak_live_bytes: 2000,
             live_internal_fragmentation_bytes: 512,
             quarantine_bytes: 256,
@@ -1348,6 +1380,60 @@ mod tests {
     }
 
     #[test]
+    fn the_low_view_does_not_depend_on_whether_a_high_arena_exists() {
+        // The covert channel the observer-keyed rule closes. A high domain must not be
+        // able to modulate anything a low observer sees by creating/destroying a labelled
+        // arena — yet an "all live arenas visible ⇒ show the raw summary" shortcut does
+        // exactly that: with no high arena the low observer received the *complete* global
+        // summary, and the moment one appeared the view flipped to the redacted one.
+        let low = ArenaLine {
+            id: 1,
+            label: 0,
+            used: 4096,
+            ..ArenaLine::default()
+        };
+        let high = ArenaLine {
+            id: 2,
+            label: 9,
+            used: 1 << 30,
+            ..ArenaLine::default()
+        };
+        let full = Stats {
+            epoch: 5,
+            live_bytes: 4096 + (1 << 30),
+            allocated_bytes_total: 9 << 30,
+            active_bytes: 4 << 30,
+            metadata_bytes: 1 << 20,
+            peak_live_bytes: 8 << 30,
+            ..Stats::default()
+        };
+
+        // World A: only the low arena exists (so the observer *does* see every arena).
+        let only_low = Stats {
+            live_bytes: 4096,
+            ..full
+        };
+        let vis_a = redact_arenas(&[low], 0);
+        let view_a = redact_summary(&only_low, &vis_a, 0);
+
+        // World B: a high arena also exists.
+        let vis_b = redact_arenas(&[low, high], 0);
+        let view_b = redact_summary(&full, &vis_b, 0);
+
+        assert_eq!(vis_a, vis_b, "the visible arena set must be identical");
+        assert_eq!(
+            view_a.to_json(),
+            view_b.to_json(),
+            "the low view changed because a high arena exists — a covert channel"
+        );
+        assert_eq!(view_a.live_bytes, 4096, "only the visible domain's bytes");
+        assert_eq!(
+            view_a.active_bytes, 0,
+            "cross-domain aggregates stay redacted"
+        );
+    }
+
+    #[test]
     fn summary_redaction_is_noninterference_for_the_whole_view() {
         // W17-6 correctness fix: the *summary* (not just the per-arena detail) a low observer
         // receives is a pure function of the visible arenas + epoch/profile — so ALL
@@ -1395,8 +1481,8 @@ mod tests {
         // The visible (low) set is identical in both; redacting summaries must match exactly.
         let vis_a = redact_arenas(&[low, high], 0);
         let vis_b = redact_arenas(&[low, high_b], 0);
-        let red_a = redact_summary(&full_a, &vis_a, false);
-        let red_b = redact_summary(&full_b, &vis_b, false);
+        let red_a = redact_summary(&full_a, &vis_a, 0);
+        let red_b = redact_summary(&full_b, &vis_b, 0);
         assert_eq!(red_a, red_b, "the redacted low-domain summary is invariant");
         // It discloses only the visible domain's live bytes, with a consistent identity.
         assert_eq!(red_a.live_bytes, 4096);
@@ -1410,7 +1496,11 @@ mod tests {
         let json_b = red_b.to_json();
         assert_eq!(json_a, json_b);
         // `all_visible` (a top observer / the POSIX PUBLIC case) is the identity: full stats.
-        assert_eq!(redact_summary(&full_a, &[low, high], true), full_a);
+        assert_eq!(
+            redact_summary(&full_a, &[low, high], OBSERVER_LABEL_TOP),
+            full_a,
+            "only the lattice-top observer reads the raw summary"
+        );
     }
 
     #[test]

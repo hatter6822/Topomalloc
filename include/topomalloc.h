@@ -173,8 +173,16 @@ void *topo_rallocx(void *ptr, size_t size, topo_flags_t flags);
 
 /* Resize in place only, to at least `size` (best effort toward size+extra);
  * returns the allocation's real usable size — success iff result >= size.
- * Never moves or frees. At M1 in-place growth beyond the current usable
- * size is not possible (extent-merge growth lands at M5). */
+ * Never moves or frees.
+ *
+ * In-place growth IS supported for a medium/large allocation: it absorbs the
+ * address-adjacent free extent (Section 25.2). It is best-effort and declines —
+ * returning the unchanged usable size — when there is no adjacent free extent,
+ * when the allocation is served from the hugepage region cache, or when it is a
+ * guarded allocation (Section 29.5: a guarded object is right-aligned inside a
+ * larger extent, so it can only be resized by moving). A small allocation is
+ * bounded by its size class. Shrinking a medium/large allocation returns its
+ * tail pages (Section 25.3) under the same best-effort rule. */
 size_t topo_xallocx(void *ptr, size_t size, size_t extra, topo_flags_t flags);
 
 /* Free with flags (advisory on this path; validated, never trusted). */
@@ -459,8 +467,12 @@ int topomalloc_debug_checks_enabled(void);
 
 /* topo_stats flag bits (Section 31.2). SUMMARY (0) is always rendered; the BY_*
  * flags add per-entity detail blocks; CONSISTENT_SNAPSHOT / RESET_PEAKS are read
- * modes. Unknown bits are ignored (forward-compatible). These mirror the Rust
- * topo_stats::StatsFlags bits exactly. */
+ * modes. An unknown bit is REJECTED, not ignored: every stats entry point returns
+ * its error form (0 for the size/length calls, -1 for topomalloc_stats_print) so a
+ * typo'd or future flag fails loudly rather than silently doing nothing — the same
+ * strict validation topo_mallocx applies to its flags (Section 10.4). Forward
+ * compatibility comes from the JSON being additive, not from ignoring input. These
+ * mirror the Rust topo_stats::StatsFlags bits exactly. */
 #define TOPOMALLOC_STATS_SUMMARY ((uint64_t) 0)
 #define TOPOMALLOC_STATS_BY_ARENA ((uint64_t) 1 << 0)
 #define TOPOMALLOC_STATS_BY_SIZE_CLASS ((uint64_t) 1 << 1)

@@ -265,6 +265,20 @@ pub struct AllocatorStats {
     /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may later
     /// be recycled (§36.13), so this is an event count, not `created − live`.
     pub arenas_destroyed: u64,
+    /// Arenas currently stuck in the terminal §36.13 `ErrorQuarantined` state — a
+    /// reset/destroy whose *backing* could not be recycled. The state has no outgoing
+    /// transition, so each one permanently consumes an arena slot (and, if delegated,
+    /// holds its parent's reserved quota), walking the table toward
+    /// `ArenaError::Exhausted`. Normally `0`.
+    pub arenas_quarantined: u64,
+    /// Cumulative guard-page `mprotect` refusals (§29.5, W18-4): a guarded allocation
+    /// the provider would not let us protect (so it was handed out **unguarded**), or a
+    /// free whose guard could not be restored. Always `0` without `guard-pages`, and `0`
+    /// on a provider with no page protection (which reports success and treats guards as
+    /// advisory). Nonzero means guarded allocations are silently unprotected — typically
+    /// `vm.max_map_count` exhaustion, since each guarded object splits a VMA — so it is
+    /// surfaced rather than left as an invisible security downgrade.
+    pub guard_protect_failures: u64,
     /// The high-water mark of `live_bytes` since the last reset (§31.2/§31.3 sampled peak
     /// heap, plan 07 W17-2). A true high-water mark maintained on the allocation charge
     /// path (`fetch_max` of live after each charge), reset by `topomalloc_stats` `RESET_PEAKS`.
@@ -475,8 +489,26 @@ fn medium_large_usable(size: usize) -> Option<usize> {
 /// `None` exactly when `allocate` would fail classification (invalid
 /// alignment/flags or rounding overflow). Pure: no allocator state is
 /// consulted, so the prediction is identical for every engine instance.
+///
+/// **Guarded requests (W18-4, §29.5).** An explicit `TOPO_GUARDED` request takes the
+/// guarded page path, whose usable size is the *tight* `align_up(size, align)` — the
+/// object is right-aligned so that its last byte abuts an inaccessible guard page. The
+/// prediction must use that formula, not the size class's: over-reporting would send a
+/// caller following the documented `nallocx` idiom ("ask, then use the whole reported
+/// size") straight into the guard page. The formula mirrors
+/// `Allocator::allocate_in` / `LargeAllocator::allocate_guarded` exactly, including the
+/// `align <= PAGE_SIZE` bound `Allocator::want_guarded` applies (an over-aligned request
+/// is *not* guarded, so it keeps the ordinary prediction).
+///
+/// Guard **sampling** (`topomalloc_guard_set_sample_rate`) can route an *unhinted*
+/// allocation into the same path, so a prediction for a plain request is an upper bound
+/// only while sampling is off; that is why sampling is opt-in and defaults to `0`, and
+/// why `topo_nallocx` documents its answer as the un-sampled result.
 pub fn predicted_usable_size(size: usize, align: usize, flags: RequestFlags) -> Option<usize> {
     let req = classify(size, align, flags.raw())?;
+    if cfg!(feature = "guard-pages") && flags.hints().guarded && req.align <= PAGE_SIZE {
+        return crate::overflow::align_up(size.max(1), req.align.max(1));
+    }
     match req.kind {
         RequestKind::Small { usable, .. } => Some(usable),
         RequestKind::Medium { .. } | RequestKind::Large { .. } => medium_large_usable(size),
@@ -914,15 +946,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         match self.hook_backend(arena) {
             Some(b) => &b.span_extents,
             None => &self.span_extents,
-        }
-    }
-
-    /// The large backing for `arena`: its own hooked region, or the shared.
-    #[inline]
-    fn large_backing(&self, arena: ArenaId) -> &dyn LargeBacking {
-        match self.hook_backend(arena) {
-            Some(b) => &b.large,
-            None => &self.large,
         }
     }
 
@@ -1744,6 +1767,39 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
+    /// Re-seed the randomized **security** samplers — the W18-4 guard-page coin and the
+    /// W18-3 quarantine sampler/evictor — from the process entropy the host installed
+    /// with [`harden::set_process_entropy`](crate::harden::set_process_entropy) (§29.4/§29.5).
+    ///
+    /// Both samplers rest on *unpredictability*: an attacker who can compute which
+    /// allocations get a guard page simply avoids them, and one who can compute the
+    /// eviction order can force an early reuse. Their compile-time seeds make the stream
+    /// identical in every process of the same binary — i.e. public — so the host must
+    /// install real entropy and call this once during start-up.
+    ///
+    /// A no-op when the host installed no entropy (the build-time seed is kept) or when
+    /// the relevant hardening feature is not compiled in. Deterministic mode is
+    /// unaffected: it re-seeds afterwards through
+    /// [`apply_deterministic_seed`](Self::apply_deterministic_seed), which wins because
+    /// the initializer calls it last.
+    pub fn seed_security_samplers(&self) {
+        #[cfg(feature = "guard-pages")]
+        if let Some(s) = crate::harden::entropy_seed(crate::deterministic::salt::GUARD) {
+            self.guard.set_seed(s);
+        }
+        #[cfg(feature = "quarantine")]
+        if let Some(s) = crate::harden::entropy_seed(crate::deterministic::salt::QUARANTINE) {
+            self.quarantine.set_seed(s);
+        }
+    }
+
+    /// Draw one guarded-allocation sampling coin. Test-only: it exercises the sampler's
+    /// stream directly so a test can compare two engines' sequences without allocating.
+    #[cfg(all(test, feature = "guard-pages"))]
+    pub(crate) fn guard_sampled_for_test(&self) -> bool {
+        self.guard.sampled()
+    }
+
     /// The current guarded-allocation sampling rate (`0` = off). `0` without the
     /// `guard-pages` feature.
     #[inline]
@@ -1815,6 +1871,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 {
                     let sg = span.lock();
                     sg.mark_quarantined(idx as usize);
+                    // §29.4 + §29.6: destroy the contents and arm the use-after-free
+                    // canary **at hold time**, not at drain. The hold *is* the detection
+                    // window the quarantine exists to create, so leaving the bytes intact
+                    // through it would (a) keep freed secrets readable through a dangling
+                    // pointer for the whole hold and (b) mean a write-after-free during it
+                    // is silently overwritten by the drain's fill and never reported.
+                    // Under the span lock, exactly where `insert_batch_scrubbing` fills:
+                    // the object is neither central-free nor handable-out (its quarantine
+                    // bit is set), so we are its sole accessor.
+                    // SAFETY: `ptr` is this object's `usable`-byte user region, freed and
+                    // now exclusively ours until the drain inserts it.
+                    unsafe { crate::harden::fill_on_free(ptr, usable) };
                 }
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
@@ -1874,6 +1942,19 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // Mark the descriptor quarantine-held (authoritative). The ring covered
                 // it from `offer` until now; the mark covers it after (incl. eviction).
                 owner.mark_quarantined(ptr);
+                // Destroy the contents at hold time, mirroring the non-quarantined large
+                // free (`free_scrubbing`): a §36.12 label downgrade zeroes, otherwise the
+                // junk-fill canary is armed. Without this the hold window — the window the
+                // quarantine exists to create — is exactly the window in which freed bytes
+                // stay readable and no canary is armed. The descriptor is marked held, so
+                // no reuse can race us.
+                // SAFETY: `ptr` is the live base of this `usable`-byte allocation, freed
+                // and exclusively ours until the drain performs the physical free.
+                if self.scrub_on_release(arena) {
+                    unsafe { crate::harden::scrub(ptr, usable) };
+                } else {
+                    unsafe { crate::harden::fill_on_free(ptr, usable) };
+                }
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
             }
@@ -1922,6 +2003,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// was held: the insert reports nothing inserted and this no-ops.
     #[cfg(feature = "quarantine")]
     fn drain_one(&self, e: &crate::harden::QuarantineEntry) {
+        // The object was canary-filled when it entered quarantine, so a mismatch now is
+        // a genuine write-after-free **during the hold** — the detection the delayed
+        // reuse buys. Verify before the drain re-fills, otherwise the drain's own fill
+        // would erase the evidence and the reuse check would pass. A no-op without
+        // `junk-fill`, and skipped for a scrubbed (zeroed, §36.12) large — that path
+        // deliberately writes zeros, not the canary.
+        if crate::harden::junk_fill_enabled()
+            && !e.user_ptr.is_null()
+            && (e.is_small() || !self.scrub_on_release(e.arena))
+        {
+            // SAFETY: the entry's user region is still mapped and exclusively ours (the
+            // object is quarantine-marked, so no reuse can race this read).
+            let intact =
+                unsafe { crate::harden::verify_free_pattern(e.user_ptr, e.bytes as usize) };
+            if !intact {
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected during the quarantine hold \
+                     (§29.4 delayed-reuse canary)",
+                );
+            }
+        }
         if e.is_small() {
             // SAFETY: `e.span` was captured from a live descriptor at free time;
             // descriptors live in never-freed metadata (§27.5), so the pointer
@@ -2909,7 +3011,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let scrub_zero = self.scrub_on_release(arena);
         // SAFETY: the arena is quiesced (its objects are not concurrently freed).
         let (_, large_bytes, large_revoked) =
-            unsafe { self.large_backing(arena).free_arena(arena, scrub_zero) };
+            unsafe { self.large_owner_for(arena).free_arena(arena, scrub_zero) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
@@ -2939,11 +3041,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let n = unsafe { (*self.spans.inner.get()).live } as usize;
         self.span_lock.release();
         n
-    }
-
-    /// Committed bytes in the span region (small-object backing).
-    pub fn span_committed_bytes(&self) -> usize {
-        self.span_extents.committed_bytes()
     }
 
     /// Whether the whole live allocator is well-formed — the Appendix B oracle for
@@ -3035,6 +3132,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // Cumulative hook failures: the persistent total from torn-down backings
         // plus every live backing's current counts (W10 observability).
         let mut hf = self.retired_hooks.snapshot();
+        // W18-4 guard-page `mprotect` refusals, summed over the shared large backend and
+        // every hooked arena's own (a guarded allocation routes to its arena's backend).
+        let mut guard_protect_failures = self.large.guard_protect_failures();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {
@@ -3044,6 +3144,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     large_backend = large_backend.add(b.large.state_bytes());
                     live_large += b.large.live_count() as u64;
                     live_internal_frag += b.large.internal_fragmentation_bytes() as u64;
+                    guard_protect_failures += b.large.guard_protect_failures();
                     let s = b.hook_failure_stats();
                     hf.commit += s.commit;
                     hf.release += s.release;
@@ -3075,6 +3176,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
             arenas_destroyed: self.arenas.destroyed_count(),
+            arenas_quarantined: self.arenas.quarantined_count() as u64,
+            guard_protect_failures,
             quarantine_bytes: self.quarantine_bytes(),
         }
     }
@@ -3245,6 +3348,19 @@ mod tests {
         // SAFETY: ptr is a valid, owned allocation of `len` bytes from Box,
         // leaked for the test's (process) lifetime.
         unsafe { BumpArena::new(ptr, len) }
+    }
+
+    /// A fresh engine with guard sampling armed at `rate` and **no** entropy re-seed —
+    /// the build-time (publicly computable) stream, for comparison.
+    #[cfg(feature = "guard-pages")]
+    fn small_allocator_at_rate<'a>(
+        m: &'a BumpArena,
+        pm: &'a PageMap,
+        rate: u64,
+    ) -> Allocator<'a, HostProvider> {
+        let a = small_allocator(m, pm);
+        a.set_guard_sample_rate(rate);
+        a
     }
 
     fn small_allocator<'a>(m: &'a BumpArena, pm: &'a PageMap) -> Allocator<'a, HostProvider> {
@@ -4846,6 +4962,290 @@ mod tests {
 
         a.set_guard_sample_rate(0);
         assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5) + W15-3b (§25.3): an in-place **shrink** of a *guarded*
+    /// allocation must be **declined**, never applied extent-relatively.
+    ///
+    /// A guarded object is right-aligned *inside* a larger extent — the extent is
+    /// `[ext_base, ext_base + (object_pages + 2) * PAGE)` while the descriptor is
+    /// `[ext_base + PAGE + pad, … + usable)` — so `desc.base() != extent.base`. The
+    /// extent-relative `split_tail(backing, new_usable)` would cut at
+    /// `extent.base + new_usable`, i.e. `desc.base() - extent.base` bytes *before* the
+    /// live object's new end, handing memory the caller still owns back to the free
+    /// pool (and releasing the still-`PROT_NONE` trailing guard into it). Shrinking
+    /// correctly would have to re-base the object against the trailing guard, which an
+    /// in-place resize cannot do — so the only sound answer is to decline and let
+    /// `realloc` take the move path (§25.3 makes the in-place shrink a SHOULD).
+    ///
+    /// Regression: before the fix this cut the extent 5,536 bytes early (the debug
+    /// build tripped `retire_large_range`'s page-alignment assert; the performance
+    /// build silently freed 21,920 live bytes into the reusable extent pool).
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_declines_the_inplace_shrink_and_stays_whole() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // Medium (> SMALL_MAX), so `realloc` reaches the in-place branch, and *not*
+        // page-aligned, so the object is right-aligned strictly inside its extent.
+        let p = a.allocate_in(ArenaId::DEFAULT, 60_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        assert_ne!(
+            p as usize % PAGE_SIZE,
+            0,
+            "object is right-aligned in-extent"
+        );
+        // SAFETY: `p` has `u0` usable bytes.
+        unsafe { ptr::write_bytes(p, 0x5A, u0) };
+
+        let q = trealloc(&a, p, 40_000, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        let u1 = a.usable_size(q).expect("resized usable");
+        assert!(u1 >= 40_000, "realloc must cover the request (usable {u1})");
+        // Declined in place ⇒ the allocation is kept whole at its original base/size.
+        assert_eq!(q, p, "no move was needed — the shrink is simply declined");
+        assert_eq!(u1, u0, "the allocation stays whole, not silently truncated");
+
+        // Every live byte survives, and no later allocation may alias the live object.
+        let live = q as usize..q as usize + u1;
+        for _ in 0..8 {
+            let r = a.malloc(20_000);
+            assert!(!r.is_null());
+            let ru = a.usable_size(r).expect("usable");
+            let other = r as usize..r as usize + ru;
+            assert!(
+                other.end <= live.start || other.start >= live.end,
+                "aliasing: {:#x}..{:#x} overlaps the live guarded object {:#x}..{:#x}",
+                other.start,
+                other.end,
+                live.start,
+                live.end
+            );
+            // SAFETY: `r` has `ru` usable bytes.
+            unsafe { ptr::write_bytes(r, 0xC3, ru) };
+        }
+        // SAFETY: `q` has `u1` usable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(q, u1) };
+        assert!(
+            bytes.iter().all(|&b| b == 0x5A),
+            "the guarded object's contents were overwritten"
+        );
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-4 (§29.5) + W15-3a (§25.2): an in-place **grow** of a *guarded* allocation
+    /// must be declined too — `grow_in_place` measures the new length from the
+    /// **extent** base, so publishing it as the descriptor's usable size would
+    /// advertise `desc.base() - extent.base` bytes *past* the extent's end (memory
+    /// belonging to the next extent). `realloc` must move instead.
+    ///
+    /// Regression: before the fix a grow past the guarded extent's own length
+    /// advertised 98,304 usable bytes at a base 25,536 bytes into a 98,304-byte
+    /// extent — 25,536 bytes of out-of-extent memory handed to the caller.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_declines_the_inplace_grow_and_moves() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        let p = a.allocate_in(ArenaId::DEFAULT, 40_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        // SAFETY: `p` has `u0` usable bytes.
+        unsafe { ptr::write_bytes(p, 0x5A, u0) };
+        // Free an adjacent extent so an (incorrect) in-place grow would have something
+        // to absorb — the fix must decline it even when the absorb is available.
+        let neighbour = a.malloc(200_000);
+        assert!(!neighbour.is_null());
+        assert_eq!(tfree(&a, neighbour), FreeOutcome::Freed);
+
+        // Grow past the guarded extent's own length (`object_pages + 2` pages).
+        let q = trealloc(&a, p, 6 * PAGE_SIZE, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        let u1 = a.usable_size(q).expect("grown usable");
+        assert!(u1 >= 6 * PAGE_SIZE);
+        assert_ne!(q, p, "a guarded grow must move, never grow in place");
+        // The preserved prefix survived the move.
+        // SAFETY: `q` has `u1 >= u0` usable bytes.
+        let kept = unsafe { core::slice::from_raw_parts(q, u0) };
+        assert!(kept.iter().all(|&b| b == 0x5A), "prefix lost on the move");
+        // The advertised range is genuinely writable (it is a plain extent-backed
+        // allocation now, not an over-advertised guarded one).
+        // SAFETY: `q` has `u1` usable bytes.
+        unsafe { ptr::write_bytes(q, 0x33, u1) };
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-4 (§29.5) + §10.3: `xallocx`/`resize_in_place` reaches the same
+    /// `LargeAllocator::shrink`/`grow` seam, so a guarded allocation must report
+    /// "not resized" rather than corrupting its extent (it may never move).
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_is_never_resized_in_place_by_xallocx() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        let p = a.allocate_in(ArenaId::DEFAULT, 60_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        // SAFETY: `p` is the live base pointer this test owns.
+        let shrunk = unsafe { a.resize_in_place(p, 40_000, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(shrunk, Some(u0), "guarded shrink-in-place must be declined");
+        // SAFETY: as above.
+        let grown = unsafe { a.resize_in_place(p, 6 * PAGE_SIZE, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(grown, Some(u0), "guarded grow-in-place must be declined");
+        assert_eq!(a.usable_size(p), Some(u0));
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+    }
+
+    /// W18-4 + W18-5 (§29.5/§29.6): a **guarded** free must not arm verify-on-reuse
+    /// for its whole extent.
+    ///
+    /// The junk-fill canary is written over the *object* only, while the canary flag is
+    /// recorded for the whole backing extent — so a guarded free that claimed the flag
+    /// left the two guard pages and the right-alignment padding un-filled. The next
+    /// allocation carved from those pages verified them, read zeros instead of
+    /// `FREE_PATTERN`, and `corruption_abort`ed a completely correct program.
+    ///
+    /// Only reachable with `junk-fill` + `guard-pages` and **without** `secure-scrub`
+    /// (which scrubs every large free and so disarms the canary anyway) — a composition
+    /// neither the single-feature nor the composed `hardened` CI pass covered; a
+    /// feature-pair pass was added alongside this test.
+    #[cfg(all(
+        feature = "junk-fill",
+        feature = "guard-pages",
+        not(feature = "secure-scrub")
+    ))]
+    #[test]
+    fn a_guarded_free_does_not_arm_verify_on_reuse_for_the_whole_extent() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // Pin the guarded extent between two live neighbours so freeing it cannot
+        // coalesce (a merge AND-joins the canary flag with a non-canary neighbour and
+        // would mask the defect). A 100-byte guarded request reserves exactly three
+        // pages: one object page bracketed by two guard pages.
+        let before = a.malloc(3 * PAGE_SIZE);
+        assert!(!before.is_null());
+        let p = a.allocate_in(ArenaId::DEFAULT, 100, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let after = a.malloc(3 * PAGE_SIZE);
+        assert!(!after.is_null());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+
+        // Reuse exactly that 3-page extent. Under verify-on-reuse the whole carve is
+        // checked against `FREE_PATTERN`; the guarded free only ever filled its 112-byte
+        // object, so claiming the canary for the extent aborted the process here.
+        for _ in 0..4 {
+            let q = a.malloc(3 * PAGE_SIZE);
+            assert!(!q.is_null(), "reuse of a recycled guarded extent failed");
+            // SAFETY: `q` has at least `3 * PAGE_SIZE` usable bytes.
+            unsafe { ptr::write_bytes(q, 0x77, 3 * PAGE_SIZE) };
+            assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        }
+        assert_eq!(tfree(&a, before), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, after), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5) + §10.3: the `nallocx` oracle must predict the **guarded** usable
+    /// size for a `TOPO_GUARDED` request, not the size class's. Over-reporting would
+    /// send a caller following the documented "ask, then use the whole reported size"
+    /// idiom into the inaccessible trailing guard page.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn predicted_usable_size_matches_the_guarded_path() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        for size in [
+            1usize,
+            100,
+            5000,
+            SMALL_MAX,
+            SMALL_MAX + 1,
+            3 * PAGE_SIZE + 1,
+        ] {
+            let predicted = predicted_usable_size(size, MIN_ALIGN, guarded).expect("classifiable");
+            let p = a.allocate_in(ArenaId::DEFAULT, size, MIN_ALIGN, guarded);
+            assert!(!p.is_null(), "guarded alloc of {size} failed");
+            let actual = a.usable_size(p).expect("usable");
+            assert_eq!(
+                predicted, actual,
+                "nallocx over/under-reports a guarded {size}-byte request"
+            );
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        // An over-aligned request is never guarded (`want_guarded` caps at PAGE_SIZE),
+        // so it keeps the ordinary prediction — and that prediction still holds.
+        let over = 2 * PAGE_SIZE;
+        let predicted = predicted_usable_size(64, over, guarded).expect("classifiable");
+        let p = a.allocate_in(ArenaId::DEFAULT, 64, over, guarded);
+        assert!(!p.is_null());
+        assert_eq!(a.usable_size(p), Some(predicted));
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): the guard-page sampler must be seeded from **per-process
+    /// entropy**, not the build-time constant.
+    ///
+    /// The sampler's security value is that an attacker cannot tell which allocations
+    /// carry guard pages. With a `const` seed the xorshift stream — and therefore the
+    /// exact set of guarded allocation indices — is identical in every process of the
+    /// same binary, so it is public: the attacker computes it once offline and places
+    /// the overflow on an unguarded slot. This pins the fix: installing entropy and
+    /// calling `seed_security_samplers` changes the stream.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn security_samplers_are_seeded_from_process_entropy() {
+        fn sampled_pattern(a: &Allocator<'_, HostProvider>) -> Vec<bool> {
+            (0..64).map(|_| a.guard_sampled_for_test()).collect()
+        }
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+
+        // Two fresh engines with no entropy installed draw the *same* stream — the
+        // build-time constant, i.e. the publicly computable sequence.
+        crate::harden::set_process_entropy(0); // ignored: the sentinel
+        let a = small_allocator(&m, &pm);
+        a.set_guard_sample_rate(4);
+        let b = small_allocator(&m, &pm);
+        b.set_guard_sample_rate(4);
+        assert_eq!(
+            sampled_pattern(&a),
+            sampled_pattern(&b),
+            "unseeded engines share the build-time stream"
+        );
+
+        // Installing entropy and re-seeding must move the stream off that constant.
+        let c = small_allocator(&m, &pm);
+        c.set_guard_sample_rate(4);
+        crate::harden::set_process_entropy(0x0123_4567_89AB_CDEF);
+        c.seed_security_samplers();
+        let d = small_allocator(&m, &pm);
+        d.set_guard_sample_rate(4);
+        crate::harden::set_process_entropy(0xFEDC_BA98_7654_3210);
+        d.seed_security_samplers();
+        let (pc, pd) = (sampled_pattern(&c), sampled_pattern(&d));
+        let baseline = sampled_pattern(&small_allocator_at_rate(&m, &pm, 4));
+        assert_ne!(pc, baseline, "entropy did not change the guarded stream");
+        assert_ne!(pd, pc, "distinct entropy must give distinct streams");
     }
 
     /// W18-6 defence-in-depth: with `secure-scrub` compiled in, **even a PUBLIC**

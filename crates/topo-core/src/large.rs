@@ -34,6 +34,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
@@ -70,6 +71,20 @@ struct LargeSlot {
     /// restores their protection before recycling. `0` ⇒ a normal allocation. Reset
     /// on every (re)acquire so a recycled slot never carries a stale guard.
     guarded: u8,
+    /// `1` ⇒ the descriptor's guard pages are actually `mprotect`ed inaccessible; `0` ⇒
+    /// the provider **refused** the protection (typically `vm.max_map_count`
+    /// exhaustion — each guarded object splits a VMA), so the bracketing pages are
+    /// ordinary memory.
+    ///
+    /// Kept separate from [`guarded`](Self::guarded) because the two mean different
+    /// things. `guarded` is the **geometry** marker: the object is right-aligned
+    /// *inside* a larger extent (`desc.base() != extent.base`), which is what makes an
+    /// extent-relative in-place resize unsound — so it must stay set whether or not the
+    /// protection took. `guard_armed` is the **protection** marker: the free path
+    /// restores only what was installed, and a `0` here is counted in
+    /// `guard_protect_failures` so the lost protection is observable rather than a
+    /// silent security downgrade. Reset on every (re)acquire.
+    guard_armed: u8,
     /// `1` ⇒ this large allocation is **held in the quarantine** (W18-3, §29.4):
     /// app-freed but not yet really freed. The authoritative double-free marker for a
     /// held large (the ring covers it until set, and an eviction removes it from the
@@ -218,6 +233,14 @@ pub struct LargeAllocator<'a, P: TopoBackingProvider> {
     /// ([`allocate_with`](Self::allocate_with) / [`free_with`](Self::free_with)) still
     /// override per call.
     region_cache: &'a (dyn RegionCacheHook + Sync),
+    /// W18-4 (§29.5): guard-page `mprotect` refusals — an install that could not be
+    /// applied (so the guarded allocation was declined and the caller fell back to an
+    /// ordinary one) or a restore that could not be undone on free. Relaxed: a
+    /// monotonic stats counter (§27.3 ordering map). Surfaced through
+    /// `AllocatorStats::guard_protect_failures` so a silent loss of protection —
+    /// typically `vm.max_map_count` exhaustion, since each guarded object splits a VMA
+    /// — is observable rather than invisible.
+    guard_protect_failures: AtomicU64,
 }
 
 /// The process-static no-op region cache — the default for a [`LargeAllocator`] not
@@ -260,6 +283,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             lock: BackendLock::new(),
             pool: UnsafeCell::new(pool),
             region_cache: &NO_REGION_CACHE,
+            guard_protect_failures: AtomicU64::new(0),
         })
     }
 
@@ -272,6 +296,17 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     pub fn with_region_cache(mut self, hook: &'a (dyn RegionCacheHook + Sync)) -> Self {
         self.region_cache = hook;
         self
+    }
+
+    /// W18-4 (§29.5): cumulative guard-page `mprotect` refusals — a guarded allocation
+    /// declined because the guard could not be installed, or a free whose guard could
+    /// not be restored. Nonzero means the host is out of VMAs (`vm.max_map_count`) or
+    /// otherwise refusing protection changes, so guarded allocations are silently
+    /// unavailable; see `AllocatorStats::guard_protect_failures`.
+    #[inline]
+    #[must_use]
+    pub fn guard_protect_failures(&self) -> u64 {
+        self.guard_protect_failures.load(Ordering::Relaxed)
     }
 
     /// The number of large allocations currently live.
@@ -291,7 +326,22 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
     /// The §20.1 physical-state byte breakdown of the large region (delegates
     /// to the extent manager) — the W8 stats-reconciliation input (§8.6).
     pub fn state_bytes(&self) -> crate::extent::StateBytes {
-        self.extents.state_bytes()
+        // The extent manager plus the installed §18.6 region cache. A cache-served
+        // allocation never reaches `alloc_z`, so without the cache's own view its bytes
+        // would be counted in `live_bytes` and nowhere else — and under the shipped
+        // `hugepage-optimized` profile, where the cache serves *every* medium/large
+        // request, `active` would read `0` against a multi-megabyte live heap, breaking
+        // the §8.6 `live + central_free <= active` identity outright. The default hook
+        // reports all-zero, so the extent-only build is byte-for-byte unchanged.
+        let mine = self.extents.state_bytes();
+        let cached = self.region_cache.state_bytes();
+        crate::extent::StateBytes {
+            reserved: mine.reserved + cached.reserved,
+            active: mine.active + cached.active,
+            dirty: mine.dirty + cached.dirty,
+            muzzy: mine.muzzy + cached.muzzy,
+            released: mine.released + cached.released,
+        }
     }
 
     /// The backend name (the provider's).
@@ -425,6 +475,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 None => (*slot).has_extent = 0,
             }
             (*slot).guarded = 0; // a normal (un-guarded) allocation
+            (*slot).guard_armed = 0;
             (*slot).quarantined = 0; // a fresh allocation is not quarantined (W18-3)
         }
         // Publish into the pagemap (the W3-6 mutator). On metadata exhaustion, roll
@@ -508,6 +559,16 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         };
         // Object pages + one guard page on each side.
         let object_pages = want.div_ceil(PAGE_SIZE);
+        // The object is right-aligned against the trailing guard, so it must fit inside
+        // the object pages: `object_base = trailing_guard_start - usable` underflows
+        // otherwise. `align <= PAGE_SIZE` guarantees it
+        // (`usable = align_up(want, align) <= align_up(want, PAGE_SIZE)`), which is what
+        // `Allocator::want_guarded` enforces — but this is a public entry point, so the
+        // bound is checked here rather than assumed. An over-aligned guarded request is
+        // simply declined (the caller falls back to the ordinary large path).
+        if usable > object_pages * PAGE_SIZE {
+            return ptr::null_mut();
+        }
         let Some(total_bytes) = object_pages
             .checked_add(2)
             .and_then(|p| p.checked_mul(PAGE_SIZE))
@@ -532,13 +593,6 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // is `align`-aligned, `align <= PAGE`).
         let trailing_guard_start = ext_base + (object_pages + 1) * PAGE_SIZE;
         let object_base = trailing_guard_start - usable;
-        // Protect the leading and trailing guard pages (best-effort; a no-op host
-        // fallback leaves them advisory).
-        let _ = self.extents.protect_range(ext_base, PAGE_SIZE, false);
-        let _ = self
-            .extents
-            .protect_range(object_base + usable, PAGE_SIZE, false);
-
         let restore_and_free = |me: &Self, backing, region| {
             // Restore both guards so the recycled extent is fully usable, then free.
             let _ = me.extents.protect_range(ext_base, PAGE_SIZE, true);
@@ -548,6 +602,40 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             // A guarded reservation being undone was never canary-filled (not eligible).
             me.return_backing(backing, region, &NO_REGION_CACHE, None, false);
         };
+
+        // Install the leading and trailing guard pages, and record whether it actually
+        // took. A provider **without** page protection answers `Ok` from the default
+        // `TopoBackingProvider::protect`, so guards are advisory there and the allocation
+        // is still correct (§2.4). A real `Err` is different in kind: the provider *can*
+        // protect and refused — each guarded object splits one RW mapping into up to five
+        // VMAs, so a workload holding many of them reaches `vm.max_map_count` and every
+        // later `mprotect(PROT_NONE)` returns ENOMEM.
+        //
+        // Discarding that error (as this used to) is a **silent security downgrade**: the
+        // object is vended marked `guarded = 1` with two ordinary read-write pages where
+        // the guards should be, so the overrun the caller asked to have trapped instead
+        // corrupts allocator-owned bytes, with no counter, stat or errno to notice by.
+        // Failing the allocation instead would be worse — a protection that cannot be
+        // applied must not become an allocation failure the caller cannot act on (§2.4) —
+        // so the object is still returned, but it is **not marked armed** and the refusal
+        // is counted for `AllocatorStats::guard_protect_failures`. If only one of the two
+        // took, it is rolled back so the extent recycles uniformly read-write.
+        let lead = self.extents.protect_range(ext_base, PAGE_SIZE, false);
+        let trail = self
+            .extents
+            .protect_range(object_base + usable, PAGE_SIZE, false);
+        let armed = lead.is_ok() && trail.is_ok();
+        if !armed {
+            self.guard_protect_failures.fetch_add(1, Ordering::Relaxed);
+            if lead.is_ok() {
+                let _ = self.extents.protect_range(ext_base, PAGE_SIZE, true);
+            }
+            if trail.is_ok() {
+                let _ = self
+                    .extents
+                    .protect_range(object_base + usable, PAGE_SIZE, true);
+            }
+        }
 
         self.lock.acquire();
         // SAFETY: lock held ⇒ exclusive pool access.
@@ -579,6 +667,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 None => (*slot).has_extent = 0,
             }
             (*slot).guarded = 1;
+            (*slot).guard_armed = armed as u8;
             (*slot).quarantined = 0; // a fresh guarded allocation is not quarantined
         }
         // SAFETY: `slot` is live and initialised; its descriptor is in never-freed metadata.
@@ -819,7 +908,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         }
         // Capture the backing, the region, and the guard marker before retiring.
         // SAFETY: `slot` is a live pool slot (it is in the pagemap).
-        let (backing, region, guarded) = unsafe {
+        let (backing, region, guarded, guard_armed) = unsafe {
             let region = Region {
                 base: (*slot).desc.base() as *mut u8,
                 len: (*slot).desc.usable_size(),
@@ -832,12 +921,14 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             } else {
                 None
             };
+            // Restore only what was actually installed (see `guard_armed`).
+            let guard_armed = (*slot).guard_armed != 0;
             let guarded = (*slot).guarded != 0;
             // Retire the pagemap entry for the *old* address BEFORE the slot can be
             // recycled to a new address (so a classifier never resolves a stale
             // address to a recycled descriptor, §17.2 P-Map-006 / DD-1 F2).
             self.pagemap.retire_large(&(*slot).desc);
-            (backing, region, guarded)
+            (backing, region, guarded, guard_armed)
         };
         pool.release(idx);
         self.lock.release();
@@ -848,15 +939,23 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // is the page-aligned trailing guard, and the leading guard is the first page of
         // the extent — `object_pages = ceil(usable/PAGE)` pages of object + 1 below it.
         // Best-effort: a host fallback with no page protection no-ops.
-        if guarded {
+        if guard_armed {
             let object_base = region.base as usize;
             let trailing_guard_start = object_base + region.len;
             let object_pages = region.len.div_ceil(PAGE_SIZE);
             let ext_base = trailing_guard_start.wrapping_sub((object_pages + 1) * PAGE_SIZE);
-            let _ = self.extents.protect_range(ext_base, PAGE_SIZE, true);
-            let _ = self
+            // A failed *restore* would recycle an extent with a `PROT_NONE` page inside
+            // it, so the next allocation carved over it faults on first touch. Count it
+            // so the condition is observable rather than a mystery SIGSEGV. (Restoring is
+            // a protection *merge*, which the kernel satisfies without allocating a VMA,
+            // so unlike the install above this is not expected to fail in practice.)
+            let a = self.extents.protect_range(ext_base, PAGE_SIZE, true);
+            let b = self
                 .extents
                 .protect_range(trailing_guard_start, PAGE_SIZE, true);
+            if a.is_err() || b.is_err() {
+                self.guard_protect_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         // Destroy the freed allocation's user bytes before the backing is returned
@@ -878,6 +977,15 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // carries no canary — never a false abort); the AND-join on coalesce keeps a
         // mixed scrub/canary merge non-verifiable too. `region` is this allocation's
         // committed user range; after retire + release we are its sole accessor.
+        // A **guarded** allocation's object is a strict subrange of its extent (a guard
+        // page on each side plus the right-alignment padding), and the canary flag is
+        // recorded for the *whole* extent — so a partial fill must NOT claim it. Marking
+        // it canary made the next reuse of those pages verify the un-filled padding and
+        // `corruption_abort` a perfectly correct program. Filling the whole extent
+        // instead is not an option: the guard pages were only *best-effort* restored to
+        // read-write just above, so a failed `mprotect` would turn the fill into a fault.
+        // A guarded extent is therefore simply not verify-on-reuse eligible, exactly like
+        // a scrubbed one.
         let did_fill = if scrub_zero {
             // SAFETY: see above — sole accessor of the committed user range.
             unsafe { crate::harden::scrub(region.base, region.len) };
@@ -885,7 +993,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         } else {
             // SAFETY: see above — sole accessor of the committed user range.
             unsafe { crate::harden::fill_on_free(region.base, region.len) };
-            crate::harden::junk_fill_enabled()
+            crate::harden::junk_fill_enabled() && !guarded
         };
 
         // Return the backing outside the pool lock (the provider call is the slow,
@@ -1095,6 +1203,19 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                         if ptr as usize != (*slot).desc.base() {
                             return None;
                         }
+                        // W18-4 (§29.5): a **guarded** allocation is right-aligned inside
+                        // a larger extent (`desc.base() != extent.base`, `usable != extent.len`
+                        // — see `allocate_guarded`), so the extent-relative `split_tail` below
+                        // would cut the extent at `extent.base + new_usable` while the live
+                        // object runs to `desc.base() + new_usable` — freeing memory the
+                        // caller still owns. Shrinking it *correctly* would have to re-base
+                        // the object against the trailing guard, which an in-place resize by
+                        // definition cannot do. Decline, exactly as for a cache-served
+                        // allocation: the caller keeps the allocation whole (`xallocx`) or
+                        // takes the always-correct move path (`realloc`), §25.3 SHOULD.
+                        if (*slot).guarded != 0 {
+                            return None;
+                        }
                         let backing = if (*slot).has_extent != 0 {
                             Some(ExtentRef {
                                 id: ExtentId((*slot).backing_id),
@@ -1223,7 +1344,15 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                     unsafe {
                         // §17.5 base-only; extent-backed only (a cache-served region
                         // is the filler's page geometry — W11/D handles its grow).
-                        if ptr as usize == (*slot).desc.base() && (*slot).has_extent != 0 {
+                        // A **guarded** allocation (W18-4, §29.5) is excluded for the same
+                        // reason as in [`shrink`](Self::shrink): its object is right-aligned
+                        // *inside* a larger extent, so growing the extent to `new_usable`
+                        // (measured from the extent base) would advertise
+                        // `desc.base() - extent.base` bytes **past** the extent's end.
+                        if ptr as usize == (*slot).desc.base()
+                            && (*slot).has_extent != 0
+                            && (*slot).guarded == 0
+                        {
                             Some((
                                 desc_ptr,
                                 (*slot).desc.usable_size(),

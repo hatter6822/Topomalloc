@@ -2017,3 +2017,41 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   "frees" from the application's view, guards/scrub change only placement/contents, never
   size/alignment/validity); the one model tie is W18-6, whose runtime scrub is the image of the
   pre-existing Lean `scrub_before_downgrade` theorem.
+
+* **Audit — authority checks belong to the observer, not to the observed (0.3.0).**
+  Two defects in this pass shared one shape: a security decision keyed on state the
+  *untrusted side* controls. Label redaction returned the raw, cross-domain stats summary
+  whenever the observer happened to dominate every **currently live** arena — so a high
+  domain could flip the low view by creating and destroying a labelled arena (a covert
+  channel), and every cross-domain aggregate was disclosed whenever no high arena existed.
+  The POSIX provider's `madvise`/`mprotect`/`mbind` ops validated only that a sub-range fit
+  inside the caller-supplied `Region`, never that the region was one of *its own*
+  reservations — so safe code could hand it a foreign `Region` and have live memory zeroed
+  or made inaccessible. Both are now decided from properties the caller cannot forge: the
+  observer's own label against a fixed lattice top, and membership in the provider's owned
+  set. The rule this ratifies: **a check that reads the state being protected is not a
+  check.**
+
+* **Audit — a "randomized" defence is only as good as its seed (0.3.0).**
+  The W18-4 guard-page sampler and the W18-3 quarantine evictor documented
+  unpredictability as the property that makes them useful, and drew from xorshift streams
+  seeded by compile-time constants — identical in every process of a given binary, so the
+  guarded allocation ordinals were offline-computable. "Randomized, not a fixed stride" was
+  true and beside the point. `topo-core` is `no_std` and cannot read the OS, so entropy is
+  now **pushed in** through `harden::set_process_entropy` — the hosted shell reads
+  `AT_RANDOM`/`getrandom(2)` once at start-up (allocation-free, raw `libc`) and the engine
+  re-seeds both samplers from it, with deterministic mode (§30.4) still overriding for
+  replay. The companion rule: environment-derived configuration is skipped under
+  `AT_SECURE`/setuid, as glibc does for `MALLOC_*`, because in a privileged process the
+  environment is attacker input.
+
+* **Audit — a lazily-initialized global must never re-enter its own initializer (0.3.0).**
+  The startup hooks that honour `$TOPOMALLOC_*` ran inside `GLOBAL.get_or_init` and reached
+  the engine through `global()`, which re-entered the still-running `OnceLock`; merely
+  exporting `TOPOMALLOC_QUARANTINE=1` hung the process at its first `malloc`. Nothing set
+  those variables in the tree, so no test noticed. Hooks now take the just-built engine by
+  reference, and `crates/topo-abi/tests/env_startup.rs` re-execs the test binary once per
+  documented variable with a bounded wait, so a reintroduction fails instead of hanging CI.
+  The same shape appeared in the fork gate, whose quiesce window the *forking thread itself*
+  could park on — an allocation from any sibling `pthread_atfork` handler was enough — fixed
+  by exempting that thread for the window.

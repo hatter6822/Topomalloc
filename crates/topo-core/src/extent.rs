@@ -1117,9 +1117,21 @@ impl ExtentMap {
         let needed_pages = needed_len / PAGE_SIZE;
         let start = bin_index(needed_pages);
         let mut best: Option<(u32, usize, usize)> = None;
+        // Step bound (defence in depth): the bin lists are doubly linked and kept
+        // acyclic by construction, but a corrupted link would otherwise make this walk
+        // spin forever while holding the backend lock. Bounding it by the slot count —
+        // the same guard `is_in_bin`/`check_invariants` carry — turns that into a
+        // degraded lookup (a miss, hence a fresh carve) instead of a hang.
+        let mut steps = 0usize;
+        let step_cap = self.cap as usize;
         for b in start..NBINS {
             let mut i = self.bins[b];
             while i != NIL {
+                steps += 1;
+                if steps > step_cap {
+                    debug_assert!(false, "find_fit: bin list is longer than the slot pool");
+                    return best;
+                }
                 let s = self.get(i);
                 // Aligned base within this extent, and the prefix it costs.
                 if let Some(aligned) = align_up(s.base, align) {
@@ -1262,11 +1274,19 @@ impl ExtentMap {
         canary: bool,
     ) -> Option<ExtentId> {
         let e = self.view(id)?;
-        debug_assert_eq!(e.state, ExtentState::Active, "freeing a non-Active extent");
-        debug_assert!(
-            e.state.can_transition(new_state),
-            "free: illegal §20.1 transition"
-        );
+        // M-004 as a **runtime** check, not just a `debug_assert`: this is a public safe
+        // method on a re-exported type, and a `performance` build compiles the assert
+        // out. Freeing an already-free extent would `bin_insert` a slot that is still
+        // linked in its size bin, corrupting the doubly-linked list into a cycle — after
+        // which `find_fit` spins forever holding the §27.2 backend lock — and would
+        // double-count `free_bytes`. Reject instead, exactly as `ExtentManager::free`
+        // reports `ExtentError::NotFree`.
+        // Rejected *quietly* (a total `None`, like every other out-of-contract input to
+        // this map): the reporting layer is `ExtentManager::free`, which already answers
+        // `ExtentError::NotFree` before it ever gets here.
+        if e.state != ExtentState::Active || !e.state.can_transition(new_state) {
+            return None;
+        }
         let mut s = self.get(id.0);
         s.state = new_state as u8;
         // W18-5: only a retained (`Dirty`) extent whose bytes were just canary-filled
@@ -1577,6 +1597,22 @@ pub trait RegionCacheHook {
     fn try_trim(&self, region: Region, new_len: usize) -> Option<usize> {
         let _ = (region, new_len);
         None
+    }
+
+    /// The cache's own §20.1 physical-state byte breakdown, for the §8.6 stats
+    /// reconciliation. Default: all-zero (a cache that owns no backing).
+    ///
+    /// **Load-bearing.** A cache-served allocation returns from
+    /// [`alloc_large`](ExtentManager::alloc_large) *before* the extent manager's
+    /// `alloc_z`, which is the only path that charges `StateBytes`. Under a profile where
+    /// the cache serves the common case — the shipped `hugepage-optimized` one, where a
+    /// `HugePageBackend` answers every medium/large request — those bytes would otherwise
+    /// be counted in `live_bytes` and in nothing else, so `virtual`/`active` would
+    /// under-report the managed VM by the whole cache footprint and the §8.6 identity
+    /// `live + central_free <= active` would be false by that amount. A cache that owns
+    /// backing reports it here so the totals close.
+    fn state_bytes(&self) -> StateBytes {
+        StateBytes::default()
     }
 }
 
@@ -3151,6 +3187,36 @@ mod tests {
         assert_eq!(mgr.view(r).unwrap().state, ExtentState::Muzzy);
         assert_eq!(mgr.committed_bytes(), 4 * PAGE);
         assert!(mgr.check_invariants());
+    }
+
+    #[test]
+    fn map_level_double_free_is_rejected_in_every_build() {
+        // `ExtentMap` is re-exported from the crate root and `free_in_canary` is a
+        // public safe method, so the M-004 "must be Active" precondition cannot rest on
+        // a `debug_assert` alone: in a `performance` build that assert is gone, and a
+        // second free would `bin_insert` a slot still linked in its size bin — turning
+        // the bin list into a cycle that makes `find_fit` spin forever under the backend
+        // lock — and double-count `free_bytes`. It must be rejected outright.
+        let mut m = map(0x4000_0000, 64);
+        let a = m.carve(8 * PAGE, PAGE, Fit::First).expect("carve");
+        let free_before = m.free_bytes();
+        assert!(m.free_in(a, ExtentState::Dirty, &NoNotify).is_some());
+        let after_one = m.free_bytes();
+        assert_eq!(after_one, free_before + 8 * PAGE);
+        // The second free is a no-op, not a corruption.
+        assert!(
+            m.free_in(a, ExtentState::Dirty, &NoNotify).is_none(),
+            "freeing an already-free extent must be rejected"
+        );
+        assert_eq!(
+            m.free_bytes(),
+            after_one,
+            "free_bytes was not double-counted"
+        );
+        assert!(m.check_invariants());
+        // The bin lists are still walkable and still serve allocations.
+        assert!(m.carve(4 * PAGE, PAGE, Fit::Best).is_some());
+        assert!(m.check_invariants());
     }
 
     #[test]

@@ -290,12 +290,23 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
 
         let mut plan = Rebalancer::plan(&pressures[..self.n_nodes], &topo)?;
         let src = plan.src.0 as usize;
-        let donor_free = pressures[src].free_bytes;
-        // Keep everything below the move; release the move's worth of empty hugepages.
-        let keep = donor_free.saturating_sub(plan.bytes);
-        let reserve_hugepages = (keep / HUGEPAGE_SIZE as u64) as usize;
+        // Release the move's worth of empty hugepages and keep the rest.
+        //
+        // `release_empty_excess` takes a hugepage **count** to retain, so the reserve must
+        // be computed from the donor's empty-backed hugepage *count* — not from
+        // `free_bytes / HUGEPAGE_SIZE`. `free_bytes` is `coverage().empty_backed_bytes`,
+        // the *committed* bytes of empty hugepages; a packed-then-emptied hugepage is only
+        // partially committed, so the byte form undercounts the population and the reserve
+        // lands far below the real count, releasing vastly more than the plan asked for
+        // (and evicting the donor's whole warm cache, breaking the `movable_surplus`
+        // bound that exists so a move never strands the donor). Same population-matching
+        // rule `HugePageBackend::release_tick` applies.
         let released = match self.backend(src) {
-            Some(b) => b.release_empty_excess(reserve_hugepages) as u64,
+            Some(b) => {
+                let empty_hp = b.empty_backed_hugepages();
+                let release_hp = plan.bytes.div_ceil(HUGEPAGE_SIZE as u64) as usize;
+                b.release_empty_excess(empty_hp.saturating_sub(release_hp)) as u64
+            }
             None => 0,
         };
         plan.bytes = released;

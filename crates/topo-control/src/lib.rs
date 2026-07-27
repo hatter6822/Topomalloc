@@ -75,7 +75,15 @@ impl Control {
                     .to_string(),
             ),
             "topo.quarantine.bytes" => Some(self.stats.quarantine_bytes.to_string()),
+            // W18-4 (§29.5): guard-page `mprotect` refusals. Nonzero means guarded
+            // allocations are being handed out **unprotected** (typically
+            // `vm.max_map_count` exhaustion), so the operator can see the security
+            // downgrade instead of only its absence of effect.
+            "topo.hardening.guard_protect_failures" => {
+                Some(self.stats.guard_protect_failures.to_string())
+            }
             "topo.arena.destroyed" => Some(self.stats.arenas_destroyed.to_string()),
+            "topo.arena.quarantined" => Some(self.stats.arenas_quarantined.to_string()),
             "topo.fragmentation.internal_sampled_bytes" => {
                 Some(self.stats.sampled_internal_fragmentation_bytes.to_string())
             }
@@ -216,7 +224,13 @@ mod tests {
             Some("4000")
         );
         assert_eq!(c.get("topo.quarantine.bytes").as_deref(), Some("0"));
+        assert_eq!(
+            c.get("topo.hardening.guard_protect_failures").as_deref(),
+            Some("0"),
+            "no refusals on a healthy host"
+        );
         assert_eq!(c.get("topo.arena.destroyed").as_deref(), Some("3"));
+        assert_eq!(c.get("topo.arena.quarantined").as_deref(), Some("0"));
         assert_eq!(
             c.get("topo.fragmentation.internal_sampled_bytes")
                 .as_deref(),

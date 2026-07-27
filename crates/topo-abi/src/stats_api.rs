@@ -111,12 +111,13 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> 
     let (summary, visible_arenas, redacting) = match observer_label {
         Some(low) => {
             let visible = topo_stats::redact_arenas(&all_arenas, low);
-            let all_visible = visible.len() == all_arenas.len();
-            (
-                topo_stats::redact_summary(&s, &visible, all_visible),
-                visible,
-                !all_visible,
-            )
+            // Redaction is keyed on the **observer's** label alone, never on which arenas
+            // happen to exist: gating it on "the observer sees every live arena" would let
+            // a high domain flip the low view by creating and destroying a labelled arena
+            // (a covert channel), and would disclose every cross-domain aggregate whenever
+            // no high arena existed. Only the lattice-top observer reads the raw summary.
+            let raw = low == topo_stats::OBSERVER_LABEL_TOP;
+            (topo_stats::redact_summary(&s, &visible, low), visible, !raw)
         }
         None => (s, all_arenas, false),
     };

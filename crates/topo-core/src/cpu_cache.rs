@@ -534,8 +534,12 @@ impl CpuCache {
     /// capacity bounds plus the per-slot **distinctness** check (a duplicate is a
     /// double-freed object, §29.3) are the B.2 per-CPU clauses.
     pub fn check_invariants(&self) -> bool {
-        for cpu in self.cpus.iter() {
+        for (cpu_idx, cpu) in self.cpus.iter().enumerate() {
             let _g = cpu.lock();
+            // W7-4: the sweep reads another CPU's slots, so drain any in-flight sequence
+            // there before reading `len`/`buf` — otherwise the checker can observe a
+            // half-committed sequence and report a spurious violation.
+            self.fence_if_non_owner(CoreId(cpu_idx as u32));
             for (sc_idx, slot) in cpu.slots.iter().enumerate() {
                 if !slot.check_invariants(SizeClassId::new(sc_idx)) {
                     return false;
@@ -564,6 +568,9 @@ impl CpuCache {
             None => return false,
         };
         let _guard = cpu.lock();
+        // W7-4: as the locked pop/push — publishing a slot buffer for a CPU the caller
+        // may not be running on must drain any in-flight sequence on that CPU first.
+        self.fence_if_non_owner(core);
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return false,
@@ -624,6 +631,14 @@ impl CpuCache {
             None => return FeOutcome::Empty,
         };
         let _guard = cpu.lock();
+        // W7-4 non-owner fence: `core` was sampled *before* the lock, so the thread may
+        // have migrated since; and in RSEQ mode an in-flight sequence on `core` does not
+        // abort merely because another CPU took the lock (the kernel aborts a critical
+        // section on preempt/migrate/signal only). Draining it here is what makes the
+        // locked fallback exclusive — without it a migrated thread and an in-flight
+        // sequence can both commit `len`, double-vending an object. A no-op off RSEQ mode
+        // and on the owning CPU. Same discipline as `pop_batch`/`push_batch`/`drain_cpu`.
+        self.fence_if_non_owner(core);
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return FeOutcome::Empty,
@@ -705,6 +720,14 @@ impl CpuCache {
             None => return FeOutcome::Full,
         };
         let _guard = cpu.lock();
+        // W7-4 non-owner fence: `core` was sampled *before* the lock, so the thread may
+        // have migrated since; and in RSEQ mode an in-flight sequence on `core` does not
+        // abort merely because another CPU took the lock (the kernel aborts a critical
+        // section on preempt/migrate/signal only). Draining it here is what makes the
+        // locked fallback exclusive — without it a migrated thread and an in-flight
+        // sequence can both commit `len`, double-vending an object. A no-op off RSEQ mode
+        // and on the owning CPU. Same discipline as `pop_batch`/`push_batch`/`drain_cpu`.
+        self.fence_if_non_owner(core);
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return FeOutcome::Full,

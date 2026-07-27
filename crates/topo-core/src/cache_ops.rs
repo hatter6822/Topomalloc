@@ -84,9 +84,19 @@ pub fn refill(
     cpu_cache: &CpuCache,
     transfer: &TransferCache,
     central: &CentralCache,
-    _pagemap: &PageMap,
+    pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
 ) -> RefillResult {
+    // Totality: every layer below is total on an out-of-range size class
+    // (`TransferCache`/`CentralCache` bounds-check with `.get()`), but the generated
+    // table accessors index unchecked. Decline here so a public entry point can never
+    // panic on a caller-supplied id — it simply refills nothing.
+    if sc.index() >= size_class::count() {
+        return RefillResult {
+            filled: 0,
+            need_span: false,
+        };
+    }
     let batch_size = size_class::batch(sc);
     let mut buf = [0usize; MAX_BATCH_LEN];
 
@@ -103,9 +113,19 @@ pub fn refill(
     if popped > 0 {
         // Step 2: push into CPU cache slot (per-CPU lock, released on return).
         let pushed = cpu_cache.push_batch(core, sc, &buf[..popped]);
-        // Return any unpushed objects to the transfer cache to prevent leaks.
+        // Return any unpushed objects to the transfer cache — and whatever the
+        // transfer cache itself declines (it can have been refilled by another core
+        // since step 1) to the **central** free list, which is the authoritative home
+        // and always accepts. Discarding the declined remainder here would leak it:
+        // the objects are no longer in the transfer cache, were never pushed to the
+        // per-CPU cache, and are not in the span's central bitmap either, so nothing
+        // could ever reach them again (§16.4 conservation).
         if pushed < popped {
-            transfer.try_push_batch(arena, sc, &buf[pushed..popped], meta);
+            let back = transfer.try_push_batch(arena, sc, &buf[pushed..popped], meta);
+            let stranded = &buf[pushed + back..popped];
+            if !stranded.is_empty() {
+                let _ = flush_addrs_to_central(stranded, sc, central, pagemap);
+            }
         }
         return RefillResult {
             filled: pushed,
@@ -172,9 +192,16 @@ pub fn refill(
 
             // Push addresses into the CPU cache slot.
             let pushed = cpu_cache.push_batch(core, sc, &addrs[..addr_count]);
-            // Return any unpushed objects to the transfer cache to prevent leaks.
+            // Return any unpushed objects to the transfer cache, and whatever *it*
+            // declines back to the central free list (as in the transfer-hit branch
+            // above): these objects were already removed from the central bitmap, so
+            // dropping the declined remainder would leak them permanently.
             if pushed < addr_count {
-                transfer.try_push_batch(arena, sc, &addrs[pushed..addr_count], meta);
+                let back = transfer.try_push_batch(arena, sc, &addrs[pushed..addr_count], meta);
+                let stranded = &addrs[pushed + back..addr_count];
+                if !stranded.is_empty() {
+                    let _ = flush_addrs_to_central(stranded, sc, central, pagemap);
+                }
             }
             RefillResult {
                 filled: pushed,
@@ -250,6 +277,14 @@ pub fn flush(
     pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
 ) -> FlushResult {
+    // Totality on an out-of-range size class, as `refill` (the table accessors index
+    // unchecked while every cache layer below bounds-checks).
+    if sc.index() >= size_class::count() {
+        return FlushResult {
+            flushed: 0,
+            spans_emptied: 0,
+        };
+    }
     let batch_size = size_class::batch(sc);
     let mut buf = [0usize; MAX_BATCH_LEN];
 
@@ -974,6 +1009,98 @@ mod tests {
             "unpushed objects should be returned to transfer"
         );
         assert_eq!(bin.len() as usize, batch_size - 4);
+    }
+
+    #[test]
+    fn refill_never_drops_objects_when_both_caches_decline() {
+        // Regression (§16.4 conservation): `refill` removes objects from the central
+        // free list, pushes what fits into the per-CPU slot, and offers the rest back
+        // to the transfer cache. The transfer cache can decline the return — it is
+        // bounded, and its bin is *lazily allocated from metadata*, so an exhausted
+        // metadata arena makes `try_push_batch` return 0. The declined remainder used
+        // to be **discarded**: those objects were then in no cache and no longer in the
+        // span's central bitmap, so nothing could ever reach them again. They must fall
+        // through to the central free list instead.
+        let m = meta(4 * 1024 * 1024);
+        // A metadata arena with no room: every lazy transfer-bin init against it fails,
+        // so both the pop (forcing the central branch) and the return-push decline.
+        let starved = meta(0);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let base = 0x5000_0000usize;
+
+        let span = make_span(1, sc, base, &m);
+        central.activate_span(&span, &pm, &m).unwrap();
+        let total_objects = span.object_count() as usize;
+
+        // Leave room for exactly two objects in the per-CPU slot.
+        let hard_cap = size_class::max_local_capacity(sc);
+        cc.init_slot(core, sc, &m, hard_cap as u32);
+        let filler: Vec<usize> = (0x8000_0000..0x8000_0000 + hard_cap - 2).collect();
+        assert_eq!(cc.push_batch(core, sc, &filler), hard_cap - 2);
+
+        let result = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &starved,
+        );
+        assert_eq!(result.filled, 2, "only two per-CPU slots were free");
+        assert!(!result.need_span);
+
+        // Conservation: every object of the span is either in the per-CPU slot (2) or
+        // back in the central free list. None may have vanished.
+        let central_free = span.central_free_count() as usize;
+        assert_eq!(
+            central_free + result.filled,
+            total_objects,
+            "refill lost objects (central {central_free} + filled {} != {total_objects})",
+            result.filled
+        );
+        assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn refill_and_flush_are_total_on_an_out_of_range_size_class() {
+        // The cache layers bounds-check a size-class id (`TransferCache`/`CentralCache`
+        // resolve their bin with `.get()`), but the generated-table accessors index
+        // unchecked. The public `refill`/`flush` entry points must not panic on a
+        // caller-supplied out-of-range id — they decline instead.
+        let m = meta(1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let bad = SizeClassId::new(size_class::count() + 7);
+        let core = CoreId::DEFAULT;
+
+        let r = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            bad,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+        );
+        assert_eq!(r.filled, 0);
+        assert!(!r.need_span);
+        let f = flush(core, ArenaId::DEFAULT, bad, &cc, &tc, &central, &pm, &m);
+        assert_eq!(f.flushed, 0);
+        assert_eq!(f.spans_emptied, 0);
     }
 
     #[test]

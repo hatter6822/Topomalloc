@@ -139,18 +139,53 @@ impl PosixBackingProvider {
         self.bind_node_calls.load(Ordering::Relaxed)
     }
 
-    /// Validate that `[offset, offset+len)` lies within `region` and return the
-    /// sub-range's start address. A request outside the region is a caller bug (the
-    /// extent manager always passes an in-range sub-extent); reject it rather than
-    /// computing an out-of-bounds pointer.
-    fn checked_subrange(region: Region, offset: usize, len: usize) -> Result<usize, BackendError> {
+    /// Validate that `region` is one of **our own** live reservations and that
+    /// `[offset, offset+len)` lies within it, returning the sub-range's start address.
+    ///
+    /// The ownership check is load-bearing for **soundness**, not just hygiene. The
+    /// physical-state operations are *safe* trait methods on a public struct, and
+    /// [`Region`] is a public struct with public `base`/`len` fields — so without it,
+    /// entirely safe code could hand this provider a `Region` describing memory it does
+    /// not own and have `madvise(MADV_DONTNEED)` silently zero it or
+    /// `mprotect(PROT_NONE)` revoke access to it:
+    ///
+    /// ```ignore
+    /// let mut v = vec![7u8; 1 << 20];
+    /// let r = Region { base: v.as_mut_ptr(), len: v.len() };
+    /// p.decommit(r, 0, v.len()).unwrap();   // would zero someone else's live bytes
+    /// p.protect(r, 0, v.len(), false).unwrap(); // would fault the next read of `v`
+    /// ```
+    ///
+    /// `release` already validated ownership and the seLe4n simulator validates every
+    /// op; this brings the POSIX provider in line, so a foreign or stale region is an
+    /// `InvalidRequest` instead of a syscall against arbitrary memory. The cost is one
+    /// uncontended mutex on the provider's slow path (commit/decommit/purge/protect are
+    /// already syscall-bound), never on the allocation fast path.
+    fn checked_subrange(
+        &self,
+        region: Region,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, BackendError> {
         let end = offset
             .checked_add(len)
             .ok_or(BackendError::InvalidRequest)?;
         if end > region.len {
             return Err(BackendError::InvalidRequest);
         }
-        Ok((region.base as usize).wrapping_add(offset))
+        let base = region.base as usize;
+        let owned = self
+            .owned
+            .lock()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        // A live reservation with this exact base that covers the region's length.
+        if !owned
+            .iter()
+            .any(|o| o.base == base && region.len <= o.mapped_len)
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        Ok(base.wrapping_add(offset))
     }
 }
 
@@ -181,7 +216,7 @@ impl TopoBackingProvider for PosixBackingProvider {
         // §20.4 commit / recommit (M-005). Performance mode: a no-op (the mapping is
         // already RW). Guard mode: `mprotect(PROT_READ|WRITE)` so the range is usable
         // again after a guarded decommit.
-        let addr = Self::checked_subrange(region, offset, len)?;
+        let addr = self.checked_subrange(region, offset, len)?;
         self.commit_calls.fetch_add(1, Ordering::Relaxed);
         if len == 0 {
             return Ok(());
@@ -195,7 +230,7 @@ impl TopoBackingProvider for PosixBackingProvider {
         // §20.4 decommit ≈ MADV_DONTNEED: drop the pages now (RSS falls; a later read
         // faults a fresh zero page). Guard mode also `mprotect(PROT_NONE)`s so a
         // use-after-free faults (§20.5).
-        let addr = Self::checked_subrange(region, offset, len)?;
+        let addr = self.checked_subrange(region, offset, len)?;
         self.decommit_calls.fetch_add(1, Ordering::Relaxed);
         if len == 0 {
             return Ok(());
@@ -207,7 +242,7 @@ impl TopoBackingProvider for PosixBackingProvider {
     fn purge_lazy(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_lazy ≈ MADV_FREE: lazy discard; old contents may persist until
         // the kernel reclaims under pressure (a valid §20.1 muzzy outcome).
-        let addr = Self::checked_subrange(region, offset, len)?;
+        let addr = self.checked_subrange(region, offset, len)?;
         self.purge_lazy_calls.fetch_add(1, Ordering::Relaxed);
         if len == 0 {
             return Ok(());
@@ -218,7 +253,7 @@ impl TopoBackingProvider for PosixBackingProvider {
 
     fn purge_forced(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_forced ≈ MADV_DONTNEED: discard contents promptly.
-        let addr = Self::checked_subrange(region, offset, len)?;
+        let addr = self.checked_subrange(region, offset, len)?;
         self.purge_forced_calls.fetch_add(1, Ordering::Relaxed);
         if len == 0 {
             return Ok(());
@@ -237,7 +272,7 @@ impl TopoBackingProvider for PosixBackingProvider {
         // W18-4 (§29.5): `mprotect` a guard page inaccessible (`PROT_NONE`) or restore
         // it read-write. The address is validated as an in-bounds sub-range; a guard
         // is OS-page-aligned (the caller passes page-aligned offsets/lengths).
-        let addr = Self::checked_subrange(region, offset, len)?;
+        let addr = self.checked_subrange(region, offset, len)?;
         if len == 0 {
             return Ok(());
         }
@@ -267,9 +302,14 @@ impl TopoBackingProvider for PosixBackingProvider {
         // it only steers placement; a failure is surfaced to the caller (the router
         // records it) and never corrupts state. No-op on non-Linux.
         self.bind_node_calls.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `region` is a live reservation of this provider; binding the NUMA policy
-        // of its page-aligned VA range performs no read/write through the pointer.
-        unsafe { sys::bind_node(region.base as usize, region.len, os_node) }
+        // Ownership-check the whole region first (as the physical-state ops): `mbind`
+        // rewrites the NUMA policy of a VA range, so a foreign or stale `Region` would
+        // let safe code repolicy memory this provider does not own.
+        let addr = self.checked_subrange(region, 0, region.len)?;
+        // SAFETY: `addr` is the base of a live reservation of this provider (validated
+        // just above); binding the NUMA policy of its page-aligned VA range performs no
+        // read/write through the pointer.
+        unsafe { sys::bind_node(addr, region.len, os_node) }
     }
 
     fn name(&self) -> &'static str {
@@ -905,6 +945,51 @@ mod tests {
     use super::*;
 
     const PAGE: usize = 16384; // the allocator page; a multiple of any OS page.
+
+    #[test]
+    fn physical_state_ops_reject_a_region_this_provider_does_not_own() {
+        // Soundness: `commit`/`decommit`/`purge_*`/`protect`/`bind_node` are **safe**
+        // trait methods and `Region` has public fields, so without an ownership check
+        // safe code could `madvise`/`mprotect` memory belonging to someone else —
+        // silently zeroing live bytes or faulting the next read of them. Every op must
+        // refuse a region that is not one of this provider's live reservations.
+        let p = PosixBackingProvider::new();
+        let mut foreign = vec![7u8; 64 * 1024];
+        let r = Region {
+            base: foreign.as_mut_ptr(),
+            len: foreign.len(),
+        };
+        let a = ArenaId::DEFAULT;
+        for (name, res) in [
+            ("commit", p.commit(r, 0, r.len)),
+            ("decommit", p.decommit(r, 0, r.len)),
+            ("purge_lazy", p.purge_lazy(r, 0, r.len)),
+            ("purge_forced", p.purge_forced(r, 0, r.len)),
+            ("protect", p.protect(r, 0, r.len, false)),
+            ("bind_node", p.bind_node(r, 0)),
+        ] {
+            assert!(
+                matches!(res, Err(BackendError::InvalidRequest)),
+                "{name} accepted a foreign region"
+            );
+        }
+        // The foreign buffer is untouched and still readable.
+        assert!(
+            foreign.iter().all(|&b| b == 7),
+            "a foreign region was modified"
+        );
+        // And a *stale* region — one this provider released — is refused too.
+        let own = p.reserve(a, 64 * 1024, 4096).expect("reserve");
+        assert!(
+            p.commit(own, 0, own.len).is_ok(),
+            "our own region is accepted"
+        );
+        p.release(a, own).expect("release");
+        assert!(
+            matches!(p.commit(own, 0, own.len), Err(BackendError::InvalidRequest)),
+            "a released region must not be re-commitable"
+        );
+    }
 
     #[test]
     fn discover_topology_yields_a_valid_snapshot() {

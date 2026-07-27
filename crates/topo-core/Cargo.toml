@@ -44,7 +44,7 @@ hugepage-optimized = []
 # The explicit `version` (not a bare path) matches every other inter-crate dep
 # and keeps `cargo deny` happy: `topo-core` is publishable, and a wildcard path
 # dep is disallowed for public crates.
-topo-arch = { path = "../topo-arch", version = "0.2.0" }
+topo-arch = { path = "../topo-arch", version = "0.3.0" }
 
 [dev-dependencies]
 # Micro-benchmark harness (W0-8, §34.6) for the W3 metadata paths. Default features

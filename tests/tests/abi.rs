@@ -402,6 +402,26 @@ fn cross_entry_points_share_one_heap() {
     let b = topomalloc_calloc(3, 16);
     let c = topomalloc_aligned_alloc(64, 128);
     let d = topo_mallocx(48, 0);
+    // Assert each entry actually produced an object: without this the test passes
+    // vacuously if any of them returns null (the frees below are then all no-ops and
+    // nothing about the shared heap is exercised).
+    for (name, p) in [
+        ("malloc", a),
+        ("calloc", b),
+        ("aligned_alloc", c),
+        ("mallocx", d),
+    ] {
+        assert!(!p.is_null(), "{name} returned null");
+        assert!(
+            topomalloc_malloc_usable_size(p) >= 48,
+            "{name} result is not owned by this allocator"
+        );
+    }
+    assert_eq!(c as usize % 64, 0, "aligned_alloc honoured its alignment");
+    // `calloc` really zeroes.
+    // SAFETY: `b` has at least 48 readable bytes.
+    let zeroed = unsafe { core::slice::from_raw_parts(b.cast::<u8>(), 48) };
+    assert!(zeroed.iter().all(|&x| x == 0), "calloc did not zero");
     // SAFETY: each pointer is live, test-owned, and freed exactly once with
     // truthful hints.
     unsafe {
@@ -410,6 +430,12 @@ fn cross_entry_points_share_one_heap() {
         topo_sdallocx(c, 128, topo_align_lg(6));
         topomalloc_free(d);
     }
+    // Every object came back: the shared heap's live bytes returned to the baseline.
+    assert_eq!(
+        topomalloc_malloc_usable_size(core::ptr::null_mut()),
+        0,
+        "usable_size(NULL) is 0"
+    );
 }
 
 #[test]
