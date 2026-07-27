@@ -2697,3 +2697,22 @@ it, downgrading the seed on exactly the seccomp-restricted hosts that reach that
 disabling deterministic mode left the guard and quarantine samplers on their reproducible
 streams, because `apply_deterministic_seed` is a no-op while the mode is off — the disable
 transition now reseeds from process entropy.
+
+**The re-exec fix, and taking a pattern without its guard.** Isolating the fork-reset test
+in a child process was right on x86-64 and broke the aarch64 job outright: the
+cross-target tests run under qemu binfmt emulation, where re-exec'ing the test binary needs
+an aarch64 dynamic loader the runner does not have (`Could not open
+'/lib/ld-linux-aarch64.so.1'`), so the child could never start and the parent's
+`assert!(status.success())` failed every run.
+
+The precedent I copied — `self_registration_path_works` — is gated
+`#[cfg(target_arch = "x86_64")]` for exactly this reason, and says so in its comment
+("gated to x86-64 native, where re-exec is reliable"). I took the mechanism and left the
+guard behind. That is the more general trap: **when copying an established pattern, copy
+its preconditions too** — the `cfg` gate on that test is not incidental tidiness, it is
+half of what makes the pattern work in this repo.
+
+Gating the fork-reset test the same way costs nothing real: `reset_after_fork` is a plain
+atomic store over process-global mode state, with no assembly and no per-arch path, so one
+architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
+are the part that matters on every target, and those are unconditional.

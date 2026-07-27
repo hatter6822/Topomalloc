@@ -682,6 +682,15 @@ fn forced_migration_conserves_tokens() {
 /// window, and casting -1 to `usize` indexes the per-CPU array out of bounds. The Rust
 /// harness runs tests as parallel threads of one process and guarantees no ordering, so
 /// isolation has to be a separate process, not a claim about which test runs last.
+///
+/// **Gated to x86-64 native**, for the same reason `self_registration_path_works` is: the
+/// cross-target test runs under qemu binfmt emulation, where re-exec'ing this binary needs
+/// an aarch64 dynamic loader the runner does not have (`Could not open
+/// '/lib/ld-linux-aarch64.so.1'`), so the child can never start. Nothing is lost by
+/// covering it on one architecture — `reset_after_fork` is a plain atomic store over
+/// process-global mode state, with no assembly and no per-arch path, so the x86-64 run
+/// exercises the whole of it.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn fork_reset_makes_enable_re_derive_the_mode() {
     const MARKER: &str = "TOPO_RSEQ_FORKRESET_CHILD";
