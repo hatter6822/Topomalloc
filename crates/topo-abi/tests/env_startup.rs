@@ -13,6 +13,17 @@
 //! the child body, then asserts the child exits promptly and successfully. A regression
 //! hangs the child; the parent's bounded wait turns that into a failure rather than a
 //! stalled CI job.
+//!
+//! **Re-exec is not available everywhere.** The AArch64 gate runs this binary under
+//! `qemu-aarch64 -L <sysroot>`, supplied by cargo's runner — a flag a self-re-exec cannot
+//! reproduce, since the child is started from `current_exe()` with no runner in front of
+//! it. The child then fails to start for reasons that have nothing to do with the
+//! allocator. The driver therefore **probes** re-exec once with a benign variable and
+//! skips (loudly) if the probe fails, so a cross-execution environment reports "cannot
+//! run here" instead of a false regression. A probe that *succeeds* followed by a
+//! variable-specific failure is a real failure and still fails the test. The property
+//! under test — an initializer hook re-entering its own `OnceLock` — is architecture
+//! -independent, so the x86-64 gate covers it fully.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,8 +53,14 @@ fn child_body() {
 }
 
 /// Run this binary again with `var=value` set and the child marker, and wait — bounded
-/// — for it to finish. Returns the child's success flag.
-fn run_child_with(var: &str, value: &str) -> bool {
+/// — for it to finish. `Ok(())` on a clean exit; `Err(diagnosis)` carrying the child's
+/// captured stderr otherwise.
+///
+/// The stderr capture is the point: with the child's output discarded, every failure
+/// here reads "the child failed" and tells a CI reader nothing about *why* — which is
+/// exactly what happened the first time this ran on AArch64. A panic message quoting the
+/// child's own output turns the next occurrence into a diagnosis.
+fn run_child_with(var: &str, value: &str) -> Result<(), String> {
     let exe = std::env::current_exe().expect("current exe");
     let mut child = Command::new(exe)
         .env(MARKER, "1")
@@ -52,14 +69,14 @@ fn run_child_with(var: &str, value: &str) -> bool {
         // does not re-enter this driver.
         .args(["--test-threads=1", "child_allocates_under_env_config"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn child");
+        .map_err(|e| format!("could not spawn the child: {e}"))?;
 
     let deadline = Instant::now() + CHILD_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait().expect("try_wait") {
-            Some(status) => return status.success(),
+            Some(status) => break status,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -67,8 +84,22 @@ fn run_child_with(var: &str, value: &str) -> bool {
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
+    };
+    if status.success() {
+        return Ok(());
     }
+    // The child has exited, so the pipe holds its complete (small) output.
+    let mut err = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut err);
+    }
+    Err(format!("exit {status}; child stderr:\n{}", err.trim_end()))
 }
+
+/// A variable name the initializer does **not** consult, so a child run with it set is a
+/// pure "can this environment re-exec the test binary?" probe.
+const PROBE: &str = "TOPOMALLOC_ENV_STARTUP_PROBE";
 
 /// The child body, selected by the marker. In the parent it is a no-op, so the same
 /// binary serves both roles.
@@ -88,6 +119,28 @@ fn every_startup_env_var_leaves_the_allocator_usable() {
     }
     // The full documented set (§32.1). `SAMPLE_RATE=0` is included because the
     // "disable" arm took a different path from the "enable" arm.
+    // Probe first: if this environment cannot re-exec the binary at all, every case below
+    // would report a false regression (see the module docs).
+    if let Err(why) = run_child_with(PROBE, "1") {
+        // On the primary x86-64 gate the job is native, so re-exec always works — a
+        // probe failure there is a broken environment, and skipping would silently
+        // retire the whole test. Fail loudly instead; only a cross-executed target may
+        // skip.
+        #[cfg(target_arch = "x86_64")]
+        panic!(
+            "env_startup: re-exec failed on a native x86-64 host, where it must work; \
+             refusing to skip and silently drop this test's coverage: {why}"
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            eprintln!(
+                "env_startup: skipping — this environment cannot re-exec the test binary \
+                 (cross-execution under a cargo `runner`?): {why}"
+            );
+            return;
+        }
+    }
+
     for (var, value) in [
         ("TOPOMALLOC_QUARANTINE", "1"),
         ("TOPOMALLOC_QUARANTINE", "4194304"),
@@ -98,9 +151,10 @@ fn every_startup_env_var_leaves_the_allocator_usable() {
         ("TOPOMALLOC_ZERO_SIZE", "null"),
         ("TOPOMALLOC_BACKEND", "posix"),
     ] {
-        assert!(
-            run_child_with(var, value),
-            "the child failed with {var}={value}"
-        );
+        if let Err(why) = run_child_with(var, value) {
+            // The probe above proved re-exec works here, so this is the allocator's
+            // failure, not the harness's.
+            panic!("the child failed with {var}={value}: {why}");
+        }
     }
 }
