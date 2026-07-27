@@ -170,11 +170,26 @@ pub fn set_base_seed(seed: u64) {
     SEED.store(seed, Ordering::Relaxed);
 }
 
+/// The current per-thread sampler seed base. Observability for the deterministic-mode
+/// transitions (§30.4): it is what distinguishes a seed-derived reproducible stream from
+/// an entropy-derived unpredictable one.
+pub fn base_seed() -> u64 {
+    SEED.load(Ordering::Relaxed)
+}
+
 /// Set the mean sample interval in bytes (`0` disables). Enabling warms up the unwinder
 /// once (outside any sampled allocation) and initializes the sampled state, so the slow
 /// path is allocation-free thereafter. Runtime-safe: a change re-syncs every thread's
 /// sampler lazily via a generation counter.
 pub fn set_rate(rate_bytes: u64) {
+    set_rate_with(rate_bytes, crate::global());
+}
+
+/// [`set_rate`] against an explicitly supplied engine. The startup path runs inside
+/// `GLOBAL.get_or_init`, where calling the crate's private `global()` would re-enter the
+/// still-running `OnceLock` and park the thread on its own initialization — a hang at
+/// the process's first allocation. Public entry points pass `crate::global()`.
+pub fn set_rate_with(rate_bytes: u64, engine: Option<&crate::AnyAllocator>) {
     if rate_bytes != 0 {
         // Initialize the state and warm the unwinder *before* arming, so the first sample
         // never triggers a first-use allocation inside the guarded slow path.
@@ -190,7 +205,7 @@ pub fn set_rate(rate_bytes: u64) {
         // Disabling reverts the allocation path to default placement: drop the learned
         // hints so the engine stops applying them (the default path is then byte-for-byte
         // unchanged).
-        if let Some(eng) = crate::global() {
+        if let Some(eng) = engine {
             eng.clear_learned_hints();
         }
     }
@@ -199,10 +214,13 @@ pub fn set_rate(rate_bytes: u64) {
 /// Read `$TOPOMALLOC_SAMPLE_RATE` (mean bytes between samples) at startup and enable
 /// sampling if it is a non-zero integer (§32.1 env config). Called once during global
 /// allocator init (under the bootstrap guard, so any setup allocation is safe).
-pub fn init_from_env() {
+///
+/// Takes the engine by reference (see [`set_rate_with`]): the startup path runs inside
+/// `GLOBAL.get_or_init`, so a nested `global()` would deadlock.
+pub fn init_from_env(engine: &crate::AnyAllocator) {
     if let Ok(v) = std::env::var("TOPOMALLOC_SAMPLE_RATE") {
         if let Ok(rate) = v.trim().parse::<u64>() {
-            set_rate(rate);
+            set_rate_with(rate, Some(engine));
         }
     }
 }
@@ -329,6 +347,58 @@ fn sample_free_slow(ptr: *mut u8) {
     if let Some(rec) = g.objects.on_free(ptr as usize) {
         let age = now.saturating_sub(rec.alloc_ms);
         g.profiles.record_free(rec.stack_id, age, rec.bytes, now);
+    }
+}
+
+/// Remove `ptr`'s sampled record **without** folding a lifetime — for a `realloc` that is
+/// about to free or move it. `None` when nothing was sampled (the common case).
+///
+/// A `realloc` cannot simply call [`on_free`] after the fact. The core frees `ptr` inside
+/// the call, so between that free and a post-hoc `on_free(ptr)` another thread can allocate
+/// the same address and, if sampled, publish a record for it — `SampledObjects::on_alloc`
+/// overwrites the duplicate address, and the post-hoc removal then retires *that thread's
+/// still-live* allocation, permanently mis-recording sampled live bytes and feeding the W14
+/// learn→place loop from corrupted data. Taking the record **before** the call closes the
+/// window: the address is ours until we hand it back.
+pub(crate) fn take_for_realloc(ptr: *mut u8) -> Option<SampledRecord> {
+    if ptr.is_null() || !ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    if !BLOOM.maybe_contains(ptr as usize) || in_sampler() {
+        return None; // definitely not sampled: no lock, no work.
+    }
+    let _guard = SamplerGuard::enter()?;
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    g.objects.on_free(ptr as usize)
+}
+
+/// Fold a [`take_for_realloc`] record's completed lifetime into its site profile — the
+/// realloc succeeded, so the original object is genuinely gone.
+pub(crate) fn retire_taken(rec: SampledRecord) {
+    let Some(_guard) = SamplerGuard::enter() else {
+        return;
+    };
+    let now = now_ms();
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    let age = now.saturating_sub(rec.alloc_ms);
+    g.profiles.record_free(rec.stack_id, age, rec.bytes, now);
+}
+
+/// Put a [`take_for_realloc`] record back — the realloc **failed**, so §25.1 leaves the
+/// original allocation live and its sample must survive untouched.
+pub(crate) fn restore_taken(ptr: *mut u8, rec: SampledRecord) {
+    let Some(_guard) = SamplerGuard::enter() else {
+        return;
+    };
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    // `on_alloc_restore`, not `on_alloc`: this record was already tracked and its object
+    // is still live, so the load-cap drop that is correct for a *new* sample would here
+    // erase a live allocation from sampled accounting for good.
+    if g.objects.on_alloc_restore(ptr as usize, rec) {
+        BLOOM.insert(ptr as usize);
     }
 }
 
@@ -521,18 +591,6 @@ pub fn fold_censored() {
             let age = now.saturating_sub(rec.alloc_ms);
             profiles.record_censored(rec.stack_id, age);
         });
-    }
-}
-
-/// Reset the membership filter and re-prime it from the live sampled set, bounding the
-/// false-positive rate over a long run (the host may call this periodically). No-op when
-/// disabled.
-pub fn refresh_bloom() {
-    if let Some(m) = STATE.get() {
-        let g = m.lock().unwrap_or_else(|e| e.into_inner());
-        BLOOM.reset();
-        // Re-prime from the live sampled addresses so no in-flight sampled free is lost.
-        g.objects.for_each_addr(|addr| BLOOM.insert(addr));
     }
 }
 

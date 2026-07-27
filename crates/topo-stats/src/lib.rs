@@ -39,7 +39,15 @@ pub struct Stats {
     pub rss_bytes: u64,
     /// Bytes held in per-CPU caches.
     pub per_cpu_bytes: u64,
-    /// Bytes held in thread caches.
+    /// Bytes held in per-thread caches — the §13 *optional* front end.
+    ///
+    /// Always `0` in this tree, and correctly so: O-002 requires the byte class be
+    /// **reported**, and §13 is an optional *alternative* to the §11 per-CPU front end
+    /// for platforms that cannot use per-CPU caches (§13.1 — "not the preferred default
+    /// on systems with RSEQ"). This tree implements the per-CPU one, so the class is
+    /// empty rather than absent. The field is part of the frozen Appendix-D JSON and of
+    /// `topomalloc_stats_t::cache_bytes`, so it stays; `explain` omits zero contributors,
+    /// so it never appears in the human-readable attribution.
     pub thread_cache_bytes: u64,
     /// Bytes held in transfer caches.
     pub transfer_bytes: u64,
@@ -85,6 +93,15 @@ pub struct Stats {
     /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may be
     /// recycled (§36.13), so this is an event count, not `created − live`.
     pub arenas_destroyed: u64,
+    /// Arenas stuck in the terminal §36.13 `ErrorQuarantined` state — see
+    /// [`topo_core::AllocatorStats::arenas_quarantined`]. Normally `0`; a nonzero,
+    /// growing value means arena slots are leaking.
+    pub arenas_quarantined: u64,
+    /// Cumulative guard-page `mprotect` refusals (§29.5, W18-4) — see
+    /// [`topo_core::AllocatorStats::guard_protect_failures`]. `0` unless the
+    /// `guard-pages` protection is compiled in *and* the host refused a protection
+    /// change, which means guarded allocations are silently unprotected.
+    pub guard_protect_failures: u64,
     /// Cumulative NUMA binding failures across all arenas (§15.5).
     pub numa_bind_failures: u64,
     /// Cumulative custom-backing (extent-hook) failures across all hooked arenas,
@@ -157,7 +174,8 @@ impl StatsFlags {
     pub const BY_ARENA: StatsFlags = StatsFlags(1 << 0);
     /// Per-size-class breakdown: central-free bytes per class.
     pub const BY_SIZE_CLASS: StatsFlags = StatsFlags(1 << 1);
-    /// Per-CPU cache breakdown (front-end caches, M2 — empty until then).
+    /// Per-CPU front-end cache breakdown: what each core's §11 slots hold. Cores holding
+    /// nothing are omitted, so an idle or drained front end renders an empty array.
     pub const BY_CPU: StatsFlags = StatsFlags(1 << 2);
     /// Per-NUMA-node breakdown (§15): the topology / router counters block.
     pub const BY_NUMA: StatsFlags = StatsFlags(1 << 3);
@@ -301,11 +319,18 @@ impl Stats {
         self.allocated_bytes_total = a.allocated_bytes_total;
         self.freed_bytes_total = a.freed_bytes_total;
         self.central_free_bytes = a.central_free_bytes;
+        // §16.4 front-end residency (W6): objects the per-CPU slots and the transfer
+        // cache hold. Freed by the application (so out of `live_bytes`) but not yet in
+        // the central bitmap (so out of `central_free_bytes`) — their own byte class.
+        self.per_cpu_bytes = a.per_cpu_bytes;
+        self.transfer_bytes = a.transfer_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
         self.exact_internal_fragmentation_bytes = a.live_internal_fragmentation_bytes;
         self.quarantine_bytes = a.quarantine_bytes;
         self.live_arenas = a.live_arenas;
         self.arenas_destroyed = a.arenas_destroyed;
+        self.arenas_quarantined = a.arenas_quarantined;
+        self.guard_protect_failures = a.guard_protect_failures;
         self.numa_bind_failures = a.numa_bind_failures;
         self.hook_failures = a.hook_failures;
         let combined = topo_core::StateBytes {
@@ -399,7 +424,7 @@ impl Stats {
         // §31.5 fragmentation, derived from the byte classes (W17-4). `external` is the free
         // **physically-backed** back-end memory not immediately useful (dirty + muzzy;
         // `released` is unbacked, so excluded); `cache` is the bytes stranded in front-end
-        // caches (per-CPU + thread + transfer, 0 until M2).
+        // caches (per-CPU + transfer; the thread-cache term is always 0, see the field).
         let frag_external = self.dirty_bytes.saturating_add(self.muzzy_bytes);
         let frag_cache = self
             .per_cpu_bytes
@@ -431,6 +456,7 @@ impl Stats {
                 "  \"arenas\": {{\n",
                 "    \"count\": {live_arenas},\n",
                 "    \"destroyed\": {arenas_destroyed},\n",
+                "    \"quarantined\": {arenas_quarantined},\n",
                 "    \"numa_bind_failures\": {numa_bind_failures},\n",
                 "    \"hook_failures\": {{\n",
                 "      \"commit\": {hf_commit},\n",
@@ -451,6 +477,9 @@ impl Stats {
                 "  }},\n",
                 "  \"quarantine\": {{\n",
                 "    \"bytes\": {quarantine}\n",
+                "  }},\n",
+                "  \"hardening\": {{\n",
+                "    \"guard_protect_failures\": {guard_protect_failures}\n",
                 "  }},\n",
                 "  \"hugepage\": {{\n",
                 "    \"coverage_bytes\": {hp_coverage},\n",
@@ -516,6 +545,8 @@ impl Stats {
             central = self.central_free_bytes,
             live_arenas = self.live_arenas,
             arenas_destroyed = self.arenas_destroyed,
+            arenas_quarantined = self.arenas_quarantined,
+            guard_protect_failures = self.guard_protect_failures,
             numa_bind_failures = self.numa_bind_failures,
             hf_commit = self.hook_failures.commit,
             hf_release = self.hook_failures.release,
@@ -605,9 +636,18 @@ impl Stats {
             });
         }
         if flags.contains(StatsFlags::BY_CPU) {
-            // Front-end per-CPU caches land at M2; the breakdown is an empty array until
-            // then (the flag resolves to a defined, additive shape, never a missing key).
-            out.push_str(",\n  \"by_cpu\": []");
+            out.push_str(",\n  \"by_cpu\": [");
+            for (i, c) in detail.cpus.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"cpu\": {}, \"objects\": {}, \"bytes\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    c.cpu,
+                    c.objects,
+                    c.bytes,
+                );
+            }
+            out.push_str(if detail.cpus.is_empty() { "]" } else { "\n  ]" });
         }
         if flags.contains(StatsFlags::BY_NUMA) {
             // Per-node §19.7 hugepage coverage (empty in the default build / single-node host;
@@ -786,6 +826,23 @@ pub struct SizeClassLine {
     pub free_bytes: u64,
 }
 
+/// One line of the §31.2 `BY_CPU` per-core breakdown (W17-2 / W6): what one core's §11
+/// front-end slots currently hold, across every size class.
+///
+/// Cores holding nothing are omitted, so the array is proportional to the front end's
+/// *live* spread rather than to `MAX_CPUS` — on a machine where a few cores do the
+/// allocating, that is the difference between a handful of lines and 128 zeroes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuCacheLine {
+    /// The core id (the index of the per-CPU slot array, i.e. the CPU the front end keys
+    /// this residency by — not necessarily a CPU any thread is running on now).
+    pub cpu: u32,
+    /// Objects this core's slots hold, summed over size classes.
+    pub objects: u64,
+    /// Bytes those objects occupy (Σ `objects × object_size` per class).
+    pub bytes: u64,
+}
+
 /// One line of the §31.2 `BY_NUMA` per-node breakdown (W17-2): a NUMA node's §19.7 hugepage
 /// coverage. Empty (all backends absent) in the default build; populated under the live NUMA
 /// router (`hugepage-optimized`).
@@ -810,6 +867,8 @@ pub struct StatsDetail<'a> {
     pub arenas: &'a [ArenaLine],
     /// `BY_SIZE_CLASS` lines.
     pub size_classes: &'a [SizeClassLine],
+    /// `BY_CPU` per-core front-end residency lines.
+    pub cpus: &'a [CpuCacheLine],
     /// `BY_NUMA` per-node lines.
     pub numa_nodes: &'a [NumaNodeLine],
 }
@@ -819,6 +878,7 @@ impl StatsDetail<'_> {
     pub const EMPTY: StatsDetail<'static> = StatsDetail {
         arenas: &[],
         size_classes: &[],
+        cpus: &[],
         numa_nodes: &[],
     };
 }
@@ -842,24 +902,37 @@ pub fn redact_arenas(arenas: &[ArenaLine], observer_label: u32) -> alloc::vec::V
         .collect()
 }
 
+/// The observer label that dominates **every** possible label, so it may see the raw
+/// summary. Kept as a property of the observer alone (see [`redact_summary`]).
+pub const OBSERVER_LABEL_TOP: u32 = u32::MAX;
+
 /// **Summary-level label redaction (§36.12, W17-6).** Produce the stats *summary* a low
 /// observer is authorized to see — the piece `redact_arenas` (which only filters the
-/// per-arena detail) leaves open. When `all_visible` is true (the observer dominates every
-/// arena — always the POSIX single-`PUBLIC`-label case), the full summary is returned
-/// unchanged (a `PUBLIC` observer legitimately sees everything). Otherwise every **cross-domain
-/// aggregate** — the global cumulative counters, the *shared* backend / cache / central /
-/// hugepage / release / placement / fragmentation state, the metadata, the peak — is redacted
-/// to zero (it mixes all domains' activity, so a low observer must not see it), and the
-/// observer-visible `live_bytes` is recomputed from the visible arenas' `used` (sound because
-/// `Σ arena.used == live_bytes`, §8.6/§36.17).
+/// per-arena detail) leaves open. Every **cross-domain aggregate** — the global cumulative
+/// counters, the *shared* backend / cache / central / hugepage / release / placement /
+/// fragmentation state, the metadata, the peak — is redacted to zero (it mixes all domains'
+/// activity, so a low observer must not see it), and the observer-visible `live_bytes` is
+/// recomputed from the visible arenas' `used` (sound because `Σ arena.used == live_bytes`,
+/// §8.6/§36.17).
 ///
 /// The result is a **pure function of `(full.epoch, full.profile, visible_arenas)`**, so —
 /// modulo the non-sensitive snapshot sequence number `epoch` — any higher-domain activity is
 /// invisible to a low observer: the summary analogue of `redact_arenas`. Together they make
 /// the JSON a low observer receives the Rust-side analogue of the proved Lean
 /// `stats_observation_noninterference`. Pure and total.
-pub fn redact_summary(full: &Stats, visible_arenas: &[ArenaLine], all_visible: bool) -> Stats {
-    if all_visible {
+///
+/// **Why there is no "the observer dominates every live arena" shortcut.** An earlier
+/// version returned the full summary when the visible arena set happened to equal the whole
+/// set. That predicate reads the *unredacted* state, so it is exactly a high-domain bit: a
+/// high domain could create a labelled arena and watch the low observer's JSON flip from the
+/// complete global summary to the all-zero redacted one, then destroy it to flip it back — a
+/// covert channel whose bandwidth is only the low observer's polling rate, and which
+/// discloses every cross-domain aggregate whenever no high arena happens to exist. Authority
+/// must be a property of the *observer*, so only [`OBSERVER_LABEL_TOP`] — which dominates
+/// every label there can ever be — reads the raw summary; a caller wanting the unrestricted
+/// view uses the unlabelled `topomalloc_stats_json` instead.
+pub fn redact_summary(full: &Stats, visible_arenas: &[ArenaLine], observer_label: u32) -> Stats {
+    if observer_label == OBSERVER_LABEL_TOP {
         return *full;
     }
     let visible_live: u64 = visible_arenas.iter().map(|a| a.used).sum();
@@ -1097,6 +1170,8 @@ mod tests {
             allocated_bytes_total: 1500,
             freed_bytes_total: 500,
             central_free_bytes: 256,
+            per_cpu_bytes: 640,
+            transfer_bytes: 128,
             span_backend: topo_core::StateBytes {
                 reserved: 10,
                 active: 20,
@@ -1123,6 +1198,8 @@ mod tests {
                 merge: 15,
             },
             arenas_destroyed: 4,
+            arenas_quarantined: 0,
+            guard_protect_failures: 2,
             peak_live_bytes: 2000,
             live_internal_fragmentation_bytes: 512,
             quarantine_bytes: 256,
@@ -1139,6 +1216,10 @@ mod tests {
         assert_eq!(s.allocated_bytes_total, 1500);
         assert_eq!(s.freed_bytes_total, 500);
         assert_eq!(s.central_free_bytes, 256);
+        // §16.4 front-end residency (W6): the per-CPU and transfer terms map through as
+        // their own byte classes — neither live nor central-free.
+        assert_eq!(s.per_cpu_bytes, 640);
+        assert_eq!(s.transfer_bytes, 128);
         assert_eq!(s.metadata_bytes, 8192);
         // The cumulative destroyed-arena count maps through (§31.1, W17-1a).
         assert_eq!(s.arenas_destroyed, 4);
@@ -1253,6 +1334,7 @@ mod tests {
         let detail = StatsDetail {
             arenas: &arenas,
             size_classes: &[],
+            cpus: &[],
             numa_nodes: &[],
         };
         // Without the flag: no by_arena key.
@@ -1341,10 +1423,65 @@ mod tests {
             &StatsDetail {
                 arenas: &redacted,
                 size_classes: &[],
+                cpus: &[],
                 numa_nodes: &[],
             },
         );
         assert!(!json.contains("1048576")); // the high arena's bytes never appear
+    }
+
+    #[test]
+    fn the_low_view_does_not_depend_on_whether_a_high_arena_exists() {
+        // The covert channel the observer-keyed rule closes. A high domain must not be
+        // able to modulate anything a low observer sees by creating/destroying a labelled
+        // arena — yet an "all live arenas visible ⇒ show the raw summary" shortcut does
+        // exactly that: with no high arena the low observer received the *complete* global
+        // summary, and the moment one appeared the view flipped to the redacted one.
+        let low = ArenaLine {
+            id: 1,
+            label: 0,
+            used: 4096,
+            ..ArenaLine::default()
+        };
+        let high = ArenaLine {
+            id: 2,
+            label: 9,
+            used: 1 << 30,
+            ..ArenaLine::default()
+        };
+        let full = Stats {
+            epoch: 5,
+            live_bytes: 4096 + (1 << 30),
+            allocated_bytes_total: 9 << 30,
+            active_bytes: 4 << 30,
+            metadata_bytes: 1 << 20,
+            peak_live_bytes: 8 << 30,
+            ..Stats::default()
+        };
+
+        // World A: only the low arena exists (so the observer *does* see every arena).
+        let only_low = Stats {
+            live_bytes: 4096,
+            ..full
+        };
+        let vis_a = redact_arenas(&[low], 0);
+        let view_a = redact_summary(&only_low, &vis_a, 0);
+
+        // World B: a high arena also exists.
+        let vis_b = redact_arenas(&[low, high], 0);
+        let view_b = redact_summary(&full, &vis_b, 0);
+
+        assert_eq!(vis_a, vis_b, "the visible arena set must be identical");
+        assert_eq!(
+            view_a.to_json(),
+            view_b.to_json(),
+            "the low view changed because a high arena exists — a covert channel"
+        );
+        assert_eq!(view_a.live_bytes, 4096, "only the visible domain's bytes");
+        assert_eq!(
+            view_a.active_bytes, 0,
+            "cross-domain aggregates stay redacted"
+        );
     }
 
     #[test]
@@ -1395,8 +1532,8 @@ mod tests {
         // The visible (low) set is identical in both; redacting summaries must match exactly.
         let vis_a = redact_arenas(&[low, high], 0);
         let vis_b = redact_arenas(&[low, high_b], 0);
-        let red_a = redact_summary(&full_a, &vis_a, false);
-        let red_b = redact_summary(&full_b, &vis_b, false);
+        let red_a = redact_summary(&full_a, &vis_a, 0);
+        let red_b = redact_summary(&full_b, &vis_b, 0);
         assert_eq!(red_a, red_b, "the redacted low-domain summary is invariant");
         // It discloses only the visible domain's live bytes, with a consistent identity.
         assert_eq!(red_a.live_bytes, 4096);
@@ -1410,7 +1547,11 @@ mod tests {
         let json_b = red_b.to_json();
         assert_eq!(json_a, json_b);
         // `all_visible` (a top observer / the POSIX PUBLIC case) is the identity: full stats.
-        assert_eq!(redact_summary(&full_a, &[low, high], true), full_a);
+        assert_eq!(
+            redact_summary(&full_a, &[low, high], OBSERVER_LABEL_TOP),
+            full_a,
+            "only the lattice-top observer reads the raw summary"
+        );
     }
 
     #[test]

@@ -172,6 +172,24 @@ jobs:
           key: tsan
       - run: cargo xtask test --kind tsan
 
+  # G-conc (loom): the fork-quiesce gate's `loom` models are cited throughout `fork.rs`
+  # and CLAUDE.md as the proof that no operation is admitted across a `fork()` — but no
+  # job ran them, so the citation rested on a gate a contributor had to remember to
+  # invoke by hand. They are exhaustive over the interleavings and take seconds. Kept a
+  # separate job rather than folded into `xtask ci` because `--cfg loom` changes
+  # RUSTFLAGS, which would force the whole workspace to rebuild twice in the main sweep.
+  loom:
+    name: loom (fork gate + protocols)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - run: cargo xtask test --kind loom
+
   # G-hard (ASan + LSan): AddressSanitizer over the topo-core library catches
   # spatial / temporal memory errors in the crate's intricate `unsafe` metadata/
   # descriptor/bitmap code, default + hardened (W19-2, §30.3). The RSEQ asm disables

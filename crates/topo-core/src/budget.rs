@@ -18,6 +18,8 @@
 //! The controller is designed to run periodically (e.g. on a timer or on
 //! every N-th allocation) and is not on the allocation fast path.
 
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use crate::cpu_cache::CpuCache;
 use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::SizeClassId;
@@ -46,15 +48,21 @@ const DEFAULT_ADAPT_INTERVAL: u64 = 4096;
 ///   path increments a per-CPU counter and calls `adapt` when the counter
 ///   crosses [`adapt_interval`](Self::adapt_interval).
 ///
-/// **Thread cache budgets.** The controller currently manages per-CPU cache
-/// soft capacities. Per-thread cache budgets are managed independently by
-/// [`ThreadCache::set_budget`](crate::thread_cache::ThreadCache::set_budget);
-/// a future enhancement may unify them under a single global budget.
+/// **Scope.** The controller manages per-CPU slot soft capacities, which is the whole
+/// §11.5 budget: the transfer cache is fixed-capacity per size class, and this tree
+/// implements no per-thread cache (§13 is an optional *alternative* front end for
+/// platforms that cannot use per-CPU caches — see `docs/DECISIONS.md`).
 pub struct CacheBudget {
     /// Global budget: maximum total soft capacity across all CPUs and SCs
     /// (in objects). When the total exceeds this, slots above the minimum are
     /// shrunk in index order (lowest CPU, lowest SC first).
-    global_budget: usize,
+    ///
+    /// Atomic (and settable through [`set_global_budget`](CacheBudget::set_global_budget))
+    /// because the right value is a property of the *machine*, which the engine learns
+    /// only when the host publishes its CPU count — after the controller has been
+    /// `const`-constructed. Relaxed: a policy knob read once per adaptation cycle, never
+    /// used for synchronisation.
+    global_budget: AtomicUsize,
     /// Miss threshold for growing a slot.
     miss_threshold: u64,
     /// Overflow threshold for shrinking a slot.
@@ -62,31 +70,35 @@ pub struct CacheBudget {
     /// Number of allocations between `adapt` calls (count-based invocation).
     adapt_interval: u64,
     /// Per-instance allocation counter for `should_adapt`.
-    alloc_counter: core::sync::atomic::AtomicU64,
+    alloc_counter: AtomicU64,
 }
 
 impl CacheBudget {
     /// Create a budget controller with the given global budget.
     pub const fn new(global_budget: usize) -> Self {
         Self {
-            global_budget,
+            global_budget: AtomicUsize::new(global_budget),
             miss_threshold: DEFAULT_MISS_THRESHOLD,
             overflow_threshold: DEFAULT_OVERFLOW_THRESHOLD,
             adapt_interval: DEFAULT_ADAPT_INTERVAL,
-            alloc_counter: core::sync::atomic::AtomicU64::new(0),
+            alloc_counter: AtomicU64::new(0),
         }
     }
 
     /// The global budget (total objects across all CPUs and SCs).
     #[inline]
     pub fn global_budget(&self) -> usize {
-        self.global_budget
+        self.global_budget.load(Ordering::Relaxed)
     }
 
-    /// Set the global budget.
+    /// Set the global budget — the §11.5 ceiling on total front-end residency, in
+    /// objects. The engine sizes it from the host's CPU count
+    /// ([`Allocator::set_front_end_cpus`](crate::Allocator::set_front_end_cpus)), since a
+    /// budget fixed at construction would either starve a many-core machine or let a
+    /// small one hold caches out of proportion to its heap.
     #[inline]
-    pub fn set_global_budget(&mut self, budget: usize) {
-        self.global_budget = budget;
+    pub fn set_global_budget(&self, objects: usize) {
+        self.global_budget.store(objects, Ordering::Relaxed);
     }
 
     /// The miss threshold (misses above this trigger a grow).
@@ -133,23 +145,42 @@ impl CacheBudget {
     /// Returns `false` unconditionally when `adapt_interval` is 0.
     #[inline]
     pub fn should_adapt(&self) -> bool {
-        let n = self
-            .alloc_counter
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let n = self.alloc_counter.fetch_add(1, Ordering::Relaxed);
         self.adapt_interval > 0 && n.is_multiple_of(self.adapt_interval)
     }
 
-    /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for each
-    /// active CPU and size class, adjusts soft capacities, and enforces the
-    /// global budget. Returns the total soft capacity after adaptation.
+    /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for every
+    /// **initialized** slot, adjusts soft capacities, and enforces the global budget.
+    /// Returns the total soft capacity after adaptation.
+    ///
+    /// The walk is over all `MAX_CPUS` slots, not `0..active_cpus`, because those index
+    /// different things: `active_cpus` is the *count* of online CPUs, while a slot is
+    /// keyed by the **CPU id** `rseq::current_cpu()` reports, and Linux does not promise
+    /// those are dense. On a host whose online CPUs are 0 and 4 the count is 2 while the
+    /// live slots are 0 and 4, so a `0..active` walk adapts a slot nothing uses and never
+    /// consumes the real slot 4's miss/overflow counters — its soft capacity frozen at the
+    /// initial value and its objects missing from the budget total. Slots are cheap to
+    /// skip (`is_initialized` is one load) and an unused one is skipped by the same test
+    /// that already guarded the dense walk, so scanning the array costs a bounded scan and
+    /// removes the sparse-CPU hole. The **global allowance** is still sized from the CPU
+    /// count (see [`Allocator::set_front_end_cpus`](crate::Allocator::set_front_end_cpus)),
+    /// which is the figure that genuinely is a population.
     pub fn adapt(&self, cpu_cache: &CpuCache) -> usize {
-        let active = cpu_cache.active_cpus() as usize;
-        if active == 0 {
-            return 0;
-        }
+        // A zero CPU count means "the host has not published one yet", **not** "there is
+        // nothing to adapt". Front-end allocation does not wait for that announcement:
+        // `current_core` deliberately spreads threads over `MAX_CPUS` (a per-thread key
+        // when no CPU id is readable), so a multithreaded embedding that constructs an
+        // allocator directly and never calls `set_front_end_cpus` initialises slots and
+        // accumulates cache residency from its first allocation. Returning early here
+        // skipped the scan *and* the global-budget enforcement for exactly that case, so
+        // those slots kept their initial soft capacities and their residency sat outside
+        // the ceiling the allocator advertises — the one state the §11.5 budget exists to
+        // bound. Adapt anyway; the count only sizes the global allowance (which
+        // `Allocator::new` initialises to the single-core figure for this reason), and
+        // every slot is skipped by the same `is_initialized` test as always.
 
         // Phase 1: per-slot adaptation based on miss/overflow stats.
-        for cpu_idx in 0..active {
+        for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
             let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
                 Some(c) => c,
                 None => continue,
@@ -192,17 +223,54 @@ impl CacheBudget {
             }
         }
 
-        // Phase 2: enforce the global budget. Repeatedly shrink slots that
-        // are above the minimum batch size until the total is within budget
-        // or no further reduction is possible. Iteration is in index order
-        // (lowest CPU, lowest SC first); a future enhancement could sort by
-        // activity to prefer shrinking the least-active slots.
-        let mut total = self.compute_total_capacity(cpu_cache, active);
+        // Phase 2: enforce the global budget, in two tiers. The first shrinks every slot
+        // to one batch — the point past which a slot stops being a useful cache, so it is
+        // the right place to stop *while the ceiling is still reachable*. The second only
+        // runs when it is not, and goes to the structural minimum of one object.
+        //
+        // The second tier is not hypothetical, and it is the front end's own doing: a
+        // slot is keyed over the whole `MAX_CPUS` array (`CpuCache::fallback_core` spreads
+        // by thread key when no CPU id is readable, deliberately independent of the
+        // published count), while the allowance is sized from that count
+        // (`Allocator::set_front_end_cpus`). More allocator threads than online CPUs
+        // therefore initialise far more slots than the ceiling was sized for, and once
+        // `initialised_slots × batch` alone exceeds it a one-batch floor makes the loop
+        // exit **over budget with no progress left** — silently, since the only signal is
+        // the returned total. Freed objects then stay resident past the ceiling the
+        // allocator advertises, which is the one state the §11.5 budget exists to bound.
+        // Narrowing the mapping to the count instead is not an option: that is exactly
+        // the orphaning bug `current_core` documents.
+        let budget = self.global_budget();
+        let mut total = self.compute_total_capacity(cpu_cache);
+        total = self.shrink_to_floor(cpu_cache, budget, total, true);
+        if total > budget {
+            total = self.shrink_to_floor(cpu_cache, budget, total, false);
+        }
 
-        while total > self.global_budget {
+        total
+    }
+
+    /// One tier of phase-2 budget enforcement: repeatedly shrink initialized slots by a
+    /// batch until `total <= budget` or nothing can give. The floor is one batch when
+    /// `batch_floor`, else one object — the structural minimum, since
+    /// [`PerCpuSlot::set_soft_capacity`](crate::cpu_cache::PerCpuSlot::set_soft_capacity)
+    /// clamps to `>= 1` and the Appendix-B.2 checker requires it. Returns the new total.
+    ///
+    /// Iteration is in index order (lowest CPU, lowest SC first); a future enhancement
+    /// could sort by activity to prefer shrinking the least-active slots. A slot driven
+    /// to the floor is not stranded there — phase 1 grows it back by a batch as soon as
+    /// its miss counter says it is needed and the budget allows.
+    fn shrink_to_floor(
+        &self,
+        cpu_cache: &CpuCache,
+        budget: usize,
+        mut total: usize,
+        batch_floor: bool,
+    ) -> usize {
+        while total > budget {
             let mut made_progress = false;
-            for cpu_idx in 0..active {
-                if total <= self.global_budget {
+            for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
+                if total <= budget {
                     break;
                 }
                 let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
@@ -210,7 +278,7 @@ impl CacheBudget {
                     None => continue,
                 };
                 for sc_idx in 0..NUM_SIZE_CLASSES {
-                    if total <= self.global_budget {
+                    if total <= budget {
                         break;
                     }
                     let sc = SizeClassId::new(sc_idx);
@@ -223,9 +291,10 @@ impl CacheBudget {
                     }
 
                     let batch = size_class::batch(sc) as u32;
+                    let floor = if batch_floor { batch } else { 1 };
                     let cur_soft = slot.soft_capacity();
-                    if cur_soft > batch {
-                        let new_soft = cur_soft.saturating_sub(batch).max(batch);
+                    if cur_soft > floor {
+                        let new_soft = cur_soft.saturating_sub(batch).max(floor);
                         let reduction = (cur_soft - new_soft) as usize;
                         slot.set_soft_capacity(new_soft);
                         total = total.saturating_sub(reduction);
@@ -237,14 +306,15 @@ impl CacheBudget {
                 break;
             }
         }
-
         total
     }
 
-    /// Compute the total soft capacity across all active CPUs and SCs.
-    fn compute_total_capacity(&self, cpu_cache: &CpuCache, active: usize) -> usize {
+    /// Compute the total soft capacity across every **initialized** slot and SC. Walks all
+    /// `MAX_CPUS` slots for the sparse-CPU-id reason documented on [`Self::adapt`] — a
+    /// slot the budget does not count is a slot the budget does not bound.
+    fn compute_total_capacity(&self, cpu_cache: &CpuCache) -> usize {
         let mut total = 0usize;
-        for cpu_idx in 0..active {
+        for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
             let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
                 Some(c) => c,
                 None => continue,
@@ -399,6 +469,40 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_cpu_id_slot_is_still_adapted() {
+        // W6-5 on a host whose *online CPU ids* are sparse. `active_cpus` is a **count**;
+        // a slot is keyed by the CPU **id** `rseq::current_cpu()` reports, and Linux does
+        // not promise those are dense (CPUs 0 and 4 online => count 2, slots 0 and 4). A
+        // walk over `0..active_cpus` would never reach slot 4, leaving its miss counter
+        // unconsumed and its soft capacity frozen at the initial value forever.
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(2); // two CPUs online...
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        // ...but the live slot is at id 4, outside the dense `0..2` range.
+        let sparse = CoreId(4);
+        cc.init_slot(sparse, sc, &m, hard_cap);
+        let slot = cc.per_cpu(sparse).unwrap().slot(sc).unwrap();
+        slot.set_soft_capacity(batch);
+        let before = slot.soft_capacity();
+
+        // Drive misses on that slot, then adapt.
+        for _ in 0..100 {
+            cc.fe_pop(sparse, A, sc, &m);
+        }
+        let budget = CacheBudget::new(100_000);
+        budget.adapt(&cc);
+
+        assert!(
+            slot.soft_capacity() > before,
+            "a slot at a sparse CPU id must still adapt: soft capacity stuck at {before}"
+        );
+    }
+
+    #[test]
     fn global_budget_constraint() {
         let m = meta(8 * 1024 * 1024);
         let cc = CpuCache::new();
@@ -436,6 +540,87 @@ mod tests {
                 "cpu {cpu_idx} should be at minimum batch size"
             );
         }
+    }
+
+    /// The one-batch floor is the right place to stop only while the ceiling is still
+    /// reachable. A slot is keyed over the whole `MAX_CPUS` array (`fallback_core` spreads
+    /// by thread key, deliberately independent of the published CPU count) while the
+    /// allowance is sized from that count, so more allocator threads than online CPUs
+    /// initialize more slots than it was sized for. Once `slots × batch` alone exceeds the
+    /// budget, a one-batch floor makes phase 2 exit **over budget with no progress left**,
+    /// and freed objects stay resident past the ceiling §11.5 exists to bound.
+    ///
+    /// Fails on the single-tier floor: it stops at `slots * batch`, twice the budget here.
+    #[test]
+    fn budget_enforcement_goes_below_a_batch_when_that_floor_would_exceed_it() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        // Two online CPUs — but sixteen threads spread over sixteen slots.
+        cc.set_active_cpus(2);
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        let slots = 16u32;
+        for cpu_idx in 0..slots {
+            cc.init_slot(CoreId(cpu_idx), sc, &m, hard_cap);
+        }
+
+        // A ceiling the one-batch floor cannot reach: half of `slots * batch`.
+        let target = (batch as usize) * (slots as usize) / 2;
+        let budget = CacheBudget::new(target);
+        let total = budget.adapt(&cc);
+
+        assert!(
+            total <= target,
+            "enforcement stopped over budget: total {total} > budget {target}"
+        );
+        // ... and every slot is still structurally well-formed (B.2 requires `soft >= 1`,
+        // which is why one object, not zero, is the floor).
+        for cpu_idx in 0..slots {
+            let cpu = cc.per_cpu(CoreId(cpu_idx)).unwrap();
+            let slot = cpu.slot(sc).unwrap();
+            assert!(
+                slot.soft_capacity() >= 1 && slot.check_invariants(sc),
+                "cpu {cpu_idx} left malformed by budget enforcement"
+            );
+        }
+    }
+
+    /// A slot driven to the sub-batch floor is not stranded there: phase 1 grows it back
+    /// as soon as its miss counter asks and the budget allows.
+    #[test]
+    fn a_slot_at_the_sub_batch_floor_recovers_when_the_budget_allows() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        let slots = 16u32;
+        for cpu_idx in 0..slots {
+            cc.init_slot(CoreId(cpu_idx), sc, &m, hard_cap);
+        }
+
+        let budget = CacheBudget::new((batch as usize) * (slots as usize) / 2);
+        budget.adapt(&cc);
+        let slot = cc.per_cpu(CoreId(0)).unwrap().slot(sc).unwrap();
+        let squeezed = slot.soft_capacity();
+        assert!(
+            squeezed < batch,
+            "expected a sub-batch floor, got {squeezed}"
+        );
+
+        // The host raises the ceiling and the slot starts missing.
+        budget.set_global_budget(100_000);
+        for _ in 0..100 {
+            cc.fe_pop(CoreId(0), A, sc, &m);
+        }
+        budget.adapt(&cc);
+        assert!(
+            slot.soft_capacity() > squeezed,
+            "a squeezed slot must grow back: still at {squeezed}"
+        );
     }
 
     #[test]

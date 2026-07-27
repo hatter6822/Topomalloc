@@ -202,12 +202,36 @@ impl FreeBitmap {
         self.word(w).fetch_and(!bit, Ordering::Relaxed) & bit != 0
     }
 
+    /// Clear object `i` with **release** ordering — the second half of a *free-bit-first*
+    /// handoff (§29.3/§29.4). The first half sets this span's central free bit; releasing
+    /// here publishes that set to any thread whose paired
+    /// [`contains_acquire`](Self::contains_acquire) observes the clear, which is what
+    /// makes the lock-free `held || central_free` double-free oracle hold on a weakly
+    /// ordered target. See [`SpanDescriptor::is_object_quarantined`].
+    #[inline]
+    pub fn remove_release(&self, i: usize) -> bool {
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        self.word(w).fetch_and(!bit, Ordering::Release) & bit != 0
+    }
+
     /// Whether object `i` is central-resident.
     #[inline]
     pub fn contains(&self, i: usize) -> bool {
         debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
         let (w, bit) = (i / 64, 1u64 << (i % 64));
         self.word(w).load(Ordering::Relaxed) & bit != 0
+    }
+
+    /// Read object `i`'s bit with **acquire** ordering — the consuming half of the
+    /// free-bit-first handoff described on [`remove_release`](Self::remove_release). A
+    /// reader that observes the cleared bit is thereby guaranteed to observe the central
+    /// free bit the releasing thread set before it.
+    #[inline]
+    pub fn contains_acquire(&self, i: usize) -> bool {
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        self.word(w).load(Ordering::Acquire) & bit != 0
     }
 
     /// Number of central-resident objects (`popcount`). The value
@@ -242,6 +266,169 @@ impl FreeBitmap {
     fn clear(&self) {
         for w in 0..self.active_words() {
             self.word(w).store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-object **front-end residency** bits (§16.4 `local_cached + transfer_cached`,
+/// plan 05 W6): `bit(i) = 1` ⟺ object `i` currently sits in a front-end cache (a
+/// per-CPU slot or the transfer cache) — freed by the application, **not** central
+/// -resident, and not re-vendable by the central layer.
+///
+/// **Why this exists.** Without it a front-end cache would lose the allocator's exact
+/// small double-free detection: today a second `free(p)` is caught by
+/// `central_insert`'s test-and-set, but a cached object never reaches the central
+/// bitmap, so the second free would push the same address into the slot twice and the
+/// cache would hand it to two callers. Answering "is this address cache-resident?" by
+/// scanning is `O(MAX_CPUS × capacity)`; marking the object is `O(1)`. The free path
+/// already resolved `(span, index)` (`validate_free`), so the mark is free there.
+///
+/// **Lock-free by construction.** Unlike [`FreeBitmap`] these bits are *not* paired
+/// with a count, so they need no span lock: [`set`](Self::set)/[`clear`](Self::clear)
+/// are atomic test-and-set / test-and-clear, which is exactly the double-free oracle.
+///
+/// **Always out-of-line** (a pointer and its word capacity, 16 bytes) rather than the
+/// hybrid inline layout [`FreeBitmap`] uses: the front end reaches these bits on a path
+/// that already walks the pagemap, so one more (metadata-resident, hot) load costs
+/// nothing, and it keeps [`SpanDescriptor`] inside its W3-2 footprint budget with no
+/// change to either profile's limit.
+///
+/// The capacity is tracked **here** rather than borrowed from the owning descriptor's
+/// [`FreeBitmap`]. The two bitmaps address the same object count but their *allocated*
+/// capacities differ by construction — a free bitmap up to [`INLINE_BITS`] objects has
+/// `INLINE_WORDS` of inline capacity while this block is carved to the exact word count —
+/// so treating one as the other lets a recycle that grows into that inline headroom clear
+/// (and later index) words past the end of this block.
+pub struct CachedBits {
+    /// `cap_words` `AtomicU64`s in monotonic metadata (never freed), or null when the
+    /// span could not obtain a block (then every operation is a safe no-op).
+    words: AtomicPtrU64,
+    /// Words actually allocated at `words`. Grows only when a recycle needs more; the
+    /// old block then leaks (monotonic metadata is never freed).
+    cap_words: AtomicU32,
+}
+
+impl CachedBits {
+    /// Storage for `object_count` objects, or `None` if metadata is exhausted.
+    fn new_for(object_count: u32, meta: &dyn MetadataAlloc) -> Option<CachedBits> {
+        let words = (object_count as usize).div_ceil(64).max(1);
+        Some(CachedBits {
+            words: AtomicPtrU64::new(alloc_bitmap_words(meta, words)?.as_ptr()),
+            cap_words: AtomicU32::new(words as u32),
+        })
+    }
+
+    /// Re-point at a slab of `object_count` objects, growing the block only when it
+    /// must (the old block then leaks — monotonic metadata is never freed) and clearing
+    /// every bit. `false` on a needed-but-failed growth (safe failure). Called under the
+    /// span lock during recycle.
+    fn recycle_to(&self, object_count: u32, meta: &dyn MetadataAlloc) -> bool {
+        let new_words = (object_count as usize).div_ceil(64).max(1);
+        if new_words > self.cap_words.load(Ordering::Acquire) as usize
+            || self.words.load(Ordering::Acquire).is_null()
+        {
+            let block = match alloc_bitmap_words(meta, new_words) {
+                Some(b) => b,
+                None => return false,
+            };
+            self.words.store(block.as_ptr(), Ordering::Release);
+            self.cap_words.store(new_words as u32, Ordering::Release);
+        } else {
+            self.clear_all(new_words);
+        }
+        true
+    }
+
+    /// `&AtomicU64` for word `w`, or `None` when no block is installed or `w` is past
+    /// the allocated capacity. The capacity bound is what makes every caller's `w`
+    /// (derived from an object index) in-range by construction rather than by contract.
+    #[inline]
+    fn word(&self, w: usize) -> Option<&AtomicU64> {
+        let p = self.words.load(Ordering::Acquire);
+        if p.is_null() || w >= self.cap_words.load(Ordering::Acquire) as usize {
+            return None;
+        }
+        // SAFETY: `p` points at `cap_words` `AtomicU64`s in metadata (never freed) and
+        // `w < cap_words`, so the offset stays inside that block.
+        Some(unsafe { &*p.add(w) })
+    }
+
+    /// Mark object `i` cache-resident. `true` iff newly set — a `false` means the
+    /// object was **already** in a front-end cache, i.e. a double free (the bitmap face
+    /// of §29.3, the cached counterpart of [`FreeBitmap::insert`]).
+    #[inline]
+    pub fn set(&self, i: usize) -> bool {
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        match self.word(w) {
+            // Unreachable for a live span: `new_for`/`recycle_to` install a block sized
+            // for the whole object count or fail the span outright, and callers bound `i`
+            // by `object_count`. Reporting "not newly set" is the safe reading — the
+            // caller treats it as "already cached" and declines to cache an object whose
+            // residency it could not record.
+            None => {
+                debug_assert!(false, "cached bit {i} has no backing word");
+                false
+            }
+            // **Acquire**, and load-bearing on the *reclaim* direction. This RMW is the
+            // free path's authoritative claim, and a claim that succeeds by reading the
+            // clear a `cached → central-free` (or `→ quarantined`) handoff published must
+            // also see the bit that handoff set *first*, so the claimant can revalidate
+            // and decline. Reading a value written by `clear`'s release makes this RMW
+            // part of that release sequence, and acquiring on it orders the releasing
+            // thread's earlier stores before everything after this call. Relaxed here left
+            // the revalidation unsound on a weakly ordered target: the claim could observe
+            // the cleared cached bit and *not* the central free bit that preceded it, so
+            // an object already in the central free list would be pushed into a per-CPU
+            // slot as well, and vended twice. Free on x86-64 (`lock or` is already a full
+            // barrier); a `ldsetal`-class instruction on AArch64.
+            Some(word) => word.fetch_or(bit, Ordering::Acquire) & bit == 0,
+        }
+    }
+
+    /// Clear object `i`'s cache residency. `true` iff it was set.
+    ///
+    /// **Release**, and load-bearing: the `cached → central-free` flush sets the central
+    /// free bit and *then* clears this one (free-bit-first), and only a release here
+    /// publishes that set to a lock-free reader whose paired acquire
+    /// [`contains`](Self::contains) observes the clear. With both sides relaxed the two
+    /// stores may reach another core in either order on a weakly ordered target, and the
+    /// `is_cached || is_central_free` oracle has a blind instant in which both read
+    /// `false`. See [`SpanDescriptor::is_free_awaiting_reuse`].
+    #[inline]
+    pub fn clear(&self, i: usize) -> bool {
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        match self.word(w) {
+            None => false,
+            Some(word) => word.fetch_and(!bit, Ordering::Release) & bit != 0,
+        }
+    }
+
+    /// Whether object `i` is cache-resident (lock-free read). **Acquire** — the consuming
+    /// half of the publication documented on [`clear`](Self::clear).
+    #[inline]
+    pub fn contains(&self, i: usize) -> bool {
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        self.word(w)
+            .is_some_and(|word| word.load(Ordering::Acquire) & bit != 0)
+    }
+
+    /// Cache-resident object count over `words` active words (§16.4
+    /// `local_cached + transfer_cached`).
+    #[inline]
+    pub fn count(&self, words: usize) -> usize {
+        (0..words)
+            .filter_map(|w| self.word(w))
+            .map(|word| word.load(Ordering::Relaxed).count_ones() as usize)
+            .sum()
+    }
+
+    /// Clear every bit over `words` active words.
+    #[inline]
+    fn clear_all(&self, words: usize) {
+        for w in 0..words {
+            if let Some(word) = self.word(w) {
+                word.store(0, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -303,10 +490,14 @@ impl SpanFlags {
 /// The non-central terms of the §16.4 partition (`local_cached`, `transfer_cached`,
 /// `quarantined`) — *logical* quantities the descriptor does not track per-op; a
 /// caller reconstructs them in debug (W5-3c) and passes them to the
-/// conservation/empty checks. All zero before caches exist (M1).
+/// conservation/empty checks. All zero in this tree — see
+/// [`reconstruct_non_central_residency`](SpanDescriptor::reconstruct_non_central_residency)
+/// for why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NonCentralResidency {
-    /// Objects held in per-CPU and thread caches.
+    /// Objects held in a thread- or CPU-local cache — the §16.4 `local_cached` term
+    /// (this tree's front end is the §11 per-CPU one; §13 thread caches are the optional
+    /// alternative it does not implement).
     pub local_cached: u32,
     /// Objects held in transfer caches.
     pub transfer_cached: u32,
@@ -428,6 +619,14 @@ pub struct SpanDescriptor {
     /// transition). Only present in `quarantine` builds, so `performance` pays nothing.
     #[cfg(feature = "quarantine")]
     quarantined_bitmap: FreeBitmap,
+    /// §16.4 `local_cached + transfer_cached` (plan 05 W6): per-object front-end
+    /// residency. See [`CachedBits`] — lock-free, and the exact double-free oracle for
+    /// an object the front-end cache holds. **Mutually exclusive** with `free_bitmap`
+    /// and `quarantined_bitmap`: an object is at most one of live / central-free /
+    /// cached / quarantined. The cached → central-free transition sets the free bit
+    /// **before** clearing this one (free-bit-first), so a lock-free
+    /// `is_cached || is_central_free` double-free check never sees both clear.
+    cached_bitmap: CachedBits,
     /// Next span in the central free list's partial chain (W5-4a), or null.
     /// Protected by the owning [`CentralBin`](crate::central::CentralBin)'s
     /// lock, **not** the span lock — the span lock protects bitmap/counts, the
@@ -482,6 +681,7 @@ impl SpanDescriptor {
         let free_bitmap = FreeBitmap::new_for(object_count, meta)?;
         #[cfg(feature = "quarantine")]
         let quarantined_bitmap = FreeBitmap::new_for(object_count, meta)?;
+        let cached_bitmap = CachedBits::new_for(object_count, meta)?;
         let desc = Self {
             base: AtomicUsize::new(base),
             id,
@@ -501,6 +701,7 @@ impl SpanDescriptor {
             free_bitmap,
             #[cfg(feature = "quarantine")]
             quarantined_bitmap,
+            cached_bitmap,
             central_next: AtomicPtr::new(ptr::null_mut()),
         };
         desc.refresh_integrity();
@@ -813,6 +1014,13 @@ impl SpanDescriptor {
         if !self.quarantined_bitmap.recycle_to(object_count, meta) {
             return false;
         }
+        // W6: resize/clear the front-end residency bits on the same terms. The recycled
+        // span is empty, so no object can be cache-resident; this clears an already-empty
+        // bitmap (and grows the block when the new class packs more objects). The word
+        // capacity is the free bitmap's, which was just resized to the same object count.
+        if !self.cached_bitmap.recycle_to(object_count, meta) {
+            return false;
+        }
         self.live_count.store(0, Ordering::Relaxed);
         self.central_free_count.store(0, Ordering::Relaxed);
 
@@ -860,6 +1068,158 @@ impl SpanDescriptor {
         self.free_bitmap.contains(i)
     }
 
+    /// W6 (§16.4): mark object `i` **cache-resident** — the front end has taken it out
+    /// of circulation. Lock-free atomic test-and-set: `true` iff newly marked, `false`
+    /// iff the object was *already* in a front-end cache, which is a **double free**
+    /// (the cached counterpart of `central_insert`'s test-and-set).
+    ///
+    /// The caller must have established the object is not central-free
+    /// ([`is_central_free`](Self::is_central_free)) and not quarantined first; together
+    /// the three checks are the complete lock-free double-free oracle.
+    #[inline]
+    pub fn try_mark_cached(&self, i: usize) -> bool {
+        if i >= self.object_count() as usize {
+            return false;
+        }
+        self.cached_bitmap.set(i)
+    }
+
+    /// W6: clear object `i`'s cache residency — the front end is handing it back to the
+    /// application (or to central). `true` iff it was marked. Lock-free.
+    #[inline]
+    pub fn unmark_cached(&self, i: usize) -> bool {
+        if i >= self.object_count() as usize {
+            return false;
+        }
+        self.cached_bitmap.clear(i)
+    }
+
+    /// W6: whether object `i` currently sits in a front-end cache (lock-free read).
+    #[inline]
+    pub fn is_cached(&self, i: usize) -> bool {
+        i < self.object_count() as usize && self.cached_bitmap.contains(i)
+    }
+
+    /// W6 (§16.4): objects of this span currently held in front-end caches
+    /// (`local_cached + transfer_cached`). Lock-free; exact when quiescent.
+    #[inline]
+    pub fn cached_count(&self) -> u32 {
+        self.cached_bitmap.count(self.free_bitmap.active_words()) as u32
+    }
+
+    /// Appendix B (W6, §16.4): **no object of this span is simultaneously cache-resident
+    /// and central-free**. This is the structural fact the lock-free double-free oracle
+    /// rests on: a free reports a double free when it observes either bit, so if the two
+    /// sets could overlap, an object could be handed out from the central list *and*
+    /// vended again from a per-CPU slot.
+    ///
+    /// Checked **under the span lock**, which is what makes it exact rather than
+    /// advisory. The `cached → central-free` flush deliberately sets the free bit before
+    /// clearing the cached one (free-bit-first, so the lock-free oracle never has a blind
+    /// instant), and that momentary overlap lives entirely inside the span lock — so a
+    /// checker holding the lock cannot observe it. The two lock-free transitions that run
+    /// concurrently with this check only ever *narrow* the sets: `try_mark_cached` marks
+    /// an object that is not central-free, and `unmark_cached` clears.
+    ///
+    /// Total + side-effect-free; the runtime counterpart of the §16.4 residency clause.
+    pub fn cached_and_central_free_are_disjoint(&self) -> bool {
+        let _guard = self.lock();
+        let words = self.free_bitmap.active_words();
+        for w in 0..words {
+            let free = self.free_bitmap.word(w).load(Ordering::Relaxed);
+            let cached = match self.cached_bitmap.word(w) {
+                Some(c) => c.load(Ordering::Relaxed),
+                None => 0,
+            };
+            if free & cached != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Appendix B (W6/W18-3, §16.4): **no object of this span is simultaneously
+    /// cache-resident and quarantined**. The companion to
+    /// [`cached_and_central_free_are_disjoint`](Self::cached_and_central_free_are_disjoint)
+    /// over the third residency set, and the one that pins the claim-release half of the
+    /// shared-claim rule: the cached bit is taken before the free's route is chosen, so
+    /// every path that ends the free early — including the double-free *detections* in
+    /// `maybe_quarantine_small` — has to give it back. An exit that returned while still
+    /// holding the mark would leave the object in both sets at once with no front-end
+    /// slot holding it, inflating `cached_count` until something unrelated cleared it.
+    ///
+    /// Checked **under the span lock**, exactly as its companion and for the same reason.
+    /// The `cached → quarantined` handoff sets the quarantined bit before clearing the
+    /// cached one (quarantined-bit-first, mirroring free-bit-first), and that deliberate
+    /// momentary overlap lives inside the lock, so a checker holding the lock cannot
+    /// observe it.
+    ///
+    /// Total + side-effect-free. Vacuously `true` without the `quarantine` feature,
+    /// where there is no quarantined set to overlap (the bitmap is not even built).
+    pub fn cached_and_quarantined_are_disjoint(&self) -> bool {
+        #[cfg(feature = "quarantine")]
+        {
+            let _guard = self.lock();
+            let words = self.free_bitmap.active_words();
+            for w in 0..words {
+                let quarantined = self.quarantined_bitmap.word(w).load(Ordering::Relaxed);
+                let cached = match self.cached_bitmap.word(w) {
+                    Some(c) => c.load(Ordering::Relaxed),
+                    None => 0,
+                };
+                if quarantined & cached != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether object `i` has been freed and is **awaiting reuse** — either sitting in
+    /// the central free list ([`is_central_free`](Self::is_central_free)) or held in a
+    /// front-end cache ([`is_cached`](Self::is_cached)).
+    ///
+    /// This, not `is_central_free` alone, is the W8 liveness probe the public
+    /// `owns`/`usable_size`/`realloc`/`resize_in_place` surface needs once the W6 front
+    /// end is live: a freed object that a per-CPU slot is holding never reaches the
+    /// central bitmap, so `is_central_free` would report it as a live allocation.
+    /// Advisory in exactly the same way as its two components (see `is_central_free`) —
+    /// exact when the caller owns the object or the span is quiescent.
+    ///
+    /// **The load order is load-bearing, not incidental.** Free-bit-first makes the
+    /// *predicate* `cached || central_free` true at every instant of the `cached →
+    /// central-free` flush — but two separate loads do not evaluate it at an instant. Read
+    /// central first and a reader can straddle the transition: central reads `false`
+    /// (pre-flush), the flush then sets central and clears cached, and cached reads `false`
+    /// (post-flush). Both loads are individually accurate and the conjunction is still
+    /// wrong, so a second free would sail past this check and re-cache an object that is
+    /// already central-free — vending one address to two callers, the exact corruption
+    /// §29.3 detection exists to prevent.
+    ///
+    /// Reading **cached first** closes it. `cached == false` at `t1` implies
+    /// `central_free == true` at `t1` (free-bit-first clears cached only *after* setting
+    /// the free bit), and the free bit is cleared only by `remove_batch` — a legitimate
+    /// re-vend under the span lock. So observing both false means a re-vend happened
+    /// between the loads, i.e. the pointer now belongs to another caller: a stale-pointer
+    /// free, which this method's callers exclude by contract and which the pre-front-end
+    /// `central_insert` test-and-set could not detect either.
+    ///
+    /// **The load order is necessary but not sufficient**, and the missing half is
+    /// ordering, not sequencing. "Free-bit-first clears cached only after setting the free
+    /// bit" is a statement about the flushing core's *program* order; the two bits are
+    /// independent locations, so on a weakly ordered target (the supported AArch64 build)
+    /// another core may observe the clear before the set even though this core issued them
+    /// the other way round. Relaxed on both sides therefore reopens exactly the straddle
+    /// the load order closes. What rules it out is the release/acquire pair:
+    /// [`CachedBits::clear`] releases and [`CachedBits::contains`] acquires, so observing
+    /// `cached == false` *happens-after* the free bit was set and the following
+    /// `is_central_free` load cannot miss it. Pinned by
+    /// `cached_to_central_flush_is_ordered_for_a_lock_free_reader`.
+    #[inline]
+    pub fn is_free_awaiting_reuse(&self, i: usize) -> bool {
+        self.is_cached(i) || self.is_central_free(i)
+    }
+
     /// Whether object `i` is currently **quarantined** (W18-3, §29.4) — a lock-free
     /// read of the quarantined bitmap, the authoritative double-free marker for a held
     /// object. Sound to read lock-free on the free path because the drain transitions
@@ -870,11 +1230,17 @@ impl SpanDescriptor {
     /// Always `false` without the `quarantine` feature (the bitmap does not exist).
     /// Distinct from the whole-span [`is_quarantined`](Self::is_quarantined) flag — this
     /// is the per-**object** W18-3 state.
+    ///
+    /// Program order alone does not carry that guarantee to another core: the drain's two
+    /// stores are independent locations, so on a weakly ordered target the clear may land
+    /// first and a reader see neither bit. The **acquire** load here pairs with the
+    /// drain's release clear ([`FreeBitmap::remove_release`]) to order them — the same
+    /// pairing the front-end residency bit uses (see [`CachedBits::clear`]).
     #[inline]
     pub fn is_object_quarantined(&self, i: usize) -> bool {
         #[cfg(feature = "quarantine")]
         {
-            self.quarantined_bitmap.contains(i)
+            self.quarantined_bitmap.contains_acquire(i)
         }
         #[cfg(not(feature = "quarantine"))]
         {
@@ -923,7 +1289,7 @@ impl SpanDescriptor {
     }
 
     /// Conservation law where `live_count` includes all objects removed from
-    /// central (including those held in CPU/transfer/thread caches). Correct
+    /// central (including those held in the per-CPU and transfer caches). Correct
     /// as long as cache layers do not separately track per-span residency.
     #[inline]
     pub fn conservation_holds_central_only(&self) -> bool {
@@ -938,7 +1304,7 @@ impl SpanDescriptor {
 
     /// Empty predicate where `live_count` includes cached objects. A span is
     /// empty only when all objects have been returned to central (`live_count == 0`
-    /// and `central_free == object_count`). Objects in CPU/transfer/thread caches
+    /// and `central_free == object_count`). Objects in the per-CPU and transfer caches
     /// keep `live_count > 0`, preventing false-positive empty detection.
     #[inline]
     pub fn is_empty_central_only(&self) -> bool {
@@ -947,10 +1313,9 @@ impl SpanDescriptor {
 
     /// Reconstruct the non-central residency terms for this span.
     ///
-    /// Currently returns `NONE`: `live_count` already includes objects held in
-    /// CPU, transfer, and thread caches (they are counted as "removed from
-    /// central"), so the conservation law holds without explicit non-central
-    /// terms. If a future milestone redefines `live_count` to mean "in
+    /// Currently returns `NONE`: `live_count` already includes objects held in the
+    /// per-CPU and transfer caches (they are counted as "removed from central"), so
+    /// the conservation law holds without explicit non-central terms. If a future milestone redefines `live_count` to mean "in
     /// application code only" (excluding cached objects), this method must
     /// return actual cache/quarantine counts and all call sites using
     /// `NonCentralResidency::NONE` must migrate.
@@ -1143,15 +1508,17 @@ impl SpanGuard<'_> {
     /// W18-3 (§29.4): clear object `i`'s **quarantined** bit (the second half of the
     /// drain transition; the first half — `central_insert`, setting the free bit — MUST
     /// run first under this same lock so a lock-free `is_quarantined || is_central_free`
-    /// check never sees a gap). A no-op when not quarantined (so the normal free path
-    /// may call it unconditionally). `true` if a bit was cleared.
+    /// check never sees a gap — and the clear is a **release** so that ordering is what
+    /// another core observes, not merely what this one executes). A no-op when not
+    /// quarantined (so the normal free path may call it unconditionally). `true` if a bit
+    /// was cleared.
     #[cfg(feature = "quarantine")]
     #[inline]
     pub fn clear_quarantined(&self, i: usize) -> bool {
         if i >= self.span.object_count() as usize {
             return false;
         }
-        self.span.quarantined_bitmap.remove(i)
+        self.span.quarantined_bitmap.remove_release(i)
     }
 
     /// Whether object `i` is quarantined (consistent under the lock).
@@ -1836,14 +2203,21 @@ mod tests {
         // fixed, compact size for every class — a 32-byte control block (inline
         // 2-word bitmap + out-of-line pointer + word counts) plus a 64-byte header.
         assert_eq!(core::mem::size_of::<FreeBitmap>(), 32);
-        // The default/`performance` descriptor is 104 bytes; a `quarantine` build adds
-        // exactly one more `FreeBitmap` (the §29.4 per-object quarantined state, W18-3).
+        // W6 (§16.4): the front-end residency bits are **always out-of-line** — one
+        // pointer + capacity, not a second hybrid bitmap — precisely so wiring the
+        // per-CPU cache costs 16 bytes per descriptor instead of 32 and both budgets below stand
+        // unchanged. The front end reaches these bits on a path that already walks the
+        // pagemap, so the extra (metadata-resident) load is free in practice.
+        assert_eq!(core::mem::size_of::<CachedBits>(), 16);
+        // The default/`performance` descriptor is 120 bytes (104 + the W6 residency
+        // bits); a `quarantine` build adds exactly one more `FreeBitmap` (the §29.4
+        // per-object quarantined state, W18-3).
         #[cfg(not(feature = "quarantine"))]
-        assert_eq!(core::mem::size_of::<SpanDescriptor>(), 104);
+        assert_eq!(core::mem::size_of::<SpanDescriptor>(), 120);
         #[cfg(feature = "quarantine")]
         assert_eq!(
             core::mem::size_of::<SpanDescriptor>(),
-            104 + core::mem::size_of::<FreeBitmap>()
+            120 + core::mem::size_of::<FreeBitmap>()
         );
         // The old design carried a 128-byte inline bitmap in *every* descriptor; the
         // hybrid is well under that whatever the class (plus one bitmap for quarantine).

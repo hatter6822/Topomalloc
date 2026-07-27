@@ -290,12 +290,21 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
 
         let mut plan = Rebalancer::plan(&pressures[..self.n_nodes], &topo)?;
         let src = plan.src.0 as usize;
-        let donor_free = pressures[src].free_bytes;
-        // Keep everything below the move; release the move's worth of empty hugepages.
-        let keep = donor_free.saturating_sub(plan.bytes);
-        let reserve_hugepages = (keep / HUGEPAGE_SIZE as u64) as usize;
+        // Release the move's worth of the donor's empty hugepages, bounded **in bytes**.
+        //
+        // `plan.bytes` is the donor's `movable_surplus` (`free − own demand`) — the whole
+        // point of which is that releasing it cannot strand the donor. That bound is a
+        // byte figure, and it must stay one: an empty hugepage's committed footprint is
+        // anywhere in `(0, HUGEPAGE_SIZE]` (a packed-then-emptied one is only partially
+        // committed), so a hugepage **count** cannot express it. Rounding the count up
+        // overshoots — two empties committed 1.5 MiB each against a 1 MiB surplus round to
+        // one whole hugepage and release 1.5 MiB, taking 0.5 MiB the donor's own demand
+        // needed — and rounding down forfeits every release smaller than a hugepage even
+        // when the real footprints would have fit. `release_empty_within_bytes` selects on
+        // each hugepage's actual committed count instead, so the release is exactly within
+        // surplus and the no-stranding guarantee survives contact with partial commitment.
         let released = match self.backend(src) {
-            Some(b) => b.release_empty_excess(reserve_hugepages) as u64,
+            Some(b) => b.release_empty_within_bytes(plan.bytes) as u64,
             None => 0,
         };
         plan.bytes = released;

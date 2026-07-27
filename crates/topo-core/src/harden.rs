@@ -47,6 +47,67 @@ use crate::lock::{LockRank, RankedLock};
 use crate::sampling::SampleBloom;
 use crate::span::SpanDescriptor;
 
+// ---------------------------------------------------------------------------
+// Process entropy for the randomized security samplers (§29.4/§29.5)
+// ---------------------------------------------------------------------------
+
+/// Per-process entropy the randomized *security* samplers seed from — the W18-4
+/// guarded-allocation coin and the W18-3 quarantine's sampling / random eviction.
+///
+/// **Why this exists.** Both samplers document unpredictability as the property that
+/// makes them useful: an attacker who can predict which allocations are guarded simply
+/// avoids those slots, and one who can predict the eviction order can force an early
+/// reuse. A compile-time constant seed gives the *same* stream in every process of the
+/// same binary, so the sequence is public — exactly the weakness the "randomized, not a
+/// fixed stride" design exists to remove. The host installs real OS entropy here once at
+/// start-up; until it does, the samplers keep their build-time constant (no worse than
+/// before, and still correct).
+///
+/// `topo-core` stays `no_std`, so entropy is **pushed in** rather than read: the hosted
+/// shell (`topo-abi`) calls [`set_process_entropy`] from its initializer, and a
+/// kernel/seLe4n embedder calls it with whatever its platform provides. Deterministic
+/// mode (§30.4) overrides it afterwards through `Allocator::apply_deterministic_seed`,
+/// so a seeded replay stays reproducible.
+///
+/// `0` means "not installed" (the sentinel).
+static PROCESS_ENTROPY: AtomicU64 = AtomicU64::new(0);
+
+/// Install this process's entropy for the randomized security samplers. The last writer
+/// wins; safe to call before or after the allocator exists (a sampler built later reads
+/// it, and a live one is re-seeded by
+/// [`Allocator::seed_security_samplers`](crate::Allocator::seed_security_samplers)).
+///
+/// A `0` value is ignored — it is the "not installed" sentinel.
+#[inline]
+pub fn set_process_entropy(value: u64) {
+    if value != 0 {
+        PROCESS_ENTROPY.store(value, Ordering::Relaxed);
+    }
+}
+
+/// The installed process entropy, or `0` when the host installed none.
+#[inline]
+#[must_use]
+pub fn process_entropy() -> u64 {
+    PROCESS_ENTROPY.load(Ordering::Relaxed)
+}
+
+/// A non-zero RNG seed for `domain_salt` derived from the installed process entropy, or
+/// `None` when none was installed (the caller keeps its build-time seed).
+///
+/// Uses the same SplitMix64 mix as the deterministic-mode `domain_seed`, so distinct
+/// salts give decorrelated streams and the entropy is not recoverable from one stream.
+#[inline]
+#[must_use]
+pub fn entropy_seed(domain_salt: u64) -> Option<u64> {
+    let e = process_entropy();
+    if e == 0 {
+        return None;
+    }
+    let mixed = crate::deterministic::mix_seed(e, domain_salt);
+    Some(if mixed == 0 { 0x1 } else { mixed })
+}
+
 /// Byte written over freshly-allocated user memory in junk-fill builds (§29.6),
 /// so reading it before initialisation is obvious. Mirrors jemalloc's `0xa5`
 /// intent with a distinct value.
@@ -653,17 +714,26 @@ impl Quarantine {
             .store(if seed == 0 { 0x1 } else { seed }, Ordering::Relaxed);
     }
 
-    /// Next xorshift value (for sampling / random eviction).
+    /// Next xorshift value (for sampling / random eviction). See
+    /// [`GuardSampler::next_rng`] for why this is a CAS and not a relaxed
+    /// load-compute-store: a draw must never resurrect a seed a concurrent
+    /// [`set_seed`](Self::set_seed) replaced.
     #[inline]
     fn next_rng(&self) -> u64 {
-        // A relaxed read-modify-write loop is fine: we only need a fast,
-        // decorrelated stream, not a strict sequence.
-        let mut x = self.rng.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng.store(x, Ordering::Relaxed);
-        x
+        let mut cur = self.rng.load(Ordering::Relaxed);
+        loop {
+            let mut x = cur;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match self
+                .rng
+                .compare_exchange_weak(cur, x, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return x,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Whether sampling admits this free (`sample_shift == 0` ⇒ always).
@@ -898,13 +968,24 @@ impl Default for Quarantine {
 /// Sampling is **randomized**, not a fixed 1-in-`rate` stride: a deterministic stride
 /// is predictable (an attacker who learns `rate` can avoid the guarded slots by
 /// counting allocations), defeating the probabilistic detection W18-4 is for. An
-/// independent per-allocation coin (GWP-ASan style) is unpredictable and still yields
-/// the same expected ~1/`rate` density.
+/// independent per-allocation coin (GWP-ASan style) still yields the same expected
+/// ~1/`rate` density.
+///
+/// Randomized is not the same as unpredictable, and the difference is the whole point:
+/// the stream is only unpredictable once it is seeded from **per-process entropy**. The
+/// `const` seed below is a placeholder — identical in every process of a given binary,
+/// so an attacker with the binary can compute the guarded slots exactly. The host must
+/// install entropy with [`set_process_entropy`] and call
+/// [`Allocator::seed_security_samplers`](crate::Allocator::seed_security_samplers)
+/// during start-up (`topo-abi` does this in its initializer); deterministic mode
+/// (§30.4) then re-seeds from the explicit global seed so a replay stays reproducible.
 pub struct GuardSampler {
     rate: AtomicU64,
     /// xorshift64 state — a fast, decorrelated stream for the per-allocation coin.
     /// Seeded non-zero (xorshift64 never leaves the non-zero orbit), distinct from
-    /// the quarantine's seed so the two samplers are uncorrelated.
+    /// the quarantine's seed so the two samplers are uncorrelated. The build-time value
+    /// is a **placeholder**: it is the same in every process, so unpredictability only
+    /// begins once the host re-seeds from [`process_entropy`] (see the type docs).
     rng: AtomicU64,
 }
 
@@ -941,17 +1022,38 @@ impl GuardSampler {
             .store(if seed == 0 { 0x1 } else { seed }, Ordering::Relaxed);
     }
 
-    /// Next xorshift value — a relaxed read-modify-write (a fast, decorrelated
-    /// stream is all sampling needs, not a strict sequence; a lost update under a
-    /// race merely re-uses a value, never biasing toward guarding).
+    /// Next xorshift value — a **CAS** read-modify-write.
+    ///
+    /// Sampling itself would be happy with a relaxed load-compute-store: a lost update
+    /// merely re-uses a value, never biasing toward guarding. Reseeding is not, and it
+    /// shares this word. A relaxed draw is a load, a computation and a *separate* store,
+    /// so a draw that read the old state before [`set_seed`](Self::set_seed) can land its
+    /// derived successor *after* it and overwrite the new seed — putting the stream back
+    /// on the one it was just moved off. That is a security property, not a statistical
+    /// one: it is exactly how [`disable_deterministic`](crate::deterministic) re-arms
+    /// §29.4/§29.5 unpredictability, and how a fork re-seeds the child away from the
+    /// parent's stream, so a silently-lost reseed leaves the guarded slots publicly
+    /// computable while the API reports otherwise. The CAS makes a draw that raced a
+    /// reseed re-read it instead, which is all the linearizability the seam needs.
+    ///
+    /// Cost lands only where sampling is on: [`sampled`](Self::sampled) returns before
+    /// this call when `rate == 0` (the default), so the off path is unchanged.
     #[inline]
     fn next_rng(&self) -> u64 {
-        let mut x = self.rng.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng.store(x, Ordering::Relaxed);
-        x
+        let mut cur = self.rng.load(Ordering::Relaxed);
+        loop {
+            let mut x = cur;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match self
+                .rng
+                .compare_exchange_weak(cur, x, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return x,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Whether to guard the next allocation **by sampling** (an explicit request is
@@ -980,6 +1082,92 @@ impl Default for GuardSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reseed must not be silently undone by a draw that raced it.
+    ///
+    /// The draw is a read-modify-write over the same word `set_seed` writes. As a
+    /// relaxed load-compute-store those are three separate steps, so a draw that read
+    /// the old state before a reseed can land its derived successor *after* it — putting
+    /// the stream straight back on the one the reseed just moved it off. That is a
+    /// security property: it is how disabling deterministic mode re-arms §29.4/§29.5
+    /// unpredictability and how a fork moves the child off the parent's stream, so a lost
+    /// reseed leaves the guarded slots publicly computable while the API reports
+    /// otherwise.
+    ///
+    /// Detected here as **lost updates**, which is the same defect viewed from the other
+    /// side: a CAS makes every draw advance the state exactly once, so `T × N` draws
+    /// return `T × N` distinct values (xorshift64's period is `2^64 − 1`, so a repeat
+    /// within a few hundred thousand steps is a lost update, not the orbit closing). A
+    /// relaxed load-compute-store lets two threads read the same state and return the
+    /// same successor — and the store that wins is precisely the one that can clobber a
+    /// concurrent seed.
+    #[test]
+    fn a_draw_cannot_clobber_a_concurrent_reseed() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        const THREADS: usize = 8;
+        const DRAWS: usize = 20_000;
+
+        for sampler in 0..2 {
+            let guard = Arc::new(GuardSampler::new());
+            let quar = Arc::new(Quarantine::new());
+            guard.set_rate(1); // `sampled()` short-circuits at rate 0/1, so draw directly
+            let seen: Vec<Vec<u64>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let g = Arc::clone(&guard);
+                        let q = Arc::clone(&quar);
+                        s.spawn(move || {
+                            (0..DRAWS)
+                                .map(|_| {
+                                    if sampler == 0 {
+                                        g.next_rng()
+                                    } else {
+                                        q.next_rng()
+                                    }
+                                })
+                                .collect::<Vec<u64>>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let all: HashSet<u64> = seen.iter().flatten().copied().collect();
+            assert_eq!(
+                all.len(),
+                THREADS * DRAWS,
+                "sampler {sampler}: {} of {} draws were lost updates — the draw is not \
+                 atomic, so it can also overwrite a concurrent reseed",
+                THREADS * DRAWS - all.len(),
+                THREADS * DRAWS,
+            );
+        }
+    }
+
+    /// The reseed itself: whatever a concurrent draw does, the *stream* after a
+    /// `set_seed` is the one the new seed determines. Single-threaded pin of the
+    /// contract the test above defends under contention.
+    #[test]
+    fn a_reseed_determines_the_stream_that_follows_it() {
+        let a = GuardSampler::new();
+        let b = GuardSampler::new();
+        a.set_seed(0xFEED_FACE_CAFE_BEEF);
+        // `b` walks a different stream first, then adopts the same seed.
+        b.set_seed(0x0123_4567_89AB_CDEF);
+        for _ in 0..64 {
+            b.next_rng();
+        }
+        b.set_seed(0xFEED_FACE_CAFE_BEEF);
+        for i in 0..64 {
+            assert_eq!(a.next_rng(), b.next_rng(), "streams diverged at draw {i}");
+        }
+        // A zero seed is coerced onto the non-zero orbit (xorshift64 never leaves it).
+        let z = GuardSampler::new();
+        z.set_seed(0);
+        assert_ne!(z.next_rng(), 0);
+    }
 
     #[test]
     fn patterns_are_distinct_and_nonzero() {

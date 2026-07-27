@@ -138,7 +138,15 @@ exclude = ["fuzz", "vendor/sele4n"]
 # acceptance; (4) LeakSanitizer on the real-allocator C-ABI pass + xtask/lsan-suppressions.txt;
 # (5) a debug-checks pass over the integration suite (topo-tests debug-checks feature) so the
 # engine sweeps run in CI over real sequences. Patch bump (0.x: new back-compat work).
-version = "0.2.0"
+# 0.3.0: full-tree audit pass. A **minor** bump, not the default patch: the 0.x minor is
+# the breaking axis and this removes public items (`overflow::{is_aligned, hugepage_round}`,
+# `sampling::refresh_bloom`, `HugePageFiller::{bin_len, first_in_bin}`,
+# `ReleaseController::set_config`, `CacheBudget::set_global_budget`,
+# `AllocationSiteProfile::size_distribution`, `Allocator::span_committed_bytes`,
+# `Allocator::large_backing` — all with zero call sites), adds the `ArenaError::HasLiveChildren`
+# variant, and changes `topo_stats::redact_summary`'s signature (its `all_visible` flag was a
+# covert channel). See the "Full-tree audit pass" section of CLAUDE.md for the defects fixed.
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

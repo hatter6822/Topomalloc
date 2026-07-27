@@ -138,15 +138,25 @@ pub fn set_sharded(enable: bool) {
     let _ = SHARD_MODE.compare_exchange(0, mode, Ordering::Release, Ordering::Relaxed);
 }
 
-/// Auto-detect: enable sharding iff a cheap per-CPU id is available right now.
-/// Convenience wrapper the global initializer calls.
+/// Auto-detect: enable sharding iff *some* cheap per-thread-or-CPU spreading key is
+/// available right now. Convenience wrapper the global initializer calls.
+///
+/// This deliberately does **not** require the RSEQ CPU id. `rseq::current_cpu()` answers
+/// `-1` until `rseq::enable()` has run, which the production wiring never does — so
+/// probing on it alone latched `MODE_SINGLE` permanently (the mode is a one-shot CAS) and
+/// every `malloc`/`free` in the process hammered `SHARDS[0]`: exactly the single contended
+/// cacheline the sharding exists to remove, with the other 63 shards dead. The per-thread
+/// key below is a sound substitute: the shard is only a *spreading* choice — an
+/// [`OperationGuard`] records the shard it incremented and decrements that same one, so a
+/// thread that migrates (or shares a shard with another) is still correct, and
+/// [`prefork`] sets the fork bit in **every** shard before draining any.
 pub fn probe_and_set_sharding() {
-    set_sharded(topo_arch::rseq::current_cpu() >= 0);
+    set_sharded(topo_arch::rseq::current_cpu() >= 0 || shard::thread_key().is_some());
 }
 
-/// The shard index for the current operation: the running CPU's shard when
-/// sharded (and a CPU id is readable), else shard 0. A relaxed read of the mode;
-/// any value yields a *valid* shard, so this is always correct.
+/// The shard index for the current operation: the running CPU's shard when sharded and a
+/// CPU id is readable, else this thread's stable key, else shard 0. A relaxed read of the
+/// mode; **any** value yields a valid shard, so this is always correct.
 #[inline]
 fn shard_index() -> usize {
     if SHARD_MODE.load(Ordering::Relaxed) == MODE_SHARDED {
@@ -154,8 +164,65 @@ fn shard_index() -> usize {
         if cpu >= 0 {
             return (cpu as usize) & (NUM_SHARDS - 1);
         }
+        if let Some(k) = shard::thread_key() {
+            return k & (NUM_SHARDS - 1);
+        }
     }
     0
+}
+
+/// A stable per-thread spreading key for [`shard_index`], used when no cheap per-CPU id is
+/// available. Costs one Local-Exec TLS read on the hot path (the same class of access the
+/// re-entrancy depth already makes).
+#[cfg(any(test, feature = "std"))]
+pub(crate) mod shard {
+    use core::cell::Cell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Hands out a distinct key per thread. Wrapping is harmless — the key only spreads.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    std::thread_local! {
+        /// `0` = unassigned; the stored value is `key + 1` so the `const` initializer stays
+        /// allocation-free and needs no `Option`.
+        static KEY: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// This thread's key, assigned on first use.
+    ///
+    /// Shared with the W6 front end ([`CpuCache::current_core`](crate::cpu_cache::CpuCache::current_core)),
+    /// which needs the same "cheap, stable, well-spread per-thread integer" when no
+    /// per-CPU id is readable. One TLS slot serves both, and a thread's fork shard and
+    /// its cache core then agree — the two hot-path spreading decisions stay correlated
+    /// instead of interleaving independently.
+    #[inline]
+    pub(crate) fn thread_key() -> Option<usize> {
+        KEY.try_with(|k| {
+            let v = k.get();
+            if v != 0 {
+                return v - 1;
+            }
+            // Golden-ratio stride so consecutive threads land on distinct shards rather
+            // than clustering on the low ones.
+            let assigned = NEXT
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9);
+            k.set(assigned.wrapping_add(1));
+            assigned
+        })
+        .ok()
+    }
+}
+
+#[cfg(not(any(test, feature = "std")))]
+pub(crate) mod shard {
+    /// No thread-local without `std`: the gate runs single-shard, which is always correct
+    /// (a `no_std` kernel profile typically has a real per-CPU id anyway). The W6 front
+    /// end falls back to core 0 for the same reason.
+    #[inline(always)]
+    pub(crate) fn thread_key() -> Option<usize> {
+        None
+    }
 }
 
 /// Sentinel shard for a **nested** guard: it owns no shard slot (the *outer*
@@ -327,6 +394,22 @@ pub fn prefork() {
     while total_in_flight() != 0 {
         core::hint::spin_loop();
     }
+    // **Exempt the forking thread for the rest of the window.** The fork-pending bit is
+    // cleared only by `postfork_parent`/`postfork_child`, both of which run on *this*
+    // thread — so if this thread itself entered a first-level guard before then, it
+    // would park on its own bit and never reach the code that clears it. That is not
+    // hypothetical: `pthread_atfork` runs a *chain* of handlers, and any other library's
+    // handler ordered between ours (a `prepare` registered before ours, or a
+    // `child`/`parent` registered before ours, since child/parent handlers run in
+    // registration order) commonly calls `malloc`/`strdup` to re-init its state.
+    //
+    // Raising the per-thread depth makes every such allocation *nested*: it takes no
+    // shard slot and skips the fork check, exactly like an arena op that re-enters
+    // `malloc`. That is sound precisely here — the drain has completed, so no other
+    // thread is inside an operation, and after the fork the child has only this thread.
+    // Unwound by `postfork_parent`; the child's `postfork_child` resets the depth
+    // outright.
+    let _ = reentry::enter();
 }
 
 /// Parent post-fork handler (§28.1): clear the fork-pending bit in every shard and
@@ -339,6 +422,8 @@ pub fn postfork_parent() {
     for s in &SHARDS {
         s.0.fetch_and(COUNT_MASK, Ordering::Release);
     }
+    // Unwind the forking-thread exemption `prefork` took (see there).
+    reentry::leave();
     FORK_LOCK.release();
 }
 
@@ -367,8 +452,9 @@ pub fn postfork_child() {
     // The forking thread held the fork lock (rank 0) at fork; clear the inherited
     // held-rank snapshot so the checker starts clean in the child.
     reset_lock_checker();
-    // Clear the inherited operation-nesting depth (the forking thread was not in an
-    // operation, so this is normally already 0 — defensive).
+    // Clear the operation-nesting depth: it carries `prefork`'s forking-thread
+    // exemption (+1) plus anything the inherited context had. The child is
+    // single-threaded and past the window, so it starts clean at zero.
     reentry::reset();
     // Disable background maintenance until the host re-arms it (§28.1).
     BACKGROUND_ENABLED.store(false, Ordering::Release);
@@ -481,6 +567,59 @@ mod tests {
         // Tolerate a poisoned lock (a prior test panicked): the gate state is reset
         // per test, so the data is not actually corrupted for our purposes.
         GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The **forking thread** must be able to allocate inside its own fork window.
+    ///
+    /// `pthread_atfork` runs a *chain* of handlers: another library's `prepare` handler
+    /// registered before ours, or its `parent`/`child` handler registered before ours
+    /// (child/parent handlers run in registration order), commonly calls
+    /// `malloc`/`strdup` to re-initialize its state — and that call lands between our
+    /// `prefork()` and `postfork_*()`. The fork-pending bit is cleared only by
+    /// `postfork_*`, which runs on this same thread, so a first-level guard here would
+    /// park on a bit only it can clear: a permanent single-thread hang at 100% CPU.
+    /// `prefork` therefore exempts the forking thread, and this pins it. A regression
+    /// hangs, so a watchdog aborts and the test fails loudly rather than stalling CI.
+    #[test]
+    fn the_forking_thread_can_allocate_inside_its_own_fork_window() {
+        let _serialize = serialize();
+        let done = Arc::new(StdAtomicBool::new(false));
+        let watch = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if done.load(StdOrdering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                eprintln!(
+                    "fork-gate watchdog: the forking thread parked on its own fork window \
+                     (an atfork-chain allocation would hang the process)"
+                );
+                std::process::abort();
+            })
+        };
+
+        prefork();
+        assert!(fork_in_progress(), "the window is open");
+        // This is what a sibling atfork handler's `malloc` does. It must be admitted.
+        {
+            let g = operation_guard();
+            // Nested inside it too (an arena/control op re-entering the allocator).
+            let inner = operation_guard();
+            drop(inner);
+            drop(g);
+        }
+        postfork_parent();
+        assert!(!fork_in_progress(), "the window closed");
+        assert_eq!(in_flight_operations(), 0, "the gate is idle again");
+        // The exemption was unwound: an ordinary guard is first-level again, so the next
+        // fork's drain still counts and waits for it.
+        assert_eq!(reentry::depth(), 0, "prefork's exemption leaked");
+
+        done.store(true, StdOrdering::Release);
+        watch.join().unwrap();
     }
 
     /// The re-entrancy-safety property (the deadlock this gate's depth tracking
@@ -762,6 +901,58 @@ mod tests {
         assert!(!fork_in_progress());
         // The gate is usable afterward.
         let _g = operation_guard();
+    }
+
+    #[test]
+    fn sharding_spreads_threads_without_an_rseq_cpu_id() {
+        // Regression: `probe_and_set_sharding` used to require an RSEQ CPU id, which the
+        // production wiring never enables — so the one-shot mode CAS latched
+        // `MODE_SINGLE` forever and every operation in the process contended `SHARDS[0]`,
+        // the exact cacheline the sharding exists to remove. The per-thread key must make
+        // the probe succeed and spread concurrent threads across shards.
+        let _serialize = serialize();
+        assert!(
+            shard::thread_key().is_some(),
+            "a hosted build always has a per-thread spreading key"
+        );
+        // The probe succeeds even with no CPU id available.
+        probe_and_set_sharding();
+
+        // Concurrent threads must not all land on shard 0.
+        //
+        // Asserted on the **key** path specifically, which is the one this test is named
+        // for. `shard_index` prefers a real `rseq::current_cpu()` when one is available,
+        // and RSEQ registration is process-global — another test in this binary enabling
+        // it flips this thread onto the CPU path, where 8 short-lived threads on a small
+        // host can genuinely share a core and legitimately collide. Reading the key
+        // directly keeps the regression this test exists for (the probe must succeed, and
+        // the key must spread, with no CPU id in the picture) without depending on
+        // global state no test here controls.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let key = shard::thread_key().expect("a hosted build has a key");
+                    let idx = key & (NUM_SHARDS - 1);
+                    seen.lock().unwrap().insert(idx);
+                    // And the composed index is in range and stable within a thread, so a
+                    // guard always unwinds the shard it incremented — whichever path it
+                    // took to get there.
+                    let composed = shard_index();
+                    assert!(composed < NUM_SHARDS, "shard index in range");
+                    assert_eq!(composed, shard_index(), "the per-thread index is stable");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let distinct = seen.lock().unwrap().len();
+        assert!(
+            distinct > 1,
+            "8 threads all landed on one shard ({distinct} distinct) — no spreading"
+        );
     }
 
     #[test]

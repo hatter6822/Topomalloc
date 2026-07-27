@@ -19,9 +19,9 @@ use crate::global;
 /// spans (B.1/B.3), and the arena registry (B.5). Returns `1` if every invariant
 /// holds (and `1` vacuously when no allocator has been created yet), `0` if a
 /// violation is detected. O(state) and lock-acquiring — for diagnostics and tests,
-/// not a hot path. The per-CPU/transfer/thread cache layer (B.2) is not owned by
-/// the engine at M1, so it is checked by its own `check_invariants` methods rather
-/// than here.
+/// not a hot path. Since W6 the engine owns the front end, so the B.2 cache group —
+/// the per-CPU slots, the transfer bins, and the per-span cached↔central-free
+/// disjointness the double-free oracle rests on — is checked here too.
 #[no_mangle]
 pub extern "C" fn topomalloc_debug_check_now() -> c_int {
     global().map_or(1, |a| a.check_invariants() as c_int)

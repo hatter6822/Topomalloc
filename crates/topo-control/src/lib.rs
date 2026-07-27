@@ -75,7 +75,29 @@ impl Control {
                     .to_string(),
             ),
             "topo.quarantine.bytes" => Some(self.stats.quarantine_bytes.to_string()),
+            // §16.4 front-end residency (plan 05 W6/W7): bytes the per-CPU slots and the
+            // transfer cache hold. Their own byte class — freed by the application (so
+            // out of `live_bytes`) but not yet in the central bitmap (so out of
+            // `central_free_bytes`) — and the quantity the §21.3 "drain caches" rung
+            // returns. `topo.cache.bytes` is the total an operator usually wants.
+            "topo.cache.bytes" => Some(
+                self.stats
+                    .per_cpu_bytes
+                    .saturating_add(self.stats.thread_cache_bytes)
+                    .saturating_add(self.stats.transfer_bytes)
+                    .to_string(),
+            ),
+            "topo.cache.per_cpu_bytes" => Some(self.stats.per_cpu_bytes.to_string()),
+            "topo.cache.transfer_bytes" => Some(self.stats.transfer_bytes.to_string()),
+            // W18-4 (§29.5): guard-page `mprotect` refusals. Nonzero means guarded
+            // allocations are being handed out **unprotected** (typically
+            // `vm.max_map_count` exhaustion), so the operator can see the security
+            // downgrade instead of only its absence of effect.
+            "topo.hardening.guard_protect_failures" => {
+                Some(self.stats.guard_protect_failures.to_string())
+            }
             "topo.arena.destroyed" => Some(self.stats.arenas_destroyed.to_string()),
+            "topo.arena.quarantined" => Some(self.stats.arenas_quarantined.to_string()),
             "topo.fragmentation.internal_sampled_bytes" => {
                 Some(self.stats.sampled_internal_fragmentation_bytes.to_string())
             }
@@ -216,7 +238,13 @@ mod tests {
             Some("4000")
         );
         assert_eq!(c.get("topo.quarantine.bytes").as_deref(), Some("0"));
+        assert_eq!(
+            c.get("topo.hardening.guard_protect_failures").as_deref(),
+            Some("0"),
+            "no refusals on a healthy host"
+        );
         assert_eq!(c.get("topo.arena.destroyed").as_deref(), Some("3"));
+        assert_eq!(c.get("topo.arena.quarantined").as_deref(), Some("0"));
         assert_eq!(
             c.get("topo.fragmentation.internal_sampled_bytes")
                 .as_deref(),
@@ -230,6 +258,29 @@ mod tests {
             "explain: {explain}"
         );
         assert!(explain.contains("live"));
+    }
+
+    #[test]
+    fn reads_the_w6_front_end_residency_keys() {
+        // Plan 05 W6/W7: front-end residency is its own §16.4 byte class, and
+        // `topo.cache.bytes` is the total (per-CPU + thread + transfer) an operator reads
+        // to see how much of the heap the caches are holding back from central.
+        let mut c = Control::new(Profile::Performance);
+        c.set_stats(Stats {
+            per_cpu_bytes: 4096,
+            transfer_bytes: 8192,
+            ..Stats::default()
+        });
+        assert_eq!(c.get("topo.cache.per_cpu_bytes").as_deref(), Some("4096"));
+        assert_eq!(c.get("topo.cache.transfer_bytes").as_deref(), Some("8192"));
+        assert_eq!(
+            c.get("topo.cache.bytes").as_deref(),
+            Some("12288"),
+            "the total sums every front-end layer"
+        );
+        // Zero (not absent) when nothing is cached, so a reader can always parse it.
+        let empty = Control::new(Profile::Performance);
+        assert_eq!(empty.get("topo.cache.bytes").as_deref(), Some("0"));
     }
 
     #[test]

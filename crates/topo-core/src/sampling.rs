@@ -425,6 +425,47 @@ impl<const CAP: usize> SampledObjects<CAP> {
         }
     }
 
+    /// Put back a record that was removed for an in-flight realloc which then **failed**
+    /// (§25.1 leaves the original allocation live, so its sample must survive untouched).
+    ///
+    /// Deliberately *not* [`on_alloc`](Self::on_alloc): that path drops the insert once
+    /// the table is at its load cap, which is the right answer for a *new* sample the
+    /// table never held. This record is different — it was already tracked and its object
+    /// is still live, so dropping it silently removes a live allocation from sampled live
+    /// bytes and from its site's lifetime histogram, permanently. The window is real: the
+    /// take frees a slot, and another thread can fill it while the core realloc runs, so
+    /// by the time the restore arrives the table can be back at the cap.
+    ///
+    /// Honouring one insert past the cap is safe because the cap is a *probe-length*
+    /// policy, not the capacity: `max_load == CAP − CAP/8`, so an empty slot always
+    /// exists below `CAP` and the probe terminates. Only a genuinely full table (which
+    /// the cap makes unreachable) declines, and that is counted like any other drop.
+    pub fn on_alloc_restore(&mut self, addr: usize, rec: SampledRecord) -> bool {
+        if addr == 0 {
+            return false;
+        }
+        if self.len >= CAP {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        let mut i = Self::home(addr);
+        loop {
+            let s = &self.slots[i];
+            if s.addr == 0 {
+                self.slots[i] = ObjSlot { addr, rec };
+                self.len += 1;
+                return true;
+            }
+            if s.addr == addr {
+                // The address was re-vended and re-sampled while the realloc was in
+                // flight. The newer record describes the allocation that owns it now, so
+                // it wins; ours is stale and its object is gone by definition.
+                return false;
+            }
+            i = (i + 1) & (CAP - 1);
+        }
+    }
+
     /// Resolve and **remove** the record for `addr`, if present (a sampled object being
     /// freed). `None` if `addr` was not a tracked sample.
     pub fn on_free(&mut self, addr: usize) -> Option<SampledRecord> {
@@ -796,5 +837,77 @@ mod tests {
         // After reset a fresh (never-inserted) address is negative (probabilistically; the
         // all-zero filter is exact).
         assert!(!bloom.maybe_contains(0xABCD_1234));
+    }
+
+    /// W17-3c: a realloc that **fails** must give its sample back, even when the table
+    /// filled up while the realloc was in flight.
+    ///
+    /// `take_for_realloc` frees a slot, and another thread can take that slot before the
+    /// restore lands — so the restore routinely arrives at a table sitting at its 7/8 load
+    /// cap. Routing it through `on_alloc` drops it there, which is right for a *new*
+    /// sample but erases a **live** allocation from sampled live bytes and its site's
+    /// lifetime histogram for good. The restore path must honour it.
+    #[test]
+    fn a_failed_realloc_restores_its_sample_even_at_the_load_cap() {
+        let mut set = SampledObjects::<16>::new();
+        let rec = |n: u64| SampledRecord {
+            stack_id: StackId(7),
+            bytes: n,
+            usable: n,
+            alloc_ms: n,
+        };
+        // Fill to the 7/8 cap (14 of 16).
+        for i in 0..14u64 {
+            assert!(set.on_alloc(0x1_0000 + (i as usize) * 0x100, rec(i)));
+        }
+        assert_eq!(set.len(), 14);
+        assert!(
+            !set.on_alloc(0xDEAD_0000, rec(99)),
+            "the cap drops a new sample, which is the intended bounded loss"
+        );
+
+        // A realloc takes one out...
+        let victim = 0x1_0000;
+        let taken = set.on_free(victim).expect("the victim was tracked");
+        assert_eq!(set.len(), 13);
+        // ...another thread fills the slot it freed, putting the table back at the cap...
+        assert!(set.on_alloc(0xBEEF_0000, rec(42)));
+        assert_eq!(set.len(), 14);
+
+        // ...and the realloc fails, so the original is still live and must come back.
+        // The route the restore used to take drops it here — that is precisely the bug:
+        // `on_alloc` cannot tell a new sample from a returning one, and at the cap it
+        // silently loses a live object's accounting.
+        assert!(
+            !set.on_alloc(victim, taken),
+            "on_alloc drops at the cap — the behaviour the restore path must not inherit"
+        );
+        assert!(
+            set.on_alloc_restore(victim, taken),
+            "a live object's sample was dropped because the table refilled during its \
+             realloc"
+        );
+        assert_eq!(set.len(), 15);
+        let mut found = false;
+        set.for_each(|r| {
+            if r.alloc_ms == 0 && r.stack_id == StackId(7) {
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "the restored record must be visible to the live scan"
+        );
+
+        // A restore whose address was re-vended and re-sampled meanwhile loses to the
+        // newer record: that address belongs to the new allocation now.
+        let newer = set.on_free(0xBEEF_0000).expect("tracked");
+        set.on_free(0x1_0000 + 0x100)
+            .expect("a filler to make room under the cap");
+        assert!(set.on_alloc(0xBEEF_0000, rec(43)));
+        assert!(
+            !set.on_alloc_restore(0xBEEF_0000, newer),
+            "the newer record owns that address now; the stale restore must lose"
+        );
     }
 }

@@ -520,3 +520,61 @@ fn w9_arena_quota_charge_never_exceeds_under_contention() {
         assert_eq!(used.load(Ordering::Acquire), expected);
     });
 }
+
+/// The W6 `cached → central-free` flush ordering (`span.rs`: `CachedBits::clear` /
+/// `CachedBits::contains` vs `FreeBitmap::insert`, consumed by
+/// `SpanDescriptor::is_free_awaiting_reuse`).
+///
+/// A flush moves an object out of a front-end cache and into the central free list by
+/// setting the central free bit and *then* clearing the cached bit — "free-bit-first", so
+/// the lock-free double-free oracle `is_cached || is_central_free` is true at every
+/// instant. A racing second free of the same object reads the two bits in the mirror
+/// order, cached first, and treats either bit as "already freed".
+///
+/// Program order on the flushing core is **not** enough to make that true on another
+/// core: the bits are independent locations, so a weakly ordered target may expose the
+/// clear before the set, and the reader sees neither bit — it then re-marks and re-caches
+/// an object central can also vend, handing one address to two callers (§29.3). Only the
+/// release/acquire pair rules the interleaving out, and that is what this model pins:
+/// swap either side back to `Relaxed` and loom finds the straddle within a few hundred
+/// interleavings.
+#[test]
+fn cached_to_central_flush_is_ordered_for_a_lock_free_reader() {
+    loom::model(|| {
+        // The two per-span bitmaps, one object's bit in each.
+        let central_free = Arc::new(AtomicBool::new(false));
+        let cached = Arc::new(AtomicBool::new(true));
+
+        // The flusher: exactly `insert_batch_inner`'s free-bit-first pair — a relaxed
+        // set of the free bit, then a **release** clear of the cached bit.
+        let flusher = {
+            let (central_free, cached) = (central_free.clone(), cached.clone());
+            thread::spawn(move || {
+                central_free.store(true, Ordering::Relaxed);
+                cached.store(false, Ordering::Release);
+            })
+        };
+
+        // The racing free: `is_free_awaiting_reuse` — **acquire** load of the cached bit
+        // first, then the central bit.
+        let reader = {
+            let (central_free, cached) = (central_free.clone(), cached.clone());
+            thread::spawn(move || {
+                let c = cached.load(Ordering::Acquire);
+                let f = central_free.load(Ordering::Relaxed);
+                c || f
+            })
+        };
+
+        flusher.join().unwrap();
+        let awaiting_reuse = reader.join().unwrap();
+
+        // The object is freed for the whole model, so the oracle must say so under every
+        // interleaving. A `false` here is the blind instant: the second free would sail
+        // past the check and re-cache an already-central-free object.
+        assert!(
+            awaiting_reuse,
+            "double-free oracle observed neither bit across the cached -> central flush"
+        );
+    });
+}

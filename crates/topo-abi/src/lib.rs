@@ -38,8 +38,10 @@ use topo_core::{
 
 mod arena_api;
 mod c_api;
+mod cache_api;
 mod debug_api;
 mod deterministic_api;
+mod entropy;
 mod errno_shim;
 mod extended;
 mod fork_api;
@@ -62,6 +64,10 @@ pub use c_api::{
     topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
     topomalloc_pvalloc, topomalloc_realloc, topomalloc_reallocarray, topomalloc_valloc,
     topomalloc_version,
+};
+pub use cache_api::{
+    topomalloc_cache_budget_tick, topomalloc_cache_flush_all, topomalloc_cache_flush_core,
+    topomalloc_cache_register_thread, topomalloc_cache_rseq_active,
 };
 pub use debug_api::{topomalloc_debug_check_now, topomalloc_debug_checks_enabled};
 pub use deterministic_api::{
@@ -191,13 +197,26 @@ impl AnyAllocator {
     /// of this allocator the caller still owns, or memory never returned by
     /// it (rejected harmlessly). A stale pointer aliasing a recycled live
     /// allocation would free another owner's object.
+    #[inline]
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // SAFETY: this method's own contract is the one being forwarded.
+        unsafe { self.free_with(ptr, false) }
+    }
+
+    /// [`free`](Self::free), honouring `TOPO_TCACHE_NONE` (§10.3): with `cache_bypass`
+    /// set, the object goes straight to the central free list instead of the running
+    /// core's front-end slot. The route `topo_dallocx`/`topo_sdallocx` take for the flag.
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free).
+    pub unsafe fn free_with(&self, ptr: *mut u8, cache_bypass: bool) -> FreeOutcome {
         let _op = topo_core::fork::operation_guard();
         // W17-3: resolve a sampled object's lifetime *before* the free; lock-free
         // (a Bloom reject) for the common non-sampled pointer, and a no-op when off.
         crate::sampling::on_free(ptr);
         // SAFETY: the caller upholds this method's identical contract.
-        dispatch!(self, a => unsafe { a.free(ptr) })
+        dispatch!(self, a => unsafe { a.free_with(ptr, cache_bypass) })
     }
 
     /// Reallocate under the §25.1 contract (failure preserves the original).
@@ -213,12 +232,30 @@ impl AnyAllocator {
         flags: RequestFlags,
     ) -> *mut u8 {
         let _op = topo_core::fork::operation_guard();
-        // W17-3: realloc retires the old object and (on success) creates a new one. Resolve
-        // the old lifetime first; sample the result as a fresh allocation. No-op when off.
-        crate::sampling::on_free(ptr);
+        // W17-3: realloc retires the old object and creates a new one — but **only on
+        // success**. A failed realloc leaves the original live (§25.1), so retiring its
+        // sampled record would fold a bogus completed lifetime into the site's histogram,
+        // drop a still-live object from `sampled_live_bytes` / `internal_sampled_bytes`
+        // permanently, and (via the W14 learn→place loop) steer real placement from
+        // corrupted data.
+        //
+        // The record is taken **before** the call, not resolved after it. The core frees
+        // `ptr` inside `realloc`, so a post-hoc `on_free(ptr)` races another thread
+        // allocating that same address: the sampled set is keyed by address, so the
+        // removal would retire *that thread's still-live* record instead. Taking it up
+        // front makes the hand-off transactional — retire it on success, put it back on
+        // failure. All three are no-ops when sampling is off.
+        let taken = crate::sampling::take_for_realloc(ptr);
         // SAFETY: the caller upholds this method's identical contract.
         let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
-        crate::sampling::on_alloc(p, new_size, min_align, flags);
+        match (p.is_null(), taken) {
+            (false, Some(rec)) => crate::sampling::retire_taken(rec),
+            (true, Some(rec)) => crate::sampling::restore_taken(ptr, rec),
+            _ => {}
+        }
+        if !p.is_null() {
+            crate::sampling::on_alloc(p, new_size, min_align, flags);
+        }
         p
     }
 
@@ -337,6 +374,81 @@ impl AnyAllocator {
         dispatch!(self, a => a.apply_deterministic_seed())
     }
 
+    /// W18 (§29.4/§29.5): re-seed the randomized **security** samplers from the process
+    /// entropy the crate installs at start-up (`entropy::install_process_entropy`), so the
+    /// guarded slots and the quarantine's eviction order are unpredictable rather than
+    /// the same publicly-computable sequence in every process of this binary. A no-op
+    /// when no entropy source answered or the hardening feature is not compiled in.
+    pub fn seed_security_samplers(&self) {
+        dispatch!(self, a => a.seed_security_samplers())
+    }
+
+    // -- the §11 front end (plan 05 W6/W7) -----------------------------------
+
+    /// Publish the host's CPU count to the front end and size the §11.5 cache budget
+    /// from it (W6-4/W6-5).
+    pub fn set_front_end_cpus(&self, cpus: u32) {
+        dispatch!(self, a => a.set_front_end_cpus(cpus))
+    }
+
+    /// Enable the W7 RSEQ fast path if the platform supports it; `false` leaves the
+    /// front end on the always-correct locked baseline (P-003).
+    pub fn enable_front_end_rseq(&self) -> bool {
+        dispatch!(self, a => a.enable_front_end_rseq())
+    }
+
+    /// Revert the front end to the locked baseline — the §28.1 child-fork
+    /// conservative mode.
+    pub fn disable_front_end_rseq(&self) {
+        dispatch!(self, a => a.disable_front_end_rseq())
+    }
+
+    /// Reset the front end in a freshly forked child (§28.1): locked baseline **and**
+    /// forget that RSEQ ever ran, since neither membarrier's registration of intent nor
+    /// the rseq area survives `fork` and a single-threaded child has no sequence left to
+    /// fence against.
+    ///
+    /// # Safety
+    ///
+    /// Inherited from [`topo_core::Allocator::reset_front_end_after_fork`]: only valid in
+    /// a quiesced single-threaded `fork` child.
+    pub unsafe fn reset_front_end_after_fork(&self) {
+        // SAFETY: the caller's identical obligation, forwarded.
+        unsafe { dispatch!(self, a => a.reset_front_end_after_fork()) }
+    }
+
+    /// Whether the W7 RSEQ fast path is active.
+    pub fn front_end_rseq_active(&self) -> bool {
+        dispatch!(self, a => a.front_end_rseq_active())
+    }
+
+    /// Register the calling thread with the RSEQ fast path (§27.6, W7-1).
+    pub fn register_front_end_thread(&self) -> bool {
+        dispatch!(self, a => a.register_front_end_thread())
+    }
+
+    /// Run one W6-5 cache-budget adaptation cycle; returns the total soft capacity
+    /// after adaptation, in objects. Host-driven, never on the allocation path.
+    pub fn cache_budget_tick(&self) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.cache_budget_tick())
+    }
+
+    /// Drain the whole front end — every core's slots *and* the transfer cache — back
+    /// into the central free lists (W6-7), the §21.3 "drain caches" rung. Returns the
+    /// objects that were resident when the drain began.
+    pub fn flush_front_end_all(&self) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.flush_front_end_all())
+    }
+
+    /// Drain **one** core's front-end slots into the transfer cache, overflowing to
+    /// central (W6-7 idle-CPU flush). Returns the objects moved out of that core.
+    pub fn flush_front_end_core(&self, core: topo_core::CoreId) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.flush_front_end_core(core))
+    }
+
     /// Run the **full Appendix-B invariant check** over the live engine on demand
     /// (W19-1, §30.2, DD-2): the shared span/large back-ends and every hooked
     /// backing (B.1/B.4), the central free-list layer and its spans (B.1/B.3), and
@@ -349,6 +461,12 @@ impl AnyAllocator {
     pub fn check_invariants(&self) -> bool {
         let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.check_invariants())
+    }
+
+    /// Visit each core holding front-end residency (§31.2 `BY_CPU` detail, W17-2 / W6):
+    /// `f(core, objects, bytes)`. Cores holding nothing are skipped.
+    pub fn for_each_cpu_cache<F: FnMut(u32, u64, u64)>(&self, f: F) {
+        dispatch!(self, a => a.for_each_cpu_cache(f))
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
@@ -623,6 +741,18 @@ static GLOBAL: OnceLock<Option<AnyAllocator>> = OnceLock::new();
 /// The selected backend name: `$TOPOMALLOC_BACKEND` or `"posix"`. An unknown or
 /// unavailable name falls back to POSIX so the default artifact is always usable.
 fn selected_backend_name() -> String {
+    // §29 / the glibc `MALLOC_*` convention: environment-derived configuration is ignored
+    // in a **secure execution** (setuid/setgid, file capabilities, `AT_SECURE=1`). The
+    // backend is configuration like any other knob, and a more consequential one than the
+    // sampling and hardening knobs already gated: in a build carrying an alternate backend
+    // (`sele4n-sim`), this variable lets whoever controls the environment replace a
+    // privileged process's allocator wholesale — changing its backing semantics, or
+    // selecting a bounded simulation backend to force allocation failure at a chosen
+    // moment. The gate has to sit *here*, before selection, because the allocator is built
+    // from this name well before the phase-5 env handling runs.
+    if crate::entropy::is_secure_execution() {
+        return "posix".into();
+    }
     std::env::var("TOPOMALLOC_BACKEND").unwrap_or_else(|_| "posix".into())
 }
 
@@ -637,21 +767,37 @@ thread_local! {
     static BOOTSTRAPPING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// RAII marker that sets [`BOOTSTRAPPING`] for the duration of `GLOBAL`
-/// initialization and clears it on the way out — even if the initializer panics.
-struct BootstrapGuard;
+/// RAII marker that sets [`BOOTSTRAPPING`] for the duration of a window in which this
+/// thread's allocations must **not** reach the engine, and restores the previous value on
+/// the way out — even if the body panics.
+///
+/// Two windows use it, for the same underlying reason (an allocation made here would
+/// re-enter `global()`), and they can nest: `GLOBAL` initialization itself, and the
+/// `pthread_atfork` call in [`fork_api::register_atfork_handlers`] — see there for why
+/// letting that one through initializes the allocator with no fork handlers installed.
+///
+/// It **restores** rather than clears, so an inner window cannot end an outer one early.
+/// That is a correctness property, not tidiness: an inner guard that cleared the flag
+/// would drop the rest of the outer window onto the engine, which is precisely what the
+/// outer window exists to prevent.
+pub(crate) struct BootstrapGuard(bool);
 
 impl BootstrapGuard {
-    fn enter() -> Self {
-        BOOTSTRAPPING.with(|b| b.set(true));
-        BootstrapGuard
+    pub(crate) fn enter() -> Self {
+        BootstrapGuard(BOOTSTRAPPING.with(|b| b.replace(true)))
     }
 }
 
 impl Drop for BootstrapGuard {
     fn drop(&mut self) {
-        BOOTSTRAPPING.with(|b| b.set(false));
+        BOOTSTRAPPING.with(|b| b.set(self.0));
     }
+}
+
+/// Whether this thread is inside a [`BootstrapGuard`] window. Test-only.
+#[cfg(test)]
+pub(crate) fn in_bootstrap_window() -> bool {
+    BOOTSTRAPPING.with(Cell::get)
 }
 
 /// The global allocator **only if already initialized**, without triggering the
@@ -671,6 +817,19 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
     // Fast path: already initialized. The steady-state allocation path pays no
     // fork-gate cost here — the per-operation gate lives in the allocator methods.
     if let Some(inner) = GLOBAL.get() {
+        // One relaxed load, then a perfectly-predicted branch that is taken exactly
+        // once per successful registration. It is the *only* place a lost registration
+        // can be recovered: `pthread_atfork` can fail transiently with `ENOMEM`, and
+        // once `GLOBAL` is initialized no caller reaches the slow path below ever
+        // again — so without this retry a single transient failure during bring-up
+        // costs the process its fork safety permanently, and every later `fork()`
+        // leaves the child on inherited allocator state with no quiesce handler.
+        // Cheap because it asks whether registration *completed*, not whether someone
+        // is attempting it; a call that races an in-flight attempt returns at once
+        // rather than blocking (see `fork_api::register_atfork_handlers`).
+        if !crate::fork_api::atfork_registered() {
+            crate::fork_api::register_atfork_handlers();
+        }
         return inner.as_ref();
     }
     // Slow path: the first allocation builds the global allocator. Two #4
@@ -713,26 +872,87 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // Phase 3: the engine exists, so the arena registry + default arena
                 // (§22, §35.4 phase 3) are now live.
                 INIT_PHASE.advance_to(InitPhase::ArenaRegistry);
-                // Phase 4: per-CPU / RSEQ front-end setup. Enable the per-CPU sharded
-                // fork gate iff a cheap per-CPU id is available (the glibc/rseq area);
-                // a safe no-op otherwise (single-shard).
+                // Phase 4: per-CPU / RSEQ front-end setup (§35.4).
+                if let Some(eng) = allocator.as_ref() {
+                    // W7-1: bring up the RSEQ fast path *first*. It is what makes
+                    // `rseq::current_cpu()` answer, so everything downstream that wants a
+                    // cheap per-CPU id — the fork gate's sharding immediately below, and
+                    // the front end's own slot selection — gets a real CPU id instead of
+                    // falling back to a per-thread key. On a platform without RSEQ this
+                    // is a no-op returning `false` and the locked baseline stands (P-003).
+                    eng.enable_front_end_rseq();
+                    // Register the thread performing the very first allocation — it is
+                    // also the first user of the fast path.
+                    //
+                    // What happens to *later* threads depends on the registration model
+                    // (§27.6), and only one of the two is automatic:
+                    //
+                    // * **glibc ≥ 2.35** registers every thread's rseq area itself, so
+                    //   this call is a presence check and later threads are already set
+                    //   up — nothing else to do.
+                    // * **self-registered** (musl, older glibc): `topo-arch` registers at
+                    //   the point it is asked to and never lazily, and the allocation
+                    //   fast path deliberately does not attempt it (registration is a
+                    //   syscall; retrying it per allocation on every unregistered thread
+                    //   would cost more than the path saves). A thread that has not
+                    //   called `topomalloc_cache_register_thread` therefore runs the
+                    //   **locked baseline** — always correct (P-003), just without the
+                    //   restartable sequences. §27.6 makes that the embedder's call to
+                    //   make at thread start, and the C surface exposes it for exactly
+                    //   this.
+                    eng.register_front_end_thread();
+                    // W6-4/W6-5: publish the online CPU count so the front end spreads
+                    // over the real machine and the §11.5 budget is sized to it.
+                    eng.set_front_end_cpus(topo_backend_posix::online_cpus());
+                }
+                // Enable the per-CPU sharded fork gate iff a cheap per-CPU id is
+                // available (the glibc/rseq area); a safe no-op otherwise (single-shard).
                 topo_core::probe_and_set_sharding();
                 INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
+                // W18 (§29.4/§29.5): install real OS entropy for the randomized
+                // *security* samplers before anything can be sampled, so the guarded
+                // slots and the quarantine's eviction order are not the same
+                // publicly-computable sequence in every process of this binary. Runs
+                // under the bootstrap guard and allocates nothing (raw `libc` only).
+                // Deterministic mode re-seeds from the explicit seed just below, so a
+                // seeded replay still reproduces exactly.
+                crate::entropy::install_process_entropy();
+                if let Some(eng) = allocator.as_ref() {
+                    eng.seed_security_samplers();
+                }
                 // Phase 5: background threads + profiling. Honour `$TOPOMALLOC_SAMPLE_RATE`
                 // (§32.1) now, under the bootstrap guard, so the sampler's one-time setup
                 // allocations are served by the system allocator and the first real sample
                 // is already armed. Only arms when the engine built.
-                crate::sampling::init_from_env();
-                // W18-3 (§29.4): honour `$TOPOMALLOC_QUARANTINE` (§32.1) under the same
-                // guard, so an operator can arm the security quarantine at load. Off
-                // unless the env var requests it (and the `quarantine` feature is built).
-                crate::quarantine_api::init_from_env();
-                crate::quarantine_api::guard_init_from_env();
-                // W19-3 (§30.4): honour `$TOPOMALLOC_DETERMINISTIC_SEED` (§32.1) under
-                // the same guard, so a deterministic run seeds its randomized samplers
-                // before the first real allocation. Off unless requested (or the
-                // `deterministic-test` profile is built).
-                crate::deterministic_api::init_from_env();
+                // Environment-derived configuration is **skipped in a secure execution**
+                // (setuid/setgid or `AT_SECURE`): the environment belongs to whoever
+                // exec'd us, so honouring it in a privileged process would let an
+                // attacker pin the guard/quarantine RNG to a seed they compute offline,
+                // switch guard sampling off, or force stack unwinding on every
+                // allocation. Same rule glibc's malloc applies to `MALLOC_*`. The
+                // compiled-in defaults (and any explicit `topomalloc_*` API call by the
+                // program itself) still apply.
+                //
+                // Each hook takes the just-built engine **by reference**: they run inside
+                // `GLOBAL.get_or_init`, so a nested `global()` would re-enter the still
+                // -running `OnceLock` and park the thread on its own initialization — a
+                // hang at the process's very first allocation, triggered by nothing more
+                // than one of these environment variables being set.
+                if let Some(eng) = allocator.as_ref() {
+                    if !crate::entropy::is_secure_execution() {
+                        crate::sampling::init_from_env(eng);
+                        // W18-3 (§29.4): honour `$TOPOMALLOC_QUARANTINE` (§32.1) under the same
+                        // guard, so an operator can arm the security quarantine at load. Off
+                        // unless the env var requests it (and the `quarantine` feature is built).
+                        crate::quarantine_api::init_from_env(eng);
+                        crate::quarantine_api::guard_init_from_env(eng);
+                        // W19-3 (§30.4): honour `$TOPOMALLOC_DETERMINISTIC_SEED` (§32.1) under
+                        // the same guard, so a deterministic run seeds its randomized samplers
+                        // before the first real allocation. Off unless requested (or the
+                        // `deterministic-test` profile is built).
+                        crate::deterministic_api::init_from_env(eng);
+                    }
+                }
                 INIT_PHASE.advance_to(InitPhase::BackgroundAndProfiling);
                 // Phase 6: every subsystem is up — open for normal operation.
                 INIT_PHASE.advance_to(InitPhase::Operational);
@@ -1001,11 +1221,12 @@ mod tests {
             ptr::write_bytes(p, 1, 128);
             g.dealloc(p, layout);
         }
-        // The engine genuinely freed it (not leaked): the slot is vended again. No
-        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
-        // central free list, which a parallel test thread can transiently touch — confirm
-        // recycling by membership in a bounded batch (held to drain toward the freed slot,
-        // then freed), not by asserting the exact next call.
+        // The engine genuinely freed it (not leaked): the slot is vended again. Every
+        // front-end layer is *shared* (a per-CPU slot serves whichever threads run on that
+        // core; the transfer cache is process-wide), so a parallel test thread can
+        // transiently take the freed object — confirm recycling by membership in a bounded
+        // batch (held to drain toward the freed slot, then freed), not by asserting the
+        // exact next call.
         let mut batch = Vec::with_capacity(64);
         let mut recycled = false;
         for _ in 0..64 {
@@ -1077,6 +1298,66 @@ mod tests {
         // SAFETY: `p` was just returned by `a` and is owned by this test.
         assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
         assert!(new_allocator_named("nope").is_none());
+    }
+
+    /// An allocation made inside a [`BootstrapGuard`] window never reaches the engine —
+    /// the property `fork_api`'s registration window relies on to keep `pthread_atfork`
+    /// from initializing `GLOBAL` before the handlers are installed.
+    ///
+    /// "Not the engine" is asserted the only way that is airtight: the engine itself is
+    /// asked, and must reject the pointer as `Foreign`. That is the same classification
+    /// the adapter's `dealloc` already routes on, so the assertion and the production path
+    /// agree by construction.
+    #[test]
+    fn an_allocation_inside_the_bootstrap_window_never_reaches_the_engine() {
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(96, 16).unwrap();
+        let p = {
+            let _w = BootstrapGuard::enter();
+            // SAFETY: valid non-zero layout; freed below through the same adapter.
+            unsafe { g.alloc(layout) }
+        };
+        assert!(
+            !p.is_null(),
+            "the bootstrap window must still serve the request"
+        );
+        let eng = global().expect("engine");
+        // SAFETY: `p` is a live pointer this adapter produced; the engine only
+        // classifies it (a pagemap lookup) and declines what it does not own.
+        let verdict = unsafe { eng.free(p) };
+        assert!(
+            matches!(verdict, FreeOutcome::Invalid(InvalidFree::Foreign)),
+            "an allocation made in the bootstrap window came from the engine, so \
+             `pthread_atfork` re-entering there would initialize GLOBAL unregistered"
+        );
+        let _w = BootstrapGuard::enter();
+        // SAFETY: same (ptr, layout), returned inside the window that produced it.
+        unsafe { g.dealloc(p, layout) };
+    }
+
+    /// [`BootstrapGuard`] **restores** the previous flag rather than clearing it, so an
+    /// inner window cannot end an outer one early — which would drop the rest of the outer
+    /// window onto the engine.
+    ///
+    /// Defensive: no path nests the two windows today (registration completes before
+    /// `GLOBAL.get_or_init` begins). It pins the property that makes adding one safe,
+    /// rather than reproducing a defect.
+    #[test]
+    fn a_nested_bootstrap_window_does_not_end_the_outer_one() {
+        assert!(!in_bootstrap_window());
+        let outer = BootstrapGuard::enter();
+        assert!(in_bootstrap_window());
+        {
+            let _inner = BootstrapGuard::enter();
+            assert!(in_bootstrap_window());
+        }
+        assert!(
+            in_bootstrap_window(),
+            "an inner window ended the outer one: the rest of the outer window would \
+             route to the engine"
+        );
+        drop(outer);
+        assert!(!in_bootstrap_window());
     }
 
     /// W16-7 (§35.4): the lazy global initializer drives the init phases all the

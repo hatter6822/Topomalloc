@@ -154,6 +154,42 @@ pub fn mode() -> Mode {
     }
 }
 
+/// Drop the process-global registration decision made by [`enable`], so the next
+/// [`enable`] re-derives it from scratch (§28.1). For a freshly forked **child**.
+///
+/// [`enable`] is idempotent by design: it short-circuits once a mode is decided, so
+/// the process pays the detection syscalls once. A `fork` child inherits that decided
+/// mode but **not** the kernel registrations behind it, and the two failures are
+/// silent in opposite directions:
+///
+/// * the `membarrier` intent (`MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ`) lives
+///   in the mm and is not inherited, so the child's non-owner fence (W7-4) fails
+///   `EPERM` on every call; and
+/// * the `rseq(2)` area registration is cleared for the child's surviving thread, so
+///   the fast path would read a `cpu_id` the kernel no longer updates.
+///
+/// Without this reset the child's `enable` returns `true` from the fast path having
+/// re-registered neither, and the front end then publishes RSEQ mode and arms fencing
+/// over a fast path the kernel is not maintaining. Resetting the decision makes the
+/// child's first `enable` redo `decide_mode`, which re-registers both or reports the
+/// mode unavailable and leaves the child on the locked baseline (P-003) — either way
+/// the mode and the registrations behind it agree.
+///
+/// Sound only in the single-threaded child: it is a plain store, and a concurrent
+/// `enable` racing it would re-run detection. [`crate::rseq`] has no way to enforce
+/// that, so the obligation is carried by its only caller,
+/// `CpuCache::reset_after_fork`, which is `unsafe` for this reason among others.
+#[inline]
+pub fn reset_after_fork() {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        imp_linux::reset_after_fork();
+    }
+}
+
 /// Register the calling thread for the RSEQ fast path (§27.6, W7-1). Must be
 /// called at thread start before the fast path is used in self-registration
 /// mode; a no-op beyond a presence check in glibc mode. Returns whether this

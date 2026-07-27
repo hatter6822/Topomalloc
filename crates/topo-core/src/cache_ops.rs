@@ -14,13 +14,30 @@
 //!   (if transfer full) classify by span -> central.insert_batch per span.
 //!
 //! - **Flush-to-central with empty detection** (W6-3c): when flushing to
-//!   central, after insert_batch, check if `span_empty` is true. If so,
-//!   the caller should deactivate the span.
+//!   central, after insert_batch, a span reported `span_empty` is handed to the
+//!   caller's `on_empty` callback (with no lock held) so it can be retired.
 //!
 //! - **flush_idle_cpu** (W6-7): flush all slots of a specific CPU.
 //!
-//! **Lock ordering.** Transfer (rank 3) < Central (rank 4) < Span (rank 5).
-//! The transfer lock is always released BEFORE the central lock is acquired.
+//! - **drain_transfer** (W6-7): empty the transfer cache into central — the second
+//!   half of a full front-end drain, since `flush_idle_cpu` only moves a core's
+//!   slots one layer *down* into that cache.
+//!
+//! **Residency (W6, §16.4).** An object held anywhere in the front end carries its
+//! span's per-object *cached* bit; the bit is the lock-free double-free oracle for an
+//! object the central bitmap has never seen. This module owns both ends of that
+//! contract: `refill` sets it as objects leave the central list, and every path back to
+//! central goes through `CentralCache::insert_batch`, which clears it **after** setting
+//! the free bit (free-bit-first, so no instant of the transition has both clear).
+//!
+//! Free-bit-first bounds the *predicate*, not a reader: a lock-free check that loads the
+//! two bits separately must read **cached first** or it can straddle the flush and see
+//! both false. See [`SpanDescriptor::is_free_awaiting_reuse`].
+//!
+//! **Lock ordering (§27.2).** Front end (rank `FRONT_END`) < transfer (`TRANSFER`) <
+//! central (`CENTRAL`) < span (`SPAN`). Each is released before the next is acquired —
+//! the transfer lock in particular is always released BEFORE the central lock is
+//! taken — so no two of these locks are ever held at once.
 
 use crate::bootstrap::MetadataAlloc;
 use crate::central::{CentralCache, InsertResult, RemoveResult};
@@ -63,6 +80,15 @@ pub struct FlushResult {
 ///
 /// Returns the number of objects refilled, and whether a new span is needed.
 ///
+/// **`place_class` (§24.6–§24.8, W14).** A batch pulled from central inherits the
+/// placement class of the span it came from, and a per-CPU slot is keyed by `(core, size
+/// class)` alone — so whatever is refilled must be substitutable for every request the
+/// slot will serve. The caller therefore names the *one* class this front end caches
+/// (the engine's placement-unhinted class), and grouping stays a real partition instead
+/// of a bias the cache silently erases by vending a hot- or cold-tagged object to an
+/// unhinted request. Pass [`ANY_PLACE_CLASS`](crate::central::ANY_PLACE_CLASS) to accept
+/// any span, which is right only for a caller that does not segregate by class.
+///
 /// **Hand-over-hand:** the transfer lock is released BEFORE the central lock
 /// is acquired.
 ///
@@ -81,12 +107,24 @@ pub fn refill(
     arena: ArenaId,
     label: Label,
     sc: SizeClassId,
+    place_class: u8,
     cpu_cache: &CpuCache,
     transfer: &TransferCache,
     central: &CentralCache,
-    _pagemap: &PageMap,
+    pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
 ) -> RefillResult {
+    // Totality: every layer below is total on an out-of-range size class
+    // (`TransferCache`/`CentralCache` bounds-check with `.get()`), but the generated
+    // table accessors index unchecked. Decline here so a public entry point can never
+    // panic on a caller-supplied id — it simply refills nothing.
+    if sc.index() >= size_class::count() {
+        return RefillResult {
+            filled: 0,
+            need_span: false,
+        };
+    }
     let batch_size = size_class::batch(sc);
     let mut buf = [0usize; MAX_BATCH_LEN];
 
@@ -103,9 +141,19 @@ pub fn refill(
     if popped > 0 {
         // Step 2: push into CPU cache slot (per-CPU lock, released on return).
         let pushed = cpu_cache.push_batch(core, sc, &buf[..popped]);
-        // Return any unpushed objects to the transfer cache to prevent leaks.
+        // Return any unpushed objects to the transfer cache — and whatever the
+        // transfer cache itself declines (it can have been refilled by another core
+        // since step 1) to the **central** free list, which is the authoritative home
+        // and always accepts. Discarding the declined remainder here would leak it:
+        // the objects are no longer in the transfer cache, were never pushed to the
+        // per-CPU cache, and are not in the span's central bitmap either, so nothing
+        // could ever reach them again (§16.4 conservation).
         if pushed < popped {
-            transfer.try_push_batch(arena, sc, &buf[pushed..popped], meta);
+            let back = transfer.try_push_batch(arena, sc, &buf[pushed..popped], meta);
+            let stranded = &buf[pushed + back..popped];
+            if !stranded.is_empty() {
+                let _ = flush_addrs_to_central(stranded, sc, central, pagemap, on_empty);
+            }
         }
         return RefillResult {
             filled: pushed,
@@ -114,19 +162,9 @@ pub fn refill(
     }
 
     // Step 3: transfer was empty. Try the central free list.
-    // The transfer lock was released in step 1 (by try_pop_batch dropping
-    // its guard). Now acquire the central lock. The cache-refill path carries no per-request
-    // placement class (it batches across requests), so it does not bias span grouping
-    // (`ANY_PLACE_CLASS`); per-request §24 grouping happens on the central small path. Cache-
-    // layer grouping is an M2 concern (W6).
-    match central.remove_batch(
-        node,
-        arena,
-        label,
-        sc,
-        crate::central::ANY_PLACE_CLASS,
-        batch_size,
-    ) {
+    // The transfer lock was released in step 1 (by try_pop_batch dropping its guard). Now
+    // acquire the central lock.
+    match central.remove_batch(node, arena, label, sc, place_class, batch_size) {
         RemoveResult::NeedSpan => RefillResult {
             filled: 0,
             need_span: true,
@@ -152,8 +190,30 @@ pub fn refill(
             let mut addr_count = 0usize;
             let mut addrs = [0usize; MAX_BATCH_LEN];
             for i in 0..batch.len() {
-                if let Some(addr) = layout.object_addr(batch.index(i) as usize) {
+                let obj = batch.index(i) as usize;
+                if let Some(addr) = layout.object_addr(obj) {
                     if addr_count < MAX_BATCH_LEN {
+                        // The `central-free → cached` transition (W6, §16.4). Marking
+                        // happens **before** the address is published to a slot: once
+                        // pushed, another core can pop it and clear the bit, and a
+                        // mark-after-push would then re-mark an object that is already
+                        // live.
+                        //
+                        // Losing this test-and-set means a concurrent `free` of the very
+                        // object central just vended claimed it first — a double or stale
+                        // free, since nobody owned it. That free will push the address
+                        // into a slot, so **drop it here**: pushing it too would put one
+                        // address in the front end twice and vend it to two callers, which
+                        // is worse than losing one object out of an already-corrupt
+                        // program's heap (§2.4 — detection must never corrupt, W18-2).
+                        if !span.try_mark_cached(obj) {
+                            debug_assert!(
+                                false,
+                                "refill: central vended an object a concurrent free had \
+                                 already cached (double free)"
+                            );
+                            continue;
+                        }
                         addrs[addr_count] = addr;
                         addr_count += 1;
                     }
@@ -163,18 +223,26 @@ pub fn refill(
             // central list handed out converts to an address — the index→address
             // mapping never drops an object (the indices are in `0..object_count`,
             // so `object_addr` always succeeds and `batch.len() <= batch_size <=
-            // MAX_BATCH_LEN` never trips the cap). A mismatch is a refill leak.
-            debug_assert_eq!(
-                addr_count,
-                batch.len(),
-                "refill lost objects converting central indices to addresses"
+            // MAX_BATCH_LEN` never trips the cap). A mismatch is a refill leak, *except*
+            // for an object a concurrent double free claimed above, which has its own
+            // `debug_assert` and is deliberately dropped.
+            debug_assert!(
+                addr_count <= batch.len(),
+                "refill produced more addresses than central vended"
             );
 
             // Push addresses into the CPU cache slot.
             let pushed = cpu_cache.push_batch(core, sc, &addrs[..addr_count]);
-            // Return any unpushed objects to the transfer cache to prevent leaks.
+            // Return any unpushed objects to the transfer cache, and whatever *it*
+            // declines back to the central free list (as in the transfer-hit branch
+            // above): these objects were already removed from the central bitmap, so
+            // dropping the declined remainder would leak them permanently.
             if pushed < addr_count {
-                transfer.try_push_batch(arena, sc, &addrs[pushed..addr_count], meta);
+                let back = transfer.try_push_batch(arena, sc, &addrs[pushed..addr_count], meta);
+                let stranded = &addrs[pushed + back..addr_count];
+                if !stranded.is_empty() {
+                    let _ = flush_addrs_to_central(stranded, sc, central, pagemap, on_empty);
+                }
             }
             RefillResult {
                 filled: pushed,
@@ -198,11 +266,13 @@ pub fn refill_with_retry<F>(
     arena: ArenaId,
     label: Label,
     sc: SizeClassId,
+    place_class: u8,
     cpu_cache: &CpuCache,
     transfer: &TransferCache,
     central: &CentralCache,
     pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
     max_retries: usize,
     mut create_span: F,
 ) -> RefillResult
@@ -211,7 +281,18 @@ where
 {
     for _ in 0..=max_retries {
         let r = refill(
-            core, node, arena, label, sc, cpu_cache, transfer, central, pagemap, meta,
+            core,
+            node,
+            arena,
+            label,
+            sc,
+            place_class,
+            cpu_cache,
+            transfer,
+            central,
+            pagemap,
+            meta,
+            on_empty,
         );
         if !r.need_span || r.filled > 0 {
             return r;
@@ -249,7 +330,16 @@ pub fn flush(
     central: &CentralCache,
     pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
 ) -> FlushResult {
+    // Totality on an out-of-range size class, as `refill` (the table accessors index
+    // unchecked while every cache layer below bounds-checks).
+    if sc.index() >= size_class::count() {
+        return FlushResult {
+            flushed: 0,
+            spans_emptied: 0,
+        };
+    }
     let batch_size = size_class::batch(sc);
     let mut buf = [0usize; MAX_BATCH_LEN];
 
@@ -284,7 +374,7 @@ pub fn flush(
         popped,
         "flush routing did not preserve the popped object count"
     );
-    let spans_emptied = flush_addrs_to_central(remainder, sc, central, pagemap);
+    let spans_emptied = flush_addrs_to_central(remainder, sc, central, pagemap, on_empty);
 
     FlushResult {
         flushed: popped,
@@ -299,11 +389,11 @@ pub fn flush(
 /// when background memory management lands, this is the natural place to notify
 /// the extent manager about emptied spans and reclaimable memory.
 ///
-/// **W7-4.** This goes through [`CpuCache::drain_cpu`], which holds the per-CPU
-/// lock for the whole drain and issues the RSEQ fence **once** when `core` is a
-/// non-owner CPU — rather than one membarrier per size class (a membarrier is an
-/// all-CPU IPI). The transfer→central moves run hand-over-hand under the
-/// (outermost) per-CPU lock.
+/// **W7-4.** This goes through [`CpuCache::drain_cpu`], which takes the per-CPU lock and
+/// issues the RSEQ fence per *chunk* when `core` is a non-owner CPU, then **releases the
+/// lock before** invoking the sink below — so the transfer/central acquisitions here are
+/// strict hand-over-hand and never nest inside the front-end lock (§27.2).
+#[allow(clippy::too_many_arguments)]
 pub fn flush_idle_cpu(
     core: CoreId,
     arena: ArenaId,
@@ -312,6 +402,7 @@ pub fn flush_idle_cpu(
     central: &CentralCache,
     pagemap: &PageMap,
     meta: &dyn MetadataAlloc,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
 ) -> usize {
     let mut buf = [0usize; MAX_BATCH_LEN];
     cpu_cache.drain_cpu(core, &mut buf, |sc, batch| {
@@ -319,14 +410,73 @@ pub fn flush_idle_cpu(
         // detection fires there, W6-3c). Same hand-over-hand discipline as `flush`.
         let pushed = transfer.try_push_batch(arena, sc, batch, meta);
         if pushed < batch.len() {
-            let _ = flush_addrs_to_central(&batch[pushed..], sc, central, pagemap);
+            let _ = flush_addrs_to_central(&batch[pushed..], sc, central, pagemap, on_empty);
         }
     })
 }
 
+/// Drain the **whole transfer cache** into the central free lists (W6-7, §21.3).
+///
+/// [`flush_idle_cpu`] empties a core's slots, but their contents land in the transfer
+/// cache — one layer down, not back in central. Only this completes the round trip, so a
+/// caller that needs front-end residency actually returned (the release controller's
+/// "drain caches" rung, an empty-span retirement sweep, a test asserting the pre-cache
+/// figures) must run both. Returns the number of objects moved, and reports each span the
+/// drain empties to `on_empty` under the same no-lock-held contract as [`flush`].
+pub fn drain_transfer(
+    arena: ArenaId,
+    transfer: &TransferCache,
+    central: &CentralCache,
+    pagemap: &PageMap,
+    meta: &dyn MetadataAlloc,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
+) -> usize {
+    let mut moved = 0usize;
+    let mut buf = [0usize; MAX_BATCH_LEN];
+    for i in 0..size_class::count() {
+        let sc = SizeClassId::new(i);
+        // Drain at most the objects present **when this call started**, snapshotted per
+        // bin. Looping until a pop comes back empty is not a bound: a program that keeps
+        // freeing keeps overflowing its per-CPU slots into this bin, so `try_pop_batch`
+        // can keep returning objects indefinitely and a maintenance call would never
+        // return. Racing pushes are left for the next flush, which is exactly the
+        // "approximate under concurrent load, exact when quiescent" contract (§31.1) —
+        // and under quiescence the snapshot *is* the whole bin, so nothing is left behind.
+        let mut remaining = transfer.bin(sc).map_or(0, |b| b.len() as usize);
+        while remaining > 0 {
+            let want = remaining.min(MAX_BATCH_LEN);
+            let n = transfer.try_pop_batch(arena, sc, &mut buf, want, meta);
+            if n == 0 {
+                break; // another drainer got there first
+            }
+            flush_addrs_to_central(&buf[..n], sc, central, pagemap, on_empty);
+            moved += n;
+            remaining -= n;
+        }
+    }
+    moved
+}
+
 /// Flush a set of addresses to the central free list, classifying each by
 /// span via the pagemap. Returns the number of spans detected as empty
-/// (W6-3c).
+/// (W6-3c) and reports **each** of them to `on_empty`.
+///
+/// The callback is what makes empty-span detection actionable: a count alone tells the
+/// caller that memory became reclaimable but not *which* span to retire, so the span
+/// would stay allocated until something else happened to empty it again — a permanent
+/// leak of a whole slab per emptied span once the front end is live. The engine passes
+/// a closure that calls `retire_span`.
+///
+/// `on_empty` runs with **no lock held**: `insert_batch` releases the central bin and span
+/// locks before returning, so retiring (which takes the span-pool and backend locks, ranked
+/// *after* `CENTRAL`) from it is rank-increasing and legal (§27.2). That holds on every
+/// caller — including [`flush_idle_cpu`], whose `drain_cpu` deliberately drops the per-CPU
+/// lock before invoking its sink (hand-over-hand, W7-4).
+///
+/// **Residency (W6, §16.4).** Every address here is a *cached* object, so `insert_batch`
+/// completes the `cached → central-free` transition by clearing its cached bit **after**
+/// setting the free bit (free-bit-first), keeping the lock-free
+/// `is_cached || is_central_free` double-free oracle true at every instant.
 ///
 /// Processes addresses in chunks of `MAX_BATCH_LEN` to handle arbitrarily
 /// large input slices.
@@ -335,6 +485,7 @@ fn flush_addrs_to_central(
     sc: SizeClassId,
     central: &CentralCache,
     pagemap: &PageMap,
+    on_empty: &mut dyn FnMut(&SpanDescriptor),
 ) -> usize {
     let mut spans_emptied = 0usize;
     let mut offset = 0usize;
@@ -400,9 +551,12 @@ fn flush_addrs_to_central(
                 let result: InsertResult =
                     central.insert_batch(span, &indices[..idx_count], idx_count);
 
-                // W6-3c: empty detection.
+                // W6-3c: empty detection. Report the span itself, not just a tally, so
+                // the caller can retire it (see the `on_empty` contract above). The
+                // central/span locks are already released here.
                 if result.span_empty {
                     spans_emptied = spans_emptied.saturating_add(1);
+                    on_empty(span);
                 }
             }
         }
@@ -428,6 +582,12 @@ impl SpanIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The emptied-span callback for tests that do not care which spans emptied (the
+    /// live engine retires them; these tests assert the counts and conservation).
+    #[allow(clippy::redundant_closure)]
+    fn no_retire(_: &SpanDescriptor) {}
+
     use crate::bootstrap::BumpArena;
     use crate::central::CentralCache;
     use crate::cpu_cache::CpuCache;
@@ -509,11 +669,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert!(r.filled > 0 && !r.need_span);
         // Conservation: the objects pulled into the cache are now "live" (held by
@@ -526,7 +688,17 @@ mod tests {
 
         // Flush: push the CPU cache's objects back down (to transfer here, since
         // it is not full). No object is created or lost.
-        let f = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let f = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert_eq!(f.flushed, r.filled);
         // The objects are now in the transfer cache; conservation still holds.
         assert!(cc.check_invariants() && tc.check_invariants() && central.check_invariants());
@@ -559,11 +731,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert!(result.filled > 0);
         assert!(!result.need_span);
@@ -594,11 +768,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert!(result.filled > 0);
         assert!(!result.need_span);
@@ -626,11 +802,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert_eq!(result.filled, 0);
         assert!(result.need_span);
@@ -653,7 +831,17 @@ mod tests {
         cc.push_batch(core, sc, &addrs);
 
         // Flush should push to transfer cache.
-        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let result = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert!(result.flushed > 0);
 
         // Transfer cache should have the addresses.
@@ -713,7 +901,17 @@ mod tests {
         cc.push_batch(core, sc, &addrs_to_flush);
 
         // Flush -- transfer is full, so objects go to central.
-        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let result = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert!(result.flushed > 0);
 
         // Conservation law should hold on the span.
@@ -738,7 +936,16 @@ mod tests {
         cc.push_batch(core, sc0, &[100, 200, 300]);
         cc.push_batch(core, sc1, &[400, 500]);
 
-        let total = flush_idle_cpu(core, ArenaId::DEFAULT, &cc, &tc, &central, &pm, &m);
+        let total = flush_idle_cpu(
+            core,
+            ArenaId::DEFAULT,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert_eq!(total, 5);
 
         // CPU slots should be empty.
@@ -787,7 +994,7 @@ mod tests {
         assert_eq!(all_addrs.len(), obj_count);
 
         // Flush all addresses to central via the internal helper.
-        let spans_emptied = flush_addrs_to_central(&all_addrs, sc, &central, &pm);
+        let spans_emptied = flush_addrs_to_central(&all_addrs, sc, &central, &pm, &mut no_retire);
 
         // The span should be detected as empty.
         assert!(span.is_empty_central_only());
@@ -821,17 +1028,29 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert!(r1.filled > 0);
         assert!(span.conservation_holds_central_only());
 
         // Flush back (via transfer or central).
-        let r2 = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let r2 = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert!(r2.flushed > 0);
 
         // The transfer cache has some objects now; they are logically in the
@@ -872,11 +1091,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             central_ref,
             pm_ref,
             m_ref,
+            &mut no_retire,
             3,
             |_sc| {
                 called += 1;
@@ -908,11 +1129,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
             3,
             |_sc| {
                 called += 1;
@@ -958,11 +1181,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert_eq!(result.filled, 4);
         assert!(!result.need_span);
@@ -974,6 +1199,112 @@ mod tests {
             "unpushed objects should be returned to transfer"
         );
         assert_eq!(bin.len() as usize, batch_size - 4);
+    }
+
+    #[test]
+    fn refill_never_drops_objects_when_both_caches_decline() {
+        // Regression (§16.4 conservation): `refill` removes objects from the central
+        // free list, pushes what fits into the per-CPU slot, and offers the rest back
+        // to the transfer cache. The transfer cache can decline the return — it is
+        // bounded, and its bin is *lazily allocated from metadata*, so an exhausted
+        // metadata arena makes `try_push_batch` return 0. The declined remainder used
+        // to be **discarded**: those objects were then in no cache and no longer in the
+        // span's central bitmap, so nothing could ever reach them again. They must fall
+        // through to the central free list instead.
+        let m = meta(4 * 1024 * 1024);
+        // A metadata arena with no room: every lazy transfer-bin init against it fails,
+        // so both the pop (forcing the central branch) and the return-push decline.
+        let starved = meta(0);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let sc = SizeClassId::new(3);
+        let core = CoreId::DEFAULT;
+        let base = 0x5000_0000usize;
+
+        let span = make_span(1, sc, base, &m);
+        central.activate_span(&span, &pm, &m).unwrap();
+        let total_objects = span.object_count() as usize;
+
+        // Leave room for exactly two objects in the per-CPU slot.
+        let hard_cap = size_class::max_local_capacity(sc);
+        cc.init_slot(core, sc, &m, hard_cap as u32);
+        let filler: Vec<usize> = (0x8000_0000..0x8000_0000 + hard_cap - 2).collect();
+        assert_eq!(cc.push_batch(core, sc, &filler), hard_cap - 2);
+
+        let result = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            crate::central::ANY_PLACE_CLASS,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &starved,
+            &mut no_retire,
+        );
+        assert_eq!(result.filled, 2, "only two per-CPU slots were free");
+        assert!(!result.need_span);
+
+        // Conservation: every object of the span is either in the per-CPU slot (2) or
+        // back in the central free list. None may have vanished.
+        let central_free = span.central_free_count() as usize;
+        assert_eq!(
+            central_free + result.filled,
+            total_objects,
+            "refill lost objects (central {central_free} + filled {} != {total_objects})",
+            result.filled
+        );
+        assert!(span.conservation_holds_central_only());
+    }
+
+    #[test]
+    fn refill_and_flush_are_total_on_an_out_of_range_size_class() {
+        // The cache layers bounds-check a size-class id (`TransferCache`/`CentralCache`
+        // resolve their bin with `.get()`), but the generated-table accessors index
+        // unchecked. The public `refill`/`flush` entry points must not panic on a
+        // caller-supplied out-of-range id — they decline instead.
+        let m = meta(1024 * 1024);
+        let pm = PageMap::new();
+        let cc = CpuCache::new();
+        let tc = TransferCache::new();
+        let central = CentralCache::new();
+        let bad = SizeClassId::new(size_class::count() + 7);
+        let core = CoreId::DEFAULT;
+
+        let r = refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            bad,
+            crate::central::ANY_PLACE_CLASS,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
+        assert_eq!(r.filled, 0);
+        assert!(!r.need_span);
+        let f = flush(
+            core,
+            ArenaId::DEFAULT,
+            bad,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
+        assert_eq!(f.flushed, 0);
+        assert_eq!(f.spans_emptied, 0);
     }
 
     #[test]
@@ -1025,7 +1356,17 @@ mod tests {
         cc.push_batch(core, sc, &addrs_to_flush);
 
         // Flush: transfer can only accept 2, rest goes to central.
-        let result = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let result = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert!(result.flushed > 0);
 
         // Conservation law should hold.
@@ -1052,7 +1393,16 @@ mod tests {
         tc.try_push_batch(ArenaId::DEFAULT, sc0, &dummy, &m);
 
         // flush_idle_cpu should still drain the slot even if transfer is full.
-        let total = flush_idle_cpu(core, ArenaId::DEFAULT, &cc, &tc, &central, &pm, &m);
+        let total = flush_idle_cpu(
+            core,
+            ArenaId::DEFAULT,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert_eq!(total, 3);
 
         let cpu = cc.per_cpu(core).unwrap();
@@ -1090,11 +1440,13 @@ mod tests {
             ArenaId::DEFAULT,
             Label::PUBLIC,
             sc,
+            crate::central::ANY_PLACE_CLASS,
             &cc,
             &tc,
             &central,
             &pm,
             &m,
+            &mut no_retire,
         );
         assert!(r1.filled > 0);
 
@@ -1113,7 +1465,17 @@ mod tests {
 
         // Push them back and flush to central.
         cc.push_batch(core, sc, &popped[..n]);
-        let r2 = flush(core, ArenaId::DEFAULT, sc, &cc, &tc, &central, &pm, &m);
+        let r2 = flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &cc,
+            &tc,
+            &central,
+            &pm,
+            &m,
+            &mut no_retire,
+        );
         assert_eq!(r2.flushed, n);
 
         assert!(span.conservation_holds_central_only());

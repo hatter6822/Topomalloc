@@ -122,12 +122,15 @@ pub extern "C" fn topomalloc_guard_sample_rate() -> u64 {
 /// Honour `$TOPOMALLOC_GUARD_SAMPLE_RATE` at startup (§32.1): a positive integer
 /// sets the guarded-allocation sampling rate. A no-op without the `guard-pages`
 /// feature.
-pub(crate) fn guard_init_from_env() {
+///
+/// Takes the engine **by reference** rather than calling [`global`]: it runs from inside
+/// `GLOBAL.get_or_init`, where the `OnceLock` has not published yet, so a nested
+/// `global()` would re-enter the running `Once` and park the thread on its own
+/// initialization — a hang at the very first `malloc`.
+pub(crate) fn guard_init_from_env(a: &crate::AnyAllocator) {
     if let Ok(raw) = std::env::var("TOPOMALLOC_GUARD_SAMPLE_RATE") {
         if let Ok(rate) = raw.trim().parse::<u64>() {
-            if let Some(a) = global() {
-                a.set_guard_sample_rate(rate);
-            }
+            a.set_guard_sample_rate(rate);
         }
     }
 }
@@ -137,7 +140,11 @@ pub(crate) fn guard_init_from_env() {
 /// the default budget; `0`/unset leaves it off. Called under the bootstrap guard so
 /// any one-time setup is served by the system allocator. Without the `quarantine`
 /// feature, enabling is a no-op (nothing is compiled to hold objects).
-pub(crate) fn init_from_env() {
+///
+/// Takes the engine by reference for the same reason as
+/// [`guard_init_from_env`]: calling [`global`] from inside `GLOBAL.get_or_init`
+/// deadlocks on the still-running `OnceLock`.
+pub(crate) fn init_from_env(a: &crate::AnyAllocator) {
     let Ok(raw) = std::env::var("TOPOMALLOC_QUARANTINE") else {
         return;
     };
@@ -147,7 +154,6 @@ pub(crate) fn init_from_env() {
     if !enable {
         return;
     }
-    let Some(a) = global() else { return };
     #[cfg(feature = "quarantine")]
     if let Some(max_bytes) = as_num {
         if max_bytes > 1 {

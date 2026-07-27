@@ -62,7 +62,7 @@ impl TransferBin {
 
     /// Acquire the bin's spinlock (rank 3), routed through the W16-1b checker.
     #[inline]
-    fn lock(&self) -> TransferGuard<'_> {
+    pub(crate) fn lock(&self) -> TransferGuard<'_> {
         self.lock.acquire();
         TransferGuard { bin: self }
     }
@@ -107,6 +107,25 @@ impl TransferBin {
     #[inline]
     pub fn len(&self) -> u32 {
         self.len.load(Ordering::Relaxed)
+    }
+
+    /// Visit every address this bin currently holds (W19-1b residency cross-check).
+    ///
+    /// # Safety
+    /// The caller MUST hold this bin's lock, so no concurrent push/pop can retype `buf`
+    /// or move `len` underneath the walk. The scan is bounded by the **capacity**, not by
+    /// the (possibly-corrupted) `len`, so it can never read past the allocated buffer.
+    pub(crate) unsafe fn for_each_entry(&self, mut f: impl FnMut(usize)) {
+        let len = (self.len() as usize).min(self.capacity() as usize);
+        let buf = self.buf_ptr();
+        if buf.is_null() {
+            return;
+        }
+        for i in 0..len {
+            // SAFETY: `i < len <= capacity`; `buf` is a valid array of `capacity` `usize`
+            // from `MetadataAlloc` (never freed) and the caller holds the bin lock.
+            f(unsafe { *buf.add(i) });
+        }
     }
 
     /// Buffer capacity (in elements).
@@ -168,7 +187,7 @@ impl TransferBin {
 }
 
 /// RAII guard for a locked [`TransferBin`].
-struct TransferGuard<'a> {
+pub(crate) struct TransferGuard<'a> {
     bin: &'a TransferBin,
 }
 

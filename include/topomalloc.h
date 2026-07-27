@@ -116,19 +116,25 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * (§22/§36.4): the default arena (id 0) is always present, and explicit
  * arenas are created with the arena API below (plan 06 W9). TOPO_ARENA(id)
  * routes an allocation to arena `id`; naming an arena that does not exist (or
- * is being reset/destroyed) is a deterministic EINVAL. topo_tcache_t is
- * declared for the §10.3 surface but has no consumer until explicit-tcache
- * routing lands (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the
- * encoding is deferred to its subsystem rather than frozen as a guess
- * (reserved flag bits hold the space). */
+ * is being reset/destroyed) is a deterministic EINVAL.
+ *
+ * There is deliberately no `topo_tcache_t`. §10.3's sketch lists one (it is a
+ * SHOULD whose naming is "illustrative", and whose conformance requirement is
+ * equivalent *functionality*), but a handle type names an explicit cache to
+ * route an allocation through, and this allocator's front end is keyed by CPU —
+ * there is nothing for a caller-held handle to name. Declaring one anyway would
+ * freeze a guess at its width for a subsystem whose design is undecided, which
+ * is the opposite of deferring it; the same reasoning is why TOPO_TCACHE(id)
+ * and TOPO_NUMA(node) are absent rather than declared (reserved flag bits hold
+ * the space). TOPO_TCACHE_NONE — *declining* the cache, which needs no handle —
+ * is supported and honoured. */
 typedef uint32_t topo_arena_t;
-typedef uint32_t topo_tcache_t;
 typedef uint64_t topo_flags_t;
 
 /* The topo_flags_t layout (validated; reserved bits MUST be zero — §10.4):
  *   bits 0–5   lg(alignment), 0 = natural        TOPO_ALIGN_LG(la)
  *   bit  6     zero returned memory              TOPO_ZERO
- *   bit  7     bypass local caches               TOPO_TCACHE_NONE
+ *   bit  7     bypass the per-CPU cache          TOPO_TCACHE_NONE
  *   bit  8     guard allocation                  TOPO_GUARDED
  *   bit  9     avoid hugepages                   TOPO_NO_HUGEPAGE
  *   bit 10     prefer hugepages                  TOPO_PREFER_HUGEPAGE
@@ -138,6 +144,14 @@ typedef uint64_t topo_flags_t;
  *   bits 53–63 reserved (must be zero)
  * Invalid words fail deterministically (NULL/0 + EINVAL); advisory hints are
  * validated and threaded to the placement subsystems as they land.
+ *
+ * TOPO_TCACHE_NONE: serve this allocation from the central free list instead
+ * of the running core's per-CPU cache. Honoured on topo_mallocx and on
+ * topo_dallocx/topo_sdallocx (where it returns the object straight to central
+ * rather than parking it in a slot). Per-call, not per-object: a bypassing
+ * allocation freed without the flag may still be absorbed by the cache. Both
+ * routes are equally correct — this controls locality and cache residency,
+ * never validity.
  *
  * TOPO_ALIGN_LG(la): an out-of-range `la` (>= 64, including negative values
  * via the unsigned conversion) encodes a reserved-bit word, so the request
@@ -173,8 +187,16 @@ void *topo_rallocx(void *ptr, size_t size, topo_flags_t flags);
 
 /* Resize in place only, to at least `size` (best effort toward size+extra);
  * returns the allocation's real usable size — success iff result >= size.
- * Never moves or frees. At M1 in-place growth beyond the current usable
- * size is not possible (extent-merge growth lands at M5). */
+ * Never moves or frees.
+ *
+ * In-place growth IS supported for a medium/large allocation: it absorbs the
+ * address-adjacent free extent (Section 25.2). It is best-effort and declines —
+ * returning the unchanged usable size — when there is no adjacent free extent,
+ * when the allocation is served from the hugepage region cache, or when it is a
+ * guarded allocation (Section 29.5: a guarded object is right-aligned inside a
+ * larger extent, so it can only be resized by moving). A small allocation is
+ * bounded by its size class. Shrinking a medium/large allocation returns its
+ * tail pages (Section 25.3) under the same best-effort rule. */
 size_t topo_xallocx(void *ptr, size_t size, size_t extra, topo_flags_t flags);
 
 /* Free with flags (advisory on this path; validated, never trusted). */
@@ -304,6 +326,58 @@ topo_arena_t topo_arena_create_hooked(const topo_extent_hooks_t *hooks, void *ct
 
 /* The maximum number of arenas that can carry their own extent hooks at once. */
 size_t topo_max_hook_backends(void);
+
+/* ------------------------------------------------------------------------
+ * Front-end cache control surface (per-CPU + transfer caches, plan 05 W6/W7)
+ *
+ * Caching is automatic: every small allocation and free that carries no
+ * explicit arena or placement hint goes through the running core's per-CPU
+ * slot, backed by a transfer cache, without touching the contended central
+ * lock. These are the host-driven *maintenance* operations (off the alloc fast
+ * path, no background thread). Front-end residency is reported as
+ * topomalloc_stats_t::cache_bytes and as cache.per_cpu_bytes /
+ * cache.transfer_bytes in the stats JSON. Each entry point returns 0 before
+ * the allocator is initialised.
+ * --------------------------------------------------------------------- */
+
+/* Drain the whole front end — every core's per-CPU slots and the transfer
+ * cache — back into the central free lists, retiring the spans that empty.
+ * This is the release ladder's "drain caches" rung: it moves no live object,
+ * loses none, and is undone by the next allocation. Returns how much residency
+ * the drain actually returned to central, not the count resident when it began
+ * — a core whose in-flight sequences cannot be fenced is safely declined and
+ * keeps its objects, and the figure reflects that (exact when quiescent). */
+size_t topomalloc_cache_flush_all(void);
+
+/* Drain one core's per-CPU slots into the transfer cache, overflowing to the
+ * central free lists (the idle-CPU flush). Returns the objects moved out of
+ * that core. Note this drains one layer only — use topomalloc_cache_flush_all
+ * to return residency all the way to central. */
+size_t topomalloc_cache_flush_core(unsigned core);
+
+/* Run one cache-budget adaptation cycle: grow the size classes this workload
+ * keeps missing on, shrink the ones it keeps overflowing, then enforce the
+ * global budget (sized from the host's CPU count at start-up). Returns the
+ * total per-CPU soft capacity afterwards, in objects. */
+size_t topomalloc_cache_budget_tick(void);
+
+/* 1 if the restartable-sequence (rseq) lock-free fast path is serving the
+ * front end, 0 if it is on the locked baseline. Diagnostic only: both modes
+ * are correct and observationally identical. Reads 0 on a platform without
+ * rseq support, under ASan/MSan, and in a forked child. */
+int topomalloc_cache_rseq_active(void);
+
+/* Register the calling thread with the rseq fast path; returns whether it can
+ * use it. Harmless and idempotent to call.
+ *
+ * Under glibc >= 2.35 this is a no-op beyond a presence check: the C library
+ * registers every thread's rseq area before it runs user code, so threads are
+ * already set up. Where TopoMalloc self-registers instead (musl, older glibc),
+ * only threads that call this use the restartable sequences -- registration is
+ * a syscall and the allocation path does not attempt it lazily. An unregistered
+ * thread still allocates correctly, on the locked baseline; call this once at
+ * thread start to get the fast path. */
+int topomalloc_cache_register_thread(void);
 
 /* ------------------------------------------------------------------------
  * NUMA control surface (topology awareness, plan 04 W13)
@@ -459,8 +533,12 @@ int topomalloc_debug_checks_enabled(void);
 
 /* topo_stats flag bits (Section 31.2). SUMMARY (0) is always rendered; the BY_*
  * flags add per-entity detail blocks; CONSISTENT_SNAPSHOT / RESET_PEAKS are read
- * modes. Unknown bits are ignored (forward-compatible). These mirror the Rust
- * topo_stats::StatsFlags bits exactly. */
+ * modes. An unknown bit is REJECTED, not ignored: every stats entry point returns
+ * its error form (0 for the size/length calls, -1 for topomalloc_stats_print) so a
+ * typo'd or future flag fails loudly rather than silently doing nothing — the same
+ * strict validation topo_mallocx applies to its flags (Section 10.4). Forward
+ * compatibility comes from the JSON being additive, not from ignoring input. These
+ * mirror the Rust topo_stats::StatsFlags bits exactly. */
 #define TOPOMALLOC_STATS_SUMMARY ((uint64_t) 0)
 #define TOPOMALLOC_STATS_BY_ARENA ((uint64_t) 1 << 0)
 #define TOPOMALLOC_STATS_BY_SIZE_CLASS ((uint64_t) 1 << 1)
@@ -515,11 +593,23 @@ int topomalloc_stats_snapshot(topomalloc_stats_t *out, uint64_t flags);
  * flag bit is rejected (writes nothing, returns 0 — Section 10.4). */
 size_t topomalloc_stats_json(char *buf, size_t cap, uint64_t flags);
 
-/* Like topomalloc_stats_json, but the BY_ARENA per-arena detail (and, for a
- * redacted low observer, ALL cross-domain summary aggregates) are REDACTED to
- * only what an observer at `observer_label` is authorized to see (Section 36.12):
- * a low domain cannot observe a higher domain's activity. On POSIX every arena is
- * PUBLIC (0), so a PUBLIC observer sees everything (the identity case). */
+/* Like topomalloc_stats_json, but REDACTED to what an observer at
+ * `observer_label` is authorized to see (Section 36.12): the BY_ARENA detail is
+ * filtered to the arenas it dominates, and the cross-domain summary aggregates
+ * are zeroed with live_bytes recomputed from the visible arenas.
+ *
+ * Redaction is keyed on the OBSERVER'S LABEL ALONE. Only
+ * TOPOMALLOC_OBSERVER_LABEL_TOP receives the raw summary; every other label --
+ * including PUBLIC (0) -- gets the redacted view, even when it happens to
+ * dominate every arena that currently exists. Gating on "this observer sees all
+ * live arenas" would be a covert channel: a high domain could flip the low view
+ * by creating and destroying a labelled arena, and every cross-domain aggregate
+ * would be disclosed whenever no high arena happened to exist.
+ *
+ * So for ordinary process-wide monitoring (including the all-PUBLIC POSIX case)
+ * use topomalloc_stats_json, or pass TOPOMALLOC_OBSERVER_LABEL_TOP here. Pass a
+ * real domain label only when you want that domain's restricted view. */
+#define TOPOMALLOC_OBSERVER_LABEL_TOP ((uint32_t) 0xFFFFFFFFu)
 size_t topomalloc_stats_json_for_label(char *buf, size_t cap, uint64_t flags,
                                        uint32_t observer_label);
 

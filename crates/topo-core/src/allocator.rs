@@ -18,7 +18,7 @@
 //!
 //! **This is the M1 path: no front-end caches.** Every operation goes through
 //! the central list's locks (the "global lock" of the milestone ladder, §5).
-//! Plan 05's per-CPU/thread caches are wired *under* the same API at M2
+//! Plan 05's per-CPU + transfer caches are wired *under* the same API (W6/W7)
 //! (W16-4 owns that transition); nothing here changes when they arrive.
 //!
 //! **Trace spine (§33.7 / principle 6).** The allocator does not emit trace
@@ -53,13 +53,17 @@ use crate::arena::{
 };
 use crate::backend::TopoBackingProvider;
 use crate::bootstrap::{BumpArena, MetadataAlloc};
+use crate::budget::CacheBudget;
+use crate::cache_ops;
 use crate::central::{CentralCache, RemoveResult};
 use crate::classify::{classify, Request, RequestKind};
+use crate::cpu_cache::CpuCache;
 use crate::error::BackendError;
 use crate::extent::{
     ExtentBacking, ExtentError, ExtentId, ExtentManager, ExtentRef, Fit, RegionCacheHook,
     StateBytes,
 };
+use crate::fe::{CoreId, FeOutcome};
 use crate::flags::{Hints, Lifetime, RequestFlags};
 use crate::generated::tables::PAGE_SIZE;
 use crate::generated::tables::SIZE_CLASSES;
@@ -69,7 +73,7 @@ use crate::ids::{ArenaId, Generation, Label, NodeId, SizeClassId, SpanId};
 use crate::large::{LargeAllocator, LargeBacking, LargeConfig};
 use crate::lock::{LockRank, RankedLock};
 use crate::overflow::align_up;
-use crate::pagemap::PageMap;
+use crate::pagemap::{PageEntry, PageMap};
 use crate::placement::{LearnedHints, PlaceClass, SizeClassDist};
 use crate::ptr_class::{
     classify_ptr, validate_free, FreeTarget, InvalidFree, MetadataRegion, PointerClass,
@@ -78,6 +82,7 @@ use crate::size_class;
 use crate::skeleton::MIN_ALIGN;
 use crate::slab::SlabLayout;
 use crate::span::{SpanDescriptor, SpanState};
+use crate::transfer_cache::TransferCache;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -216,6 +221,70 @@ pub enum FreeOutcome {
     DoubleFree,
 }
 
+/// What the quarantine did with a freed object (§29.4, W18-3) — and, crucially, whether
+/// it still holds that object's **exclusive claim**.
+///
+/// The quarantine has to take its claim *before* it offers the entry to the ring (a
+/// concurrent offer may evict and drain this very entry the instant it is published), so
+/// on a declined offer the claim is already held by a free that now has to finish some
+/// other way. Releasing it there and re-claiming later is what opens a window in which
+/// the object is owned by nobody: a second free of the same address slips in, takes the
+/// quarantine claim itself, and both frees report success — leaving one address in a
+/// front-end slot (or the central list) *and* in the quarantine ring, to be vended while
+/// a later drain frees it again. The claim is therefore handed **from one residency
+/// marker to the next** without a gap, and this type is what carries that obligation
+/// back to the caller.
+///
+/// # The free-path claim rule
+///
+/// Every bug this type exists to prevent has been the same bug on a different path, so
+/// the rule is written here rather than re-derived at each call site:
+///
+/// > **Every route that can free an object must contend on *one* atomic, and must do so
+/// > before choosing its route.**
+///
+/// A freed object is in exactly one of a small number of residency states — live,
+/// claimed, front-end-cached, quarantined, central-free — and the ones that are
+/// separately-addressable bits are only mutually exclusive because the code makes them
+/// so. Two properties follow, and both have been violated in turn:
+///
+/// * **One claim, not one per route.** If the cache route claims the cached bit and the
+///   quarantine route claims the quarantined bit, two frees of one object can each win
+///   *their own* atomic and both succeed. Checking the other route's marker first does
+///   not fix it: a load is not a claim, and the two checks can both precede the two sets.
+/// * **Claim before you branch.** Any predicate consulted *before* the claim — the
+///   quarantine's runtime switch, front-end cacheability, `TOPO_TCACHE_NONE` — can be
+///   observed differently by two concurrent frees, and a free that read its way to a
+///   route without claiming anything has nothing to exclude the other with. The runtime
+///   switch is the sharpest case, because it can genuinely change between the two reads.
+///
+/// Concretely: a cacheable small free claims the cached bit before consulting the
+/// quarantine at all; a non-cacheable small free and every large free claim the
+/// quarantined mark before reading the switch. In each case the *first* thing any free of
+/// that object does is contend on the same word as every other free of it, and everything
+/// after that runs under an exclusive claim.
+///
+/// The transition into central-free is the one marker that stays separate, because
+/// `free_bitmap` is the central list's allocation structure and not merely a marker. It
+/// is ordered free-bit-first against the claim it replaces, so a lock-free
+/// `claimed || central_free` observer never sees both clear — one hand-ordered pair,
+/// which is tractable to keep proved.
+// Without the `quarantine` feature the helpers collapse to `NotEngaged` and the other two
+// variants are never produced — but the callers still match all three, so they are live
+// code in exactly the builds that have a quarantine to hold anything.
+#[cfg_attr(not(feature = "quarantine"), allow(dead_code))]
+enum QuarantineDisposition {
+    /// The quarantine settled the free outright: it *held* the object (reuse delayed) or
+    /// detected a double free. Nothing further to do.
+    Settled(FreeOutcome),
+    /// The quarantine declined to hold the object but **still holds its claim**. The
+    /// caller completes the free and releases the claim only once the next marker is
+    /// set, so `is_quarantined || is_cached || is_central_free` is true at every instant.
+    ClaimHeld,
+    /// The quarantine took no claim (compiled out, or disabled).
+    NotEngaged,
+}
+
 // ---------------------------------------------------------------------------
 // Stats (§8.6/§31, the W8 reconciliation surface for plan 07)
 // ---------------------------------------------------------------------------
@@ -242,6 +311,14 @@ pub struct AllocatorStats {
     /// Free object bytes resident in the central lists (Σ over classes of
     /// `central_free_count × object_size`).
     pub central_free_bytes: u64,
+    /// Free object bytes held in the §11 per-CPU slots (W6-4/W7). Part of the §16.4
+    /// `local_cached` term: these objects have been freed by the application (so they are
+    /// **not** in `live_bytes`) but have not reached the central bitmap (so they are not
+    /// in `central_free_bytes` either).
+    pub per_cpu_bytes: u64,
+    /// Free object bytes held in the §11.4 transfer cache (W6-3) — the §16.4
+    /// `transfer_cached` term, accounted exactly as `per_cpu_bytes`.
+    pub transfer_bytes: u64,
     /// §20.1 physical-state breakdown of the span (small-object) region.
     pub span_backend: StateBytes,
     /// §20.1 physical-state breakdown of the medium/large region.
@@ -265,6 +342,20 @@ pub struct AllocatorStats {
     /// `arena.destroyed_count`, plan 07 W17-1a). Monotonic; a destroyed id may later
     /// be recycled (§36.13), so this is an event count, not `created − live`.
     pub arenas_destroyed: u64,
+    /// Arenas currently stuck in the terminal §36.13 `ErrorQuarantined` state — a
+    /// reset/destroy whose *backing* could not be recycled. The state has no outgoing
+    /// transition, so each one permanently consumes an arena slot (and, if delegated,
+    /// holds its parent's reserved quota), walking the table toward
+    /// `ArenaError::Exhausted`. Normally `0`.
+    pub arenas_quarantined: u64,
+    /// Cumulative guard-page `mprotect` refusals (§29.5, W18-4): a guarded allocation
+    /// the provider would not let us protect (so it was handed out **unguarded**), or a
+    /// free whose guard could not be restored. Always `0` without `guard-pages`, and `0`
+    /// on a provider with no page protection (which reports success and treats guards as
+    /// advisory). Nonzero means guarded allocations are silently unprotected — typically
+    /// `vm.max_map_count` exhaustion, since each guarded object splits a VMA — so it is
+    /// surfaced rather than left as an invisible security downgrade.
+    pub guard_protect_failures: u64,
     /// The high-water mark of `live_bytes` since the last reset (§31.2/§31.3 sampled peak
     /// heap, plan 07 W17-2). A true high-water mark maintained on the allocation charge
     /// path (`fetch_max` of live after each charge), reset by `topomalloc_stats` `RESET_PEAKS`.
@@ -475,8 +566,26 @@ fn medium_large_usable(size: usize) -> Option<usize> {
 /// `None` exactly when `allocate` would fail classification (invalid
 /// alignment/flags or rounding overflow). Pure: no allocator state is
 /// consulted, so the prediction is identical for every engine instance.
+///
+/// **Guarded requests (W18-4, §29.5).** An explicit `TOPO_GUARDED` request takes the
+/// guarded page path, whose usable size is the *tight* `align_up(size, align)` — the
+/// object is right-aligned so that its last byte abuts an inaccessible guard page. The
+/// prediction must use that formula, not the size class's: over-reporting would send a
+/// caller following the documented `nallocx` idiom ("ask, then use the whole reported
+/// size") straight into the guard page. The formula mirrors
+/// `Allocator::allocate_in` / `LargeAllocator::allocate_guarded` exactly, including the
+/// `align <= PAGE_SIZE` bound `Allocator::want_guarded` applies (an over-aligned request
+/// is *not* guarded, so it keeps the ordinary prediction).
+///
+/// Guard **sampling** (`topomalloc_guard_set_sample_rate`) can route an *unhinted*
+/// allocation into the same path, so a prediction for a plain request is an upper bound
+/// only while sampling is off; that is why sampling is opt-in and defaults to `0`, and
+/// why `topo_nallocx` documents its answer as the un-sampled result.
 pub fn predicted_usable_size(size: usize, align: usize, flags: RequestFlags) -> Option<usize> {
     let req = classify(size, align, flags.raw())?;
+    if cfg!(feature = "guard-pages") && flags.hints().guarded && req.align <= PAGE_SIZE {
+        return crate::overflow::align_up(size.max(1), req.align.max(1));
+    }
     match req.kind {
         RequestKind::Small { usable, .. } => Some(usable),
         RequestKind::Medium { .. } | RequestKind::Large { .. } => medium_large_usable(size),
@@ -696,6 +805,24 @@ pub struct Allocator<'a, P: TopoBackingProvider> {
     /// non-zero rate samples ordinary allocations into the guarded page path.
     #[cfg(feature = "guard-pages")]
     guard: crate::harden::GuardSampler,
+    /// The §11 **front end**: the per-CPU object cache (plan 05 W6-2/W6-4, with the W7
+    /// RSEQ fast path when the platform supports it). A cacheable small allocation pops
+    /// from the running CPU's slot and a cacheable free pushes back into it, so neither
+    /// touches the *contended* central bin lock — that is the whole point of the layer
+    /// (§27.2: the front end is the outermost data-path lock, and under RSEQ there is
+    /// no lock at all).
+    cpu_cache: CpuCache,
+    /// The §11.4 **middle end**: the transfer cache batching objects between the
+    /// per-CPU slots and the central free lists (W6-3). A slot refills from here before
+    /// falling through to central, and flushes here before overflowing to central, so a
+    /// producer/consumer pair on different CPUs exchanges batches without ever reaching
+    /// the central layer.
+    transfer: TransferCache,
+    /// W6-5 cache-budget controller: adapts each slot's soft capacity from its
+    /// miss/overflow counters and caps the total bytes the front end may hold. Driven by
+    /// the host through [`cache_budget_tick`](Self::cache_budget_tick) (the W12 release
+    /// pump's natural cadence), never from the allocation path.
+    budget: CacheBudget,
 }
 
 // SAFETY: `central`, `span_extents`, `large`, `pagemap`, and `arenas` carry
@@ -837,6 +964,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             quarantine: crate::harden::Quarantine::new(),
             #[cfg(feature = "guard-pages")]
             guard: crate::harden::GuardSampler::new(),
+            cpu_cache: CpuCache::new(),
+            transfer: TransferCache::new(),
+            // Sized for a single core until the host publishes its CPU count through
+            // `set_front_end_cpus`; the front end starts with no slots initialised
+            // anyway, so this only bounds the pre-announcement steady state.
+            budget: CacheBudget::new(Self::PER_CPU_OBJECT_BUDGET),
         })
     }
 
@@ -914,15 +1047,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         match self.hook_backend(arena) {
             Some(b) => &b.span_extents,
             None => &self.span_extents,
-        }
-    }
-
-    /// The large backing for `arena`: its own hooked region, or the shared.
-    #[inline]
-    fn large_backing(&self, arena: ArenaId) -> &dyn LargeBacking {
-        match self.hook_backend(arena) {
-            Some(b) => &b.large,
-            None => &self.large,
         }
     }
 
@@ -1068,9 +1192,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             }
         } else {
             match req.kind {
-                RequestKind::Small { sc, .. } => {
-                    self.alloc_small(arena, sc, self.small_place_class(&req))
-                }
+                RequestKind::Small { sc, .. } => self.alloc_small(
+                    arena,
+                    sc,
+                    self.small_place_class(&req),
+                    req.flags.hints().cache_bypass,
+                ),
                 RequestKind::Medium { .. } | RequestKind::Large { .. } => {
                     // Route to the arena's own hooked large backing if it has one (W10);
                     // otherwise the shared backend, carrying the request's placement hints
@@ -1214,10 +1341,908 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         PlaceClass::from_hints(ph).as_u8()
     }
 
-    /// Small-object allocation: pull one object from the central list, **preferring a span
-    /// of placement class `class`** (§24.6–§24.8, W14) so cold / hot / short-lived small
-    /// objects cluster; creating and activating a new (class-tagged) span when none is
-    /// available (§A.2's OOM-retry loop).
+    // -- the §11 front end: per-CPU + transfer caches (plan 05 W6/W7) --------
+
+    /// Whether small objects of `(arena, place_class)` participate in the front-end
+    /// caches (W6).
+    ///
+    /// **Only the default arena's placement-*unhinted* spans do** (see
+    /// [`unhinted_place_class`](Self::unhinted_place_class) for which class that is —
+    /// it is derived, not named). The reason is that a
+    /// cached object carries *no* provenance beyond its size class: a slot is keyed by
+    /// `(core, sc)` alone, so whatever it vends must be substitutable for **any**
+    /// cacheable request of that class. Restricting the cache to one `(arena, label,
+    /// node, place class)` tuple makes that literally true, which is what keeps the
+    /// properties the central path establishes per-request exact rather than approximate:
+    ///
+    /// * §22.7 arena isolation and §36.4 quota exactness — an explicit arena's objects
+    ///   never enter a shared pool, so they cannot be handed to another arena.
+    /// * §36.12 label isolation — likewise for a labelled arena's memory.
+    /// * §24.6–§24.8 placement grouping (W14) — a cold/hot/short-tagged span's objects
+    ///   are never vended to an unhinted request, so grouping stays a real partition.
+    ///
+    /// Both sides decide in O(1) from data already in hand (the allocation's arena +
+    /// computed class; the freed object's span). Everything outside this tuple keeps the
+    /// pre-W6 central path **byte for byte**.
+    ///
+    /// Cacheability cannot change under a cached object: a span is re-tagged
+    /// ([`SpanDescriptor::set_place_class`]) only while it is *empty*, and an empty span
+    /// has no cached objects (a cached object keeps `live_count` raised — §8.5).
+    #[inline]
+    fn front_end_cacheable(arena: ArenaId, place_class: u8) -> bool {
+        arena == ArenaId::DEFAULT && place_class == Self::unhinted_place_class()
+    }
+
+    /// The [`PlaceClass`] tag a **placement-unhinted** small request computes — the one
+    /// class the front end caches.
+    ///
+    /// Derived by running the neutral hints through the same
+    /// [`PlaceClass::from_hints`]/[`Hotness::from_hint`] pair
+    /// [`small_place_class`](Self::small_place_class) uses, rather than named as a
+    /// constant, because the two must agree *by construction*: an unhinted request maps
+    /// to [`PlaceClass::Cold`] today (`from_hint(0)` reads a zero hotness as cold, so
+    /// `TOPO_COLD` and "no hint" are deliberately indistinguishable and share one span
+    /// pool), and naming `PlaceClass::Default` here instead would silently cache
+    /// *nothing* — the predicate would simply never match. Folds to a constant.
+    #[inline]
+    fn unhinted_place_class() -> u8 {
+        PlaceClass::from_hints(crate::huge::PlaceHints {
+            hotness: Hotness::from_hint(0),
+            lifetime: Lifetime::Unspecified,
+        })
+        .as_u8()
+    }
+
+    /// Bound on the pop/refill alternation in [`alloc_small_cached`]. Each iteration
+    /// either returns an object, refills the slot, or gives up, so this only caps a
+    /// pathological interleaving in which other threads drain every refill; the central
+    /// path then serves the request.
+    const FRONT_END_POP_RETRY: u32 = 8;
+
+    /// Try to serve a cacheable small request from the front end (W6-2/W6-4, and the W7
+    /// restartable sequence when [`CpuCache::enable_rseq`] took). Null ⇒ the caller falls
+    /// through to the central path; this never fails an allocation on its own.
+    ///
+    /// Popping is the `cached → live` transition of the §16.4 residency state machine, so
+    /// the object's cached bit is cleared before it is handed out. That clear is also the
+    /// point at which a slot entry that is *not* marked cached is detected — an
+    /// impossible state that would mean the bit and the slot had diverged — and dropped
+    /// rather than double-vended.
+    fn alloc_small_cached(&self, sc: SizeClassId) -> *mut u8 {
+        for _ in 0..Self::FRONT_END_POP_RETRY {
+            // Re-read the running core **every iteration**, and refill the core the pop
+            // reports rather than this hint, so a refill and the pop that is meant to
+            // consume it always target the same slot.
+            //
+            // Both halves matter, and neither alone is enough. In RSEQ mode `fe_pop`
+            // ignores the hint and operates on the hardware-current CPU, so a thread that
+            // migrated after the snapshot pops from its new CPU's slot while a refill
+            // keyed to the hint pushes batches into the old one. The allocation then
+            // cannot see the objects it just pulled out of central — and because the
+            // refill *moved* them (central loses them, a slot the pop never reads gains
+            // them), an allocation that should have succeeded can report OOM with free
+            // objects sitting on another core. Re-reading each iteration alone does not
+            // fix that: if the misdirected refill took the *last* central batch, the next
+            // iteration finds its slot empty, `refill_front_end` reports central empty,
+            // and the loop returns null with the batch parked where nothing will look for
+            // it. Taking the served core from the pop closes the window instead of
+            // narrowing it.
+            let hint = self.cpu_cache.current_core();
+            // `served` is the core the pop *actually* used, which in RSEQ mode is the
+            // hardware CPU and not necessarily `hint` — a thread that migrated in
+            // between differs. Refilling `served` rather than `hint` is what keeps the
+            // batch and the pop that must consume it on the same slot; see
+            // `CpuCache::fe_pop_tracked`.
+            let (outcome, served) =
+                self.cpu_cache
+                    .fe_pop_tracked(hint, ArenaId::DEFAULT, sc, self.meta);
+            match outcome {
+                FeOutcome::Success(addr) => {
+                    let p = self.claim_cached_object(addr, sc);
+                    if !p.is_null() {
+                        return p;
+                    }
+                    // A slot entry we could not claim (see `claim_cached_object`): it is
+                    // already accounted for there, so simply try the next one.
+                }
+                FeOutcome::Empty => {
+                    // `None` ⇒ the front end declined without touching a slot (pinned mode
+                    // with no resolvable core). Refilling would have to invent a core, and
+                    // the reason the pop declined is that no core is safe to touch — so
+                    // serve from central instead.
+                    let Some(served) = served else {
+                        return ptr::null_mut();
+                    };
+                    if !self.refill_front_end(served, sc) {
+                        return ptr::null_mut(); // central list is empty: needs a span
+                    }
+                    // **Consume the refill in the iteration that performed it, from the
+                    // slot it went into.** A refill *moves* objects: central loses a
+                    // batch and `served`'s slot gains it. Looping back to
+                    // `fe_pop_tracked` instead would re-read the running CPU, so a thread
+                    // that migrated in between polls a different slot and never sees the
+                    // batch it just created — and if that refill took central's last
+                    // batch, the loop reports OOM with reusable objects parked on a core
+                    // nothing will look at.
+                    //
+                    // Carrying the parked core forward to a recovery probe at the OOM
+                    // point is not enough, which is the bug this replaces: across two
+                    // migrations (A → B → C) only the *most recent* refilled core is
+                    // remembered, so a batch left on A is forgotten the moment B is
+                    // refilled, and a concurrent consumer draining B turns the exhausted
+                    // backend into a spurious OOM with A still holding objects. Making
+                    // every refill self-consuming removes the bookkeeping instead of
+                    // widening it: no iteration can end with a batch this loop created
+                    // sitting in a slot the loop will not revisit, whatever the migration
+                    // pattern. `fe_pop_on_core` is what makes that possible — it honours
+                    // the core argument regardless of the running CPU, which the
+                    // RSEQ-mode `fe_pop` cannot do by design.
+                    //
+                    // A miss here is legitimate and not a stranding: either another
+                    // thread drained the slot first, or the slot was already full when
+                    // the refill ran and `refill_front_end` handed its batch to the
+                    // transfer cache one layer down instead (which is exactly why it
+                    // reports `need_span` rather than `filled > 0`). Either way the
+                    // objects are reachable, so the bounded loop simply retries.
+                    if let FeOutcome::Success(addr) =
+                        self.cpu_cache
+                            .fe_pop_on_core(served, ArenaId::DEFAULT, sc, self.meta)
+                    {
+                        let p = self.claim_cached_object(addr, sc);
+                        if !p.is_null() {
+                            return p;
+                        }
+                    }
+                }
+                // `fe_pop` never yields these (`Full` is a push outcome; the RSEQ path
+                // resolves `Abort` internally or falls back to the locked path). Decline
+                // to the central path rather than assume.
+                FeOutcome::Full | FeOutcome::Abort => return ptr::null_mut(),
+            }
+        }
+        ptr::null_mut()
+    }
+
+    /// Turn an address popped from a front-end slot into a live object pointer:
+    /// resolve its `(span, index)` through the pagemap, clear its cached bit, and hand it
+    /// out through the ordinary [`hand_out_object`](Self::hand_out_object) — so a cached
+    /// allocation gets the same provenance-correct pointer derivation and the same
+    /// `junk-fill` verify-on-reuse canary check (§29.6) as a central one.
+    ///
+    /// Returns null for any entry it cannot claim. Each such case is an *impossible*
+    /// state (the front end only ever holds addresses that `refill`/`free` resolved to a
+    /// live span of this class and marked cached), so each is `debug_assert`ed; in release
+    /// the entry is dropped, which loses at most one object rather than risking a
+    /// double-vend (§2.4). `hand_out_object`'s own failure paths return the object to the
+    /// central list, so that case does not leak either.
+    fn claim_cached_object(&self, addr: usize, sc: SizeClassId) -> *mut u8 {
+        let PageEntry::Small(span_ptr) = self.pagemap.lookup(addr) else {
+            debug_assert!(
+                false,
+                "front end held an address with no small pagemap entry"
+            );
+            return ptr::null_mut();
+        };
+        if span_ptr.is_null() {
+            debug_assert!(false, "front end held an address whose span entry is null");
+            return ptr::null_mut();
+        }
+        // SAFETY: the pagemap only publishes descriptors that live in never-freed
+        // metadata (§27.5), so the pointer stays dereferenceable.
+        let span = unsafe { &*span_ptr };
+        if span.size_class() != sc {
+            debug_assert!(false, "front end held an object of a different size class");
+            return ptr::null_mut();
+        }
+        let Some(layout) = SlabLayout::compute(sc, span.base(), span.slab_header() as usize) else {
+            debug_assert!(
+                false,
+                "claim_cached_object: span geometry no longer computes"
+            );
+            return ptr::null_mut();
+        };
+        let Some(idx) = layout.addr_to_index(addr) else {
+            debug_assert!(false, "claim_cached_object: address is not an object base");
+            return ptr::null_mut();
+        };
+        // The `cached → live` transition. The test-and-clear is what makes it exclusive:
+        // whichever thread clears the bit owns the object, so two slots that somehow held
+        // the same address could not both vend it.
+        if !span.unmark_cached(idx) {
+            debug_assert!(false, "front end held an object that is not marked cached");
+            return ptr::null_mut();
+        }
+        let Ok(index) = u16::try_from(idx) else {
+            debug_assert!(false, "claim_cached_object: object index exceeds u16");
+            return ptr::null_mut();
+        };
+        self.hand_out_object(span, index)
+    }
+
+    /// Refill the running core's slot for `sc` from the transfer cache, falling through to
+    /// the central free list (W6-3a). Returns whether anything landed in the slot; `false`
+    /// means both layers were empty, i.e. the class needs a new span — which the central
+    /// path (the single authority on span creation) then does.
+    #[inline]
+    fn refill_front_end(&self, core: CoreId, sc: SizeClassId) -> bool {
+        let mut on_empty = |span: &SpanDescriptor| self.retire_span(span);
+        let r = cache_ops::refill(
+            core,
+            NodeId::DEFAULT,
+            ArenaId::DEFAULT,
+            Label::PUBLIC,
+            sc,
+            // Only the one class this front end caches: a slot is keyed by `(core, sc)`
+            // alone, so pulling from a hot/cold/short-tagged span would vend a grouped
+            // object to an unhinted request and quietly erase the W14 partition.
+            Self::unhinted_place_class(),
+            &self.cpu_cache,
+            &self.transfer,
+            &self.central,
+            self.pagemap,
+            self.meta,
+            &mut on_empty,
+        );
+        // **`need_span`, not `filled > 0`.** They answer different questions, and only
+        // the first is the one the caller is asking ("is central out of objects, so that
+        // making a span is the *only* way forward?").
+        //
+        // A refill can legitimately place nothing in this slot while objects remain
+        // plainly available: another thread sharing the slot can fill it in between, so
+        // `push_batch` accepts zero and the batch this call removed from central is handed
+        // to the transfer cache instead. Reporting that as "central is empty" sends the
+        // caller straight to span creation, and on an exhausted backend it returns OOM
+        // while the objects it just moved sit one layer down. Retrying the pop is both
+        // correct and bounded — the caller's loop is capped, and falls through to the
+        // central path if the alternation really does not settle.
+        !r.need_span
+    }
+
+    /// Flush a batch out of the running core's slot for `sc` into the transfer cache,
+    /// overflowing to the central free list (W6-3b/3c), retiring any span the overflow
+    /// empties.
+    #[inline]
+    fn flush_front_end(&self, core: CoreId, sc: SizeClassId) {
+        let mut on_empty = |span: &SpanDescriptor| self.retire_span(span);
+        cache_ops::flush(
+            core,
+            ArenaId::DEFAULT,
+            sc,
+            &self.cpu_cache,
+            &self.transfer,
+            &self.central,
+            self.pagemap,
+            self.meta,
+            &mut on_empty,
+        );
+    }
+
+    /// Try to absorb a freed cacheable small object into the front end (W6). `Some` ⇒ the
+    /// free is complete; `None` ⇒ the caller finishes it on the central path (the object
+    /// is left marked cached, and `insert_batch_inner` clears that bit free-bit-first as
+    /// part of the ordinary `cached → central-free` flush transition).
+    ///
+    /// **Precondition:** the caller has already won this object's
+    /// [`SpanDescriptor::try_mark_cached`] — the **double-free oracle** for every free of
+    /// a cacheable object, exactly as `central_insert`'s test-and-set is for one that
+    /// reaches the central bitmap. It is taken in `free_with` rather than here because a
+    /// *bypassing* free (`TOPO_TCACHE_NONE`, force-slow-path) never calls this function
+    /// yet must still settle the same race; two concurrent frees of one live object then
+    /// both reach that single atomic and exactly one wins, whichever routes each takes.
+    fn free_small_cached(
+        &self,
+        ptr: *mut u8,
+        span: &SpanDescriptor,
+        arena: ArenaId,
+        usable: usize,
+    ) -> Option<FreeOutcome> {
+        // Holding the claim ⇒ this object is exclusively ours: it is neither
+        // central-free (nothing can vend it) nor yet in a slot (nothing can pop it).
+        // W18-5 (§29.6): arm the use-after-free canary here — the cached counterpart of
+        // `insert_batch_scrubbing`'s under-the-span-lock fill — so a cached object carries
+        // the same redzone a central-free one does, and `hand_out_object` verifies it on
+        // reuse. A true no-op unless `junk-fill` is compiled in.
+        // SAFETY: `ptr` is this object's `usable`-byte user region, just freed and
+        // exclusively ours until the push below publishes it.
+        unsafe { crate::harden::fill_on_free(ptr, usable) };
+        let sc = span.size_class();
+        let hint = self.cpu_cache.current_core();
+        // `served` is the core the push *actually* used — the hardware CPU in RSEQ mode,
+        // the §36.10 oracle's core in pinned mode — which `hint` need not name, since
+        // `current_core` consults neither. The flush below has to target that core and not
+        // the hint: draining the hint drains a slot that is not the full one, and in pinned
+        // mode drains one this thread does not own, racing its pinned worker's non-atomic
+        // buffer. `None` ⇒ the front end declined without touching any slot, so there is
+        // nothing to flush and no core it would be safe to guess. See
+        // `CpuCache::fe_push_tracked`.
+        let (outcome, served) =
+            self.cpu_cache
+                .fe_push_tracked(hint, arena, sc, ptr as usize, self.meta);
+        let mut pushed = outcome.is_success();
+        if !pushed {
+            if let Some(served) = served {
+                // At soft capacity (§11.5): push a batch down the hierarchy and retry once.
+                self.flush_front_end(served, sc);
+                pushed = self
+                    .cpu_cache
+                    .fe_push(served, arena, sc, ptr as usize, self.meta)
+                    .is_success();
+            }
+        }
+        if !pushed {
+            return None; // the central path completes the free
+        }
+        self.account_small_free(arena, usable);
+        Some(FreeOutcome::Freed)
+    }
+
+    /// Complete a small free that has passed [`free_with`](Self::free_with)'s lock-free
+    /// "already awaiting reuse" **screen** — quarantine, then the authoritative claim,
+    /// then the front-end-or-central routing.
+    ///
+    /// Split out from `free_with` because the screen is only *advisory* (two loads, no
+    /// claim): the concurrency question is what happens when a second free of the same
+    /// object passes the screen and *then* the claim is taken. Calling this directly with
+    /// the claim already held is exactly that interleaving, which is how
+    /// `a_bypassing_free_racing_a_cached_free_cannot_also_succeed` pins it as a fixed wall.
+    fn free_small_screened(
+        &self,
+        ptr: *mut u8,
+        span: &SpanDescriptor,
+        idx: u16,
+        arena: ArenaId,
+        usable: usize,
+        cache_bypass: bool,
+    ) -> FreeOutcome {
+        // W6 (§29.3): for a **front-end-cacheable** object the cached marker is the
+        // authoritative free-path claim — its test-and-set is what decides between two
+        // concurrent frees, exactly as `central_insert`'s does for an object that reaches
+        // the bitmap. *Every* route that can free such an object has to take it, including
+        // the two that go straight to central: `TOPO_TCACHE_NONE` (§10.3) and the
+        // deterministic force-slow-path. A route that skipped it would insert into a
+        // bitmap a cached free never touches, so a concurrent normal free and a bypassing
+        // one could each succeed — one address sitting in a per-CPU slot *and* in the
+        // central free list, to be vended to two callers.
+        //
+        // It is taken **first**, ahead of the quarantine decision, because it is the one
+        // claim every route to this object shares. Consulting the quarantine first left
+        // the two claims independent — they are different atomics (the quarantined bit is
+        // a test-and-set under the span lock, the cached bit is lock-free), so each route
+        // could read the other's marker before that marker was set and both succeed,
+        // leaving one address in a per-CPU slot *and* in the quarantine ring. Toggling the
+        // runtime quarantine switch mid-free reaches it directly: a free that read
+        // "disabled" took no claim at all, so it had nothing to exclude the free that
+        // arrived a moment later with the switch on. Claiming the shared marker before the
+        // route is chosen makes the choice irrelevant to who wins.
+        let cacheable = Self::front_end_cacheable(arena, span.place_class());
+        if cacheable {
+            if !span.try_mark_cached(idx as usize) {
+                return FreeOutcome::DoubleFree;
+            }
+            // **Revalidate under the claim.** `try_mark_cached`'s own contract asks the
+            // caller to establish "not central-free, not quarantined" first, and
+            // `free_with`'s screen does — but that screen runs *before* the claim, so it
+            // is advisory: nothing holds between the two. The interleaving it misses is a
+            // **handoff**, not a simultaneous free. Two frees of one live object both pass
+            // the screen; the first wins this claim, completes down the central path, and
+            // `insert_batch_inner` releases the claim as part of the `cached →
+            // central-free` transition (free-bit-first). The second then arrives at a
+            // *cleared* cached bit, takes the claim legitimately, and — with the
+            // quarantine off, so nothing else re-checks — pushes an address that is
+            // already in the central free list into a per-CPU slot. Both layers then vend
+            // it: the double free the claim exists to catch, admitted by the claim itself.
+            //
+            // The state the screen looked at is only stable once the claim is held, so the
+            // check belongs here, after it. It is exact rather than advisory for the same
+            // reason: both handoffs publish their replacement marker *before* releasing
+            // this one (free-bit-first in `insert_batch_inner`, quarantined-bit-first in
+            // the quarantine hold), and `try_mark_cached` acquires (see [`CachedBits::set`]),
+            // so a claim that observed the release must observe the marker too. Releasing
+            // our mark restores exactly the pre-claim state.
+            if span.is_central_free(idx as usize) || span.is_object_quarantined(idx as usize) {
+                span.unmark_cached(idx as usize);
+                return FreeOutcome::DoubleFree;
+            }
+        }
+        // W18-3 (§29.4): when the quarantine is active it may *hold* this freed object
+        // out of circulation (delaying reuse) or detect a quarantine-hit double free —
+        // returning the final outcome; a true no-op (always `NotEngaged`) without the
+        // `quarantine` feature. `cacheable` tells it the shared claim is already held, so
+        // it neither re-checks the cached bit (that mark is ours) nor asks the caller to
+        // release anything: on a hold it performs the quarantined-bit-first handoff
+        // itself, and on a decline it leaves our mark exactly as it found it.
+        let quarantine_claim =
+            match self.maybe_quarantine_small(ptr, span, idx, arena, usable, cacheable) {
+                QuarantineDisposition::Settled(outcome) => return outcome,
+                // A **non-cacheable** object has no cached bit, so the quarantine's own
+                // mark is its only claim, and the caller releases it once the central
+                // insert has replaced it (free-bit-first, in `insert_batch_inner`).
+                QuarantineDisposition::ClaimHeld => true,
+                QuarantineDisposition::NotEngaged => false,
+            };
+        debug_assert!(
+            !(quarantine_claim && cacheable),
+            "a cacheable object's quarantine claim is settled inside maybe_quarantine_small"
+        );
+        // W6/W7: absorb the free into the running core's slot unless this call declined
+        // the cache. `None` ⇒ the front end declined and the central path below completes
+        // the free (the object stays marked cached until `insert_batch_inner` clears it
+        // free-bit-first).
+        if cacheable && !cache_bypass && !crate::deterministic::force_slow_path() {
+            if let Some(outcome) = self.free_small_cached(ptr, span, arena, usable) {
+                return outcome;
+            }
+        }
+        // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the use-after-free
+        // canary under the span lock; a true no-op otherwise.
+        let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
+        if r.inserted == 0 {
+            // Already central-free (double free) or the span raced its teardown; nothing
+            // was mutated (W8 hardening).
+            //
+            // W6 defence in depth: a cacheable object reaching here still carries the
+            // claim taken above — either the front end declined its push or this call
+            // bypassed the cache — and it sits in no slot. Clearing the mark restores
+            // exactly the pre-W6 state; the alternative is an object that is unreachable
+            // *and* reports a double free forever. A no-op for a non-cacheable object,
+            // which is never marked. Either way nothing else can hold this object's mark:
+            // reaching here means we won its `try_mark_cached`.
+            span.unmark_cached(idx as usize);
+            // Same reasoning for a *non*-cacheable object still carrying the quarantine
+            // claim: the insert that would have released it (free-bit-first, inside
+            // `insert_batch_inner`) did not happen, so release it here rather than leave
+            // the object unfreeable. Cacheable objects released theirs above.
+            if quarantine_claim && !cacheable {
+                self.release_quarantine_claim_small(span, idx);
+            }
+            return FreeOutcome::DoubleFree;
+        }
+        self.account_small_free(arena, usable);
+        if r.span_empty {
+            self.retire_span(span);
+        }
+        FreeOutcome::Freed
+    }
+
+    /// Record a completed small free: the cumulative `freed` counter (§8.6
+    /// `live == allocated − freed`) and the owning arena's quota credit (§36.17 exact
+    /// accounting). Shared by the central and the cached free paths so the two cannot
+    /// drift.
+    #[inline]
+    fn account_small_free(&self, arena: ArenaId, usable: usize) {
+        self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
+        self.arenas.credit(arena, usable as u64);
+    }
+
+    // -- front-end control surface (host-driven) -----------------------------
+
+    /// Per-CPU share of the §11.5 global front-end budget, in objects: one batch for
+    /// each size class. A slot's soft capacity starts at one batch and the W6-5
+    /// controller only grows the classes a workload actually misses on, so this is the
+    /// "every class warm on every core" ceiling, not a reservation.
+    const PER_CPU_OBJECT_BUDGET: usize = 32 * SIZE_CLASSES.len();
+
+    /// Publish the host's CPU count to the front end (W6-4/W6-5) and size the §11.5
+    /// global cache budget from it. The count sizes the *global allowance* and nothing
+    /// else; it does **not** bound which core an allocation may use (a slot is valid for
+    /// any core id below `MAX_CPUS`), nor which cores the W6-5 controller and the
+    /// idle-flush sweep visit — both walk the whole array, because a CPU *count* is a
+    /// population and a slot is keyed by a CPU *id*, and Linux does not promise those
+    /// ids are dense (see [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)).
+    ///
+    /// That separation is what makes a stale, absent, or *shrinking* count cost
+    /// adaptation quality and never correctness. It is load-bearing:
+    /// [`CpuCache::current_core`] used to take its no-RSEQ fallback key modulo this
+    /// count, so publishing one re-mapped every thread into `0..cpus` and orphaned
+    /// whatever the pre-publication mapping had cached at higher indices — objects
+    /// already removed from central, hence a spurious OOM on an exhausted backend. The
+    /// mapping is now independent of the count, so this call cannot strand anything.
+    pub fn set_front_end_cpus(&self, cpus: u32) {
+        self.cpu_cache.set_active_cpus(cpus);
+        let n = self.cpu_cache.active_cpus().max(1) as usize;
+        self.budget
+            .set_global_budget(n.saturating_mul(Self::PER_CPU_OBJECT_BUDGET));
+    }
+
+    /// Enable the W7 RSEQ fast path for the front end if the platform supports it
+    /// (Linux + x86-64/AArch64, no ASan/MSan). Returns whether it is now active; on
+    /// `false` the front end stays on the always-correct locked baseline (P-003).
+    ///
+    /// Also makes `rseq::current_cpu()` answer, which is what lets
+    /// [`CpuCache::current_core`] key slots by the *running CPU* instead of a per-thread
+    /// key — so enabling this improves the locked baseline too, not only the lock-free
+    /// sequences.
+    pub fn enable_front_end_rseq(&self) -> bool {
+        self.cpu_cache.enable_rseq()
+    }
+
+    /// Register the calling thread with the RSEQ fast path (§27.6, W7-1). A no-op
+    /// beyond a presence check in glibc mode; `false` when the fast path is not active.
+    pub fn register_front_end_thread(&self) -> bool {
+        self.cpu_cache.register_current_thread()
+    }
+
+    /// Revert the front end to the locked baseline (§28.1 conservative mode) — the
+    /// `pthread_atfork` child handler's counterpart to
+    /// [`enable_front_end_rseq`](Self::enable_front_end_rseq). Cached objects are
+    /// unaffected: the child inherits the slots, their contents, and the per-object
+    /// cached bits as a consistent copy (the fork gate quiesced every operation before
+    /// the fork), so they stay reachable through the locked path.
+    pub fn disable_front_end_rseq(&self) {
+        self.cpu_cache.disable_rseq();
+    }
+
+    /// Reset the front end in a freshly forked **child** (§28.1): the locked baseline,
+    /// the W7-4 fence latch cleared because a single-threaded child provably has no
+    /// in-flight restartable sequence, and the architecture layer's registration decision
+    /// dropped so the child re-derives it. See [`CpuCache::reset_after_fork`] — in
+    /// particular for why the child *must* forget, not merely may: neither membarrier's
+    /// registration of intent nor the rseq area survives `fork`, so a child that still
+    /// believed it had to fence could not, and one that still believed RSEQ was enabled
+    /// would run the fast path over kernel state that no longer exists.
+    ///
+    /// **The reset re-routes the child's slot selection, so it must also drain.** Unlike
+    /// [`disable_front_end_rseq`](Self::disable_front_end_rseq) — which leaves
+    /// `rseq::current_cpu()` answering, so a slot stays keyed by CPU id and every
+    /// inherited object stays reachable over the locked path — dropping the registration
+    /// decision makes `current_cpu()` report "no id". [`CpuCache::current_core`] then
+    /// keys by [`fallback_core`](CpuCache::fallback_core), so the child's single thread
+    /// reaches **one** slot while the parent's residency sits in however many CPU-indexed
+    /// slots its threads happened to run on. Those objects were *removed from central* to
+    /// get there, so leaving them parked is the same spurious-OOM shape as a mapping that
+    /// moves under the host's feet: an exhausted backing provider returns null with
+    /// reusable objects in slots nothing will look at. Draining every slot back to
+    /// central restores reachability whatever the child later routes to, and is the
+    /// §28.1 conservative-mode choice besides — a fresh child has no use for the parent's
+    /// front-end residency, and the drain retires any span it empties.
+    ///
+    /// Draining is sound *here* for precisely the reason it was the wrong answer at the
+    /// CPU-count publication point (see [`CpuCache::current_core`]): there, a thread that
+    /// had already sampled the old mapping could push after the drain, so it only
+    /// narrowed the window; here the caller's safety obligation **is** quiescence, so a
+    /// drain is complete by construction. The reset happens first, so the drain finds the
+    /// fence latch already cleared and never attempts the `membarrier` whose registration
+    /// did not survive the fork.
+    ///
+    /// # Safety
+    ///
+    /// Inherited verbatim from [`CpuCache::reset_after_fork`]: the caller must guarantee
+    /// a **quiesced single-threaded context** (a `fork` child, from the `pthread_atfork`
+    /// child handler). Clearing the fence latch with an RSEQ operation in flight lets a
+    /// subsequent non-owner locked access skip the fence that would have aborted it and
+    /// race the sequence's commit. That same obligation is what makes the drain total.
+    pub unsafe fn reset_front_end_after_fork(&self) {
+        // SAFETY: the caller's identical obligation, forwarded.
+        unsafe { self.cpu_cache.reset_after_fork() }
+        // Then return the inherited residency to central, where it is reachable from
+        // whichever slot the child now routes to. Ordered after the reset so no
+        // non-owner fence is attempted (the latch is clear); safe to run from the child
+        // handler because the parent quiesced every operation before `fork`, so the
+        // structures this walks are consistent and unlocked (§28.1).
+        let _ = self.flush_front_end_all();
+    }
+
+    /// Whether the W7 RSEQ fast path is currently active.
+    #[inline]
+    pub fn front_end_rseq_active(&self) -> bool {
+        self.cpu_cache.rseq_mode()
+    }
+
+    /// Enable the seLe4n pinned-thread per-core fast path (W7-5, §36.10) using the
+    /// runtime's per-core identity oracle. The RSEQ and pinned paths are mutually
+    /// exclusive deployment choices.
+    ///
+    /// # Safety
+    ///
+    /// Forwards [`CpuCache::enable_pinned_core`]'s obligation unchanged: the pinned
+    /// sequences take no per-CPU lock and the non-owner fence does not cover them, so the
+    /// caller must uphold the §36.10 hand-off contract — one pinned thread per core, and
+    /// no drain (`flush_front_end_core`, `flush_front_end_all`, `check_invariants`)
+    /// against a core whose pinned thread is active. See that method for the full
+    /// contract and for why the RSEQ path needs no such promise.
+    pub unsafe fn enable_front_end_pinned(&self, current_core: fn() -> i32) {
+        // SAFETY: this method's own contract is `enable_pinned_core`'s, forwarded
+        // unchanged to our caller.
+        unsafe { self.cpu_cache.enable_pinned_core(current_core) };
+    }
+
+    /// Run one W6-5 cache-budget adaptation cycle: grow the slots a workload keeps
+    /// missing on, shrink the ones it keeps overflowing, then enforce the §11.5 global
+    /// budget. Host-driven (the W12 release pump's natural cadence) and **never** called
+    /// from the allocation path — the same pure-policy/host-driven split as the release
+    /// controller. Returns the total soft capacity after adaptation, in objects.
+    ///
+    /// **Then drains if measured residency is still above the ceiling.** Shrinking soft
+    /// capacities bounds residency only *prospectively* — a push is refused once a slot
+    /// is at its cap, but objects already resident above a freshly lowered cap stay until
+    /// something pops or flushes them, and the transfer cache's residency is not in the
+    /// capacity total at all. So a tick that lowers caps (after `set_front_end_cpus`
+    /// reduces the allowance, say) can report a total *within* budget while the front end
+    /// holds more than the advertised §11.5 ceiling — and an idle workload keeps holding
+    /// it, because nothing pops. Triggering on **residency** covers that and the
+    /// structural case (more initialized slots than the CPU-count-sized allowance was
+    /// sized for, so even the floor exceeds the budget — see
+    /// [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)); a capacity trigger
+    /// covers only the second, which is why this asks the question it actually means.
+    ///
+    /// Both layers, via [`flush_front_end_all`](Self::flush_front_end_all), and
+    /// necessarily all of it: flushing cores alone pushes their contents into the
+    /// transfer cache, which is front-end residency too, so it would move the overage
+    /// rather than return it. Draining to *exactly* the ceiling is not expressible with
+    /// these mechanisms — the transfer drain is per-class all-or-nothing — so this
+    /// returns the whole front end when it fires. It fires only above the ceiling the
+    /// host asked to be enforced, and a steady-state front end sits under it (each push
+    /// is capped and the caps sum to the budget).
+    ///
+    /// **Declines in pinned mode**, which is a safety obligation, not a policy
+    /// preference. A pinned sequence takes no per-CPU lock — §36.10 makes the pinned
+    /// thread its slot's sole accessor — and no fence can drain one, so a concurrent
+    /// drain would read and rewrite a slot buffer under a running pinned worker. That is
+    /// precisely the hazard [`enable_front_end_pinned`](Self::enable_front_end_pinned)
+    /// makes its caller promise to avoid, and *this* method is **safe**, so it may not
+    /// introduce a drain the pinned contract's enumerated list (`flush_front_end_core` /
+    /// `flush_front_end_all` / `check_invariants`) does not name — a safe periodic tick
+    /// would otherwise silently violate an `unsafe` precondition the host had discharged.
+    /// A pinned runtime owns core assignment and can drain at a hand-off point itself;
+    /// skipping the rung here costs a ceiling overshoot, never soundness (§2.4).
+    pub fn cache_budget_tick(&self) -> usize {
+        let total = self.budget.adapt(&self.cpu_cache);
+        if !self.cpu_cache.pinned_mode() && self.front_end_objects() > self.budget.global_budget() {
+            let _ = self.flush_front_end_all();
+        }
+        total
+    }
+
+    /// Flush every front-end slot of `core` down to the transfer cache, overflowing to
+    /// the central free lists and retiring any span that empties (W6-7 idle-CPU flush).
+    /// Returns the number of objects moved out of the per-CPU slots.
+    ///
+    /// This is the §21.3 "drain caches" rung of the release ladder: it converts
+    /// front-end residency back into central-free (and, once a span empties, into
+    /// returnable backing) without touching any live object.
+    pub fn flush_front_end_core(&self, core: CoreId) -> usize {
+        let mut on_empty = |span: &SpanDescriptor| self.retire_span(span);
+        cache_ops::flush_idle_cpu(
+            core,
+            ArenaId::DEFAULT,
+            &self.cpu_cache,
+            &self.transfer,
+            &self.central,
+            self.pagemap,
+            self.meta,
+            &mut on_empty,
+        )
+    }
+
+    /// Drain the **whole** front end — every core's slots *and* the transfer cache —
+    /// back into the central free lists, retiring every span that empties (W6-7).
+    /// Returns how much residency the drain **actually** returned to central.
+    ///
+    /// Both layers, in that order, is what makes this a real drain: `flush_idle_cpu`
+    /// pushes a core's slots one level *down* into the transfer cache, so draining the
+    /// slots alone would leave the objects in the front end and their spans non-empty.
+    ///
+    /// **The figure is the residency delta, not the pre-drain residency.** Summing the
+    /// two passes would double-count an object drained all the way through (it leaves
+    /// both layers), but reporting the opening count assumes the drain always succeeds —
+    /// and it does not: [`CpuCache::drain_cpu`] declines a core whose in-flight RSEQ
+    /// sequences it cannot fence (a caller denied `membarrier` by seccomp, say), leaving
+    /// that core's objects resident and safely untouched. Returning the opening count
+    /// there tells a §21.3 memory-pressure controller it recovered memory that is in fact
+    /// still cached, so it credits an ineffective rung and skips a harsher one it needed.
+    /// Measuring what left counts each object once *and* reflects every decline.
+    /// Approximate under concurrent load (a free racing the drain may repopulate a slot
+    /// behind it), exact when quiescent — the §31.1 convention.
+    ///
+    /// Sweeps all `MAX_CPUS`, not just the announced active count, so a slot left behind
+    /// on a core that went offline is drained too.
+    pub fn flush_front_end_all(&self) -> usize {
+        let before = self.front_end_objects();
+        for c in 0..crate::cpu_cache::MAX_CPUS {
+            self.flush_front_end_core(CoreId(c as u32));
+        }
+        let mut on_empty = |span: &SpanDescriptor| self.retire_span(span);
+        cache_ops::drain_transfer(
+            ArenaId::DEFAULT,
+            &self.transfer,
+            &self.central,
+            self.pagemap,
+            self.meta,
+            &mut on_empty,
+        );
+        before.saturating_sub(self.front_end_objects())
+    }
+
+    /// Objects currently resident in the front end, over every core and size class
+    /// (§16.4 `local_cached + transfer_cached`). Lock-free approximate reads.
+    fn front_end_objects(&self) -> usize {
+        let mut n = 0usize;
+        for i in 0..SIZE_CLASSES.len() {
+            let sc = SizeClassId::new(i);
+            if let Some(bin) = self.transfer.bin(sc) {
+                n = n.saturating_add(bin.len() as usize);
+            }
+            for c in 0..crate::cpu_cache::MAX_CPUS {
+                if let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) {
+                    if let Some(slot) = cpu.slot(sc) {
+                        n = n.saturating_add(slot.len() as usize);
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// Appendix B (W6/W18-3, §16.4): every span this allocator owns keeps its
+    /// **cache-resident set disjoint from both the central-free and the quarantined
+    /// sets** — the structural fact the lock-free double-free oracle rests on (see
+    /// [`SpanDescriptor::cached_and_central_free_are_disjoint`] and
+    /// [`SpanDescriptor::cached_and_quarantined_are_disjoint`], which is where the
+    /// per-span checks and their concurrency arguments live).
+    ///
+    /// Robust under concurrent load: each span's two bitmaps are read together under that
+    /// span's own lock, so this is a conjunction of individually-exact checks rather than
+    /// a global count that a racing operation could tear. Total + side-effect-free,
+    /// O(span slots).
+    ///
+    /// Disjointness is *one* of the two facts the oracle needs; the other — that a marker
+    /// names an object the front end really holds — is
+    /// [`front_end_markers_name_held_objects`](Self::front_end_markers_name_held_objects).
+    fn front_end_residency_is_disjoint(&self) -> bool {
+        self.span_lock.acquire();
+        // SAFETY: span lock held ⇒ exclusive pool head-state access.
+        let high_water = unsafe { (*self.spans.inner.get()).high_water };
+        self.span_lock.release();
+        for i in 0..high_water {
+            // SAFETY: `i < high_water <= cap`, and pool slots live in never-freed
+            // metadata, so the descriptor stays readable. A recycled or never-activated
+            // slot is checked too — harmlessly, since its bitmaps are cleared (and a
+            // never-used slot's are zero-sized).
+            let desc = unsafe { &(*self.spans.slot_ptr(i)).desc };
+            if !desc.cached_and_central_free_are_disjoint() {
+                return false;
+            }
+            // The same disjointness over the third residency set. Catches a free path
+            // that returned early still holding the shared cached claim — the failure
+            // mode the `settled` helper in `maybe_quarantine_small` exists to prevent.
+            if !desc.cached_and_quarantined_are_disjoint() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Appendix B (W6, §16.4): **every object the front end holds carries its cached
+    /// marker** — walked from the caches to the markers, the direction disjointness cannot
+    /// see.
+    ///
+    /// Disjointness alone is a weaker fact than the double-free oracle needs. It says the
+    /// cached and central-free sets do not overlap; it says nothing about whether a cached
+    /// *bit* corresponds to a real cache entry, or — the dangerous direction — whether an
+    /// address sitting in a per-CPU slot or transfer bin is marked at all. An unmarked
+    /// held object is invisible to `try_mark_cached`, so a second free of it is admitted
+    /// and the same address is vended twice (§29.3), and a bitmap-only check reports a
+    /// healthy allocator throughout. This walks the caches themselves: resolve each held
+    /// address to its span and object index exactly as the free path does
+    /// ([`validate_free`]), and require the marker to be set.
+    ///
+    /// **Direction and quiescence.** Only entry ⇒ marker is asserted, because only that
+    /// direction is a violation. Marker ⇒ entry is *transiently false by design*: a free
+    /// marks before it pushes and an allocation pops before it unmarks, so a marker with
+    /// no entry is the ordinary mid-operation state, not drift. Each per-CPU slot and
+    /// transfer bin is read under its own lock, which excludes the locked path but not the
+    /// W7 RSEQ sequences (they take no lock, §27.4) — so under RSEQ traffic a pop between
+    /// the entry read and the marker read can report a spurious violation. Exact when the
+    /// front end is quiescent, which is how the oracle is used
+    /// ([`check_invariants`](Self::check_invariants) is the on-demand sweep behind
+    /// `topomalloc_debug_check_now`, not a per-transition assert). Total +
+    /// side-effect-free, O(cache entries).
+    fn front_end_markers_name_held_objects(&self) -> bool {
+        let mut ok = true;
+        let mut check = |addr: usize| {
+            if !ok {
+                return;
+            }
+            if addr == 0 {
+                ok = false;
+                return;
+            }
+            // A cached address must still resolve as a small object of a live span; the
+            // free path resolves it exactly this way. Anything else means the front end is
+            // holding an address the pagemap no longer calls a small object — a retired or
+            // rewritten span, which is itself the drift this check exists to catch.
+            match validate_free(self.pagemap, self.meta_region, addr) {
+                Ok(FreeTarget::Small { span, object_index }) => {
+                    // SAFETY: the pagemap only ever names descriptors in never-freed
+                    // metadata (§27.5), so the descriptor stays readable.
+                    let span = unsafe { &*span };
+                    if !span.is_cached(object_index) {
+                        ok = false;
+                    }
+                }
+                _ => ok = false,
+            }
+        };
+        for c in 0..crate::cpu_cache::MAX_CPUS {
+            let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) else {
+                continue;
+            };
+            let core = CoreId(c as u32);
+            let _guard = cpu.lock();
+            // W7-4: the lock alone does not exclude an RSEQ sequence that began *before*
+            // the lock byte was published — and those sequences write the slot's
+            // **non-atomic** buffer. Reading it without draining them is a data race
+            // (UB), not merely the approximate read the doc below describes. Fence
+            // exactly as `CpuCache::check_invariants` does, under the same lock.
+            if !self.cpu_cache.fence_if_non_owner(core) {
+                // Cannot drain this CPU's in-flight sequences, so its buffer cannot be
+                // read without racing them. Skip the core rather than commit the UB the
+                // fence exists to prevent; the walk is already documented as an
+                // approximate, best-effort read.
+                continue;
+            }
+            for i in 0..SIZE_CLASSES.len() {
+                if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
+                    // SAFETY: this CPU's lock is held for the whole walk, and any
+                    // sequence that started before the lock was taken has been drained by
+                    // the fence above, so this thread is the only accessor.
+                    unsafe { slot.for_each_entry(&mut check) };
+                }
+            }
+        }
+        for i in 0..SIZE_CLASSES.len() {
+            if let Some(bin) = self.transfer.bin(SizeClassId::new(i)) {
+                let _guard = bin.lock();
+                // SAFETY: this bin's lock is held for the whole walk.
+                unsafe { bin.for_each_entry(&mut check) };
+            }
+        }
+        ok
+    }
+
+    /// Objects currently resident in the front end: the per-CPU slots plus the transfer
+    /// cache (§16.4 `local_cached + transfer_cached`). Lock-free approximate reads, exact
+    /// when quiescent (§31.1). Returned as `(per_cpu_bytes, transfer_bytes)`.
+    fn front_end_bytes(&self) -> (u64, u64) {
+        let mut per_cpu = 0u64;
+        let mut transfer = 0u64;
+        for (i, row) in SIZE_CLASSES.iter().enumerate() {
+            let sc = SizeClassId::new(i);
+            let size = row.size as u64;
+            if let Some(bin) = self.transfer.bin(sc) {
+                transfer += bin.len() as u64 * size;
+            }
+            let mut objects = 0u64;
+            for c in 0..crate::cpu_cache::MAX_CPUS {
+                if let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) {
+                    if let Some(slot) = cpu.slot(sc) {
+                        objects += slot.len() as u64;
+                    }
+                }
+            }
+            per_cpu += objects * size;
+        }
+        (per_cpu, transfer)
+    }
+
+    /// Small-object allocation: serve from the §11 **front end** when the request is
+    /// cacheable ([`front_end_cacheable`](Self::front_end_cacheable), W6/W7), else — and
+    /// on any front-end miss it cannot resolve — pull one object from the central list,
+    /// **preferring a span of placement class `class`** (§24.6–§24.8, W14) so cold / hot /
+    /// short-lived small objects cluster; creating and activating a new (class-tagged)
+    /// span when none is available (§A.2's OOM-retry loop).
+    ///
+    /// `cache_bypass` is the request's `TOPO_TCACHE_NONE` (§10.3
+    /// [`RequestFlags::CACHE_BYPASS`]): the caller has asked *not* to be served from a
+    /// local cache, so the front end is skipped and the object comes from central. The
+    /// flag is per-call, not per-object — a bypassed allocation's later `free` may still
+    /// be absorbed by the front end unless that free also carries the flag.
+    ///
+    /// The front end is a pure *accelerator*: it can decline for any reason (empty slot
+    /// with an empty central list, an RSEQ abort, exhausted slot metadata) and the central
+    /// path below then serves the request unchanged. So the front end can never turn into
+    /// a spurious OOM, and the central path remains the single authority on span creation
+    /// and the §A.2 retry loop (§2.4 availability before policy).
     ///
     /// Class grouping is advisory and never causes a spurious OOM: if a class-tagged span
     /// cannot be created (backend exhausted), the loop falls back to reusing *any* partial
@@ -1228,7 +2253,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// span; span creation draws from a finite region/pool, so a thread can
     /// loop only while *other* threads consume the objects it activates —
     /// i.e. only while the system as a whole makes progress.
-    fn alloc_small(&self, arena: ArenaId, sc: SizeClassId, class: u8) -> *mut u8 {
+    fn alloc_small(
+        &self,
+        arena: ArenaId,
+        sc: SizeClassId,
+        class: u8,
+        cache_bypass: bool,
+    ) -> *mut u8 {
+        if !cache_bypass
+            && Self::front_end_cacheable(arena, class)
+            && !crate::deterministic::force_slow_path()
+        {
+            let p = self.alloc_small_cached(sc);
+            if !p.is_null() {
+                return p;
+            }
+        }
         loop {
             match self
                 .central
@@ -1259,12 +2299,69 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                                 let span = unsafe { &*batch.span() };
                                 self.hand_out_object(span, batch.index(0))
                             }
-                            RemoveResult::NeedSpan => ptr::null_mut(),
+                            RemoveResult::NeedSpan => self.alloc_small_from_transfer(arena, sc),
                         };
                     }
                 }
             }
         }
+    }
+
+    /// The last thing tried before an allocation reports OOM: take one object back out of
+    /// the **transfer cache** (§11.4).
+    ///
+    /// Central is not the only place this allocator parks a free small object, and the
+    /// fallback above searched nowhere else. Two routes leave objects here that no central
+    /// lookup can see:
+    ///
+    /// * A refill whose `push_batch` is **declined**. `cache_ops::refill` removes a batch
+    ///   from central, and when the per-CPU push declines it returns the remainder to the
+    ///   transfer cache — deliberately, since dropping it would leak (§16.4). The push
+    ///   declines whenever the W7-4 non-owner fence cannot be issued, which a thread that
+    ///   migrated after `fe_pop_tracked` and cannot call `membarrier` (a seccomp policy
+    ///   denying it) hits every time. `alloc_small_cached`'s bounded loop then gives up
+    ///   and the objects it moved out of central stay in the transfer cache.
+    /// * A **front-end-bypassing** request (`TOPO_TCACHE_NONE` §10.3, or the §30.4
+    ///   force-slow-path) never calls `alloc_small_cached` at all, so it never consults
+    ///   the transfer cache even in the ordinary case.
+    ///
+    /// Either way an exhausted backend turned into a spurious OOM with reusable objects
+    /// one layer down. **Availability before policy (§2.4)** — the same trade the
+    /// `ANY_PLACE_CLASS` retry just above makes, and made in the same place, so a bypass
+    /// flag or a placement tag can cost a request its *preference* but never its
+    /// allocation. Reached only when a span could not be created **and** no partial span
+    /// of any class exists, so an ordinary workload never executes it.
+    ///
+    /// **Arena is not negotiable.** [`TransferCache::try_pop_batch`] ignores its arena
+    /// argument — the bins are keyed by size class alone — which is sound only because
+    /// [`front_end_cacheable`](Self::front_end_cacheable) gates every *entry* point, so a
+    /// bin holds default-arena objects and nothing else. A new consumer has to re-apply
+    /// that gate or it hands one arena's memory to another, breaking §22.7 isolation and
+    /// §36.4 quota exactness. Placement class is conceded here (as above); the arena is
+    /// not.
+    ///
+    /// **What this deliberately does not reach:** objects resident in *other cores'*
+    /// per-CPU slots. No allocation path can drain those safely — the non-owner fence is
+    /// exactly what has failed in the first route above, and in §36.10 pinned mode
+    /// draining a core this thread does not own is undefined behaviour outright. The
+    /// running core's own slot is already drained by `alloc_small_cached` on every
+    /// non-bypassing request. That boundary is a real limit, not an oversight.
+    fn alloc_small_from_transfer(&self, arena: ArenaId, sc: SizeClassId) -> *mut u8 {
+        if arena != ArenaId::DEFAULT {
+            return ptr::null_mut();
+        }
+        let mut buf = [0usize; 1];
+        if self
+            .transfer
+            .try_pop_batch(arena, sc, &mut buf, 1, self.meta)
+            != 1
+        {
+            return ptr::null_mut();
+        }
+        // The object carries the `cached` mark `refill`/`flush` set on it, so it is
+        // claimed exactly as a slot entry is — same `cached → live` transition, same
+        // test-and-clear exclusivity, same junk-fill verify-on-reuse.
+        self.claim_cached_object(buf[0], sc)
     }
 
     /// Hand object `index` out of `span`: resolve its pointer ([`object_ptr`](Self::object_ptr))
@@ -1498,7 +2595,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// recycled, currently-live allocation (the classic double-free): freeing
     /// it would release another owner's object and invalidate that owner's
     /// outstanding pointer.
+    #[inline]
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // SAFETY: this method's own contract is the one being forwarded.
+        unsafe { self.free_with(ptr, false) }
+    }
+
+    /// [`free`](Self::free), honouring the request's `TOPO_TCACHE_NONE`
+    /// ([`RequestFlags::CACHE_BYPASS`], §10.3): with `cache_bypass` set, the object is
+    /// returned **straight to the central free list** instead of being parked in the
+    /// running core's front-end slot.
+    ///
+    /// This is what `topo_dallocx`/`topo_sdallocx` route the flag to. Both outcomes are
+    /// equally correct — the central list is the authoritative home and the front end only
+    /// ever delays the trip there — so the flag is a locality/residency choice, never a
+    /// safety one. It is per-call: freeing with the flag does not mark the *object* as
+    /// uncacheable, it only declines the cache for this one free.
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free).
+    pub unsafe fn free_with(&self, ptr: *mut u8, cache_bypass: bool) -> FreeOutcome {
         if ptr.is_null() {
             return FreeOutcome::Null;
         }
@@ -1526,28 +2643,22 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // and recycle under a racing thread, and its class/arena with it.
                 let usable = size_class::usable_size(span.size_class());
                 let arena = span.arena();
-                // W18-3 (§29.4): when the quarantine is active it may *hold* this
-                // freed object out of circulation (delaying reuse) or detect a
-                // quarantine-hit double free — returning the final outcome; a true
-                // no-op (always `None`) without the `quarantine` feature.
-                if let Some(outcome) = self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
-                    return outcome;
-                }
-                // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the
-                // use-after-free canary under the span lock; a true no-op otherwise.
-                let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
-                if r.inserted == 0 {
-                    // Already central-free (double free) or the span raced
-                    // its teardown; nothing was mutated (W8 hardening).
+                // W6 (§29.3): reject a double free of an object that is already
+                // **awaiting reuse**, in the central bitmap *or* in a front-end cache.
+                //
+                // Both halves are load-bearing once the front end is live, and neither
+                // check below covers them. `central_insert`'s test-and-set (the
+                // authoritative central oracle) never sees a cached object, which never
+                // reached the bitmap. And the cached path's own test-and-set never sees a
+                // *central-free* one — so a free → flush → free sequence would find the
+                // cached bit clear, mark the object cached a second time, and hand the
+                // same address to two callers. This lock-free pair is what closes both
+                // directions; the authoritative test-and-sets still decide every race
+                // between two *concurrent* frees.
+                if span.is_free_awaiting_reuse(idx as usize) {
                     return FreeOutcome::DoubleFree;
                 }
-                self.freed_bytes.fetch_add(usable as u64, Ordering::Relaxed);
-                // Credit the owning arena's quota (§36.17 exact accounting).
-                self.arenas.credit(arena, usable as u64);
-                if r.span_empty {
-                    self.retire_span(span);
-                }
-                FreeOutcome::Freed
+                self.free_small_screened(ptr, span, idx, arena, usable, cache_bypass)
             }
             Ok(FreeTarget::Large { desc }) => {
                 // SAFETY: `desc` is a live large descriptor — the pagemap classified
@@ -1569,9 +2680,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // its descriptor live, so a later double free re-resolves it and is
                 // caught as a hit. `usable == 0` (already freed) is left to the
                 // immediate path's double-free check. No-op without `quarantine`.
-                if let Some(outcome) = self.maybe_quarantine_large(ptr, arena, usable) {
-                    return outcome;
-                }
+                let quarantine_claim = match self.maybe_quarantine_large(ptr, arena, usable) {
+                    QuarantineDisposition::Settled(outcome) => return outcome,
+                    // Declined but still claimed: the immediate free below inherits the
+                    // claim and retires the descriptor, which is what clears it.
+                    QuarantineDisposition::ClaimHeld => true,
+                    QuarantineDisposition::NotEngaged => false,
+                };
                 // W18-6 (§36.12): zero the freed bytes before the backing returns to
                 // the shared pool when this arena could be reused at a lower label
                 // (decided lock-free); the scrub itself happens race-free under the
@@ -1585,6 +2700,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     self.arenas.credit(arena, usable as u64);
                     FreeOutcome::Freed
                 } else {
+                    // The free did not retire the descriptor, so the recycle that clears a
+                    // held claim never happens: release it here, or every later free of
+                    // this pointer would be reported as a quarantine-hit double free.
+                    if quarantine_claim {
+                        self.release_quarantine_claim_large(owner, ptr);
+                    }
                     FreeOutcome::DoubleFree
                 }
             }
@@ -1744,6 +2865,39 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
+    /// Re-seed the randomized **security** samplers — the W18-4 guard-page coin and the
+    /// W18-3 quarantine sampler/evictor — from the process entropy the host installed
+    /// with [`harden::set_process_entropy`](crate::harden::set_process_entropy) (§29.4/§29.5).
+    ///
+    /// Both samplers rest on *unpredictability*: an attacker who can compute which
+    /// allocations get a guard page simply avoids them, and one who can compute the
+    /// eviction order can force an early reuse. Their compile-time seeds make the stream
+    /// identical in every process of the same binary — i.e. public — so the host must
+    /// install real entropy and call this once during start-up.
+    ///
+    /// A no-op when the host installed no entropy (the build-time seed is kept) or when
+    /// the relevant hardening feature is not compiled in. Deterministic mode is
+    /// unaffected: it re-seeds afterwards through
+    /// [`apply_deterministic_seed`](Self::apply_deterministic_seed), which wins because
+    /// the initializer calls it last.
+    pub fn seed_security_samplers(&self) {
+        #[cfg(feature = "guard-pages")]
+        if let Some(s) = crate::harden::entropy_seed(crate::deterministic::salt::GUARD) {
+            self.guard.set_seed(s);
+        }
+        #[cfg(feature = "quarantine")]
+        if let Some(s) = crate::harden::entropy_seed(crate::deterministic::salt::QUARANTINE) {
+            self.quarantine.set_seed(s);
+        }
+    }
+
+    /// Draw one guarded-allocation sampling coin. Test-only: it exercises the sampler's
+    /// stream directly so a test can compare two engines' sequences without allocating.
+    #[cfg(all(test, feature = "guard-pages"))]
+    pub(crate) fn guard_sampled_for_test(&self) -> bool {
+        self.guard.sampled()
+    }
+
     /// The current guarded-allocation sampling rate (`0` = off). `0` without the
     /// `guard-pages` feature.
     #[inline]
@@ -1759,12 +2913,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     }
 
     /// Try to hold a freed **small** object in the quarantine (§29.4, W18-3).
-    /// Returns `Some(outcome)` when the quarantine handled the free — it *held* the
-    /// object (`Freed`; reuse delayed) or detected a double free — and `None` when
-    /// the caller should free it immediately (quarantine disabled / policy declined).
+    /// [`Settled`](QuarantineDisposition::Settled) when the quarantine handled the free —
+    /// it *held* the object (`Freed`; reuse delayed) or detected a double free;
+    /// [`ClaimHeld`](QuarantineDisposition::ClaimHeld) when it declined but still owns the
+    /// object's claim (the caller frees it and releases the claim behind the next marker);
+    /// [`NotEngaged`](QuarantineDisposition::NotEngaged) when it took no claim at all.
     /// The app-facing free is accounted here on the held path; the object's physical
     /// return is deferred until an eviction drains it (`drain_one`). A true no-op
-    /// (`None`) without the `quarantine` feature.
+    /// (`NotEngaged`) without the `quarantine` feature.
     #[cfg(feature = "quarantine")]
     fn maybe_quarantine_small(
         &self,
@@ -1773,7 +2929,26 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         idx: u16,
         arena: ArenaId,
         usable: usize,
-    ) -> Option<FreeOutcome> {
+        holds_cached: bool,
+    ) -> QuarantineDisposition {
+        // **Every `Settled` exit releases the caller's shared claim first.** The claim
+        // rule (see `free_small_screened`) says the cached bit is taken before the route
+        // is chosen, so that two frees of one object cannot claim independently. That
+        // makes acquisition safe but says nothing about *release*, and a `Settled` return
+        // ends the free right here — the caller does not reach `insert_batch_inner`, the
+        // one place that otherwise clears the bit (free-bit-first). Returning `Settled`
+        // while still holding the mark strands it: the object is then simultaneously
+        // marked cached and (usually) quarantined, no front-end slot holds it, and
+        // `cached_count` over-reports until something else happens to clear it — a
+        // residency corruption produced by the *detection* of a caller's bug rather than
+        // by the bug itself. `settled` is the only way to build a `Settled` here so that
+        // no exit can forget; the `cached ∩ quarantined = ∅` checker below pins it.
+        let settled = |outcome: FreeOutcome| {
+            if holds_cached {
+                span.unmark_cached(idx as usize);
+            }
+            QuarantineDisposition::Settled(outcome)
+        };
         // A double free of a **held** object: the authoritative per-object quarantined
         // bit says so (lock-free atomic read, W18-3). Checked FIRST and unconditionally
         // — even when the runtime switch is off, held objects may still be draining, and
@@ -1782,17 +2957,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // lock, so a concurrent double free of an evicted-but-not-yet-drained object is
         // still caught here (it is not in the ring, but its bit is set).
         if span.is_object_quarantined(idx as usize) {
-            return Some(FreeOutcome::DoubleFree);
+            return settled(FreeOutcome::DoubleFree);
         }
-        if !self.quarantine.is_enabled() {
-            return None;
+        // Reading the runtime switch is only safe **once this object is claimed**, so it
+        // is gated on the caller already holding the shared cached claim. A non-cacheable
+        // object holds nothing yet: its claim is the quarantined mark taken below, and it
+        // must be taken before the switch decides the route — otherwise two frees that
+        // straddle a concurrent enable take different routes, and the one that read
+        // "disabled" continues to central (clearing the other's mark and possibly retiring
+        // the span) while the other publishes the same object to the ring.
+        if holds_cached && !self.quarantine.is_enabled() {
+            return QuarantineDisposition::NotEngaged;
         }
         // A double free of an object that was already *immediately* freed (now
         // central-free): the bitmap says so (lock-free atomic read). Reject as a
         // double free without holding — holding a central-free object could let a
         // concurrent reuse and the deferred drain collide (§2.4: never corrupt).
         if span.is_central_free(idx as usize) {
-            return Some(FreeOutcome::DoubleFree);
+            return settled(FreeOutcome::DoubleFree);
+        }
+        // W6 (§29.3): and the same for an object already awaiting reuse in a **front-end
+        // cache** — unless that mark is the caller's own. For a cacheable object the
+        // cached bit *is* the shared claim, taken in `free_small_screened` before this
+        // call precisely so the two routes cannot claim independently; treating our own
+        // claim as someone else's would turn every cacheable free into a double-free
+        // report. For a non-cacheable object nothing takes that bit, so the check stands
+        // as the guard it always was.
+        if !holds_cached && span.is_cached(idx as usize) {
+            return settled(FreeOutcome::DoubleFree);
         }
         let entry = crate::harden::QuarantineEntry {
             user_ptr: ptr,
@@ -1801,23 +2993,84 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             arena,
             bytes: usable as u64,
         };
+        // **Claim the object before it can be published to the ring.** `offer` pushes the
+        // entry and releases the quarantine lock, after which any concurrent `offer` may
+        // evict *this* entry and drain it — really freeing the object. Marking afterwards
+        // would then race that drain: the object could be back in the central list (or,
+        // for a large, its backing unmapped) while this thread is still filling it, so the
+        // fill would scribble over another owner's live allocation. Marking first closes
+        // the window — the drain observes the mark and completes the transition properly.
+        //
+        // `mark_quarantined` is a test-and-set under the span lock, so it is *also* the
+        // authoritative double-free check: losing it means the object is already held.
+        {
+            let sg = span.lock();
+            // `settled` clears the cached bit, a lock-free bitmap store on a different
+            // word than the span lock guards, so taking this exit under `sg` is fine.
+            if !sg.mark_quarantined(idx as usize) {
+                return settled(FreeOutcome::DoubleFree);
+            }
+            // The claim is in hand, so the switch can now be consulted safely for the
+            // route this object did *not* pre-claim. Off ⇒ hand the claim to the caller
+            // (`insert_batch_inner` clears it free-bit-first) rather than filling and
+            // offering; the object is claimed throughout either way.
+            if !holds_cached && !self.quarantine.is_enabled() {
+                return QuarantineDisposition::ClaimHeld;
+            }
+            // §29.4 + §29.6: destroy the contents and arm the use-after-free canary **at
+            // hold time**, not at drain. The hold *is* the detection window the quarantine
+            // exists to create, so leaving the bytes intact through it would (a) keep freed
+            // secrets readable through a dangling pointer for the whole hold and (b) mean a
+            // write-after-free during it is silently overwritten by the drain's fill and
+            // never reported. Under the span lock, exactly where `insert_batch_scrubbing`
+            // fills: the object is neither central-free nor handable-out (its quarantine
+            // bit is set) and is not yet in the ring, so we are its sole accessor.
+            // SAFETY: `ptr` is this object's `usable`-byte user region, freed and now
+            // exclusively ours.
+            unsafe { crate::harden::fill_on_free(ptr, usable) };
+        }
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
-            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
-            crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
-                // Mark the object quarantined under the span lock — the authoritative
-                // marker. The ring's `AlreadyQuarantined` covered the brief window from
-                // `offer` until now; from here the bit covers it (including after an
-                // eviction removes it from the ring). Then account the app-free and
-                // drain any evicted objects (their bits are cleared by the drain's
-                // `insert_batch`, free-bit-first).
-                {
-                    let sg = span.lock();
-                    sg.mark_quarantined(idx as usize);
+                // The quarantine owns the object now, so hand the shared claim over to its
+                // marker: **quarantined-bit-first**, mirroring the free-bit-first handoff
+                // `insert_batch_inner` performs. The quarantined bit was set above, before
+                // the entry could be published, and the cached bit is cleared only here —
+                // so `is_quarantined || is_cached` is true at every instant, and no reader
+                // that observes the clear can miss the mark that replaced it. The bit must
+                // come off: a quarantined object is *not* front-end-resident, and leaving
+                // it set would corrupt `cached_count`'s §16.4 meaning and the residency
+                // stats, besides making a later legitimate free look like a double free.
+                if holds_cached {
+                    span.unmark_cached(idx as usize);
                 }
+                // Account the app-free and drain any evicted objects (their bits are
+                // cleared by the drain's `insert_batch`, free-bit-first).
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
-                Some(FreeOutcome::Freed)
+                QuarantineDisposition::Settled(FreeOutcome::Freed)
+            }
+            // The ring declined (or, unreachably, already had it — the mark is exclusive,
+            // so we cannot both hold the claim and be in the ring). **Keep the claim** and
+            // let the caller finish on the ordinary cache-or-central path; the fill above
+            // is exactly what that path would have written anyway.
+            //
+            // Clearing it here instead — which is what this did — leaves the object
+            // claimed by nobody between this line and the caller's next marker, and a
+            // second free of the same address that reaches this function inside that
+            // window takes the claim, is sampled *in*, and returns `Freed` while the first
+            // free also returns `Freed` from the cache or central path. One address, two
+            // successful frees, resident in a front-end slot and in the ring at once.
+            crate::harden::Offer::Declined | crate::harden::Offer::AlreadyQuarantined => {
+                if holds_cached {
+                    // The caller's cached mark never left its hand, so this object was
+                    // claimed throughout and there is nothing to hand over — just drop the
+                    // quarantine's own mark (safe in this order: the cached bit is still
+                    // set, so the residency union never goes empty) and let the caller
+                    // finish on the ordinary cache-or-central path.
+                    self.release_quarantine_claim_small(span, idx);
+                    return QuarantineDisposition::NotEngaged;
+                }
+                QuarantineDisposition::ClaimHeld
             }
         }
     }
@@ -1831,9 +3084,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         _idx: u16,
         _arena: ArenaId,
         _usable: usize,
-    ) -> Option<FreeOutcome> {
-        None
+        _holds_cached: bool,
+    ) -> QuarantineDisposition {
+        QuarantineDisposition::NotEngaged
     }
+
+    /// Release a [`ClaimHeld`](QuarantineDisposition::ClaimHeld) quarantine claim on a
+    /// small object, once the caller holds the marker that replaces it. A no-op without
+    /// the `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn release_quarantine_claim_small(&self, span: &SpanDescriptor, idx: u16) {
+        span.lock().clear_quarantined(idx as usize);
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn release_quarantine_claim_small(&self, _span: &SpanDescriptor, _idx: u16) {}
 
     /// Try to hold a freed **large** allocation in the quarantine (§29.4, W18-3).
     /// As [`maybe_quarantine_small`](Self::maybe_quarantine_small). `usable == 0`
@@ -1846,7 +3113,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         ptr: *mut u8,
         arena: ArenaId,
         usable: usize,
-    ) -> Option<FreeOutcome> {
+    ) -> QuarantineDisposition {
         let owner = self.large_owner_for(arena);
         // A double free of a **held** large: the authoritative per-descriptor mark says
         // so (checked under the pool lock). Checked FIRST and unconditionally — even
@@ -1854,10 +3121,33 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // of an evicted-but-not-yet-drained large is still caught (it left the ring, but
         // its descriptor mark is set), closing the eviction-window gap for the large path.
         if owner.is_quarantined(ptr) {
-            return Some(FreeOutcome::DoubleFree);
+            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+        }
+        // **Claim the descriptor before reading the switch**, so that every route out of
+        // this function has already contended on one atomic.
+        //
+        // The claim serves two purposes at once, and it is the second that dictates the
+        // ordering. It is the quarantine's exclusive hold (a racing evict + drain retires
+        // the descriptor and may decommit the backing, so a scrub sequenced after `offer`
+        // could write through an unmapped pointer). But it is *also* the free path's
+        // shared claim — the one thing both the quarantine route and the immediate-free
+        // route below contend on. Reading `is_enabled()` first, and returning unclaimed
+        // when it was off, is what let two frees of one pointer take different routes and
+        // both proceed: one through the immediate free that retires and decommits, the
+        // other marking and scrubbing the same bytes. The toggle is not really the bug —
+        // it is what makes the two routes reachable concurrently, and a free that claims
+        // nothing has nothing to exclude the other with.
+        //
+        // The test-and-set under the pool lock is also the authoritative double-free check.
+        if !owner.mark_quarantined(ptr) {
+            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
         }
         if !self.quarantine.is_enabled() || usable == 0 {
-            return None;
+            // Not going to hold it — but the claim is taken, so hand it to the caller
+            // rather than dropping it here. `ClaimHeld` is exactly that contract: the
+            // immediate free that follows retires the descriptor (every reacquire resets
+            // the flag), and releases the claim explicitly only if that free fails.
+            return QuarantineDisposition::ClaimHeld;
         }
         let entry = crate::harden::QuarantineEntry {
             user_ptr: ptr,
@@ -1866,16 +3156,39 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             arena,
             bytes: usable as u64,
         };
+        // Destroy the contents at hold time, mirroring the non-quarantined large free
+        // (`free_scrubbing`): a §36.12 label downgrade zeroes, otherwise the junk-fill
+        // canary is armed. Without this the hold window — the window the quarantine exists
+        // to create — is exactly the window in which freed bytes stay readable and no
+        // canary is armed. The descriptor is marked held and not yet in the ring, so no
+        // reuse or drain can race us.
+        // SAFETY: `ptr` is the live base of this `usable`-byte allocation, freed and
+        // exclusively ours.
+        if self.scrub_on_release(arena) {
+            unsafe { crate::harden::scrub(ptr, usable) };
+        } else {
+            unsafe { crate::harden::fill_on_free(ptr, usable) };
+        }
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
-            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
-            crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
-                // Mark the descriptor quarantine-held (authoritative). The ring covered
-                // it from `offer` until now; the mark covers it after (incl. eviction).
-                owner.mark_quarantined(ptr);
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
-                Some(FreeOutcome::Freed)
+                QuarantineDisposition::Settled(FreeOutcome::Freed)
+            }
+            // Declined (or, unreachably, already ringed — the mark is exclusive): **keep**
+            // the claim through the immediate free that follows. Releasing it here leaves
+            // the descriptor claimed by nobody until that free takes the pool lock, and a
+            // second free of the same pointer inside that window marks it, *scrubs it*,
+            // and publishes it to the ring — writing through memory this thread is
+            // concurrently decommitting, and leaving a ring entry over freed backing.
+            //
+            // The claim needs no explicit release on the success path: the immediate free
+            // retires the descriptor (making the slot non-resolvable, so `is_quarantined`
+            // reads `false` for any later free) and every (re)acquire resets the flag, so
+            // a recycled slot never inherits it. Only a *failed* free has to release it —
+            // see the caller.
+            crate::harden::Offer::Declined | crate::harden::Offer::AlreadyQuarantined => {
+                QuarantineDisposition::ClaimHeld
             }
         }
     }
@@ -1887,9 +3200,23 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         _ptr: *mut u8,
         _arena: ArenaId,
         _usable: usize,
-    ) -> Option<FreeOutcome> {
-        None
+    ) -> QuarantineDisposition {
+        QuarantineDisposition::NotEngaged
     }
+
+    /// Release a [`ClaimHeld`](QuarantineDisposition::ClaimHeld) quarantine claim on a
+    /// large allocation whose immediate free did **not** retire the descriptor (so the
+    /// recycle that would have cleared the flag never happens). A no-op without the
+    /// `quarantine` feature.
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn release_quarantine_claim_large(&self, owner: &dyn LargeBacking, ptr: *mut u8) {
+        owner.unmark_quarantined(ptr);
+    }
+
+    #[cfg(not(feature = "quarantine"))]
+    #[inline]
+    fn release_quarantine_claim_large(&self, _owner: &dyn LargeBacking, _ptr: *mut u8) {}
 
     /// Account an object entering quarantine (the app-facing free) and drain any
     /// entries its admission evicted (their *real* physical free), **outside** the
@@ -1922,6 +3249,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// was held: the insert reports nothing inserted and this no-ops.
     #[cfg(feature = "quarantine")]
     fn drain_one(&self, e: &crate::harden::QuarantineEntry) {
+        // The object was canary-filled when it entered quarantine, so a mismatch now is
+        // a genuine write-after-free **during the hold** — the detection the delayed
+        // reuse buys. Verify before the drain re-fills, otherwise the drain's own fill
+        // would erase the evidence and the reuse check would pass. A no-op without
+        // `junk-fill`, and skipped for a scrubbed (zeroed, §36.12) large — that path
+        // deliberately writes zeros, not the canary.
+        if crate::harden::junk_fill_enabled()
+            && !e.user_ptr.is_null()
+            && (e.is_small() || !self.scrub_on_release(e.arena))
+        {
+            // SAFETY: the entry's user region is still mapped and exclusively ours (the
+            // object is quarantine-marked, so no reuse can race this read).
+            let intact =
+                unsafe { crate::harden::verify_free_pattern(e.user_ptr, e.bytes as usize) };
+            if !intact {
+                crate::harden::corruption_abort(
+                    "topomalloc: use-after-free detected during the quarantine hold \
+                     (§29.4 delayed-reuse canary)",
+                );
+            }
+        }
         if e.is_small() {
             // SAFETY: `e.span` was captured from a live descriptor at free time;
             // descriptors live in never-freed metadata (§27.5), so the pointer
@@ -2131,7 +3479,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             Ok(FreeTarget::Small { span, object_index }) => {
                 // SAFETY: descriptors live in never-freed metadata.
                 let span = unsafe { &*span };
-                if span.is_central_free(object_index) {
+                if span.is_free_awaiting_reuse(object_index) {
                     return None; // freed, awaiting reuse: not a live object
                 }
                 Some(size_class::usable_size(span.size_class()))
@@ -2159,7 +3507,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         match validate_free(self.pagemap, self.meta_region, ptr as usize) {
             Ok(FreeTarget::Small { span, object_index }) => {
                 // SAFETY: descriptors live in never-freed metadata.
-                !unsafe { &*span }.is_central_free(object_index)
+                !unsafe { &*span }.is_free_awaiting_reuse(object_index)
             }
             Ok(FreeTarget::Large { .. }) => true,
             _ => false,
@@ -2255,7 +3603,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // W8 liveness probe: a freed object awaiting reuse is not a
                     // valid realloc source (resizing it "in place" would alias the
                     // central free list; copying from it would read stale bytes).
-                    if span_ref.is_central_free(object_index) {
+                    // "Awaiting reuse" covers the W6 front end too — a freed object a
+                    // per-CPU slot is holding never reaches the central bitmap.
+                    if span_ref.is_free_awaiting_reuse(object_index) {
                         return ptr::null_mut();
                     }
                     let row = match size_class::checked_row(sc) {
@@ -2477,7 +3827,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             } => {
                 // SAFETY: descriptors live in never-freed metadata.
                 let span_ref = unsafe { &*span };
-                if span_ref.is_central_free(object_index) {
+                if span_ref.is_free_awaiting_reuse(object_index) {
                     return None; // a freed object awaiting reuse is not a resize source
                 }
                 // In-place can never re-base, so the requested alignment must hold.
@@ -2909,7 +4259,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let scrub_zero = self.scrub_on_release(arena);
         // SAFETY: the arena is quiesced (its objects are not concurrently freed).
         let (_, large_bytes, large_revoked) =
-            unsafe { self.large_backing(arena).free_arena(arena, scrub_zero) };
+            unsafe { self.large_owner_for(arena).free_arena(arena, scrub_zero) };
         if large_bytes > 0 {
             self.freed_bytes
                 .fetch_add(large_bytes as u64, Ordering::Relaxed);
@@ -2941,11 +4291,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         n
     }
 
-    /// Committed bytes in the span region (small-object backing).
-    pub fn span_committed_bytes(&self) -> usize {
-        self.span_extents.committed_bytes()
-    }
-
     /// Whether the whole live allocator is well-formed — the Appendix B oracle for
     /// the engine (W19-1, DD-2): the shared span/large back-ends and **every
     /// per-arena hooked backing** (B.1/B.4), the central free-list layer and its
@@ -2968,7 +4313,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // object backing — sound here because every central span of a live
             // engine is committed; a no-op when junk-fill is compiled out. (Large
             // objects carry the W18 per-extent verify-on-reuse canary instead.)
-            && self.central.verify_free_patterns();
+            && self.central.verify_free_patterns()
+            // B.2 (cache invariants, W19-1b): every per-CPU slot is within its capacity
+            // bounds and holds distinct addresses (a duplicate is a double-vended object,
+            // §29.3), and every transfer bin likewise. Both are total + side-effect-free.
+            && self.cpu_cache.check_invariants()
+            && self.transfer.check_invariants()
+            // W6 (§16.4): the per-object cached bits agree with what the front end
+            // actually holds — the residency marker cannot drift from the slots it
+            // describes without breaking the double-free oracle built on it. Both
+            // directions of "agree", since they are separate facts: no object is
+            // simultaneously cached and central-free (bitmap-side, concurrency-robust),
+            // *and* every address the caches hold is actually marked (cache-side, the
+            // direction in which drift double-vends).
+            && self.front_end_residency_is_disjoint()
+            && self.front_end_markers_name_held_objects();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {
@@ -3008,6 +4367,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
     }
 
+    /// Visit each core that currently holds front-end residency — the per-core
+    /// decomposition of `AllocatorStats::per_cpu_bytes` for the §31.2 `BY_CPU` detail view
+    /// (plan 07 W17-2): `f(core_index, objects, bytes)`.
+    ///
+    /// Cores holding **nothing** are skipped, so a visitor sees a list proportional to the
+    /// front end's live spread rather than to `MAX_CPUS`. Lock-free approximate reads,
+    /// exact when quiescent (§31.1) — exactly as [`stats`](Self::stats) sums them.
+    pub fn for_each_cpu_cache<F: FnMut(u32, u64, u64)>(&self, mut f: F) {
+        for c in 0..crate::cpu_cache::MAX_CPUS {
+            let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) else {
+                // The array is carved lazily; a null one means no core holds anything.
+                return;
+            };
+            let mut objects = 0u64;
+            let mut bytes = 0u64;
+            for (i, row) in SIZE_CLASSES.iter().enumerate() {
+                if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
+                    let n = slot.len() as u64;
+                    objects += n;
+                    bytes += n * row.size as u64;
+                }
+            }
+            if objects > 0 {
+                f(c as u32, objects, bytes);
+            }
+        }
+    }
+
     /// Take a statistics snapshot (§31.1; the W8 DoD "state exposes stats and
     /// reconciles" surface). See [`AllocatorStats`] for the field semantics
     /// and consistency model.
@@ -3022,6 +4409,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 central_free_bytes += bin.total_central_free() * row.size as u64;
             }
         }
+        // §16.4 front-end residency (W6): bytes the per-CPU slots and the transfer cache
+        // hold. These are *neither* live nor central-free — a cached object has been
+        // freed by the application (so it left `live`) but has not reached the central
+        // bitmap (so it has not joined `central_free`). They are the third term of the
+        // §8.6 `live + central_free + cached + quarantined <= active` decomposition.
+        let (per_cpu_bytes, transfer_bytes) = self.front_end_bytes();
         // Aggregate the shared backend with every per-arena hooked region (W10), so
         // the §20.1 physical-state breakdown and the live-large count reflect *all*
         // backends — not just the shared one (an arena's own region is still this
@@ -3035,6 +4428,9 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // Cumulative hook failures: the persistent total from torn-down backings
         // plus every live backing's current counts (W10 observability).
         let mut hf = self.retired_hooks.snapshot();
+        // W18-4 guard-page `mprotect` refusals, summed over the shared large backend and
+        // every hooked arena's own (a guarded allocation routes to its arena's backend).
+        let mut guard_protect_failures = self.large.guard_protect_failures();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {
@@ -3044,6 +4440,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     large_backend = large_backend.add(b.large.state_bytes());
                     live_large += b.large.live_count() as u64;
                     live_internal_frag += b.large.internal_fragmentation_bytes() as u64;
+                    guard_protect_failures += b.large.guard_protect_failures();
                     let s = b.hook_failure_stats();
                     hf.commit += s.commit;
                     hf.release += s.release;
@@ -3065,6 +4462,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             allocated_bytes_total: allocated,
             freed_bytes_total: freed,
             central_free_bytes,
+            per_cpu_bytes,
+            transfer_bytes,
             span_backend,
             large_backend,
             pagemap_metadata_bytes: self.pagemap.metadata_bytes() as u64,
@@ -3075,6 +4474,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             numa_bind_failures: self.arenas.total_numa_bind_failures(),
             hook_failures: hf,
             arenas_destroyed: self.arenas.destroyed_count(),
+            arenas_quarantined: self.arenas.quarantined_count() as u64,
+            guard_protect_failures,
             quarantine_bytes: self.quarantine_bytes(),
         }
     }
@@ -3148,6 +4549,11 @@ mod tests {
             /// capability-revoke failure so the arena-destroy drain quarantines
             /// (§36.13), the partial-failure path POSIX cannot otherwise reach.
             fail_revoke: AtomicBool,
+            /// When set, `reserve` fails — modeling an exhausted backend, so
+            /// `create_span` cannot make progress and the allocation path has to
+            /// fall back on whatever free objects already exist. Behind an `Arc` so a
+            /// test can flip it *after* the allocator has built its spans.
+            fail_reserve: Arc<AtomicBool>,
             /// Count of `revoke_descendants` calls — lets a test observe that the
             /// recycle discipline (§36.6) revokes on *every* retirement, including
             /// the normal empty-span path, where POSIX/SIM revoke is a silent
@@ -3161,6 +4567,7 @@ mod tests {
                 Self {
                     owned: Mutex::new(Vec::new()),
                     fail_revoke: AtomicBool::new(false),
+                    fail_reserve: Arc::new(AtomicBool::new(false)),
                     revokes: Arc::new(AtomicU64::new(0)),
                 }
             }
@@ -3169,6 +4576,13 @@ mod tests {
             /// arena-drain quarantine path).
             pub(super) fn fail_revoke(&self) {
                 self.fail_revoke.store(true, Ordering::Relaxed);
+            }
+
+            /// A handle to the "backend is exhausted" switch, cloned *before* the
+            /// provider is moved into the allocator so a test can flip it once the
+            /// spans it wants already exist (§A.2).
+            pub(super) fn fail_reserve_handle(&self) -> Arc<AtomicBool> {
+                Arc::clone(&self.fail_reserve)
             }
 
             /// A handle to the revoke counter — cloned *before* the provider is
@@ -3187,6 +4601,9 @@ mod tests {
             ) -> Result<Region, BackendError> {
                 if size == 0 || !align.is_power_of_two() {
                     return Err(BackendError::InvalidRequest);
+                }
+                if self.fail_reserve.load(Ordering::Relaxed) {
+                    return Err(BackendError::OutOfMemory);
                 }
                 let layout = Layout::from_size_align(size, align.max(PAGE_SIZE))
                     .map_err(|_| BackendError::InvalidRequest)?;
@@ -3247,6 +4664,90 @@ mod tests {
         unsafe { BumpArena::new(ptr, len) }
     }
 
+    /// §28.1: the fork reset drops the RSEQ registration decision, so
+    /// `rseq::current_cpu()` stops answering and `CpuCache::current_core` keys by
+    /// `fallback_core` — **one** slot for the child's single thread, while the parent's
+    /// residency sits in however many CPU-indexed slots its threads ran on. Those objects
+    /// were removed from central to get there, so leaving them parked is a spurious OOM
+    /// waiting for an exhausted backing provider. The reset must therefore drain, and can:
+    /// its safety contract *is* quiescence.
+    ///
+    /// Fails without the drain — the inherited nine stay resident.
+    #[test]
+    fn a_fork_reset_parks_no_residency_in_slots_the_child_cannot_reach() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+
+        // The parent ran on CPUs 1, 5 and 9; the child will route to exactly one slot.
+        for (i, core) in [CoreId(1), CoreId(5), CoreId(9)].into_iter().enumerate() {
+            let base = 0x1_0000 + i * 0x1000;
+            a.cpu_cache.init_slot(core, sc, &m, 32);
+            a.cpu_cache
+                .push_batch(core, sc, &[base, base + 0x10, base + 0x20]);
+        }
+        assert_eq!(a.front_end_objects(), 9, "test setup");
+
+        // SAFETY: a single-threaded test with no RSEQ operation in flight — exactly the
+        // quiesced-child context this method requires of its caller.
+        unsafe { a.reset_front_end_after_fork() };
+
+        assert_eq!(
+            a.front_end_objects(),
+            0,
+            "inherited residency left parked in slots the child cannot route to"
+        );
+    }
+
+    /// `flush_front_end_all` reports what the drain **returned**, not what was resident
+    /// when it started: `drain_cpu` declines a core whose in-flight sequences it cannot
+    /// fence, and crediting a §21.3 memory-pressure controller for memory still cached
+    /// makes it skip a harsher rung it needed.
+    ///
+    /// **This pins the mechanism, it is not a behavioural regression test.** The decline
+    /// needs a `membarrier` refusal (a seccomp policy denying the syscall), which no
+    /// in-process test can provoke, and absent one the two formulations agree — a complete
+    /// drain returns the opening residency either way. What it does hold is the identity
+    /// the old code assumed rather than measured, so a future partial drain is counted.
+    #[test]
+    fn flush_front_end_all_reports_the_residency_it_actually_returned() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(1);
+
+        for (i, core) in [CoreId(0), CoreId(3)].into_iter().enumerate() {
+            let base = 0x2_0000 + i * 0x1000;
+            a.cpu_cache.init_slot(core, sc, &m, 32);
+            a.cpu_cache.push_batch(core, sc, &[base, base + 0x20]);
+        }
+
+        let before = a.front_end_objects();
+        let returned = a.flush_front_end_all();
+        let after = a.front_end_objects();
+
+        assert_eq!(
+            returned,
+            before - after,
+            "the figure must be the residency delta, not the opening count"
+        );
+        assert_eq!(after, 0, "a quiesced drain is complete (§31.1)");
+    }
+
+    /// A fresh engine with guard sampling armed at `rate` and **no** entropy re-seed —
+    /// the build-time (publicly computable) stream, for comparison.
+    #[cfg(feature = "guard-pages")]
+    fn small_allocator_at_rate<'a>(
+        m: &'a BumpArena,
+        pm: &'a PageMap,
+        rate: u64,
+    ) -> Allocator<'a, HostProvider> {
+        let a = small_allocator(m, pm);
+        a.set_guard_sample_rate(rate);
+        a
+    }
+
     fn small_allocator<'a>(m: &'a BumpArena, pm: &'a PageMap) -> Allocator<'a, HostProvider> {
         Allocator::new(
             HostProvider::new(),
@@ -3299,6 +4800,152 @@ mod tests {
         for p in &seen {
             assert_eq!(tfree(&a, *p as *mut u8), FreeOutcome::Freed);
         }
+        assert!(a.check_invariants());
+    }
+
+    /// §2.4 / §A.2: an allocation may report OOM only once **every** place this allocator
+    /// parked a free object of the class has been looked in. The central fallback searched
+    /// central twice (class-tagged, then any class) and stopped — but the transfer cache
+    /// holds objects that were *removed from central* to get there, so an exhausted
+    /// backend returned null with reusable memory one layer down.
+    ///
+    /// Driven through a **front-end-bypassing** request (`TOPO_TCACHE_NONE`, §10.3), which
+    /// is one of the two routes into the gap and the one an in-process test can reach: it
+    /// skips `alloc_small_cached` entirely, so `alloc_small` is the only consumer and the
+    /// transfer cache is never otherwise consulted.
+    ///
+    /// The other route — a refill whose `push_batch` is declined because the W7-4
+    /// non-owner fence cannot be issued — needs a seccomp policy denying `membarrier`,
+    /// which no in-process test can provoke. It strands objects in the *same* place by the
+    /// *same* call (`refill`'s return-the-remainder path), so this covers the mechanism
+    /// for both; what it does not do is reproduce that trigger.
+    ///
+    /// Fails without the fix: the first bypassing allocation to return null does so with
+    /// `transfer_bytes` still above zero.
+    #[test]
+    fn an_oom_is_reported_only_after_the_transfer_cache_has_been_drained_too() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let span_p = HostProvider::new();
+        let exhausted = span_p.fail_reserve_handle();
+        let a = Allocator::new(
+            span_p,
+            HostProvider::new(),
+            &m,
+            &m,
+            &pm,
+            ArenaId::DEFAULT,
+            AllocatorConfig::small(),
+        )
+        .expect("allocator");
+
+        // Park a batch in the transfer cache the way the front end does: fill the running
+        // core's slot past its soft capacity so a free overflows one batch down (W6-3b).
+        let sc = size_class(64, 8).expect("class");
+        let batch = crate::size_class::batch(sc);
+        let live: Vec<*mut u8> = (0..batch * 4).map(|_| a.malloc(64)).collect();
+        assert!(live.iter().all(|p| !p.is_null()));
+        for p in &live {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        let parked = a.stats().transfer_bytes;
+        assert!(
+            parked > 0,
+            "precondition: the frees must overflow a batch into the transfer cache"
+        );
+
+        // The backend is now exhausted, so `create_span` cannot make progress and every
+        // request must be served from objects that already exist.
+        exhausted.store(true, Ordering::Relaxed);
+
+        // Bypassing requests never consult the front end, so they drain central and then
+        // face the choice this fix is about.
+        let flags = RequestFlags::NONE.with_cache_bypass();
+        let mut got: Vec<*mut u8> = Vec::new();
+        loop {
+            let p = a.allocate(64, 8, flags);
+            if p.is_null() {
+                break;
+            }
+            got.push(p);
+        }
+
+        assert_eq!(
+            a.stats().transfer_bytes,
+            0,
+            "OOM was reported with {} bytes still resident in the transfer cache — \
+             objects that had been removed from central to get there",
+            a.stats().transfer_bytes
+        );
+        assert!(
+            !got.is_empty(),
+            "sanity: the drain must have served something"
+        );
+        for p in got {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        assert!(a.check_invariants());
+    }
+
+    /// §22.7 / §36.4: the transfer-cache last resort is gated on the **arena**, and that
+    /// gate is load-bearing rather than defensive.
+    ///
+    /// `TransferCache::try_pop_batch` ignores its arena argument — the bins are keyed by
+    /// size class alone — which is sound only because `front_end_cacheable` gates every
+    /// entry point, so a bin holds default-arena objects and nothing else. A consumer that
+    /// does not re-apply that gate hands one arena's memory to another: isolation broken,
+    /// and the receiving arena charged for an object it never reserved.
+    ///
+    /// Placement class *is* conceded at this point (the `ANY_PLACE_CLASS` retry just above
+    /// already does), so this is specifically about the boundary that is not policy.
+    ///
+    /// Pins the mechanism directly rather than through a starved explicit arena: an
+    /// explicit arena holds its own reservation, so driving it to the point where this
+    /// last resort is the only thing left would take a second fault-injection seam that
+    /// exists nowhere else. Fails with the arena check removed — the explicit arena's call
+    /// returns a default-arena object.
+    #[test]
+    fn the_transfer_last_resort_never_vends_across_an_arena_boundary() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        assert_ne!(id, ArenaId::DEFAULT);
+
+        // Park default-arena objects in the transfer cache: fill the running core's slot
+        // past its soft capacity so a free overflows one batch down (W6-3b).
+        let sc = size_class(64, 8).expect("class");
+        let batch = crate::size_class::batch(sc);
+        let live: Vec<*mut u8> = (0..batch * 4).map(|_| a.malloc(64)).collect();
+        assert!(live.iter().all(|p| !p.is_null()));
+        for p in &live {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        let parked = a.stats().transfer_bytes;
+        assert!(
+            parked > 0,
+            "precondition: objects parked in the transfer cache"
+        );
+
+        // The explicit arena must get nothing, and must disturb nothing.
+        assert!(
+            a.alloc_small_from_transfer(id, sc).is_null(),
+            "an explicit arena was served from the default arena's transfer cache"
+        );
+        assert_eq!(
+            a.stats().transfer_bytes,
+            parked,
+            "the default arena's parked objects must be untouched"
+        );
+
+        // The gate is a boundary, not a blanket refusal: the owning arena is served.
+        let p = a.alloc_small_from_transfer(ArenaId::DEFAULT, sc);
+        assert!(
+            !p.is_null(),
+            "the default arena must be able to recover its own objects"
+        );
+        assert!(a.stats().transfer_bytes < parked);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
     }
 
@@ -3494,6 +5141,1012 @@ mod tests {
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
     }
 
+    // -- the §11 front end on the live path (plan 05 W6/W7) -------------------
+
+    /// The front end is **wired**, not merely present: an ordinary `malloc`/`free` pair
+    /// puts the object into a per-CPU slot and takes it back out again. Without the
+    /// wiring the residency stays zero and the LIFO identity below is coincidence, so
+    /// both halves are asserted.
+    #[test]
+    fn a_freed_small_object_is_held_in_the_front_end_and_vended_back() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let before = a.stats();
+        assert_eq!(before.per_cpu_bytes, 0, "nothing cached before the free");
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+
+        let s = a.stats();
+        assert_eq!(s.live_bytes, 0);
+        assert_eq!(
+            s.per_cpu_bytes, 64,
+            "the free landed in the running core's slot"
+        );
+        // The rest of the freshly activated slab is central-free; this object is not —
+        // the central total is unchanged by the free.
+        assert_eq!(
+            s.central_free_bytes, before.central_free_bytes,
+            "…and therefore *not* in central"
+        );
+
+        // The next same-class request is served from that slot (LIFO), so it gets the
+        // very object just freed.
+        let q = a.malloc(64);
+        assert_eq!(p, q, "the front end vends the most recently freed object");
+        assert_eq!(a.stats().per_cpu_bytes, 0);
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// §29.3 with the front end live: the cached bit is the double-free oracle for an
+    /// object the central bitmap has never seen. This is the property the whole W6
+    /// residency-marker design exists to preserve — without it, the second free would
+    /// push the same address into the slot again and the cache would vend it twice.
+    #[test]
+    fn a_double_free_of_a_cached_object_is_detected_and_vends_once() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        // Cache-resident, so `is_central_free` is false — only the cached bit can catch
+        // this, and it must, repeatedly.
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert_eq!(a.stats().per_cpu_bytes, 64, "a rejected free adds nothing");
+
+        // Exactly one object comes back out, and it is not vended twice.
+        let q1 = a.malloc(64);
+        let q2 = a.malloc(64);
+        assert_eq!(q1, p);
+        assert_ne!(q1, q2, "the double-freed object was vended exactly once");
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q1), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, q2), FreeOutcome::Freed);
+    }
+
+    /// A double free that spans the `cached → central-free` flush: the object is freed,
+    /// held in the front end, drained to central, and only *then* freed again. The
+    /// free-bit-first ordering in `insert_batch_inner` is what makes this catchable —
+    /// the free bit is set before the cached bit is cleared, so no instant of the
+    /// transition has both clear.
+    #[test]
+    fn a_double_free_across_the_flush_transition_is_detected() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        a.flush_front_end_all();
+        assert_eq!(a.stats().per_cpu_bytes, 0);
+        assert!(
+            a.stats().central_free_bytes >= 64,
+            "the object reached central"
+        );
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert!(a.check_invariants());
+    }
+
+    /// Appendix B (W6, §16.4): the residency checker must actually walk the caches, not
+    /// only the bitmaps. Disjointness is blind to an object *held* by the front end whose
+    /// cached marker is clear — and that object is invisible to `try_mark_cached`, so a
+    /// second free of it is admitted and the address is vended twice (§29.3).
+    ///
+    /// Constructs exactly that drift: free an object so it lands in a per-CPU slot (marker
+    /// set, entry present), then clear the marker behind the checker's back. The two
+    /// bitmaps stay disjoint throughout, so a disjointness-only check still reports a
+    /// healthy allocator; the cache-side walk is what catches it.
+    #[test]
+    fn a_held_object_whose_marker_was_cleared_is_caught() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(
+            span.is_cached(object_index),
+            "the freed object is held by the front end and marked"
+        );
+        assert!(
+            a.check_invariants(),
+            "healthy before the drift is introduced"
+        );
+
+        // The drift: the front end still holds the address, but the marker is gone.
+        assert!(span.unmark_cached(object_index));
+        assert!(
+            span.cached_and_central_free_are_disjoint(),
+            "the bitmaps are still disjoint — this is precisely what disjointness misses"
+        );
+        assert!(
+            !a.check_invariants(),
+            "a held object with no cached marker must fail the residency check"
+        );
+
+        // Restore, so the allocator is well-formed again at drop.
+        assert!(span.try_mark_cached(object_index));
+        assert!(a.check_invariants());
+    }
+
+    /// §29.3 / §10.3: a free that **bypasses** the front end (`TOPO_TCACHE_NONE`, or the
+    /// deterministic force-slow-path) must settle the double-free race through the *same*
+    /// atomic claim a cached free does. It goes straight to the central bitmap — which a
+    /// cached object never enters — so if it skipped the claim, a normal free and a
+    /// bypassing free of one live object could each succeed and leave the address in a
+    /// per-CPU slot *and* in the central free list, to be vended twice.
+    ///
+    /// The interleaving is reproduced exactly: `free_small_screened` is `free_with`'s body
+    /// *after* its advisory screen, so calling it with the cached bit already set is the
+    /// racing normal free winning the claim in the window between the bypassing free's
+    /// screen and its own claim.
+    #[test]
+    fn a_bypassing_free_racing_a_cached_free_cannot_also_succeed() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let idx = object_index as u16;
+        assert!(
+            Allocator::<HostProvider>::front_end_cacheable(span.arena(), span.place_class()),
+            "the default arena's unhinted small objects are the cacheable case"
+        );
+
+        // The racing normal free wins the claim; it has not pushed into a slot yet.
+        assert!(span.try_mark_cached(object_index));
+
+        // The bypassing free is already past its screen. It must lose, and — the part
+        // that actually matters — it must not reach the central bitmap. (The span's other
+        // slots are central-free from activation, hence the before/after comparison.)
+        let usable = size_class::usable_size(span.size_class());
+        let before = a.stats();
+        let outcome = a.free_small_screened(p, span, idx, span.arena(), usable, true);
+        assert_eq!(outcome, FreeOutcome::DoubleFree);
+        assert!(
+            !span.is_central_free(object_index),
+            "the bypassing free inserted an object the front end already owns"
+        );
+        let after = a.stats();
+        assert_eq!(
+            after.central_free_bytes, before.central_free_bytes,
+            "the losing free must not publish the object to central"
+        );
+        assert_eq!(
+            after.freed_bytes_total, before.freed_bytes_total,
+            "the losing free must account nothing"
+        );
+        assert!(span.cached_and_central_free_are_disjoint());
+        assert!(a.check_invariants());
+    }
+
+    /// W6 (§29.3): the racing free that arrives **after** the winner completed, i.e.
+    /// across the `cached → central-free` handoff rather than before it.
+    ///
+    /// `try_mark_cached` asks its caller to establish "not central-free, not quarantined"
+    /// first, and `free_with`'s screen does — but before the claim, so nothing holds
+    /// between the two. The winner's central insert *releases* the claim as part of the
+    /// transition, so a second free that passed the screen earlier and stalled arrives at
+    /// a cleared bit and takes it legitimately. Without a revalidation under the claim it
+    /// then pushes an address that is already in the central free list into a per-CPU
+    /// slot, and both layers vend it.
+    ///
+    /// Fails without the revalidation: the second free returns `Freed`, the object is
+    /// cached *and* central-free, and the B.3 disjointness checker trips.
+    #[test]
+    fn a_free_delayed_across_the_cached_to_central_handoff_is_detected() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let idx = object_index as u16;
+        let usable = size_class::usable_size(span.size_class());
+
+        // The winner: a bypassing free that goes all the way to central, releasing the
+        // cached claim free-bit-first on the way.
+        assert_eq!(
+            a.free_small_screened(p, span, idx, span.arena(), usable, true),
+            FreeOutcome::Freed
+        );
+        assert!(span.is_central_free(object_index));
+        assert!(
+            !span.is_cached(object_index),
+            "the handoff releases the claim — that is what makes it re-takeable"
+        );
+
+        // The loser passed `free_with`'s screen before any of that and stalled. It now
+        // finds a clear cached bit and claims it legitimately; only the revalidation
+        // under the claim can catch it.
+        let before = a.stats();
+        let outcome = a.free_small_screened(p, span, idx, span.arena(), usable, false);
+        assert_eq!(outcome, FreeOutcome::DoubleFree);
+        assert!(
+            !span.is_cached(object_index),
+            "the losing free must release the claim it took"
+        );
+        assert_eq!(a.front_end_objects(), 0, "and must not park it in a slot");
+        assert!(span.cached_and_central_free_are_disjoint());
+        let after = a.stats();
+        assert_eq!(
+            after.freed_bytes_total, before.freed_bytes_total,
+            "the losing free must account nothing"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// §11.5: the budget ceiling is on *residency*, and adaptation bounds it only
+    /// prospectively — a lowered cap refuses future pushes but evicts nothing, and the
+    /// transfer cache is not in the capacity total at all. A tick whose capacity total
+    /// lands within budget can therefore leave residency above it indefinitely.
+    ///
+    /// Fails on the capacity trigger: `adapt` squeezes the one slot to a capacity of 1
+    /// (within the budget of 2), so a `total > budget` test never fires and the five
+    /// resident objects stay.
+    #[test]
+    fn a_budget_tick_drains_residency_above_the_ceiling_not_just_capacity() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+        let core = CoreId(2);
+
+        a.cpu_cache.init_slot(core, sc, &m, 32);
+        a.cpu_cache.push_batch(
+            core,
+            sc,
+            &[0x3_0000, 0x3_0020, 0x3_0040, 0x3_0060, 0x3_0080],
+        );
+        assert_eq!(a.front_end_objects(), 5, "test setup");
+
+        // A ceiling below residency, but one adaptation can bring *capacity* under.
+        a.budget.set_global_budget(2);
+        let total = a.cache_budget_tick();
+        assert!(
+            total <= 2,
+            "adaptation should reach the ceiling on capacity: {total}"
+        );
+        assert_eq!(
+            a.front_end_objects(),
+            0,
+            "residency above the advertised ceiling must be returned, not just capped"
+        );
+    }
+
+    /// §36.10: `cache_budget_tick` is **safe**, so it may not perform a drain the pinned
+    /// contract's caller promised would not happen. A pinned sequence takes no per-CPU
+    /// lock and no fence can drain one, so draining under a running pinned worker races
+    /// its non-atomic slot buffer. Skipping the rung overshoots the ceiling; performing
+    /// it is undefined behaviour (§2.4 — safety before policy).
+    ///
+    /// Fails without the `pinned_mode` guard: the tick drains all five objects.
+    #[test]
+    fn a_budget_tick_declines_to_drain_in_pinned_mode() {
+        fn core_zero() -> i32 {
+            0
+        }
+
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+        let core = CoreId(2);
+
+        a.cpu_cache.init_slot(core, sc, &m, 32);
+        a.cpu_cache.push_batch(
+            core,
+            sc,
+            &[0x4_0000, 0x4_0020, 0x4_0040, 0x4_0060, 0x4_0080],
+        );
+        a.budget.set_global_budget(2);
+
+        // SAFETY: a single-threaded test — no pinned operation is in flight, which is
+        // `enable_pinned_core`'s obligation. The mode flag is per-instance, so this
+        // cannot disturb another test.
+        unsafe { a.enable_front_end_pinned(core_zero) };
+
+        let _ = a.cache_budget_tick();
+        assert_eq!(
+            a.front_end_objects(),
+            5,
+            "a safe tick must not drain slots a pinned worker may own"
+        );
+    }
+
+    /// W6 + W18-3 (§29.3/§29.4): the quarantine claim and the cached claim have to be
+    /// **mutually exclusive**, because a free chooses between them.
+    ///
+    /// Once a free hands its quarantine claim over to the cached bit, that bit is the only
+    /// marker the object carries. A quarantine that does not consult it will happily claim
+    /// an object already sitting in a per-CPU slot, sample it *in*, and return `Freed`
+    /// while the first free also returned `Freed` — one address resident in the front end
+    /// *and* in the ring, to be vended to a caller while a later drain frees it underneath
+    /// them. Calling `free_small_screened` with the cached bit already set is exactly the
+    /// second free arriving after the handoff, the same way
+    /// `a_bypassing_free_racing_a_cached_free_cannot_also_succeed` reproduces its window.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn the_quarantine_cannot_claim_an_object_the_front_end_already_holds() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // Hold everything offered, so a missing check shows up as a real hold rather than
+        // being masked by sampling.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 8,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let idx = object_index as u16;
+        let usable = size_class::usable_size(span.size_class());
+
+        // The winning free has handed its claim to the cached bit: the front end owns the
+        // object, and the quarantined bit is clear.
+        assert!(span.try_mark_cached(object_index));
+        assert!(!span.is_object_quarantined(object_index));
+
+        // The second free reaches the quarantine having passed the advisory screen before
+        // that handoff. It must lose.
+        let held_before = a.quarantine_objects();
+        let outcome = a.free_small_screened(p, span, idx, span.arena(), usable, false);
+        assert_eq!(outcome, FreeOutcome::DoubleFree);
+        assert_eq!(
+            a.quarantine_objects(),
+            held_before,
+            "the quarantine held an object the front end already owns"
+        );
+        assert!(
+            !span.is_object_quarantined(object_index),
+            "the object is claimed by the front end; the quarantine must not re-claim it"
+        );
+        assert!(span.is_cached(object_index), "the front end still owns it");
+        assert!(!span.is_central_free(object_index));
+        assert!(span.cached_and_central_free_are_disjoint());
+        assert!(a.check_invariants());
+    }
+
+    /// The claim rule on the **non-cacheable small** path — the third and last route.
+    ///
+    /// An explicit-arena or placement-hinted small object never enters the front end, so
+    /// it has no cached bit to pre-claim: the quarantine's own mark is its shared claim,
+    /// and it has to be taken before the runtime switch chooses the route. Leaving that
+    /// one branch reading the switch unclaimed is what let two frees straddling a
+    /// concurrent enable both proceed — one continuing to central (clearing the other's
+    /// mark, possibly retiring the span) while the other published the same object to the
+    /// ring, whose later canary check then reads reused or retired backing.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_non_cacheable_free_claims_before_reading_the_switch() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A placement-hinted small object: hinted spans are never front-end cacheable, so
+        // this exercises the `holds_cached == false` route.
+        let p = a.allocate(64, MIN_ALIGN, RequestFlags::NONE.with_hotness(255));
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only names descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        assert!(
+            !Allocator::<HostProvider>::front_end_cacheable(span.arena(), span.place_class()),
+            "a hot-hinted span must not be front-end cacheable — otherwise this test is \
+             exercising the cacheable route instead"
+        );
+        let usable = size_class::usable_size(span.size_class());
+        let idx = object_index as u16;
+
+        // Quarantine **off**: the case that used to return unclaimed.
+        assert!(!a.quarantine.is_enabled());
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::ClaimHeld
+            ),
+            "a non-cacheable free must claim before reading the switch, even when off"
+        );
+        assert!(
+            span.is_object_quarantined(object_index),
+            "the claim must actually be held on return"
+        );
+
+        // A second free arriving with the switch now on must lose to that claim.
+        a.set_quarantine_enabled(true);
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "the second free must lose whatever the switch says"
+        );
+
+        a.release_quarantine_claim_small(span, idx);
+        a.set_quarantine_enabled(false);
+        tfree(&a, p);
+    }
+
+    /// The same claim rule on the **large** path: a free claims the descriptor before it
+    /// reads the quarantine switch, so the switch flipping mid-free cannot let two frees
+    /// of one allocation take different routes and both proceed.
+    ///
+    /// This is the small-object finding one path over, and the reason it is worth its own
+    /// test: the fix there was "claim before you branch", and the large path had been left
+    /// branching on `is_enabled()` while still unclaimed. The consequence is worse than
+    /// for a small object — the losing interleaving has one thread scrubbing bytes the
+    /// other is concurrently retiring and decommitting, and a ring entry left pointing at
+    /// a retired descriptor.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_large_free_claims_its_descriptor_before_reading_the_switch() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let usable = 3 * PAGE_SIZE;
+        let p = a.malloc(usable);
+        assert!(!p.is_null());
+
+        // The quarantine is **off** — the case that used to return unclaimed. The free
+        // must still take the descriptor claim and hand it back, because the immediate
+        // free that follows is the other route this has to exclude.
+        assert!(!a.quarantine.is_enabled());
+        let disposition = a.maybe_quarantine_large(p, ArenaId::DEFAULT, usable);
+        assert!(
+            matches!(disposition, QuarantineDisposition::ClaimHeld),
+            "a large free must claim before reading the switch, even when it is off"
+        );
+        let owner = a.large_owner_for(ArenaId::DEFAULT);
+        assert!(
+            owner.is_quarantined(p),
+            "the claim must actually be held on return"
+        );
+
+        // A second free arriving now — with the switch flipped on, which is exactly the
+        // window the report describes — must lose to the claim already held, rather than
+        // marking and scrubbing memory the first free is about to retire.
+        a.set_quarantine_enabled(true);
+        assert!(
+            matches!(
+                a.maybe_quarantine_large(p, ArenaId::DEFAULT, usable),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "the second free must lose whatever the switch says"
+        );
+
+        // Release the claim and let the object go, so the test leaves no held descriptor.
+        a.release_quarantine_claim_large(owner, p);
+        a.set_quarantine_enabled(false);
+        tfree(&a, p);
+    }
+
+    /// A **cacheable** free holds one claim from start to finish, whatever the quarantine
+    /// decides — and the runtime switch cannot open a window between the two routes.
+    ///
+    /// The quarantined bit (a test-and-set under the span lock) and the cached bit
+    /// (lock-free) are different atomics, so while each route claimed its own, two frees of
+    /// one object could each read the other's marker before it was set and both succeed —
+    /// leaving the address in a per-CPU slot *and* in the ring, to be vended while a later
+    /// drain frees it underneath the new owner. Toggling the switch mid-free reaches it
+    /// directly: a free that reads "disabled" claims nothing at all, so it has nothing to
+    /// exclude the free that arrives a moment later with the switch on.
+    ///
+    /// The fix is that a cacheable free takes the *shared* cached claim before the
+    /// quarantine is consulted at all. This checks it at the seam, in both directions: a
+    /// declined offer leaves that claim untouched and reports nothing outstanding, and a
+    /// second free arriving at any point after it loses.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_cacheable_free_keeps_its_claim_across_a_declined_offer() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // Every offer declined, so the free falls through to the cache-or-central path
+        // while the quarantine is genuinely engaged.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 0,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only names descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let usable = size_class::usable_size(span.size_class());
+        let idx = object_index as u16;
+        // The caller takes the shared claim first, exactly as `free_small_screened` does.
+        assert!(
+            span.try_mark_cached(object_index),
+            "the object is live and unclaimed"
+        );
+        let disposition = a.maybe_quarantine_small(p, span, idx, span.arena(), usable, true);
+        // Declined *and* nothing left outstanding: the cached mark never left our hand, so
+        // there is no second claim for the caller to release.
+        assert!(
+            matches!(disposition, QuarantineDisposition::NotEngaged),
+            "a declined offer on a cacheable object owes the caller nothing"
+        );
+        assert!(
+            span.is_cached(object_index),
+            "the shared claim must survive the quarantine declining it"
+        );
+        assert!(
+            !span.is_object_quarantined(object_index),
+            "the quarantine's own mark must not be stranded on a declined offer"
+        );
+
+        // And the exclusion the whole ordering exists for: a second free of this object,
+        // arriving now with the switch on, must lose. Before the reorder it would pass the
+        // cached probe against a bit the first free had not yet set and be sampled in.
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "a second free must lose to the claim the first one already holds"
+        );
+    }
+
+    /// The other half of the handoff: a **declined** offer must pass its claim on rather
+    /// than drop it, and must not strand it either.
+    ///
+    /// Releasing the claim inside the declined branch leaves the object owned by nobody
+    /// until the caller takes its next marker — the window a second free slips into. Not
+    /// releasing it at all is the opposite failure: the object stays marked quarantined
+    /// forever and every later free of it reports a phantom double free. The claim has to
+    /// travel to the cached bit and then be cleared, leaving exactly one marker.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_declined_quarantine_offer_hands_its_claim_to_the_front_end() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // A zero-object budget: every offer is declined, so every free takes the
+        // claim-held path.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 0,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: as above.
+        let span = unsafe { &*span };
+
+        let usable = size_class::usable_size(span.size_class());
+        let idx = object_index as u16;
+
+        // The contract, checked at the seam: a declined offer reports that it **still
+        // holds** the claim, and the bit really is set at the instant the caller takes
+        // over. Clearing it here instead — reporting "not engaged" with the bit already
+        // dropped — is what leaves the object owned by nobody until the caller's next
+        // marker, the window a second free of the same address slips into.
+        // `holds_cached: false` is the **non-cacheable** route, which is the one this
+        // contract still governs: there the quarantine's own mark is the object's only
+        // claim, so a decline has to hand it to the caller rather than drop it. (A
+        // cacheable free now takes the shared cached claim before this call and keeps it
+        // throughout, so its decline reports `NotEngaged` with nothing outstanding — the
+        // case `a_cacheable_free_keeps_its_claim_across_a_declined_offer` covers.)
+        let disposition = a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false);
+        assert!(
+            matches!(disposition, QuarantineDisposition::ClaimHeld),
+            "a declined offer must hand its claim to the caller, not drop it"
+        );
+        assert!(
+            span.is_object_quarantined(object_index),
+            "the claim must still be held when the caller takes over"
+        );
+        assert_eq!(a.quarantine_objects(), 0, "the offer was declined");
+
+        // Handing it over is the caller's job, and it leaves exactly one marker behind.
+        assert!(span.try_mark_cached(object_index));
+        a.release_quarantine_claim_small(span, idx);
+        assert!(
+            !span.is_object_quarantined(object_index),
+            "a handed-over claim must not be stranded: every later free of this object \
+             would report a phantom double free"
+        );
+        span.unmark_cached(object_index);
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert_eq!(a.quarantine_objects(), 0, "the offer was declined");
+        assert!(
+            !span.is_object_quarantined(object_index),
+            "a declined claim must not be stranded: every later free would be a phantom \
+             double free"
+        );
+        // Exactly one marker survives, and it is the one the free actually routed to.
+        assert!(
+            span.is_cached(object_index) || span.is_central_free(object_index),
+            "the object must be awaiting reuse in exactly one place"
+        );
+        assert!(span.cached_and_central_free_are_disjoint());
+
+        // And the object is genuinely reusable — the claim did not leak.
+        let q = a.malloc(64);
+        assert!(!q.is_null());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// The claim rule's *release* half: a `Settled` return ends the free without ever
+    /// reaching `insert_batch_inner`, so it has to give back the shared cached claim it
+    /// took before the route was chosen. Detecting a caller's double free must not
+    /// corrupt our own residency accounting.
+    ///
+    /// The sequence is the reachable one: with the quarantine on, the first free of a
+    /// cacheable object takes the cached claim and hands it to the quarantine's marker
+    /// (quarantined-bit-first), leaving the object quarantined and *not* cached. A second
+    /// free then passes the caller's central/cached screen, successfully re-takes the
+    /// cached bit, and only then does `maybe_quarantine_small` see the quarantined marker
+    /// and settle as a double free — with that fresh claim outstanding. Without the
+    /// release the object sits in both residency sets at once while no slot holds it, and
+    /// `cached_count` over-reports until the ring happens to drain.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_quarantine_hit_double_free_releases_the_claim_it_took() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(
+            span.is_object_quarantined(object_index),
+            "the first free hands the claim to the quarantine's marker"
+        );
+        assert!(
+            !span.is_cached(object_index),
+            "and clears the cached bit as it does so"
+        );
+        let cached_before = span.cached_count();
+
+        // The double free is reported...
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        // ...without stranding the claim it took to get there.
+        assert!(
+            !span.is_cached(object_index),
+            "a settled double free must release the shared claim it took"
+        );
+        assert_eq!(
+            span.cached_count(),
+            cached_before,
+            "residency accounting is unchanged by detecting a double free"
+        );
+        assert!(
+            span.cached_and_quarantined_are_disjoint(),
+            "the object must not be cached and quarantined at once"
+        );
+        // Repeatable: each detection is self-contained, so the leak cannot accumulate.
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert_eq!(span.cached_count(), cached_before);
+        assert!(span.cached_and_quarantined_are_disjoint());
+        assert!(a.check_invariants());
+    }
+
+    /// The Appendix-B checker that pins the property above, proved to be load-bearing:
+    /// a span with an object in both residency sets must fail it. Without a negative
+    /// test a checker that silently returned `true` would look identical in CI.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn cached_and_quarantined_overlap_is_caught() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: as above.
+        let span = unsafe { &*span };
+        assert!(span.cached_and_quarantined_are_disjoint());
+
+        // Force exactly the state a leaked claim produces.
+        assert!(span.lock().mark_quarantined(object_index));
+        assert!(span.try_mark_cached(object_index));
+        assert!(
+            !span.cached_and_quarantined_are_disjoint(),
+            "the checker must catch an object held in both residency sets"
+        );
+        assert!(
+            !a.check_invariants(),
+            "and the allocator-wide sweep must surface it"
+        );
+
+        // Restore, so the allocator is left consistent for teardown.
+        span.unmark_cached(object_index);
+        span.lock().clear_quarantined(object_index);
+        assert!(span.cached_and_quarantined_are_disjoint());
+        assert!(a.check_invariants());
+    }
+
+    /// §22.7 / §36.4: an explicit arena's objects never enter the shared front end, so
+    /// its quota accounting stays exact and its memory cannot be vended to the default
+    /// arena. The whole cacheability restriction exists for this.
+    #[test]
+    fn an_explicit_arenas_objects_never_enter_the_front_end() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+
+        let mut ptrs = Vec::new();
+        for _ in 0..64 {
+            let p = a.allocate_in(id, 64, MIN_ALIGN, RequestFlags::NONE);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        let used = a.arena_stats(id).unwrap().used;
+        assert_eq!(used, 64 * 64);
+        for p in ptrs {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        let s = a.stats();
+        assert_eq!(
+            s.per_cpu_bytes, 0,
+            "an explicit arena's frees bypass the front end"
+        );
+        assert_eq!(s.transfer_bytes, 0);
+        // The quota is credited immediately, not when a cache eventually flushes.
+        assert_eq!(a.arena_stats(id).unwrap().used, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// §24.6–§24.8 (W14) survives the front end: a **hot-hinted** small object never
+    /// reaches the shared cache, and the cache never refills from a hot-tagged span — so
+    /// an unhinted request cannot be handed an object the placement layer deliberately
+    /// segregated. A slot is keyed by `(core, size class)` alone, so this is the property
+    /// that keeps grouping a real partition instead of a bias the cache silently erases.
+    ///
+    /// Half the hot objects stay live throughout: an *empty* span carries no grouping and
+    /// is legitimately re-tagged on reuse, so only a span that is still hot-tagged tests
+    /// anything.
+    #[test]
+    fn placement_grouping_survives_the_front_end() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let hot = RequestFlags::NONE.with_hotness(200);
+
+        let mut hots = Vec::new();
+        for _ in 0..64 {
+            let p = a.allocate(64, MIN_ALIGN, hot);
+            assert!(!p.is_null());
+            hots.push(p);
+        }
+        // Free half; the other half keeps their span non-empty, so it stays hot-tagged.
+        let released: Vec<*mut u8> = hots.drain(..32).collect();
+        for p in &released {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        let s = a.stats();
+        assert_eq!(
+            s.per_cpu_bytes + s.transfer_bytes,
+            0,
+            "a hot-tagged object must not enter the shared front end"
+        );
+
+        // An unhinted allocation must not be served from those freed hot objects, whether
+        // directly from central or by way of a cache refill. (Grouping is advisory, so
+        // this is a partition claim, not a safety one — but it is exactly the claim the
+        // cacheability restriction is documented to preserve.)
+        let released_set: std::collections::HashSet<usize> =
+            released.iter().map(|p| *p as usize).collect();
+        let mut plain = Vec::new();
+        for _ in 0..200 {
+            let p = a.malloc(64);
+            assert!(!p.is_null());
+            assert!(
+                !released_set.contains(&(p as usize)),
+                "an unhinted request was served an object from a hot-grouped span ({p:?})"
+            );
+            plain.push(p);
+        }
+        for p in plain {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        for p in hots {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        assert!(a.check_invariants());
+    }
+
+    /// The front end is an accelerator, never a source of failure (§2.4): a burst that
+    /// far exceeds every slot's soft capacity keeps allocating and freeing correctly,
+    /// every object is distinct while live, and the engine ends well-formed with the
+    /// §16.4 residency accounted.
+    #[test]
+    fn a_burst_far_beyond_slot_capacity_conserves_every_object() {
+        let m = meta(32 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let n = 4000usize;
+
+        for _round in 0..3 {
+            let mut ptrs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let p = a.malloc(64);
+                assert!(!p.is_null(), "the front end must never turn into an OOM");
+                ptrs.push(p);
+            }
+            let mut sorted = ptrs.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "no object was vended twice");
+            assert_eq!(a.stats().live_bytes, (n * 64) as u64);
+            for p in ptrs {
+                assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+            }
+            assert_eq!(a.stats().live_bytes, 0);
+            assert!(a.check_invariants());
+        }
+        // Everything is recoverable: the drain returns every cached object to central.
+        let resident = a.flush_front_end_all();
+        assert!(resident > 0);
+        let s = a.stats();
+        assert_eq!(s.per_cpu_bytes, 0);
+        assert_eq!(s.transfer_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// The §16.4 residency law under multi-threaded load: threads allocate and free
+    /// concurrently across several size classes, and at the quiescent end every object
+    /// is accounted for — nothing live, nothing lost, every invariant (including the
+    /// cached/central-free disjointness the double-free oracle rests on) intact.
+    #[test]
+    fn concurrent_front_end_traffic_conserves_every_object() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let a = &a;
+
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                s.spawn(move || {
+                    let sizes = [16usize, 64, 200, 1000];
+                    let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (t << 32);
+                    let mut held: Vec<*mut u8> = Vec::new();
+                    for _ in 0..8_000 {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        if held.len() > 64 || (rng & 1 == 0 && !held.is_empty()) {
+                            let i = (rng >> 8) as usize % held.len();
+                            let p = held.swap_remove(i);
+                            // SAFETY: `p` came from this allocator and this thread still
+                            // owns it (it is removed from `held` before the free).
+                            assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+                        } else {
+                            let sz = sizes[(rng >> 16) as usize % sizes.len()];
+                            let p = a.malloc(sz);
+                            assert!(!p.is_null());
+                            held.push(p);
+                        }
+                    }
+                    for p in held {
+                        // SAFETY: as above.
+                        assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
+                    }
+                });
+            }
+        });
+
+        let s = a.stats();
+        assert_eq!(s.live_bytes, 0, "every allocation was freed");
+        assert_eq!(s.allocated_bytes_total, s.freed_bytes_total);
+        assert!(a.check_invariants());
+        // The drain returns the whole front end to central, and the engine is still
+        // well-formed afterwards (spans retired by the drain included).
+        a.flush_front_end_all();
+        let d = a.stats();
+        assert_eq!(d.per_cpu_bytes, 0);
+        assert_eq!(d.transfer_bytes, 0);
+        assert!(a.check_invariants());
+    }
+
+    /// W6-5: the budget controller is reachable from the engine and bounded by the
+    /// §11.5 global budget the host's CPU count sizes.
+    #[test]
+    fn the_cache_budget_tick_adapts_within_the_published_budget() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // With no CPU count published the controller has nothing to visit.
+        assert_eq!(a.cache_budget_tick(), 0);
+
+        a.set_front_end_cpus(2);
+        let mut ptrs = Vec::new();
+        for _ in 0..500 {
+            ptrs.push(a.malloc(64));
+        }
+        for p in ptrs {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        let total = a.cache_budget_tick();
+        assert!(total > 0, "an exercised class has soft capacity");
+        assert!(
+            total <= 2 * 32 * SIZE_CLASSES.len(),
+            "the total soft capacity stays within the published global budget"
+        );
+        assert!(a.check_invariants());
+    }
+
     #[test]
     #[cfg(not(debug_assertions))]
     fn double_free_is_reported_not_corrupting_in_release() {
@@ -3531,6 +6184,16 @@ mod tests {
         for p in ptrs.drain(..) {
             assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         }
+        // W6: the front end holds part of what was freed, so those objects have not
+        // reached the central bitmap and their spans are not empty *yet*. Caching
+        // **delays** retirement; it never makes it wrong. Draining the front end
+        // (§21.3's "drain caches" rung) completes the `cached → central-free`
+        // transitions and the emptied spans retire exactly as before.
+        let drained = a.flush_front_end_all();
+        assert!(
+            drained > 0,
+            "the front end must have absorbed some of those frees"
+        );
         // 3 spans emptied; 1 cached per bin; 2 retired.
         assert_eq!(a.live_span_count(), 1);
         assert!(a.check_invariants());
@@ -4347,7 +7010,10 @@ mod tests {
         assert_eq!(s1.live_large, 1);
         assert!(s1.span_backend.active > 0, "span backing is active");
 
-        // Free half the small objects: they become central-free bytes.
+        // Free half the small objects. W6: a freed object lands in the front end first,
+        // so the bytes are split across `central_free` and the two cache classes — the
+        // §16.4 decomposition. Their **sum** is what the freed half must equal, and that
+        // is the identity worth asserting: an object is in exactly one of the classes.
         let half = per_span / 2;
         for p in ptrs.drain(..half as usize) {
             assert_eq!(tfree(&a, p), FreeOutcome::Freed);
@@ -4355,7 +7021,11 @@ mod tests {
         let s2 = a.stats();
         assert_eq!(s2.freed_bytes_total, half * 64);
         assert_eq!(s2.live_bytes, (per_span - half) * 64 + big_usable);
-        assert_eq!(s2.central_free_bytes, half * 64);
+        assert_eq!(
+            s2.central_free_bytes + s2.per_cpu_bytes + s2.transfer_bytes,
+            half * 64,
+            "every freed small object is central-free or held in the front end"
+        );
 
         // Free everything: live returns to zero and the identities hold.
         for p in ptrs.drain(..) {
@@ -4365,10 +7035,20 @@ mod tests {
         let s3 = a.stats();
         assert_eq!(s3.live_bytes, 0);
         assert_eq!(s3.allocated_bytes_total, s3.freed_bytes_total);
-        // The emptied span is cached (1 per bin), all its objects central-free.
-        assert_eq!(s3.central_free_bytes, per_span * 64);
-        assert_eq!(s3.live_spans, 1);
+        assert_eq!(
+            s3.central_free_bytes + s3.per_cpu_bytes + s3.transfer_bytes,
+            per_span * 64
+        );
         assert_eq!(s3.live_large, 0);
+        // Draining the front end moves every cached object back to central, at which
+        // point the pre-W6 figures hold exactly: the emptied span is cached (1 per bin)
+        // with all its objects central-free.
+        a.flush_front_end_all();
+        let s3d = a.stats();
+        assert_eq!(s3d.per_cpu_bytes, 0);
+        assert_eq!(s3d.transfer_bytes, 0);
+        assert_eq!(s3d.central_free_bytes, per_span * 64);
+        assert_eq!(s3d.live_spans, 1);
         // Realloc accounts through its legs: a move adds then frees.
         let q = a.malloc(100);
         let q2 = trealloc(&a, q, 5000, MIN_ALIGN, RequestFlags::NONE);
@@ -4848,6 +7528,290 @@ mod tests {
         assert!(a.check_invariants());
     }
 
+    /// W18-4 (§29.5) + W15-3b (§25.3): an in-place **shrink** of a *guarded*
+    /// allocation must be **declined**, never applied extent-relatively.
+    ///
+    /// A guarded object is right-aligned *inside* a larger extent — the extent is
+    /// `[ext_base, ext_base + (object_pages + 2) * PAGE)` while the descriptor is
+    /// `[ext_base + PAGE + pad, … + usable)` — so `desc.base() != extent.base`. The
+    /// extent-relative `split_tail(backing, new_usable)` would cut at
+    /// `extent.base + new_usable`, i.e. `desc.base() - extent.base` bytes *before* the
+    /// live object's new end, handing memory the caller still owns back to the free
+    /// pool (and releasing the still-`PROT_NONE` trailing guard into it). Shrinking
+    /// correctly would have to re-base the object against the trailing guard, which an
+    /// in-place resize cannot do — so the only sound answer is to decline and let
+    /// `realloc` take the move path (§25.3 makes the in-place shrink a SHOULD).
+    ///
+    /// Regression: before the fix this cut the extent 5,536 bytes early (the debug
+    /// build tripped `retire_large_range`'s page-alignment assert; the performance
+    /// build silently freed 21,920 live bytes into the reusable extent pool).
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_declines_the_inplace_shrink_and_stays_whole() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // Medium (> SMALL_MAX), so `realloc` reaches the in-place branch, and *not*
+        // page-aligned, so the object is right-aligned strictly inside its extent.
+        let p = a.allocate_in(ArenaId::DEFAULT, 60_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        assert_ne!(
+            p as usize % PAGE_SIZE,
+            0,
+            "object is right-aligned in-extent"
+        );
+        // SAFETY: `p` has `u0` usable bytes.
+        unsafe { ptr::write_bytes(p, 0x5A, u0) };
+
+        let q = trealloc(&a, p, 40_000, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        let u1 = a.usable_size(q).expect("resized usable");
+        assert!(u1 >= 40_000, "realloc must cover the request (usable {u1})");
+        // Declined in place ⇒ the allocation is kept whole at its original base/size.
+        assert_eq!(q, p, "no move was needed — the shrink is simply declined");
+        assert_eq!(u1, u0, "the allocation stays whole, not silently truncated");
+
+        // Every live byte survives, and no later allocation may alias the live object.
+        let live = q as usize..q as usize + u1;
+        for _ in 0..8 {
+            let r = a.malloc(20_000);
+            assert!(!r.is_null());
+            let ru = a.usable_size(r).expect("usable");
+            let other = r as usize..r as usize + ru;
+            assert!(
+                other.end <= live.start || other.start >= live.end,
+                "aliasing: {:#x}..{:#x} overlaps the live guarded object {:#x}..{:#x}",
+                other.start,
+                other.end,
+                live.start,
+                live.end
+            );
+            // SAFETY: `r` has `ru` usable bytes.
+            unsafe { ptr::write_bytes(r, 0xC3, ru) };
+        }
+        // SAFETY: `q` has `u1` usable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(q, u1) };
+        assert!(
+            bytes.iter().all(|&b| b == 0x5A),
+            "the guarded object's contents were overwritten"
+        );
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-4 (§29.5) + W15-3a (§25.2): an in-place **grow** of a *guarded* allocation
+    /// must be declined too — `grow_in_place` measures the new length from the
+    /// **extent** base, so publishing it as the descriptor's usable size would
+    /// advertise `desc.base() - extent.base` bytes *past* the extent's end (memory
+    /// belonging to the next extent). `realloc` must move instead.
+    ///
+    /// Regression: before the fix a grow past the guarded extent's own length
+    /// advertised 98,304 usable bytes at a base 25,536 bytes into a 98,304-byte
+    /// extent — 25,536 bytes of out-of-extent memory handed to the caller.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_declines_the_inplace_grow_and_moves() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        let p = a.allocate_in(ArenaId::DEFAULT, 40_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        // SAFETY: `p` has `u0` usable bytes.
+        unsafe { ptr::write_bytes(p, 0x5A, u0) };
+        // Free an adjacent extent so an (incorrect) in-place grow would have something
+        // to absorb — the fix must decline it even when the absorb is available.
+        let neighbour = a.malloc(200_000);
+        assert!(!neighbour.is_null());
+        assert_eq!(tfree(&a, neighbour), FreeOutcome::Freed);
+
+        // Grow past the guarded extent's own length (`object_pages + 2` pages).
+        let q = trealloc(&a, p, 6 * PAGE_SIZE, MIN_ALIGN, RequestFlags::NONE);
+        assert!(!q.is_null());
+        let u1 = a.usable_size(q).expect("grown usable");
+        assert!(u1 >= 6 * PAGE_SIZE);
+        assert_ne!(q, p, "a guarded grow must move, never grow in place");
+        // The preserved prefix survived the move.
+        // SAFETY: `q` has `u1 >= u0` usable bytes.
+        let kept = unsafe { core::slice::from_raw_parts(q, u0) };
+        assert!(kept.iter().all(|&b| b == 0x5A), "prefix lost on the move");
+        // The advertised range is genuinely writable (it is a plain extent-backed
+        // allocation now, not an over-advertised guarded one).
+        // SAFETY: `q` has `u1` usable bytes.
+        unsafe { ptr::write_bytes(q, 0x33, u1) };
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+    }
+
+    /// W18-4 (§29.5) + §10.3: `xallocx`/`resize_in_place` reaches the same
+    /// `LargeAllocator::shrink`/`grow` seam, so a guarded allocation must report
+    /// "not resized" rather than corrupting its extent (it may never move).
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn guarded_allocation_is_never_resized_in_place_by_xallocx() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        let p = a.allocate_in(ArenaId::DEFAULT, 60_000, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let u0 = a.usable_size(p).expect("guarded usable");
+        // SAFETY: `p` is the live base pointer this test owns.
+        let shrunk = unsafe { a.resize_in_place(p, 40_000, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(shrunk, Some(u0), "guarded shrink-in-place must be declined");
+        // SAFETY: as above.
+        let grown = unsafe { a.resize_in_place(p, 6 * PAGE_SIZE, MIN_ALIGN, RequestFlags::NONE) };
+        assert_eq!(grown, Some(u0), "guarded grow-in-place must be declined");
+        assert_eq!(a.usable_size(p), Some(u0));
+        assert!(a.check_invariants());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+    }
+
+    /// W18-4 + W18-5 (§29.5/§29.6): a **guarded** free must not arm verify-on-reuse
+    /// for its whole extent.
+    ///
+    /// The junk-fill canary is written over the *object* only, while the canary flag is
+    /// recorded for the whole backing extent — so a guarded free that claimed the flag
+    /// left the two guard pages and the right-alignment padding un-filled. The next
+    /// allocation carved from those pages verified them, read zeros instead of
+    /// `FREE_PATTERN`, and `corruption_abort`ed a completely correct program.
+    ///
+    /// Only reachable with `junk-fill` + `guard-pages` and **without** `secure-scrub`
+    /// (which scrubs every large free and so disarms the canary anyway) — a composition
+    /// neither the single-feature nor the composed `hardened` CI pass covered; a
+    /// feature-pair pass was added alongside this test.
+    #[cfg(all(
+        feature = "junk-fill",
+        feature = "guard-pages",
+        not(feature = "secure-scrub")
+    ))]
+    #[test]
+    fn a_guarded_free_does_not_arm_verify_on_reuse_for_the_whole_extent() {
+        let m = meta(64 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        // Pin the guarded extent between two live neighbours so freeing it cannot
+        // coalesce (a merge AND-joins the canary flag with a non-canary neighbour and
+        // would mask the defect). A 100-byte guarded request reserves exactly three
+        // pages: one object page bracketed by two guard pages.
+        let before = a.malloc(3 * PAGE_SIZE);
+        assert!(!before.is_null());
+        let p = a.allocate_in(ArenaId::DEFAULT, 100, MIN_ALIGN, guarded);
+        assert!(!p.is_null());
+        let after = a.malloc(3 * PAGE_SIZE);
+        assert!(!after.is_null());
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+
+        // Reuse exactly that 3-page extent. Under verify-on-reuse the whole carve is
+        // checked against `FREE_PATTERN`; the guarded free only ever filled its 112-byte
+        // object, so claiming the canary for the extent aborted the process here.
+        for _ in 0..4 {
+            let q = a.malloc(3 * PAGE_SIZE);
+            assert!(!q.is_null(), "reuse of a recycled guarded extent failed");
+            // SAFETY: `q` has at least `3 * PAGE_SIZE` usable bytes.
+            unsafe { ptr::write_bytes(q, 0x77, 3 * PAGE_SIZE) };
+            assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        }
+        assert_eq!(tfree(&a, before), FreeOutcome::Freed);
+        assert_eq!(tfree(&a, after), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5) + §10.3: the `nallocx` oracle must predict the **guarded** usable
+    /// size for a `TOPO_GUARDED` request, not the size class's. Over-reporting would
+    /// send a caller following the documented "ask, then use the whole reported size"
+    /// idiom into the inaccessible trailing guard page.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn predicted_usable_size_matches_the_guarded_path() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let guarded = RequestFlags::from_raw(RequestFlags::GUARDED).unwrap();
+
+        for size in [
+            1usize,
+            100,
+            5000,
+            SMALL_MAX,
+            SMALL_MAX + 1,
+            3 * PAGE_SIZE + 1,
+        ] {
+            let predicted = predicted_usable_size(size, MIN_ALIGN, guarded).expect("classifiable");
+            let p = a.allocate_in(ArenaId::DEFAULT, size, MIN_ALIGN, guarded);
+            assert!(!p.is_null(), "guarded alloc of {size} failed");
+            let actual = a.usable_size(p).expect("usable");
+            assert_eq!(
+                predicted, actual,
+                "nallocx over/under-reports a guarded {size}-byte request"
+            );
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        // An over-aligned request is never guarded (`want_guarded` caps at PAGE_SIZE),
+        // so it keeps the ordinary prediction — and that prediction still holds.
+        let over = 2 * PAGE_SIZE;
+        let predicted = predicted_usable_size(64, over, guarded).expect("classifiable");
+        let p = a.allocate_in(ArenaId::DEFAULT, 64, over, guarded);
+        assert!(!p.is_null());
+        assert_eq!(a.usable_size(p), Some(predicted));
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// W18-4 (§29.5): the guard-page sampler must be seeded from **per-process
+    /// entropy**, not the build-time constant.
+    ///
+    /// The sampler's security value is that an attacker cannot tell which allocations
+    /// carry guard pages. With a `const` seed the xorshift stream — and therefore the
+    /// exact set of guarded allocation indices — is identical in every process of the
+    /// same binary, so it is public: the attacker computes it once offline and places
+    /// the overflow on an unguarded slot. This pins the fix: installing entropy and
+    /// calling `seed_security_samplers` changes the stream.
+    #[cfg(feature = "guard-pages")]
+    #[test]
+    fn security_samplers_are_seeded_from_process_entropy() {
+        fn sampled_pattern(a: &Allocator<'_, HostProvider>) -> Vec<bool> {
+            (0..64).map(|_| a.guard_sampled_for_test()).collect()
+        }
+        let m = meta(4 * 1024 * 1024);
+        let pm = PageMap::new();
+
+        // Two fresh engines with no entropy installed draw the *same* stream — the
+        // build-time constant, i.e. the publicly computable sequence.
+        crate::harden::set_process_entropy(0); // ignored: the sentinel
+        let a = small_allocator(&m, &pm);
+        a.set_guard_sample_rate(4);
+        let b = small_allocator(&m, &pm);
+        b.set_guard_sample_rate(4);
+        assert_eq!(
+            sampled_pattern(&a),
+            sampled_pattern(&b),
+            "unseeded engines share the build-time stream"
+        );
+
+        // Installing entropy and re-seeding must move the stream off that constant.
+        let c = small_allocator(&m, &pm);
+        c.set_guard_sample_rate(4);
+        crate::harden::set_process_entropy(0x0123_4567_89AB_CDEF);
+        c.seed_security_samplers();
+        let d = small_allocator(&m, &pm);
+        d.set_guard_sample_rate(4);
+        crate::harden::set_process_entropy(0xFEDC_BA98_7654_3210);
+        d.seed_security_samplers();
+        let (pc, pd) = (sampled_pattern(&c), sampled_pattern(&d));
+        let baseline = sampled_pattern(&small_allocator_at_rate(&m, &pm, 4));
+        assert_ne!(pc, baseline, "entropy did not change the guarded stream");
+        assert_ne!(pd, pc, "distinct entropy must give distinct streams");
+    }
+
     /// W18-6 defence-in-depth: with `secure-scrub` compiled in, **even a PUBLIC**
     /// arena's backing is scrubbed on release — not only the non-PUBLIC arenas the
     /// §36.12 MUST already covers.
@@ -5160,6 +8124,9 @@ mod tests {
         for p in ptrs {
             assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         }
+        // W6: the front end holds some of the freed objects, so drain it before
+        // asserting on retirement — a cached object keeps its span non-empty.
+        a.flush_front_end_all();
         let after = revokes.load(Ordering::Relaxed);
         assert!(
             after > before,
@@ -5293,6 +8260,87 @@ mod tests {
             .is_null());
         assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
+    }
+
+    /// A refill must be consumable from the slot it targeted, by a thread running
+    /// anywhere — the primitive `alloc_small_cached` now leans on to consume each refill
+    /// in the iteration that performed it.
+    ///
+    /// A refill *moves* objects: central loses a batch and the target slot gains it. The
+    /// loop previously looped back to the running-CPU pop instead, and carried the last
+    /// refilled core forward to a single recovery probe at the OOM point. Across two
+    /// migrations (A → B → C) that forgets A the moment B is refilled, so a concurrent
+    /// consumer draining B turns an exhausted backend into a spurious OOM with a full
+    /// batch still sitting on A. Consuming each refill immediately removes the
+    /// bookkeeping rather than widening it — no iteration can end with a batch this loop
+    /// created in a slot the loop will not revisit, whatever the migration pattern.
+    ///
+    /// The loop shapes are indistinguishable without a migration (both pop from the slot
+    /// they just filled), so what is pinned here is the mechanism: a core-addressed pop
+    /// reaches its slot regardless of the running CPU, and the running-CPU pop cannot see
+    /// it — which is precisely why the batch used to be lost.
+    #[test]
+    fn a_refill_is_consumable_from_the_core_it_targeted_not_the_running_one() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let req = classify(64, MIN_ALIGN, 0).expect("classify");
+        let sc = match req.kind {
+            RequestKind::Small { sc, .. } => sc,
+            other => panic!("expected small, got {other:?}"),
+        };
+
+        // One allocation creates the span; its remaining objects land in central, which
+        // is what a refill draws from.
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+
+        // A core this thread is certainly not running on.
+        let far = CoreId(crate::cpu_cache::MAX_CPUS as u32 - 1);
+        let running = a.cpu_cache.current_core();
+        assert_ne!(running, far, "test needs a core other than the running one");
+
+        // Mirror the loop's own order: the pop that reports `Empty` is what lazily
+        // initializes the slot, and `push_batch` declines an uninitialized one (its batch
+        // would go to the transfer cache instead). So the refill in the `Empty` arm
+        // always targets a slot that can receive it.
+        assert!(matches!(
+            a.cpu_cache
+                .fe_pop_on_core(far, ArenaId::DEFAULT, sc, a.meta),
+            FeOutcome::Empty
+        ));
+        assert!(
+            a.refill_front_end(far, sc),
+            "central holds this class's objects, so the refill must not report need_span"
+        );
+
+        // The running-CPU pop cannot see the batch. This is the whole failure mode: a
+        // thread that migrated after its refill polls *this* slot, finds it empty, and —
+        // if that refill took central's last batch — reports OOM.
+        assert!(
+            matches!(
+                a.cpu_cache.fe_pop(running, ArenaId::DEFAULT, sc, a.meta),
+                FeOutcome::Empty
+            ),
+            "the refill went to `far`, so the running core's slot must still be empty"
+        );
+
+        // The core-addressed pop does, which is what makes immediate consumption
+        // possible and what the old recovery probe could only do for one core.
+        let addr = match a
+            .cpu_cache
+            .fe_pop_on_core(far, ArenaId::DEFAULT, sc, a.meta)
+        {
+            FeOutcome::Success(addr) => addr,
+            other => panic!("the refilled batch must be reachable through its core: {other:?}"),
+        };
+        let claimed = a.claim_cached_object(addr, sc);
+        assert!(!claimed.is_null(), "a refilled object must claim cleanly");
+
+        tfree(&a, claimed);
+        tfree(&a, p);
+        assert!(a.check_invariants(), "state stays well-formed");
     }
 
     #[test]

@@ -8,8 +8,7 @@
 //! that duplicated, lost, or mis-bounded an object would trip the checker and the
 //! fuzzer would report the input. The central free list and the full engine
 //! (B.1/B.3/B.4/B.5) are fuzzed by `malloc_api`; this target covers the standalone
-//! no_std front-end cache layer. (The per-thread cache, a `std`-only structure, is
-//! covered by its unit + negative tests.)
+//! no_std front-end cache layer.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

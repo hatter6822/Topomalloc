@@ -31,12 +31,14 @@ use crate::policy::{zero_size_policy, ZeroSizePolicy};
 
 /// Map an [`ArenaError`] onto the POSIX `errno` taxonomy — the projection of the
 /// §36.14 `TOPO_ERR_*` classes a C caller can read after a failed arena call:
-/// authority denials are `EACCES`, a draining/inactive arena is `EBUSY`, a quota
-/// overrun is `ENOMEM`, and every malformed/illegal request is `EINVAL`.
+/// authority denials are `EACCES`, a draining/inactive arena or one still holding
+/// live delegated children is `EBUSY` (the caller retries after destroying the
+/// subtree), a quota overrun is `ENOMEM`, and every malformed/illegal request is
+/// `EINVAL`.
 pub(crate) fn arena_errno(e: ArenaError) -> i32 {
     match e {
         ArenaError::AuthorityDenied => EACCES,
-        ArenaError::NotActive => EBUSY,
+        ArenaError::NotActive | ArenaError::HasLiveChildren => EBUSY,
         ArenaError::QuotaExceeded | ArenaError::Exhausted => ENOMEM,
         ArenaError::NotFound
         | ArenaError::Attenuation

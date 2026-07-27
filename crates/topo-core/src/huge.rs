@@ -64,7 +64,7 @@ use core::ptr::{self, NonNull};
 use crate::backend::{Region, TopoBackingProvider};
 use crate::bootstrap::MetadataAlloc;
 use crate::error::BackendError;
-use crate::extent::{BackendLock, RegionCacheHook};
+use crate::extent::{BackendLock, RegionCacheHook, StateBytes};
 use crate::flags::{Hints, HugepagePolicy, Lifetime};
 use crate::generated::tables::{HUGE_THRESHOLD, PAGE_SIZE};
 use crate::ids::ArenaId;
@@ -702,6 +702,9 @@ pub struct HugePageFiller {
     /// Per-bin list heads (intrusive, over touched hugepages). Index by `HugeBin as
     /// usize`.
     bins: [u32; HugeBin::COUNT],
+    /// Per-bin list tails, where [`bin_insert`](HugePageFiller::bin_insert) files a
+    /// **full** hugepage. Same indexing as [`bins`](Self::bins).
+    bin_tails: [u32; HugeBin::COUNT],
     /// Cumulative subreleases performed (the §19.6 metric the control plane reads).
     subrelease_events: u64,
 }
@@ -744,6 +747,7 @@ impl HugePageFiller {
             region_base,
             next_untouched: 0,
             bins: [NIL; HugeBin::COUNT],
+            bin_tails: [NIL; HugeBin::COUNT],
             subrelease_events: 0,
         })
     }
@@ -800,21 +804,47 @@ impl HugePageFiller {
 
     // --- bin index (touched hugepages) ---------------------------------------
 
-    /// Insert touched hugepage `i` at the head of `bin`'s list and record the filed
-    /// bin on the slot.
+    /// Insert touched hugepage `i` into `bin`'s list and record the filed bin on the
+    /// slot: a **completely full** hugepage at the *tail*, every other one at the head.
+    ///
+    /// A full hugepage can never fit a run, so filing it behind the ones that still can
+    /// is what lets [`place`](Self::place)'s bounded per-bin scan spend its budget on real
+    /// candidates. Full hugepages are *not* confined to the [`Full`](HugeBin::Full) bin
+    /// `PACKING_ORDER` excludes — §19.4 files a **hot** full one in
+    /// [`HotDense`](HugeBin::HotDense), the first bin scanned — so without this a hot
+    /// workload's full hugepages would crowd the fittable ones past the cap.
     fn bin_insert(&mut self, i: u32, bin: HugeBin) {
-        let head = self.bins[bin as usize];
+        let b = bin as usize;
         let mut s = self.get(i);
+        let at_tail = s.used() >= PAGES_PER_HUGEPAGE;
         s.bin = bin as u8;
-        s.bin_prev = NIL;
-        s.bin_next = head;
-        self.put(i, s);
-        if head != NIL {
-            let mut h = self.get(head);
-            h.bin_prev = i;
-            self.put(head, h);
+        if at_tail {
+            let tail = self.bin_tails[b];
+            s.bin_prev = tail;
+            s.bin_next = NIL;
+            self.put(i, s);
+            if tail != NIL {
+                let mut t = self.get(tail);
+                t.bin_next = i;
+                self.put(tail, t);
+            } else {
+                self.bins[b] = i;
+            }
+            self.bin_tails[b] = i;
+        } else {
+            let head = self.bins[b];
+            s.bin_prev = NIL;
+            s.bin_next = head;
+            self.put(i, s);
+            if head != NIL {
+                let mut h = self.get(head);
+                h.bin_prev = i;
+                self.put(head, h);
+            } else {
+                self.bin_tails[b] = i;
+            }
+            self.bins[b] = i;
         }
-        self.bins[bin as usize] = i;
     }
 
     /// Remove touched hugepage `i` from its current filed bin.
@@ -833,16 +863,36 @@ impl HugePageFiller {
             let mut n = self.get(s.bin_next);
             n.bin_prev = s.bin_prev;
             self.put(s.bin_next, n);
+        } else {
+            debug_assert_eq!(
+                self.bin_tails[bin], i,
+                "hugepage not at the tail of its bin"
+            );
+            self.bin_tails[bin] = s.bin_prev;
         }
     }
 
     /// Re-file touched hugepage `i` into the bin its current occupancy/state implies
-    /// (H-003), if that differs from its filed bin. Called after any change to a
-    /// hugepage's `live`/`released`/`hotness`.
+    /// (H-003) **and the end of that bin its fullness implies**. Called after any change
+    /// to a hugepage's `live`/`released`/`hotness`.
+    ///
+    /// Re-filing on the bin alone is not enough: occupancy also moves a hugepage between
+    /// the fittable group (head) and the full group (tail) *without* changing its bin — a
+    /// hot hugepage at 7/8 filling up stays [`HotDense`](HugeBin::HotDense). Left in
+    /// place it would ossify in front of hugepages that can still fit a run, which is
+    /// exactly what the split in [`bin_insert`](Self::bin_insert) exists to prevent. Since
+    /// every occupancy change re-files, the resulting order is exact: every hugepage that
+    /// can fit a run precedes every one that cannot (asserted by
+    /// [`check_invariants`](Self::check_invariants)).
     fn refile(&mut self, i: u32) {
         let s = self.get(i);
         let target = s.target_bin();
-        if s.bin != target as u8 {
+        let at_right_end = if s.used() >= PAGES_PER_HUGEPAGE {
+            self.bin_tails[target as usize] == i
+        } else {
+            self.bins[target as usize] == i
+        };
+        if s.bin != target as u8 || !at_right_end {
             self.bin_remove(i);
             self.bin_insert(i, target);
         }
@@ -888,50 +938,82 @@ impl HugePageFiller {
         }
     }
 
-    /// Number of touched hugepages currently in `bin` (a slow stats walk).
-    pub fn bin_len(&self, bin: HugeBin) -> usize {
-        let mut n = 0usize;
-        let mut i = self.bins[bin as usize];
-        while i != NIL {
-            n += 1;
-            i = self.get(i).bin_next;
-            if n > self.capacity as usize {
-                break; // cycle guard (defensive)
-            }
-        }
-        n
-    }
-
-    /// The base address of a hugepage currently in `bin` (the list head), or `None`
-    /// if the bin is empty — used by the demand-reserve path (W11-1b) to pick an
-    /// empty-backed hugepage to release.
-    pub fn first_in_bin(&self, bin: HugeBin) -> Option<usize> {
-        let head = self.bins[bin as usize];
-        if head == NIL {
-            None
-        } else {
-            Some(self.huge_base(head))
-        }
-    }
-
     /// The next **empty-backed** hugepage at slot index `>= from` — `(index, base,
     /// committed_pages)` — or `None` if none remains in `[from, touched)`. "Empty
-    /// backed" = touched, `used == 0`, no subreleased page (i.e. in the
-    /// [`EmptyBacked`](HugeBin::EmptyBacked) bin). The committed-page count is its live
-    /// RSS (the pages the HugeCache holds backed for reuse). The demand-reserve shrink
-    /// (W11-1b) walks this by ascending index so it deterministically visits every
-    /// empty hugepage exactly once and always makes progress — unlike repeatedly
-    /// taking the bin head, which can stall on a hugepage that cannot be released.
+    /// backed" = touched, `used == 0`, and still holding at least one **committed**
+    /// page. The committed-page count is its live RSS (the pages the HugeCache holds
+    /// backed for reuse). The demand-reserve shrink (W11-1b) walks this by ascending
+    /// index so it deterministically visits every empty hugepage exactly once and
+    /// always makes progress — unlike repeatedly taking the bin head, which can stall
+    /// on a hugepage that cannot be released.
+    ///
+    /// A **partially subreleased** empty hugepage (some pages already returned, the
+    /// rest still committed) is included: it is empty, it holds real RSS, and
+    /// [`coverage`](Self::coverage) already reports its committed bytes as
+    /// `empty_backed_bytes` — the supply the W12 controller plans against. Excluding
+    /// it here (as this used to) made that supply un-reclaimable, so every tick
+    /// re-planned release work the mechanism refused to execute (stranded RSS + a
+    /// non-converging plan). A fully-released empty hugepage has nothing to reclaim
+    /// and is skipped by the `committed > 0` test.
     fn next_empty_backed(&self, from: u32) -> Option<(u32, usize, usize)> {
         let mut i = from;
         while i < self.next_untouched {
             let s = self.get(i);
-            if s.touched != 0 && s.used() == 0 && s.subreleased() == 0 {
-                return Some((i, self.huge_base(i), popcount(&s.committed)));
+            if s.touched != 0 && s.used() == 0 {
+                let committed = popcount(&s.committed);
+                if committed != 0 {
+                    return Some((i, self.huge_base(i), committed));
+                }
             }
             i += 1;
         }
         None
+    }
+
+    /// The number of hugepages [`next_empty_backed`](Self::next_empty_backed) would
+    /// visit — i.e. empty hugepages that still hold committed backing. This is the
+    /// population the demand **reserve** counts (and whose committed bytes
+    /// [`coverage`](Self::coverage) reports as `empty_backed_bytes`), so the reserve
+    /// and the supply are drawn from the same set.
+    fn empty_backed_hugepages(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0u32;
+        while i < self.next_untouched {
+            let s = self.get(i);
+            if s.touched != 0 && s.used() == 0 && popcount(&s.committed) != 0 {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    /// The next **maximal committed run** of hugepage slot `hp` at page offset
+    /// `>= from`, as `(offset, pages)`, or `None` when none remains.
+    ///
+    /// [`subrelease`](Self::subrelease) takes a *contiguous run*, so a caller that
+    /// wants to reclaim a hugepage's whole RSS must walk its runs: a committed set is
+    /// **not** in general the prefix `[0, popcount)` (an over-aligned placement leaves
+    /// stride holes, and a subrelease-then-partial-refill leaves a released hole), and
+    /// passing the popcount as a run length makes `subrelease` refuse the whole
+    /// hugepage — reclaiming nothing.
+    fn next_committed_run(&self, hp: u32, from: usize) -> Option<(usize, usize)> {
+        if hp >= self.next_untouched {
+            return None;
+        }
+        let s = self.get(hp);
+        let mut off = from;
+        while off < PAGES_PER_HUGEPAGE && !bit_get(&s.committed, off) {
+            off += 1;
+        }
+        if off >= PAGES_PER_HUGEPAGE {
+            return None;
+        }
+        let mut end = off;
+        while end < PAGES_PER_HUGEPAGE && bit_get(&s.committed, end) {
+            end += 1;
+        }
+        Some((off, end - off))
     }
 
     // --- placement (W11-2b candidate selection, W11-4a packing) --------------
@@ -1062,12 +1144,38 @@ impl HugePageFiller {
         // Candidate selection over the packing-ordered bins (bounded scan, W11-2b):
         // the densest bin that yields any fit wins (packing), best score within it.
         let mut best: Option<(u32, usize, i64)> = None; // (hugepage, run_offset, score)
-        let mut scanned = 0usize;
-        'bins: for &bin in PACKING_ORDER.iter() {
+        let mut scanned;
+        for &bin in PACKING_ORDER.iter() {
             let mut i = self.bins[bin as usize];
             let mut found_in_bin = false;
+            // The cap is **per bin**, not cumulative. `HotDense` is the first bin scanned
+            // and `classify_bin` files a *completely full* hugepage there whenever it is
+            // hot (only the non-hot full case becomes `Full`, which `PACKING_ORDER` omits),
+            // so a hot workload accumulates full hugepages in the very first bin. With a
+            // cumulative cap those alone exhausted the whole placement budget and aborted
+            // the entire descent, so every request opened a fresh hugepage even though
+            // `NearlyFull`/`Medium`/`Sparse` ones had room — until the region ran out and
+            // the backend stopped serving altogether, exactly inverting the §19.5 packing
+            // policy. Per-bin, exhausting one bin's budget only moves on to the next.
+            scanned = 0;
             while i != NIL {
                 let s = self.get(i);
+                // The cap counts **every** node visited, a full hugepage included, so the
+                // walk is bounded by `SCAN_CAP` regardless of what the bin holds — the
+                // placement cost cannot grow with the backend's capacity. `bin_insert`
+                // files full hugepages at the tail, behind every one that can still fit a
+                // run, so the budget is still spent on real candidates first.
+                scanned += 1;
+                // A full hugepage can never fit a run; skip it without walking its bitmap.
+                // `Full` is excluded from `PACKING_ORDER` for exactly this reason, but a
+                // *hot* full hugepage is filed `HotDense`, which is not.
+                if s.used() >= PAGES_PER_HUGEPAGE {
+                    i = s.bin_next;
+                    if scanned >= SCAN_CAP {
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(off) = find_run_aligned(&s.live, pages, stride) {
                     found_in_bin = true;
                     let sc = Self::score(&s, hints, off, pages);
@@ -1082,11 +1190,10 @@ impl HugePageFiller {
                     }
                 }
                 i = s.bin_next;
-                scanned += 1;
                 // Approximate-bin cap (§19.3 "MAY use approximate bins"): never scan
-                // an unbounded number of hugepages on a single placement.
+                // an unbounded number of hugepages within one bin.
                 if scanned >= SCAN_CAP {
-                    break 'bins;
+                    break;
                 }
             }
             // Packing (§19.5): a fit in a denser bin is preferred — stop descending
@@ -1840,16 +1947,26 @@ impl HugePageFiller {
             }
             i += 1;
         }
-        // 2. Each bin list is well-formed and counts match.
+        // 2. Each bin list is well-formed, ordered fittable-before-full, and counts match.
         for (b, (&head, &expected)) in self.bins.iter().zip(binned.iter()).enumerate() {
             let mut j = head;
             let mut prev = NIL;
             let mut seen = 0usize;
+            let mut seen_full = false;
             while j != NIL {
                 let s = self.get(j);
                 if s.touched != 1 || s.bin as usize != b || s.bin_prev != prev {
                     return false;
                 }
+                // Every hugepage that can still fit a run precedes every one that cannot
+                // (`bin_insert` files full ones at the tail, `refile` keeps them there).
+                // This is what makes `place`'s bounded per-bin scan spend its budget on
+                // real candidates instead of on hugepages with no room.
+                let full = s.used() >= PAGES_PER_HUGEPAGE;
+                if seen_full && !full {
+                    return false;
+                }
+                seen_full |= full;
                 prev = j;
                 j = s.bin_next;
                 seen += 1;
@@ -1859,6 +1976,9 @@ impl HugePageFiller {
             }
             if seen != expected {
                 return false; // a touched hugepage missing from / extra in its bin
+            }
+            if self.bin_tails[b] != prev {
+                return false; // the tail pointer must name the list's last node
             }
         }
         true
@@ -2505,10 +2625,30 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// release controller (plan 04 W12); this is the **mechanism** it drives. Bounds the
     /// HugeCache so a churny workload's empty hugepages do not pin RSS indefinitely.
     pub fn release_empty_excess(&self, reserve: usize) -> usize {
+        self.release_empty_excess_bounded(reserve, usize::MAX)
+    }
+
+    /// [`release_empty_excess`](Self::release_empty_excess) with an explicit upper bound
+    /// on how many hugepages this call may release.
+    ///
+    /// The reserve alone is not a budget. It is derived from a *snapshot* of the empty
+    /// population, but the walk below sees the population as it is **now**: application
+    /// frees running concurrently can empty more hugepages after the snapshot, and every
+    /// one of them lands beyond the reserve and is released. A tick planned and
+    /// rate-capped for a single hugepage can then decommit many, blowing through the
+    /// §20.2 release budget and producing exactly the latency and RSS-refault spike the
+    /// cap exists to prevent. `max_release` bounds the work by what was actually planned,
+    /// so a concurrent emptying defers to the next tick (where the controller's §20.3
+    /// backlog already accounts for it) instead of being swept up by this one.
+    pub fn release_empty_excess_bounded(&self, reserve: usize, max_release: usize) -> usize {
         let mut released = 0usize;
+        let mut releases = 0usize;
         let mut kept = 0usize;
         let mut from = 0u32;
         loop {
+            if releases >= max_release {
+                break;
+            }
             // Find the next empty-backed hugepage (and its committed footprint) under
             // the lock; release it outside (re-acquiring). Advancing `from` past each
             // visited hugepage guarantees the walk terminates and visits each once.
@@ -2526,14 +2666,116 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
                 kept += 1;
                 continue;
             }
-            // Release exactly this hugepage's committed prefix (its RSS). `committed
-            // == 0` (no backing) is already released — nothing to reclaim. A guard or
-            // revoke refusal returns 0; skip it and keep reclaiming the others (a
-            // concurrent change just makes the subrelease a re-validated no-op).
-            if committed == 0 {
+            debug_assert!(
+                committed > 0,
+                "next_empty_backed only yields backed empties"
+            );
+            let _ = committed;
+            // Count-bounded, not byte-bounded: this variant's contract is "at most
+            // `max_release` hugepages", so each one releases in full.
+            released += self.release_hugepage_runs(idx, base, u64::MAX);
+            releases += 1;
+        }
+        released
+    }
+
+    /// **Demand-reserve shrink bounded by bytes**, the byte-denominated counterpart of
+    /// [`release_empty_excess`](Self::release_empty_excess): release whole empty-backed
+    /// hugepages while the **committed bytes released so far** stay within `budget`.
+    /// Returns the bytes actually released (always `<= budget`).
+    ///
+    /// A caller whose bound is a byte figure cannot express it as a `reserve` count
+    /// without overshooting. An empty hugepage's committed footprint is anywhere in
+    /// `(0, HUGEPAGE_SIZE]` — a packed-then-emptied one is only partially committed — so
+    /// converting a byte budget to a hugepage count has no correct rounding: rounding up
+    /// releases more than the budget, and rounding down forfeits every release below one
+    /// hugepage even when the actual footprints would fit. Selecting on each hugepage's
+    /// real `committed` count is exact, and it is already in hand — `next_empty_backed`
+    /// returns it. Used by the §15.4 rebalancer, whose move size is a `movable_surplus`
+    /// **byte** bound that exists precisely so a move never strands the donor.
+    ///
+    /// Skips (rather than stops at) a hugepage too large for the remaining budget, so a
+    /// fully-committed hugepage at the head does not mask smaller releasable ones behind
+    /// it; the walk is by ascending slot index and visits each hugepage once.
+    pub fn release_empty_within_bytes(&self, budget: u64) -> usize {
+        let mut released = 0usize;
+        let mut from = 0u32;
+        loop {
+            let next = {
+                let g = self.lock();
+                g.inner.filler.next_empty_backed(from)
+            };
+            let (idx, base, committed) = match next {
+                Some(t) => t,
+                None => break,
+            };
+            from = idx + 1;
+            // Charge the hugepage's committed footprint against what is left. `committed`
+            // is a page count; a release can only ever return that many pages' RSS.
+            let cost = (committed as u64).saturating_mul(PAGE_SIZE as u64);
+            let remaining = budget.saturating_sub(released as u64);
+            if cost > remaining {
                 continue;
             }
-            match self.subrelease(base, committed, true) {
+            // Pass `remaining`, not `cost`: `cost` came from a sample taken before the
+            // lock was dropped, and the hugepage may hold more now. The budget is the
+            // real bound, and it is the one the contract below asserts.
+            released += self.release_hugepage_runs(idx, base, remaining);
+        }
+        debug_assert!(
+            released as u64 <= budget,
+            "byte-budgeted release overshot: {released} > {budget}"
+        );
+        released
+    }
+
+    /// Release **every maximal committed run** of empty hugepage `idx` (its RSS),
+    /// returning the bytes released.
+    ///
+    /// `subrelease` takes a contiguous run, and a committed set is not in general the
+    /// prefix `[0, popcount)` — an over-aligned placement leaves stride holes and a
+    /// subrelease-then-partial-refill leaves a released hole — so passing the popcount as
+    /// a run length made `subrelease` refuse and reclaim nothing. Walking the runs
+    /// reclaims exactly the backed pages, whatever their layout. A guard or revoke refusal
+    /// returns 0; skip that run and keep reclaiming the others (a concurrent change just
+    /// makes the subrelease a re-validated no-op). `search_from` advances past each run
+    /// examined, so the walk is O(`PAGES_PER_HUGEPAGE`) and always terminates.
+    /// Release the committed runs of hugepage `idx`, returning at most `max_bytes`.
+    ///
+    /// The cap is not redundant with the caller's accounting. The caller samples a
+    /// hugepage's committed footprint under the lock and then drops it, but this walk
+    /// releases the runs present when *it* runs: a page-light empty can be sampled at one
+    /// committed page, reused for a much larger allocation, and be empty again by the time
+    /// the release reaches it — at which point an uncapped walk decommits the whole
+    /// hugepage against a one-page charge. That breaks the byte-budget contract the
+    /// §20.2 rate cap depends on, and can take back memory a NUMA donor's
+    /// `movable_surplus` had reserved for its own demand. Capping here enforces the bound
+    /// against the state that actually exists at release time rather than a stale sample.
+    fn release_hugepage_runs(&self, idx: u32, base: usize, max_bytes: u64) -> usize {
+        let mut released = 0usize;
+        let mut search_from = 0usize;
+        loop {
+            let remaining = max_bytes.saturating_sub(released as u64);
+            if remaining == 0 {
+                break;
+            }
+            let run = {
+                let g = self.lock();
+                g.inner.filler.next_committed_run(idx, search_from)
+            };
+            let Some((off, mut pages)) = run else { break };
+            search_from = off + pages;
+            // Trim the run to what the budget still allows. A partial release is a valid
+            // §20.1 outcome (the remainder stays committed for a later tick); releasing
+            // the whole run because it *started* inside the budget is not.
+            let budget_pages = (remaining / PAGE_SIZE as u64) as usize;
+            if budget_pages == 0 {
+                break;
+            }
+            if pages > budget_pages {
+                pages = budget_pages;
+            }
+            match self.subrelease(base + off * PAGE_SIZE, pages, true) {
                 0 => continue,
                 bytes => released += bytes,
             }
@@ -2569,10 +2811,15 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
         // rest. `release_empty_excess` takes a hugepage *count* to retain.
         let released = if plan.release_empty_hugepages_bytes > 0 {
             let hp = HUGEPAGE_SIZE as u64;
-            // The actual empty-backed hugepage *count* (the §19.4 bin), not
+            // The actual empty-backed hugepage *count*, not
             // `empty_backed_bytes / HUGEPAGE_SIZE` — a packed-then-emptied hugepage is
-            // only partially committed, so the byte form would undercount it.
-            let empty_hp = cov.bins[HugeBin::EmptyBacked as usize] as usize;
+            // only partially committed, so the byte form would undercount it. It counts
+            // exactly the population `release_empty_excess` walks (empty **and** still
+            // holding committed pages), not the §19.4 `EmptyBacked` bin: a partially
+            // subreleased empty hugepage is filed `PartialSubreleased` yet contributes
+            // its committed bytes to `empty_backed_bytes` above, so using the bin count
+            // here would draw the reserve and the supply from different populations.
+            let empty_hp = self.empty_backed_hugepages();
             // Round the rung-2 byte budget UP to whole hugepages: rung 2 releases in
             // whole-hugepage units, so a positive *sub-hugepage* budget still makes
             // progress (releasing one hugepage) instead of flooring to zero and planning
@@ -2581,7 +2828,14 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             // per-tick overshoot is bounded by one hugepage.
             let release_hp = plan.release_empty_hugepages_bytes.div_ceil(hp) as usize;
             let reserve_hp = empty_hp.saturating_sub(release_hp);
-            self.release_empty_excess(reserve_hp) as u64
+            // Bound the work by the *plan*, not only by the reserve. `empty_hp` is a
+            // snapshot, and `release_empty_excess` walks the population as it stands when
+            // it runs: concurrent frees that empty further hugepages after the sample all
+            // fall beyond `reserve_hp` and would be released too, so one planned and
+            // rate-capped hugepage could become many. Passing `release_hp` as the ceiling
+            // keeps a tick's actual release equal to what the controller budgeted; the
+            // §20.3 backlog carries any remainder to the next tick.
+            self.release_empty_excess_bounded(reserve_hp, release_hp) as u64
         } else {
             0
         };
@@ -2591,6 +2845,45 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// The §19.7 coverage metrics (W11-5) for this backend's hugepages.
     pub fn coverage(&self) -> HugeStats {
         self.lock().inner.filler.coverage()
+    }
+
+    /// This backend's §20.1 physical-state byte breakdown over its whole reservation, so a
+    /// cache-served allocation is accounted in the §8.6 stats identities exactly like an
+    /// extent-served one (the `RegionCacheHook::state_bytes` contract).
+    ///
+    /// The mapping from the §19.7 coverage view:
+    /// * **active** — live (handed-out) bytes;
+    /// * **dirty** — backed-but-free: the fragmentation bytes on in-use hugepages plus the
+    ///   committed bytes of fully-empty ones (both hold real RSS and are cheap to reuse);
+    /// * **released** — decommitted: the released bytes of empty hugepages plus the
+    ///   partially-subreleased bytes of in-use ones;
+    /// * **reserved** — the rest of the reservation (never-committed virtual), computed as
+    ///   the remainder so `total()` is exactly the reservation length and the §8.6
+    ///   `virtual == active + pageheap_free` identity closes by construction.
+    ///
+    /// Muzzy is always `0`: the filler decommits directly (there is no lazy-purge state).
+    pub fn state_bytes(&self) -> StateBytes {
+        let cov = self.coverage();
+        let region_len = self.region.len;
+        let active = cov.live_total_bytes as usize;
+        let dirty = cov.fragmentation_bytes as usize + cov.empty_backed_bytes as usize;
+        let released = cov.empty_released_bytes as usize + cov.partial_subreleased_bytes as usize;
+        StateBytes {
+            reserved: region_len.saturating_sub(active + dirty + released),
+            active,
+            dirty,
+            muzzy: 0,
+            released,
+        }
+    }
+
+    /// The number of **empty-backed** hugepages — empty (`used == 0`) and still
+    /// holding committed backing. This is exactly the population
+    /// [`release_empty_excess`](Self::release_empty_excess) walks and whose committed
+    /// bytes [`coverage`](Self::coverage) reports as `empty_backed_bytes`, so the
+    /// demand reserve and the release supply agree (W11-1b / W12 rung 2).
+    pub fn empty_backed_hugepages(&self) -> usize {
+        self.lock().inner.filler.empty_backed_hugepages()
     }
 
     /// Cumulative subrelease events (§19.6 metric).
@@ -2633,6 +2926,11 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
 }
 
 impl<P: TopoBackingProvider> RegionCacheHook for HugePageBackend<P> {
+    #[inline]
+    fn state_bytes(&self) -> StateBytes {
+        HugePageBackend::state_bytes(self)
+    }
+
     #[inline]
     fn try_alloc(&self, bytes: usize, align: usize, hints: Hints) -> Option<Region> {
         // Honor the request's §10.4 hugepage preference: a `NO_HUGEPAGE`
@@ -3117,6 +3415,128 @@ mod filler_tests {
             1,
             "packed into one hugepage, none opened needlessly"
         );
+    }
+
+    #[test]
+    fn full_hot_hugepages_do_not_starve_the_packing_descent() {
+        // Regression: `classify_bin` files a **completely full** hugepage in `HotDense`
+        // when it is hot, and `HotDense` is the first bin `PACKING_ORDER` scans. With a
+        // cumulative `SCAN_CAP` those full hugepages alone exhausted the whole placement
+        // budget and `break 'bins` aborted the entire descent — so every subsequent
+        // placement opened a *fresh* hugepage even though partially-used ones had room,
+        // until the region was exhausted and the backend stopped serving. The cap is now
+        // per bin and a full hugepage is skipped without spending budget.
+        let mut f = filler(SCAN_CAP + 8);
+        let hot = PlaceHints {
+            hotness: Hotness::Hot,
+            ..PlaceHints::default()
+        };
+
+        // Fill SCAN_CAP + 2 hugepages completely, hot ⇒ each is filed `HotDense`.
+        for _ in 0..SCAN_CAP + 2 {
+            let p = f
+                .place(PAGES_PER_HUGEPAGE, PAGE_SIZE, hot)
+                .expect("full hugepage");
+            f.mark_committed(&p);
+        }
+
+        // One more hugepage, carved into two runs so a whole run can be freed (the
+        // filler validates the exact extent, M-004). Freeing the big one leaves it with
+        // plenty of room and files it in a much emptier bin.
+        let big = f
+            .place(PAGES_PER_HUGEPAGE - 8, PAGE_SIZE, hot)
+            .expect("big run");
+        f.mark_committed(&big);
+        let small = f.place(8, PAGE_SIZE, hot).expect("small run");
+        f.mark_committed(&small);
+        let partial_hp = big.base / HUGEPAGE_SIZE;
+        assert_eq!(
+            small.base / HUGEPAGE_SIZE,
+            partial_hp,
+            "both runs share one hugepage"
+        );
+        assert!(f.free(big.base, PAGES_PER_HUGEPAGE - 8).valid);
+        let touched_before = f.touched();
+
+        // A new hot request must PACK into that hugepage's free room, not open a fresh
+        // one — even though SCAN_CAP + 2 full `HotDense` hugepages precede it.
+        let p = f.place(4, PAGE_SIZE, hot).expect("placement");
+        f.mark_committed(&p);
+        assert_eq!(
+            f.touched(),
+            touched_before,
+            "the placement opened a fresh hugepage instead of packing into the one with room"
+        );
+        assert_eq!(
+            p.base / HUGEPAGE_SIZE,
+            partial_hp,
+            "the run landed in the hugepage that had room"
+        );
+        assert!(f.check_invariants());
+    }
+
+    /// Regression (bounded placement, §19.3): the per-bin scan counts **every** node it
+    /// walks against `SCAN_CAP`, hugepages it skips for being full included. Skipping them
+    /// for free made the walk unbounded — §19.4 files a *hot* full hugepage in `HotDense`,
+    /// the first bin `PACKING_ORDER` scans, not the excluded `Full` one, so a hot workload
+    /// made every placement traverse its entire backend and allocation latency grew with
+    /// the region's capacity.
+    ///
+    /// Counting alone would trade that for a packing loss (the budget spent on hugepages
+    /// with no room), so `bin_insert` files a full hugepage at the *tail*: every hugepage
+    /// that can still fit a run precedes every one that cannot. That ordering is what this
+    /// test pins — the fittable hugepage stays inside the scan budget no matter how many
+    /// full ones accumulate.
+    #[test]
+    fn a_bin_full_of_full_hugepages_stays_within_the_scan_budget() {
+        let mut f = filler(4 * SCAN_CAP);
+        let hot = PlaceHints {
+            hotness: Hotness::Hot,
+            ..PlaceHints::default()
+        };
+
+        // One hugepage with room to spare, dense and hot enough to be filed `HotDense`.
+        let big = f
+            .place(PAGES_PER_HUGEPAGE - 8, PAGE_SIZE, hot)
+            .expect("big run");
+        f.mark_committed(&big);
+
+        // Then far more than a budget's worth of *completely full* hot hugepages, each
+        // filed in that same bin.
+        for _ in 0..3 * SCAN_CAP {
+            let p = f
+                .place(PAGES_PER_HUGEPAGE, PAGE_SIZE, hot)
+                .expect("full hugepage");
+            f.mark_committed(&p);
+        }
+        assert!(f.check_invariants());
+
+        // The hugepage with room is still within the bin's scan budget of its head — the
+        // full ones are all behind it.
+        let bin = f.bin_of(big.base).expect("filed in a bin");
+        let mut j = f.bins[bin as usize];
+        let mut pos = 0usize;
+        while j != NIL && j != big.hugepage {
+            j = f.get(j).bin_next;
+            pos += 1;
+        }
+        assert_eq!(j, big.hugepage, "the fittable hugepage is in its bin");
+        assert!(
+            pos < SCAN_CAP,
+            "the fittable hugepage sits at position {pos}, past the {SCAN_CAP}-node budget"
+        );
+
+        // So the capped scan finds it: the placement packs instead of opening a fresh one.
+        let touched_before = f.touched();
+        let p = f.place(4, PAGE_SIZE, hot).expect("placement");
+        f.mark_committed(&p);
+        assert_eq!(
+            f.touched(),
+            touched_before,
+            "the placement opened a fresh hugepage instead of packing into the one with room"
+        );
+        assert_eq!(p.hugepage, big.hugepage);
+        assert!(f.check_invariants());
     }
 
     #[test]
@@ -3881,6 +4301,52 @@ mod backend_tests {
     }
 
     #[test]
+    fn a_byte_budgeted_release_never_overshoots_a_partial_commitment() {
+        // W13-3 no-stranding: the rebalancer's move size is a `movable_surplus` **byte**
+        // bound, and partially-committed empty hugepages are what make a hugepage *count*
+        // unable to express it. Build empties whose committed footprint is a fraction of a
+        // hugepage (allocate a sub-hugepage region, then free it), and check the
+        // byte-budgeted release stays within budget where rounding a count up would not.
+        let b = backend(4);
+        let part = HUGEPAGE_SIZE / 4;
+        let regions: Vec<Region> = (0..3)
+            .map(|_| {
+                b.allocate(part, PAGE_SIZE, PlaceHints::default())
+                    .expect("sub-hugepage region")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        let backed = b.coverage().empty_backed_bytes;
+        assert!(
+            backed > 0 && backed < 3 * HUGEPAGE_SIZE as u64,
+            "empties are only partially committed ({backed} bytes), the case under test"
+        );
+
+        // A budget below the smallest footprint releases nothing — and in particular does
+        // not round up to one whole hugepage.
+        assert!(
+            b.empty_backed_hugepages() > 0,
+            "there are empty-backed hugepages to release"
+        );
+        assert_eq!(
+            b.release_empty_within_bytes(1),
+            0,
+            "a 1-byte budget must not release a whole partially-committed hugepage"
+        );
+
+        // A budget of the full backed footprint releases at most that many bytes. The
+        // pre-fix `div_ceil` path would have released whole hugepages regardless.
+        let released = b.release_empty_within_bytes(backed) as u64;
+        assert!(
+            released <= backed,
+            "byte-budgeted release overshot its budget: {released} > {backed}"
+        );
+        assert!(b.check_invariants());
+    }
+
+    #[test]
     fn release_empty_excess_shrinks_the_hugecache_to_the_reserve() {
         // W11-1b demand-reserve mechanism: freeing whole hugepages fills the HugeCache
         // (empty-backed); `release_empty_excess(reserve)` returns the excess backing to
@@ -3912,6 +4378,91 @@ mod backend_tests {
             cov.empty_backed_bytes, HUGEPAGE_SIZE as u64,
             "one kept as reserve"
         );
+    }
+
+    /// §20.2: `release_hugepage_runs` honours its own byte cap.
+    ///
+    /// The caller samples a hugepage's committed footprint under the lock, drops the
+    /// lock, and only then walks the runs — so the footprint at release time can exceed
+    /// the sample (the hugepage was reused and re-emptied larger in between). The
+    /// caller's `cost > remaining` screen cannot catch that, because it tests the stale
+    /// number. The cap therefore has to live in the walk, and this exercises it directly:
+    /// a hugepage with a *full* commitment, released under a one-page cap.
+    ///
+    /// Driving the private walk is deliberate. Going through `release_empty_within_bytes`
+    /// would prove nothing — its screen rejects the hugepage before the walk ever runs,
+    /// which is exactly why the uncapped version passed that route unchanged.
+    #[test]
+    fn the_hugepage_run_walk_honours_its_byte_cap() {
+        let b = backend(4);
+        let r = b
+            .allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("whole hugepage");
+        assert!(b.free_region(r));
+
+        let (idx, base, committed) = {
+            let g = b.lock();
+            g.inner
+                .filler
+                .next_empty_backed(0)
+                .expect("an empty-backed hugepage")
+        };
+        assert!(
+            committed * PAGE_SIZE > PAGE_SIZE,
+            "the hugepage must hold more than the cap for this to test anything \
+             (committed = {committed} pages)"
+        );
+
+        let cap = PAGE_SIZE as u64;
+        let released = b.release_hugepage_runs(idx, base, cap);
+        assert!(
+            released as u64 <= cap,
+            "the walk released {released} bytes against a {cap}-byte cap"
+        );
+    }
+
+    /// §20.2: the release **budget** bounds a tick's work, not just the reserve.
+    ///
+    /// `release_empty_excess` walks the empty population as it stands when it runs, so a
+    /// reserve computed from an earlier snapshot is not a cap: hugepages emptied by
+    /// concurrent frees after the sample all fall beyond the reserve and would be swept
+    /// up too. Here the reserve is deliberately stale — computed as if only two hugepages
+    /// were empty when four are — which is exactly the shape a concurrent emptying
+    /// produces. Unbounded, that releases three; the plan called for one.
+    #[test]
+    fn a_bounded_release_never_exceeds_the_planned_count() {
+        let b = backend(4);
+        let regions: Vec<Region> = (0..4)
+            .map(|_| {
+                b.allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+                    .expect("whole hugepage")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        assert_eq!(b.coverage().empty_backed_bytes, 4 * HUGEPAGE_SIZE as u64);
+
+        // A plan for one hugepage, with a reserve drawn from a two-hugepage snapshot.
+        let released = b.release_empty_excess_bounded(1, 1);
+        assert_eq!(
+            released, HUGEPAGE_SIZE,
+            "a tick must release exactly what was planned, not everything past the reserve"
+        );
+        assert_eq!(
+            b.coverage().empty_backed_bytes,
+            3 * HUGEPAGE_SIZE as u64,
+            "the hugepages emptied after the snapshot stay for the next tick"
+        );
+
+        // The remainder is still reachable — bounding defers work, it does not drop it.
+        let released = b.release_empty_excess_bounded(1, 8);
+        assert_eq!(
+            released,
+            2 * HUGEPAGE_SIZE,
+            "the reserve still holds one back"
+        );
+        assert_eq!(b.coverage().empty_backed_bytes, HUGEPAGE_SIZE as u64);
         // Idempotent at the reserve.
         assert_eq!(b.release_empty_excess(1), 0);
         assert!(b.check_invariants());
@@ -4078,6 +4629,107 @@ mod backend_tests {
         let cov = b.coverage();
         assert_eq!(cov.empty_backed_bytes, 0, "no committed RSS left");
         assert_eq!(cov.empty_released_bytes, 2 * 120 * PAGE_SIZE as u64);
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn release_empty_excess_reclaims_a_committed_set_with_a_hole() {
+        // Regression: `next_empty_backed` reports the committed **popcount**, and
+        // `subrelease` interprets its `pages` argument as a contiguous *run* starting at
+        // the given base. Passing the popcount therefore assumed the committed set was
+        // the prefix `[0, popcount)`. It is not in general: an over-aligned placement
+        // leaves stride holes. With a hole, `run_popcount(committed, 0, count) < count`,
+        // `subrelease` refused, and the hugepage's whole RSS was stranded for the
+        // process's lifetime while `coverage()` kept advertising it as reclaimable.
+        let b = backend(4);
+        // Two over-aligned placements: `align_stride(4 * PAGE_SIZE) == 4`, so the second
+        // run must start at a page offset that is a multiple of 4 — leaving page 3
+        // never committed.
+        let a = b
+            .allocate(3 * PAGE_SIZE, 4 * PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        let c = b
+            .allocate(3 * PAGE_SIZE, 4 * PAGE_SIZE, PlaceHints::default())
+            .expect("c");
+        assert_eq!(
+            a.base as usize / HUGEPAGE_SIZE,
+            c.base as usize / HUGEPAGE_SIZE,
+            "both over-aligned runs pack into one hugepage"
+        );
+        assert_eq!(
+            c.base as usize - a.base as usize,
+            4 * PAGE_SIZE,
+            "the second run is stride-aligned, leaving page 3 uncommitted"
+        );
+        touch(a);
+        touch(c);
+        assert!(b.free_region(a));
+        assert!(b.free_region(c));
+        // One empty hugepage whose committed set is {0,1,2, 4,5,6} — popcount 6, but
+        // *not* the prefix [0,6).
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 6 * PAGE_SIZE as u64);
+        // Every committed byte must come back, hole or not.
+        let released = b.release_empty_excess(0);
+        assert_eq!(
+            released,
+            6 * PAGE_SIZE,
+            "both committed runs reclaimed across the hole"
+        );
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 0, "no committed RSS left");
+        assert_eq!(cov.empty_released_bytes, 6 * PAGE_SIZE as u64);
+        assert_eq!(b.release_empty_excess(0), 0, "idempotent once drained");
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn release_empty_excess_reclaims_a_partially_subreleased_empty() {
+        // Regression: `next_empty_backed` required `subreleased() == 0`, so an empty
+        // hugepage that had been subreleased and then partially refilled was invisible
+        // to the release mechanism — while `coverage()` still counted its committed
+        // bytes into `empty_backed_bytes`, the very supply `release_tick` plans rung-2
+        // work against. The controller re-planned the same non-executable release every
+        // tick and the RSS was never reclaimed.
+        // Capacity 1 so the refill below cannot escape into a fresh hugepage — it must
+        // land back in the subreleased one, which is the state under test.
+        let b = backend(1);
+        // 1. Fill 8 pages, free them, and release the whole hugepage.
+        let a = b
+            .allocate(8 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("a");
+        touch(a);
+        assert!(b.free_region(a));
+        assert_eq!(b.release_empty_excess(0), 8 * PAGE_SIZE);
+        // 2. Refill only 2 of the 8 released pages, then free them: the hugepage is
+        //    empty again but still carries 6 subreleased pages and 2 committed ones.
+        let c = b
+            .allocate(2 * PAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("c");
+        touch(c);
+        assert!(b.free_region(c));
+        let cov = b.coverage();
+        assert_eq!(
+            cov.empty_backed_bytes,
+            2 * PAGE_SIZE as u64,
+            "empty, but still 2 committed pages of RSS"
+        );
+        assert_eq!(cov.empty_released_bytes, 6 * PAGE_SIZE as u64);
+        assert_eq!(
+            b.empty_backed_hugepages(),
+            1,
+            "the reserve must see the same hugepage the release walk does"
+        );
+        // The remaining committed RSS must be reclaimable.
+        assert_eq!(
+            b.release_empty_excess(0),
+            2 * PAGE_SIZE,
+            "a partially-subreleased empty is still reclaimable"
+        );
+        let cov = b.coverage();
+        assert_eq!(cov.empty_backed_bytes, 0);
+        assert_eq!(cov.empty_released_bytes, 8 * PAGE_SIZE as u64);
+        assert_eq!(b.empty_backed_hugepages(), 0, "nothing left to reclaim");
         assert!(b.check_invariants());
     }
 

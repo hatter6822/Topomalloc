@@ -120,6 +120,7 @@ fuzz_target!(|data: &[u8]| {
     let detail = StatsDetail {
         arenas: &arenas,
         size_classes: &size_classes,
+        cpus: &[],
         numa_nodes: &numa_nodes,
     };
 
@@ -135,11 +136,15 @@ fuzz_target!(|data: &[u8]| {
     //    visible arenas (+ epoch/profile), so a *higher*-labelled arena is invisible.
     let observer = b.u32();
     let visible = redact_arenas(&arenas, observer);
-    let all_visible = visible.len() == arenas.len();
-    let red = redact_summary(&s, &visible, all_visible);
+    // Redaction is keyed on the **observer's label alone**, never on which arenas happen to
+    // exist — gating it on "the observer sees every live arena" would let a high domain flip
+    // the low view by creating and destroying an arena (a covert channel). Only the lattice
+    // top reads the raw summary.
+    let raw = observer == topo_stats::OBSERVER_LABEL_TOP;
+    let red = redact_summary(&s, &visible, observer);
 
     // 3. A redacted summary discloses only the visible domain's live bytes.
-    if !all_visible {
+    if !raw {
         let disclosed: u64 = visible.iter().fold(0u64, |a, x| a.wrapping_add(x.used));
         assert_eq!(
             red.live_bytes, disclosed,
@@ -158,9 +163,8 @@ fuzz_target!(|data: &[u8]| {
         });
         // Only meaningful when the injected arena is genuinely higher (so still hidden).
         let visible2 = redact_arenas(&arenas2, observer);
-        let all_visible2 = visible2.len() == arenas2.len();
-        if !all_visible && !all_visible2 && visible2 == visible {
-            let red2 = redact_summary(&s, &visible2, all_visible2);
+        if !raw && visible2 == visible {
+            let red2 = redact_summary(&s, &visible2, observer);
             assert_eq!(red, red2, "a higher-domain arena is invisible to a low observer");
             assert_eq!(red.to_json(), red2.to_json());
         }

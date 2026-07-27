@@ -26,9 +26,9 @@ yet.
 Within a stable major series:
 
 * **Public C API names and struct ABI MUST remain stable.** Opaque handles are
-  preferred over exposed structs (`topo_arena_t`/`topo_tcache_t` are opaque
-  integer handles; the only exposed struct is the generated, pinned
-  `topomalloc_size_class_t`).
+  preferred over exposed structs (`topo_arena_t` is an opaque integer handle;
+  the exposed structs are the generated, pinned `topomalloc_size_class_t` and
+  the frozen `topomalloc_stats_t`).
 * **Stats JSON fields are additive** — fields may be *added*, never removed or
   renamed; consumers must ignore unknown fields. The renderer in `topo-stats`
   is written to make additions the only change.
@@ -144,7 +144,7 @@ returns its region to the backing via `dealloc`.
 | `topomalloc_stats_t` | the fixed core byte-class snapshot struct — 27 `uint64_t` fields (epoch, application incl. `peak_live`/`rss`, cache, central, the §20.1 backend split + `total_managed_vm`, metadata, quarantine, hugepage coverage + ratio, fragmentation [sampled + exact], arena counts, numa nodes). Additive across the 0.x series (fields append, never reorder); the layout is pinned by the ABI smoke tests. |
 | `topomalloc_stats_snapshot(out, flags)` | fill `*out` from a fresh live snapshot; `0` on success, `-1` on a NULL `out` **or an unknown flag bit** (§10.4). |
 | `topomalloc_stats_json(buf, cap, flags)` | render the snapshot as Appendix-D JSON into `buf` (NUL-terminated, truncated to `cap`); returns the full length (excl. NUL). `buf=NULL`/`cap=0` queries the length; an unknown flag bit returns `0` (writes nothing). |
-| `topomalloc_stats_json_for_label(buf, cap, flags, observer_label)` | as above, but **redacted** for the `observer_label` domain (§36.12): the `BY_ARENA` detail is filtered to the arenas it may see, **and** when a higher-labelled arena is hidden the cross-domain summary aggregates are zeroed (`live_bytes` recomputed from the visible arenas) — a low domain cannot infer a higher domain's activity. |
+| `topomalloc_stats_json_for_label(buf, cap, flags, observer_label)` | as above, but **redacted** for the `observer_label` domain (§36.12): the `BY_ARENA` detail is filtered to the arenas it dominates, **and** the cross-domain summary aggregates are zeroed (`live_bytes` recomputed from the visible arenas) — a low domain cannot infer a higher domain's activity. Keyed on the **observer's label alone**: only `TOPOMALLOC_OBSERVER_LABEL_TOP` gets the raw summary; every other label (including `PUBLIC`) gets the redacted view even when it dominates every arena that happens to exist, because gating on that would let a high domain flip the low view by creating and destroying an arena. Use `topomalloc_stats_json` (or `..._TOP`) for ordinary process-wide monitoring. |
 | `topomalloc_stats_print(out, flags)` | write a human-readable dump (a header + the §31.6 explanation + the JSON) to the `FILE* out`; `0` on success, `-1` on a NULL stream / unknown flag / short write. |
 | `topomalloc_explain_memory(buf, cap)` | render a one-line RSS attribution (§31.6, "RSS is 2.5 GiB: 1.8 GiB live, …") into `buf`; returns the full length. |
 

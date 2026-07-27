@@ -533,3 +533,63 @@ mod sele4n {
         assert!(posix_outcome.3 && sim_outcome.3, "both well-formed");
     }
 }
+
+/// §8.6 reconciliation over a **hugepage-backed** engine.
+///
+/// The identity `live + central_free <= active` is asserted by `tests/stats.rs`, but only
+/// over the default extent engine. Under the shipped `hugepage-optimized` profile every
+/// medium/large request is served by the `RegionCacheHook`, which returns before
+/// `ExtentManager::alloc_z` — the only path that charges `StateBytes`. So those bytes are
+/// counted in `live_bytes` and in nothing else, and the backend byte classes under-report
+/// the process's managed VM by the entire hugepage footprint.
+#[test]
+fn reconciliation_holds_over_a_hugepage_backed_engine() {
+    let m: &'static BumpArena = meta(4 << 20);
+    let pm = pagemap();
+    let huge: &'static HugePageBackend<PosixBackingProvider> = Box::leak(Box::new(huge_backend(8)));
+    let alloc = Allocator::new_with_huge(
+        PosixBackingProvider::new(),
+        PosixBackingProvider::new(),
+        huge,
+        m,
+        m,
+        pm,
+        topo_core::ids::ArenaId::DEFAULT,
+        AllocatorConfig::small(),
+    )
+    .expect("hugepage-backed allocator");
+
+    let mut live = Vec::new();
+    for _ in 0..16 {
+        let p = alloc.allocate_in(
+            topo_core::ids::ArenaId::DEFAULT,
+            256 * 1024,
+            PAGE,
+            RequestFlags::NONE,
+        );
+        assert!(!p.is_null());
+        live.push(p);
+    }
+    let s = alloc.stats();
+    let active = (s.span_backend.active + s.large_backend.active) as u64;
+    let central = s.central_free_bytes;
+    assert!(
+        s.live_bytes + central <= active,
+        "§8.6: live ({}) + central_free ({}) must fit in active backing ({})",
+        s.live_bytes,
+        central,
+        active
+    );
+    // The other two §8.6 identities close over the combined backend view too.
+    for b in [s.span_backend, s.large_backend] {
+        assert_eq!(
+            b.total(),
+            b.active + b.reserved + b.dirty + b.muzzy + b.released,
+            "state bytes partition the managed region"
+        );
+    }
+    for p in live {
+        // SAFETY: each pointer is live and freed exactly once.
+        unsafe { alloc.free(p) };
+    }
+}

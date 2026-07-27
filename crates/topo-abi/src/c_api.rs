@@ -96,12 +96,25 @@ pub extern "C" fn topomalloc_malloc(size: usize) -> *mut c_void {
 /// double free — undefined behavior, like `free` in C.
 #[no_mangle]
 pub unsafe extern "C" fn topomalloc_free(ptr: *mut c_void) {
+    // SAFETY: identical contract, forwarded. C has no cache-bypass flag on `free`.
+    unsafe { free_with_flag(ptr, false) };
+}
+
+/// The body of [`topomalloc_free`] with the `TOPO_TCACHE_NONE` routing exposed, for
+/// [`topo_dallocx`](crate::topo_dallocx) (§10.3). Sharing it is what keeps the flagged
+/// entry point's `errno` preservation and no-op-on-any-non-`Freed`-outcome policy
+/// identical to the plain one — they must not drift.
+///
+/// # Safety
+///
+/// As [`topomalloc_free`].
+pub(crate) unsafe fn free_with_flag(ptr: *mut c_void, cache_bypass: bool) {
     preserving_errno(|| {
         if let Some(a) = engine() {
             // Every non-Freed outcome is a safe no-op at this boundary; the
             // hardened profile escalates instead (plan 08 W18).
             // SAFETY: this entry point's contract is the engine's contract.
-            let _ = unsafe { a.free(ptr.cast::<u8>()) };
+            let _ = unsafe { a.free_with(ptr.cast::<u8>(), cache_bypass) };
         }
     });
 }
@@ -380,7 +393,7 @@ fn sized_hint_matches(a: &AnyAllocator, ptr: *mut u8, size: usize, align: usize)
 /// builds (W8-3 / plan 08 W18-2), then perform the normal classified free —
 /// the hint is **never** used to select the free path at M1, so a wrong hint
 /// cannot corrupt state in any profile (it is UB the checker catches).
-unsafe fn free_sized_common(ptr: *mut c_void, align: usize, size: usize) {
+unsafe fn free_sized_common(ptr: *mut c_void, align: usize, size: usize, cache_bypass: bool) {
     preserving_errno(|| {
         if ptr.is_null() {
             return; // C23: free_sized(NULL, n) is a no-op like free(NULL)
@@ -400,8 +413,25 @@ unsafe fn free_sized_common(ptr: *mut c_void, align: usize, size: usize) {
             }
         }
         // SAFETY: the sized-free entry points carry the free contract.
-        let _ = unsafe { a.free(ptr.cast::<u8>()) };
+        let _ = unsafe { a.free_with(ptr.cast::<u8>(), cache_bypass) };
     });
+}
+
+/// The sized-free body with the `TOPO_TCACHE_NONE` routing exposed, for
+/// [`topo_sdallocx`](crate::topo_sdallocx) (§10.3). The C23 entry points below never
+/// bypass — C23 has no such flag.
+///
+/// # Safety
+///
+/// As [`topomalloc_free_sized`].
+pub(crate) unsafe fn free_sized_with(
+    ptr: *mut c_void,
+    align: usize,
+    size: usize,
+    cache_bypass: bool,
+) {
+    // SAFETY: identical contract, forwarded.
+    unsafe { free_sized_common(ptr, align, size, cache_bypass) };
 }
 
 /// `void topomalloc_free_sized(void* ptr, size_t size)` (C23, §10.1): `size`
@@ -416,7 +446,7 @@ unsafe fn free_sized_common(ptr: *mut c_void, align: usize, size: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn topomalloc_free_sized(ptr: *mut c_void, size: usize) {
     // SAFETY: identical contract, forwarded.
-    unsafe { free_sized_common(ptr, 1, size) };
+    unsafe { free_sized_common(ptr, 1, size, false) };
 }
 
 /// `void topomalloc_free_aligned_sized(void* ptr, size_t alignment, size_t
@@ -446,7 +476,7 @@ pub unsafe extern "C" fn topomalloc_free_aligned_sized(
         1
     };
     // SAFETY: identical contract, forwarded.
-    unsafe { free_sized_common(ptr, align, size) };
+    unsafe { free_sized_common(ptr, align, size, false) };
 }
 
 // ---------------------------------------------------------------------------
@@ -505,11 +535,12 @@ mod tests {
             assert_eq!(p.cast::<u8>().read(), 0x5a);
         }
         tfree(p);
-        // The engine recycles (no more M0 leak): the freed slot is vended again. No
-        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
-        // central free list, which a parallel test thread can transiently touch — confirm
-        // recycling by membership in a bounded batch (held to drain toward the freed slot,
-        // then freed), not by asserting the exact next call.
+        // The engine recycles (no more M0 leak): the freed slot is vended again. Every
+        // front-end layer is *shared* (a per-CPU slot serves whichever threads run on that
+        // core; the transfer cache is process-wide), so a parallel test thread can
+        // transiently take the freed object — confirm recycling by membership in a bounded
+        // batch (held to drain toward the freed slot, then freed), not by asserting the
+        // exact next call.
         let mut batch = Vec::with_capacity(64);
         let mut recycled = false;
         for _ in 0..64 {
@@ -894,7 +925,7 @@ mod tests {
         // SAFETY: `p` is live and test-owned; the mismatched size hint is
         // exactly the checked condition under test (the free never happens —
         // the assert fires first).
-        unsafe { free_sized_common(p, 1, 4000) };
+        unsafe { free_sized_common(p, 1, 4000, false) };
     }
 
     #[test]

@@ -384,7 +384,16 @@ fn locked_byte_diverts_to_fallback() {
     if cpu < 0 || !pin_to(cpu as usize) {
         return;
     }
-    let cpu = rseq::current_cpu() as usize;
+    // Re-read after pinning, but *check* it: `current_cpu()` reports -1 whenever the
+    // rseq area is not registered for this thread, and casting that to `usize` yields
+    // `usize::MAX`, which indexes the per-CPU array out of bounds. Another test in this
+    // binary can legitimately reset the process-global rseq state (fork semantics), so
+    // an unchecked cast here turns a benign interleaving into a panic.
+    let cpu = rseq::current_cpu();
+    if cpu < 0 {
+        return;
+    }
+    let cpu = cpu as usize;
     let cache = Cache::new();
     let sc = 0;
 
@@ -410,7 +419,16 @@ fn uninitialised_buffer_diverts_to_fallback() {
     if cpu < 0 || !pin_to(cpu as usize) {
         return;
     }
-    let cpu = rseq::current_cpu() as usize;
+    // Re-read after pinning, but *check* it: `current_cpu()` reports -1 whenever the
+    // rseq area is not registered for this thread, and casting that to `usize` yields
+    // `usize::MAX`, which indexes the per-CPU array out of bounds. Another test in this
+    // binary can legitimately reset the process-global rseq state (fork semantics), so
+    // an unchecked cast here turns a benign interleaving into a panic.
+    let cpu = rseq::current_cpu();
+    if cpu < 0 {
+        return;
+    }
+    let cpu = cpu as usize;
     let cache = Cache::new();
     let sc = 2;
     // Null out the buffer pointer to simulate an uninitialised slot.
@@ -450,7 +468,13 @@ fn signal_near_sequence_conserves() {
     let cache = Arc::new(Cache::new());
     let sc = 1;
     const NTOK: usize = 100;
-    let cpu = rseq::current_cpu() as usize;
+    // Checked for the same reason as above: -1 (no registered area) must not become
+    // `usize::MAX` and index the per-CPU array.
+    let cpu = rseq::current_cpu();
+    if cpu < 0 {
+        return;
+    }
+    let cpu = cpu as usize;
     let tokens: Vec<usize> = (0..NTOK).map(|i| 0xE00000 + i).collect();
     cache.seed(cpu, sc, &tokens);
 
@@ -633,4 +657,69 @@ fn forced_migration_conserves_tokens() {
         recovered, expected,
         "token multiset conserved under migration"
     );
+}
+
+/// §28.1: `reset_after_fork` drops the process-global registration decision so the next
+/// `enable` re-derives it, rather than short-circuiting on a decision whose kernel
+/// registrations `fork` invalidated.
+///
+/// `enable` is idempotent by design — it returns from a fast path once a mode is
+/// decided, so the detection syscalls run once per process. That is exactly wrong in a
+/// fork child: the child inherits the decided mode but neither the membarrier intent
+/// (it lives in the mm) nor its thread's rseq area registration. Without this reset the
+/// child re-enters RSEQ mode over kernel state that no longer exists, and its non-owner
+/// fences (W7-4) fail every call.
+///
+/// The observable contract, and all this can portably assert: after a reset the mode
+/// reads back as undecided, and a fresh `enable` re-derives the same answer (detection
+/// is deterministic on a given host). A `reset` that did nothing would leave
+/// `available()` true on an RSEQ-capable host and fail here.
+///
+/// **Runs in its own process** (the `self_registration_path_works` re-exec pattern).
+/// The reset is a destructive mutation of process-global state, and the window in which
+/// `available()` reads false is *not* one a concurrent test tolerates: a sibling that has
+/// already checked `current_cpu() >= 0` and pinned to it will re-read -1 inside that
+/// window, and casting -1 to `usize` indexes the per-CPU array out of bounds. The Rust
+/// harness runs tests as parallel threads of one process and guarantees no ordering, so
+/// isolation has to be a separate process, not a claim about which test runs last.
+///
+/// **Gated to x86-64 native**, for the same reason `self_registration_path_works` is: the
+/// cross-target test runs under qemu binfmt emulation, where re-exec'ing this binary needs
+/// an aarch64 dynamic loader the runner does not have (`Could not open
+/// '/lib/ld-linux-aarch64.so.1'`), so the child can never start. Nothing is lost by
+/// covering it on one architecture — `reset_after_fork` is a plain atomic store over
+/// process-global mode state, with no assembly and no per-arch path, so the x86-64 run
+/// exercises the whole of it.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn fork_reset_makes_enable_re_derive_the_mode() {
+    const MARKER: &str = "TOPO_RSEQ_FORKRESET_CHILD";
+    if std::env::var(MARKER).is_err() {
+        // Parent: re-run just this test alone, where mutating the global mode is safe.
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", "fork_reset_makes_enable_re_derive_the_mode"])
+            .env(MARKER, "1")
+            .status()
+            .expect("spawn fork-reset child");
+        assert!(status.success(), "fork-reset child failed");
+        return;
+    }
+    let first = rseq::enable();
+    assert_eq!(rseq::available(), first);
+
+    rseq::reset_after_fork();
+    assert!(
+        !rseq::available(),
+        "a reset mode must read as undecided, not as the parent's decision"
+    );
+
+    // And the decision is genuinely re-derivable, not destroyed: detection re-runs and
+    // reaches the same conclusion, re-registering the membarrier intent on the way.
+    let second = rseq::enable();
+    assert_eq!(
+        second, first,
+        "re-enabling after a fork reset must re-derive the same mode"
+    );
+    assert_eq!(rseq::available(), first);
 }

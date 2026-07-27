@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** workspace version `0.2.0`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
+**Current Status:** workspace version `0.4.3`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
 
 ## Essential Build Commands
 
@@ -87,7 +87,7 @@ Background agents run concurrently and may finish after foreground modifications
 - **Lean theorems/lemmas:** `snake_case` (e.g., `malloc_preserves_wf`, `size_class_table_covers_all_small_requests`)
 - **Lean structures/types:** `CamelCase` (e.g., `State`, `WellFormed`, `SizeClassRow`)
 - **Lean state variables:** `s`, `s'`; hypotheses: `h`-prefixed (`hpre`, `hwf`)
-- **Lean namespaces:** `TopoMalloc`, `TopoMalloc.Theorems`, `TopoMalloc.SeLe4n`
+- **Lean namespaces:** `TopoMalloc` (including everything under `TopoMalloc/Theorems/`, which is a *directory*, not a namespace), `TopoMalloc.SeLe4n`, `TopoMalloc.Huge`, `TopoMalloc.ExtentHooks`
 - **Lean proof style:** Prefer tactic mode (`by …`) for non-trivial proofs; use `calc` for equational chains
 - **Crate names:** `topo-<domain>` (e.g., `topo-core`, `topo-abi`, `topo-backend-posix`)
 - **IDs:** typed newtype wrappers: `ArenaId`, `SizeClassId`, `SpanId`, `LargeId`, `Label`, `Generation`
@@ -116,7 +116,7 @@ Each pull request bumps the patch component (semver) unless explicitly stated ot
 
 ```toml
 # Cargo.toml [workspace.package]
-version = "0.2.0"
+version = "0.4.3"
 ```
 
 Mechanics: use patch (default) for bug fixes / refactors / tests; minor for new backwards-compatible functionality; major for breaking changes.
@@ -148,8 +148,9 @@ A change is **done** only when (see `planning/plans/README.md` §8):
 
 ## Current Development Status
 
-**Milestone:** the central allocator path and post-M1 infrastructure are active. Front-end/cache work continues according to the plan — its
-**concurrency foundation (W16: lock hierarchy, fork, TLS, init phases) is landed** (see below).
+**Milestone:** the central allocator path and post-M1 infrastructure are active. The
+**front end (W6/W7) is landed and live** (see below), on the concurrency foundation
+**W16 (lock hierarchy, fork, TLS, init phases)** established.
 Reallocation, aligned allocation & calloc zeroing (W15) is **complete and optimal** (all units, no
 deferrals): the §25 realloc state machine — `realloc(NULL,n)`/`realloc(p,0)` policy, content
 preservation, failure-preserves-the-original via the always-correct move path (§25.4, arena preserved,
@@ -361,6 +362,64 @@ example asserts the steady-state path runs at depth 1) + TLS-via-`dlopen` (`tls_
 hook-re-entry fail-safe test, and a TSan pass over the whole `topo-core` lib. The per-op gate (~13 ns,
 `benches/fork_gate.rs`) is the M2 fork-safety cost; per-CPU sharding removes the contended cacheline.
 
+The §11 **front end — per-CPU cache, transfer cache and the W7 RSEQ fast path (W6/W7) — is
+wired onto the live small path**, completing plan 05's cache track. A cacheable small
+`malloc` pops from the running core's slot (`CpuCache::fe_pop`, the W7 restartable sequence
+where the platform supports it, else the ranked-lock baseline) and a cacheable `free` pushes
+back into it, so neither touches the contended central bin lock; a miss refills a batch
+through the §11.4 transfer cache (`cache_ops::refill`), an overflow flushes one down
+(`cache_ops::flush`), and every span an overflow empties is retired through the new
+`on_empty` callback — the finding the audit left open. **Cacheable** means the default
+arena's *placement-unhinted* spans and nothing else (`Allocator::front_end_cacheable`): a
+slot is keyed by `(core, size class)` alone, so everything it holds must be substitutable
+for any request of that class, and restricting it to one placement tuple is what keeps
+§22.7 arena isolation, §36.4 quota exactness, §36.12 label isolation and the W14 grouping
+exact — an explicit arena or a cold/hot/short-tagged span keeps the pre-W6 central path
+byte for byte. Exact **double-free detection survives** the move: a cached object never
+reaches the central bitmap, so `central_insert`'s test-and-set cannot see a second free of
+one, and a per-span lock-free **`CachedBits`** marker takes over — `try_mark_cached` is the
+free-path oracle (its test-and-set decides between two concurrent frees exactly as
+`central_insert` does), `unmark_cached` is the alloc-path claim, and the `cached →
+central-free` flush clears the bit **after** setting the free bit (free-bit-first, so
+`is_cached || is_central_free` is true at every instant). The engine also rejects a free of
+an object already awaiting reuse in *either* set before the cache path runs, so a
+free → flush → free sequence cannot re-cache a central-free object. Front-end residency is
+its own §8.6 byte class (`AllocatorStats::{per_cpu_bytes,transfer_bytes}` →
+`cache.*` in the stats JSON), the covering identity `live + central_free + cached <= active`
+counts it, and the §21.3 "drain caches" rung returns it (`topomalloc_cache_flush_all`, which
+sweeps **both** layers — flushing a core's slots only pushes their contents one level down).
+The C control surface is `topomalloc_cache_{flush_all,flush_core,budget_tick,rseq_active,
+register_thread}`; §35.4 phase 4 enables RSEQ (which also gives the fork gate a real CPU id)
+and publishes the online CPU count, and the `pthread_atfork` child reverts to the locked
+baseline (§28.1). The per-CPU array is carved from metadata on first use rather than
+embedded by value, so an embedding that never touches the front end pays nothing and a
+failed carve degrades to the central path (§2.4). It is **concurrency/policy, not an
+abstract §33.4 transition** — the front end moves *where* a free object waits, never whether
+it exists, and the §16.4 conservation law is unchanged (`live_count` already counted
+"removed from central", which subsumes cache residency) — so there is **no Lean obligation**:
+the double-free oracle is pinned by the fixed-wall tests
+`a_double_free_of_a_cached_object_is_detected_and_vends_once` and
+`a_double_free_across_the_flush_transition_is_detected`, the residency invariant by
+`SpanDescriptor::cached_and_central_free_are_disjoint` (an Appendix-B checker run from
+`Allocator::check_invariants`), and the wiring itself by
+`crates/topo-abi/tests/front_end.rs` (the front end observed through the public C surface,
+so a regression that silently unwires it fails CI). The §13 **thread cache is not
+implemented** and its prototype (`thread_cache.rs`) was removed: §13 is an optional
+*alternative* front end for platforms that cannot use per-CPU caches (§13.1 — "not the
+preferred default on systems with RSEQ"), P-003's fallback is met by the *locked* per-CPU
+baseline (a lock-sharded mode, proven observationally identical to the RSEQ path by the
+`rseq_equivalence` battery), and §160 prefers per-CPU over per-thread for RSS on
+high-thread-count systems. `Stats::thread_cache_bytes` stays and reports `0` (O-002).
+See `planning/plans/05` §"W6-1" and `docs/DECISIONS.md`. Removing it surfaced two things
+the absence of a front end had excused: **`TOPO_TCACHE_NONE`** (§10.3) was decoded into
+`RequestFlags::CACHE_BYPASS` and never consumed — it is now honoured on `topo_mallocx`
+*and* on `topo_dallocx`/`topo_sdallocx` (shared free body, so `errno` handling cannot
+drift), pinned by `tcache_none_bypasses_the_front_end_on_both_sides`; and the §31.2
+**`BY_CPU`** flag rendered a hard-coded `[]` — it now renders real per-core residency
+(`Allocator::for_each_cpu_cache` → `CpuCacheLine`). `cargo xtask ci` also gained a
+**`fuzz targets compile`** step: the `fuzz/` workspace is excluded from the main one, so
+nothing built it, and a 0.3.0 signature change had left two targets uncompilable.
+
 Observability: stats, telemetry & profiling (W17) completes plan 07's observability track ahead of its M6
 slot. The pure renderer is `topo-stats` and the live C surface is `crates/topo-abi/src/stats_api.rs`. **W17-1a
 (stats core):** the §31.1 "where is the memory?" snapshot now carries *every* byte class as a non-negative
@@ -415,8 +474,77 @@ bounded-skew convention cover operational debugging today) and the seLe4n resour
 backend/cache *partitioning* (the per-arena + whole-summary redaction is the complete Rust-side mechanism for
 the POSIX profile).
 
+**Full-tree audit pass.** A sweep across every crate, the Lean model, the tests and the docs
+fixed the following; each is pinned by a regression test that fails without the fix.
+
+*Memory safety / correctness.* A **guarded** allocation (W18-4) is right-aligned *inside* a
+larger extent, so `desc.base() != extent.base` — but `LargeAllocator::{shrink,grow}` measured
+the resize from the **extent** base. An in-place `realloc`/`xallocx` of one therefore freed
+live bytes into the reusable extent pool (shrink) or advertised memory past the extent's end
+(grow); the debug build tripped a page-alignment assert, the performance build corrupted
+silently. Both now decline for a guarded allocation (an in-place resize cannot re-base an
+object against its guard), and `allocate_guarded` rejects an over-aligned request rather than
+underflowing its base. `cache_ops::refill` dropped objects it had already removed from the
+central free list when the transfer cache declined the return (a permanent leak — the
+regression test loses 30 objects without the fix); the remainder now falls through to central.
+`refill`/`flush` are total on an out-of-range size class, and `ExtentMap::free_in_canary`
+rejects a non-`Active` extent at runtime rather than only under `debug_assert` (a second free
+otherwise cycled a size-bin list and hung `find_fit` under the backend lock; `find_fit` also
+gained a step bound).
+
+*Availability.* Setting **`TOPOMALLOC_QUARANTINE=1`** (or any other startup env var) hung the
+process at its first `malloc`: the init hooks called `global()` from inside
+`GLOBAL.get_or_init`, re-entering the still-running `OnceLock`. They now take the engine by
+reference. The **fork gate** deadlocked the forking thread itself — an allocation from any
+`pthread_atfork` handler ordered between our `prefork` and `postfork_*` parked on a bit only
+that thread could clear — so `prefork` now exempts it for the window.
+
+*Concurrency.* The RSEQ-mode locked fallback (`fe_pop_locked`/`fe_push_locked`, plus
+`init_slot`/`check_invariants`) omitted the W7-4 non-owner fence, so a thread that migrated
+between sampling its CPU and taking that CPU's lock could race an in-flight RSEQ sequence and
+double-vend an object.
+
+*Security.* The randomized security samplers (guard-page coin, quarantine evictor) used
+**fixed compile-time seeds**, making the "unpredictable" guarded slots identical and
+publicly computable in every process; they are now seeded from per-process OS entropy through
+a `no_std`-preserving seam (`harden::set_process_entropy`), with deterministic mode still
+overriding. A guard-page `mprotect` refusal was silently ignored, vending an object marked
+guarded with two ordinary read-write pages; the geometry marker and the *armed* marker are now
+distinct and refusals are counted (`AllocatorStats::guard_protect_failures`). A quarantined
+object's bytes were left intact for the whole hold, so freed secrets stayed readable and the
+delayed-reuse window armed no canary — the fill/scrub now happens on entry and the drain
+*verifies* it. Environment-derived configuration is skipped under `AT_SECURE`/setuid, as glibc
+does for `MALLOC_*`. The POSIX provider's physical-state ops validated only the sub-range, not
+region ownership, so safe code could `madvise`/`mprotect` memory it did not own. Label
+redaction keyed the "show the raw summary" shortcut on which arenas happened to exist, letting
+a high domain modulate the low view by creating and destroying an arena; it is now keyed on the
+observer's label alone. A guarded free marked the whole extent canary-filled while filling only
+its object, so reuse `corruption_abort`ed a correct program under `junk-fill,guard-pages` — a
+composition CI did not build, now covered by a feature-pair pass.
+
+*Accounting / policy.* Destroying an intermediate delegated arena returned its whole
+reservation to its parent while its own children stayed allocatable, letting a subtree exceed
+the root quota; a destroy with live children is refused. `release_empty_excess` treated a
+hugepage's committed **popcount** as a contiguous prefix (so a hugepage with a committed hole
+never had its RSS reclaimed) and skipped partially-subreleased empties whose bytes it kept
+reporting as reclaimable supply (a plan that never converged). `rate_budget` granted a full
+second of allowance on every zero-length interval, bypassing the §20.2 cap by orders of
+magnitude. `NodeRouter::rebalance_tick` converted a byte reserve into a hugepage count,
+releasing far more than the planned move. `nallocx` over-reported a guarded request's usable
+size (walking a caller into the guard page), and a **failed** `realloc` retired the still-live
+object from the heap sampler.
+
+*Hygiene.* Removed `overflow::{is_aligned, hugepage_round}` and `sampling::refresh_bloom`
+(zero call sites) and the duplicate `Allocator::large_backing`; corrected the §9.7 overflow-map,
+the extent-hook `release` failure contract, the `no_std` hook-reentrancy limitation, and the
+public header's `xallocx`/stats-flag documentation. Two vacuous tests were made real, and CI
+gained passes for the `deterministic-test` profile and the `junk-fill,guard-pages` /
+`junk-fill,quarantine` feature pairs, plus a dedicated **loom** workflow job — the fork-quiesce
+models are cited as that gate's proof but no job ran them.
+
 **Test counts:**
-- Rust: ~870 tests across 12 crates (`cargo test --workspace`); the W18 `hardened`
+- Rust: ~1200 `#[test]` functions across the 8 library crates plus the integration, tool and
+  xtask crates (`cargo test --workspace`); the W18 `hardened`
   profile, each hardening feature **alone**, and the POSIX/Sim hardening integration suite
   (guard-page SIGSEGV death test, large use-after-free SIGABRT death test, live quarantine
   control) run as dedicated `cargo xtask test` passes
@@ -464,8 +592,8 @@ capability-monotonicity, quota, and revocation theorems live in the seLe4n bridg
 
 | Crate | Role | License | `no_std` |
 |-------|------|---------|----------|
-| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13), the lifetime/hotness/site-profile placement policy + the heap-sampling machinery (W14 + W17-3), the security & hardening primitives (`harden`: junk fill, quarantine, guarded-alloc sampler, scrub — W18) | MIT | Yes |
-| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, the `topomalloc_stats_*` / `topomalloc_explain_memory` observability surface (§31, W17) + live snapshot composer, the `topomalloc_profile_*` sampling control surface (W17-3), the `topomalloc_quarantine_*` / `topomalloc_guard_*` hardening control surface (W18), live sampler glue, errno, Rust `GlobalAlloc` | MIT | No |
+| `topo-core` | classifier, size classes, the backing-provider seam, metadata/pagemap, extent manager, the M1 central-path allocator, the §11 front end (per-CPU + transfer caches and the W7 RSEQ fast path, wired live for default-arena unhinted small objects — W6/W7), the capability-backed arena registry (W9), the extent-hook backing adapter (W10), the hugepage filler / region cache (W11), the release controller / background-purge pump (W12), the topology model / placement / rebalancer + the live NUMA `NodeRouter` (W13), the lifetime/hotness/site-profile placement policy + the heap-sampling machinery (W14 + W17-3), the security & hardening primitives (`harden`: junk fill, quarantine, guarded-alloc sampler, scrub — W18) | MIT | Yes |
+| `topo-abi` | C API (§10.1–§10.4), C23 sized free, `topo_*x` extended API, arena + `topo_extent_hooks_t` (§23.2) ABI, the `topomalloc_cache_*` front-end control surface (§11, W6/W7), the `topomalloc_stats_*` / `topomalloc_explain_memory` observability surface (§31, W17) + live snapshot composer, the `topomalloc_profile_*` sampling control surface (W17-3), the `topomalloc_quarantine_*` / `topomalloc_guard_*` hardening control surface (W18), live sampler glue, errno, Rust `GlobalAlloc` | MIT | No |
 | `topo-backend-posix` | `PosixBackingProvider` — mmap/madvise/mprotect (single-authority) + best-effort `bind_node` (Linux `mbind`, §15.5) + `protect` (the W18-4 guard-page `mprotect(PROT_NONE)` seam, §29.5); `discover_topology` — §15.2 sysfs CPU/LLC/NUMA discovery; `OsCore` — `sched_getcpu` current-CPU oracle (W13) | MIT | No |
 | `topo-backend-sele4n` | `Sele4nSim` + (M1) `Sele4nBackingProvider` over the real seLe4n ABI | GPL-3.0-or-later | No |
 | `topo-arch` | per-arch RSEQ restartable sequences + fast-path mode selector | MIT | Yes |
@@ -525,14 +653,14 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 | 14-clause `WellFormed` preservation | per-transition preservers | `Theorems/*.lean` |
 | Coupled alloc preserves invariants | `allocStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
 | Coupled free preserves invariants | `freeStep_preserves_invariants` | `SeLe4n/Refinement.lean` |
-| Exact byte accounting | `ArenaQuotaExact` | `SeLe4n/Refinement.lean` |
+| Exact byte accounting | `ArenaQuotaExact` (a `WellFormed` clause, discharged by the coupled step theorems) | `SeLe4n/Bridge.lean` |
 | Delegated subtree ≤ root quota | `subtree_used_le_quota` | `SeLe4n/CapBackedArena.lean` |
 | Hooks preserve disjointness (given §23.3) | `alloc_preserves_disjoint` | `ExtentHooks.lean` |
 | Per-arena hooked regions isolate (§22.7) | `perArena_disjoint_regions_isolate` | `ExtentHooks.lean` |
 | Partial subrelease preserves live backing (H-005) | `subrelease_preserves_live_backing` | `HugePageFiller.lean` |
 | Hugepage bin matches occupancy (H-003) | `partialSubreleased_iff_subreleased` | `HugePageFiller.lean` |
 | Bundle inhabitation (non-vacuity) | `topoSeLe4nWellFormed_empty` | `SeLe4n/Refinement.lean` |
-| SMP correctness | `schedule_invariant` (every interleaving) | `SeLe4n/SMP.lean` |
+| SMP correctness | `runSmp_conserves` / `runSmp_core_isolation` / `runSmp_low_equivalence` (every interleaving) | `SeLe4n/SMP.lean` |
 | RSEQ abort safety | `per_core_cache_abort_no_change` | `SeLe4n/ClientRuntime.lean` |
 | Stats non-interference | `stats_observation_noninterference` | `SeLe4n/InformationFlow.lean` |
 
@@ -551,7 +679,7 @@ No `sorry`, no `admit`, no `native_decide`. The only postulated axioms are the f
 ```text
 topomalloc/
 ├── crates/
-│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, hugepage filler, placement policy + sampling, hardening: harden.rs)
+│   ├── topo-core/             (no_std allocator core: classifier, seam, metadata, spans, extents, front-end caches + RSEQ, hugepage filler, placement policy + sampling, hardening: harden.rs)
 │   ├── topo-abi/              (C/C++/Rust ABI surface: malloc, free, GlobalAlloc, stats/explain + profile/sampling control)
 │   ├── topo-backend-posix/    (mmap/madvise/mprotect — the POSIX backend)
 │   ├── topo-backend-sele4n/   (Sele4nSim + real seLe4n ABI — GPL-3.0-or-later)

@@ -471,6 +471,11 @@ pub enum ArenaError {
     /// The operation is not permitted on the default arena (§22.5: reset/destroy
     /// is for explicit arenas, not the always-present default).
     IsDefault,
+    /// The arena still has live delegated children, so it cannot be destroyed
+    /// (§36.4): returning its reservation to its own parent while its children are
+    /// still allocatable would let the subtree exceed the root quota. Destroy the
+    /// subtree bottom-up.
+    HasLiveChildren,
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +619,10 @@ impl ArenaPolicy {
     }
 
     /// Set the soft per-arena cache budget in bytes (`0` ⇒ global default).
+    ///
+    /// Like the field it sets, this is **carried, not yet consumed**: the front-end cache
+    /// layer that reads it lands with plan 05 W6 (M2), so today it only records the
+    /// policy (round-tripped through `stats`/`configure`).
     pub const fn with_cache_budget(mut self, bytes: u64) -> Self {
         self.cache_budget_bytes = bytes;
         self
@@ -876,6 +885,18 @@ struct ArenaAtomics {
     /// the table lock at create/configure; **survives a reset** (placement config is
     /// sticky). Purely a policy value: a wrong read loses locality, never correctness.
     numa: AtomicU64,
+    /// Live **delegated children** — arenas this one delegated that have not yet
+    /// reached [`Destroyed`](ArenaState::Destroyed) (§36.4). Mutated only under the
+    /// table lock (delegate adds, a child's `finish_destroy` subtracts).
+    ///
+    /// Load-bearing for the §36.4 tree-wide quota bound (the runtime image of the Lean
+    /// `subtree_used_le_quota`): a destroy returns this arena's whole reservation to
+    /// *its* parent, so destroying an intermediate arena while its own children are
+    /// still allocatable would free the grandparent's budget twice over — the subtree
+    /// could then exceed the root quota. [`begin_destroy`](ArenaTable::begin_destroy)
+    /// therefore refuses while this is nonzero; the host destroys the subtree
+    /// bottom-up.
+    live_children: AtomicU32,
     /// The arena's information-flow [`Label`] (§36.12), mirrored from
     /// [`ArenaMeta::label`] so the retire/teardown path can read it **lock-free**
     /// (W18-6 scrub-before-downgrade). Set under the table lock at create/delegate
@@ -902,6 +923,7 @@ impl ArenaAtomics {
             numa_bind_failures: AtomicU64::new(0),
             hook_slot: AtomicU8::new(0),
             numa: AtomicU64::new(NumaPolicy::OsDefault.encode()),
+            live_children: AtomicU32::new(0),
             label: AtomicU32::new(Label::PUBLIC.0),
         }
     }
@@ -1278,7 +1300,15 @@ impl ArenaTable {
             self.reserve_child_quota_locked(parent, del.quota_limit)?;
         }
         match self.create_locked(&policy, parent.0 + 1, pstats.generation.0) {
-            Ok(child) => Ok(child),
+            Ok(child) => {
+                // §36.4: the parent now funds a live child. Its destroy is blocked until
+                // the child is destroyed, so the reservation it returns to *its* parent
+                // is never released while descendants funded by it remain allocatable.
+                if let Some(pa) = self.slot(parent) {
+                    pa.live_children.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(child)
+            }
             Err(e) => {
                 // A failed create must leak no reservation: give the budget back.
                 if parent_finite {
@@ -1371,7 +1401,32 @@ impl ArenaTable {
         if arena == ArenaId::DEFAULT {
             return Err(ArenaError::IsDefault);
         }
-        self.transition(arena, ArenaState::Draining)
+        // §36.4 tree-wide quota bound: `finish_destroy` returns this arena's whole
+        // reservation to its own parent. Doing that while its delegated children are
+        // still `Active` would free that budget twice — once here and once in each
+        // child, which keeps its `quota_limit` — letting the subtree allocate past the
+        // root quota (the bound the Lean `subtree_used_le_quota` proves). Refuse, so the
+        // host destroys the subtree bottom-up.
+        // The child check and the `Active → Draining` transition must be **one** critical
+        // section. Read separately, the count is a TOCTOU: `delegate` validates the parent
+        // is `Active` and increments `live_children` under this same lock, so a check that
+        // observes zero, then a transition that acquires the lock afterwards, lets a
+        // delegation interleave between them. Both then succeed — the parent is draining
+        // *and* has a live child — and `finish_destroy` returns the parent's whole
+        // reservation to *its* parent while the new child keeps its quota: exactly the
+        // subtree overcommit this counter exists to prevent. Serialized here, one of the
+        // two always loses: either `delegate` sees `Draining` and fails `NotActive`, or the
+        // count is non-zero and the destroy is refused.
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            if a.live_children.load(Ordering::Acquire) != 0 {
+                return Err(ArenaError::HasLiveChildren);
+            }
+            self.transition_locked(arena, ArenaState::Draining)
+        })();
+        self.lock.release();
+        r
     }
 
     /// Complete a destroy (`Draining → Destroyed`, §36.13 step 7): bump the
@@ -1448,17 +1503,21 @@ impl ArenaTable {
     /// Apply a single guarded lifecycle transition under the lock.
     fn transition(&self, arena: ArenaId, to: ArenaState) -> Result<(), ArenaError> {
         self.lock.acquire();
-        let r = (|| {
-            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
-            let cur = ArenaState::from_u8(a.state.load(Ordering::Acquire));
-            if !cur.can_transition(to) {
-                return Err(ArenaError::IllegalTransition);
-            }
-            a.state.store(to as u8, Ordering::Release);
-            Ok(())
-        })();
+        let r = self.transition_locked(arena, to);
         self.lock.release();
         r
+    }
+
+    /// [`transition`](Self::transition) with the table lock already held, so a caller can
+    /// compose it with other checks into **one** critical section (see `begin_destroy`).
+    fn transition_locked(&self, arena: ArenaId, to: ArenaState) -> Result<(), ArenaError> {
+        let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+        let cur = ArenaState::from_u8(a.state.load(Ordering::Acquire));
+        if !cur.can_transition(to) {
+            return Err(ArenaError::IllegalTransition);
+        }
+        a.state.store(to as u8, Ordering::Release);
+        Ok(())
     }
 
     // -- accounting (hot path, §36.17) ----------------------------------------
@@ -1609,13 +1668,29 @@ impl ArenaTable {
         let Some(pa) = self.slot(parent) else {
             return;
         };
-        // An unlimited parent partitions no budget, so it reserved nothing.
-        if pa.quota_limit.load(Ordering::Relaxed) == QUOTA_UNLIMITED {
-            return;
-        }
         // Credit only the exact incarnation that delegated this child; a
         // destroyed/recreated parent (generation bumped) is already gone.
         if pa.generation.load(Ordering::Relaxed) != m.parent_generation {
+            return;
+        }
+        // The child is gone, so it no longer blocks the parent's own destroy. This is
+        // released for *every* live parent incarnation, including an unlimited one that
+        // partitioned no budget — the count tracks authority, not bytes.
+        let mut c = pa.live_children.load(Ordering::Relaxed);
+        loop {
+            let next = c.saturating_sub(1);
+            match pa.live_children.compare_exchange_weak(
+                c,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => c = observed,
+            }
+        }
+        // An unlimited parent partitions no budget, so it reserved nothing.
+        if pa.quota_limit.load(Ordering::Relaxed) == QUOTA_UNLIMITED {
             return;
         }
         let Some(ca) = self.slot(child) else {
@@ -1815,6 +1890,31 @@ impl ArenaTable {
             .filter(|&i| {
                 ArenaState::from_u8(self.atomics[i].state.load(Ordering::Acquire))
                     != ArenaState::Destroyed
+            })
+            .count()
+    }
+
+    /// The number of arenas currently in the terminal
+    /// [`ErrorQuarantined`](ArenaState::ErrorQuarantined) state (§36.13).
+    ///
+    /// A quarantine is reached when a reset/destroy drained every object but some
+    /// **backing** could not be recycled (a custom `ExtentHooks` backing refusing its
+    /// region return). §22.3 defines no outgoing transition from it, so the slot is
+    /// never recycled and — for a delegated arena — its parent's reserved quota is held
+    /// for the process's lifetime. A host that repeats create/destroy against a backing
+    /// that intermittently refuses therefore walks toward `ArenaError::Exhausted` with
+    /// nothing to see. Surfacing the count (`arenas.quarantined` in the stats JSON,
+    /// `topo.arena.quarantined` in the control namespace) makes that approach
+    /// observable long before it is fatal.
+    pub fn quarantined_count(&self) -> usize {
+        self.lock.acquire();
+        // SAFETY: lock held.
+        let hw = unsafe { (*self.inner.get()).high_water } as usize;
+        self.lock.release();
+        (0..hw)
+            .filter(|&i| {
+                ArenaState::from_u8(self.atomics[i].state.load(Ordering::Acquire))
+                    == ArenaState::ErrorQuarantined
             })
             .count()
     }
@@ -2236,13 +2336,59 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_parent_before_its_child_keeps_accounting_sound() {
-        // The reservation is returned only to the parent incarnation that granted
-        // it (generation-checked, §36.13). Destroying the parent first bumps its
-        // generation, so the orphaned child's later destroy finds a mismatch and
-        // safely *skips* the return — no underflow, the table stays well-formed.
-        // (The orphaned child is a lifecycle the caller owns; this asserts only
-        // that the quota accounting cannot be corrupted by it.)
+    fn a_racing_delegate_and_destroy_cannot_both_succeed() {
+        // The §36.4 subtree bound rests on "a parent with live children cannot be
+        // destroyed". Checking `live_children` outside the lock that `delegate` increments
+        // it under is a TOCTOU: both can succeed, and `finish_destroy` then returns the
+        // parent's whole reservation to *its* parent while the new child keeps its quota —
+        // the exact overcommit the counter prevents. Race the two on the same parent many
+        // times and assert the outcomes are mutually exclusive.
+        //
+        // A narrow window, so this is a probabilistic detector of a regression rather than
+        // a guaranteed one; the fix is structural (one critical section) and this pins the
+        // invariant it establishes.
+        for _ in 0..200 {
+            let t = ArenaTable::new();
+            let parent = t
+                .create(&ArenaPolicy::explicit().with_quota(1 << 20))
+                .expect("parent");
+            let p0 = t.stats(parent).expect("parent stats");
+            let del = Delegation::inheriting(&p0, 4096, "c");
+            let t = &t;
+            let del = &del;
+            let (d, b) = std::thread::scope(|s| {
+                let dh = s.spawn(move || t.delegate(parent, del));
+                let bh = s.spawn(move || t.begin_destroy(parent));
+                (dh.join().unwrap(), bh.join().unwrap())
+            });
+            if b.is_ok() {
+                assert!(
+                    d.is_err(),
+                    "a delegation must not succeed against a parent whose destroy won"
+                );
+                assert_eq!(
+                    t.stats(parent).map(|st| st.reserved),
+                    Some(0),
+                    "a draining parent reserved nothing for a child that lost the race"
+                );
+            }
+            if d.is_ok() {
+                assert!(
+                    b.is_err(),
+                    "a destroy must not succeed against a parent that gained a child"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_parent_cannot_be_destroyed_while_it_has_live_children() {
+        // §36.4 tree-wide quota bound. `finish_destroy` returns the arena's whole
+        // reservation to *its* parent, so destroying an intermediate arena while its own
+        // children are still Active would release that budget while each child keeps its
+        // `quota_limit` — letting the subtree allocate past the root quota (the bound the
+        // Lean `subtree_used_le_quota` proves). The destroy is refused instead, and the
+        // host tears the subtree down bottom-up.
         let t = ArenaTable::new();
         let parent = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
         let p0 = t.stats(parent).unwrap();
@@ -2251,12 +2397,79 @@ mod tests {
             .unwrap();
         assert_eq!(t.stats(parent).unwrap().reserved, 40);
 
-        t.begin_destroy(parent).unwrap();
-        t.finish_destroy(parent).unwrap();
-        // The parent incarnation is gone (generation bumped); destroying the child
-        // must not panic, underflow, or break the invariants.
+        assert_eq!(
+            t.begin_destroy(parent),
+            Err(ArenaError::HasLiveChildren),
+            "an intermediate arena cannot be destroyed out from under its children"
+        );
+        assert!(t.is_active(parent), "the refused destroy changed nothing");
+
+        // Bottom-up works, and returns the reservation exactly once.
         t.begin_destroy(child).unwrap();
         t.finish_destroy(child).unwrap();
+        assert_eq!(t.stats(parent).unwrap().reserved, 0);
+        assert_eq!(t.stats(parent).unwrap().remaining_quota(), 100);
+        t.begin_destroy(parent).unwrap();
+        t.finish_destroy(parent).unwrap();
+        assert!(t.check_invariants());
+    }
+
+    #[test]
+    fn a_grandchild_cannot_outlive_its_parent_and_over_commit_the_root() {
+        // The concrete over-commit the guard closes: P(100) → C(100) → G(100). Before the
+        // fix, destroying C credited C's whole 100-byte reservation back to P while G
+        // stayed Active with its own 100-byte ceiling, so P and G could together hold 200
+        // live bytes against a 100-byte root quota.
+        let t = ArenaTable::new();
+        let p = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
+        let p0 = t.stats(p).unwrap();
+        let c = t
+            .delegate(p, &Delegation::inheriting(&p0, 100, "c"))
+            .unwrap();
+        let c0 = t.stats(c).unwrap();
+        let g = t
+            .delegate(c, &Delegation::inheriting(&c0, 100, "g"))
+            .unwrap();
+
+        // The whole root quota is delegated down the chain.
+        assert_eq!(t.stats(p).unwrap().remaining_quota(), 0);
+        assert_eq!(t.stats(c).unwrap().remaining_quota(), 0);
+        assert_eq!(t.stats(g).unwrap().remaining_quota(), 100);
+
+        assert_eq!(t.begin_destroy(c), Err(ArenaError::HasLiveChildren));
+        // So the budget stays partitioned: only the leaf can spend it.
+        assert_eq!(t.try_charge(p, 1), Err(ArenaError::QuotaExceeded));
+        assert_eq!(t.try_charge(c, 1), Err(ArenaError::QuotaExceeded));
+        t.try_charge(g, 100).unwrap();
+        assert_eq!(t.try_charge(g, 1), Err(ArenaError::QuotaExceeded));
+        let subtree_used =
+            t.stats(p).unwrap().used + t.stats(c).unwrap().used + t.stats(g).unwrap().used;
+        assert_eq!(subtree_used, 100, "Σ subtree own-live ≤ root quota");
+        assert!(t.check_invariants());
+    }
+
+    #[test]
+    fn destroying_an_orphaned_child_keeps_accounting_sound() {
+        // A parent whose incarnation is gone can still be named by a child's metadata —
+        // e.g. the slot was recycled and re-created. The reservation is returned only to
+        // the incarnation that granted it (generation-checked, §36.13), so the child's
+        // destroy safely *skips* the return: no underflow, and the table stays
+        // well-formed.
+        let t = ArenaTable::new();
+        let parent = t.create(&ArenaPolicy::explicit().with_quota(100)).unwrap();
+        let p0 = t.stats(parent).unwrap();
+        let child = t
+            .delegate(parent, &Delegation::inheriting(&p0, 40, "c"))
+            .unwrap();
+        // Forge the stale link the generation check exists for: pretend the parent
+        // incarnation the child was delegated from has been replaced.
+        let pa = t.slot(parent).unwrap();
+        pa.generation.fetch_add(1, Ordering::Relaxed);
+
+        t.begin_destroy(child).unwrap();
+        t.finish_destroy(child).unwrap();
+        // The stale parent was neither credited nor underflowed.
+        assert_eq!(t.stats(parent).unwrap().reserved, 40);
         assert!(t.check_invariants());
     }
 

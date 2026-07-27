@@ -10,7 +10,7 @@
   <a href="https://github.com/hatter6822/topomalloc/actions/workflows/ci.yml">
     <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/hatter6822/topomalloc/ci.yml?branch=main&label=CI" />
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.2.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.4.3-blue" />
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.94-dea584" />
   <img alt="Lean" src="https://img.shields.io/badge/Lean-4.28.0-10b981" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-informational" />
@@ -25,14 +25,15 @@ seLe4n integration is isolated behind explicit GPL-3.0-or-later artifacts.
 
 | Attribute | Value |
 |-----------|-------|
-| Project version | `0.2.0` |
+| Project version | `0.4.3` |
 | Rust toolchain | `1.94` stable, pinned by `rust-toolchain.toml` |
 | Lean toolchain | `v4.28.0`, pinned by `lean-toolchain` |
 | Primary platforms | x86-64 and AArch64 |
 | Default artifact | MIT POSIX allocator (`libtopomalloc`) |
 | Optional GPL artifact | seLe4n simulator / real ABI integration |
 
-The current tree contains the central allocator path, extended C ABI, arena and
+The current tree contains the central allocator path, the per-CPU/transfer front
+end with its restartable-sequence fast path, extended C ABI, arena and
 extent-hook surfaces, hugepage-aware backing, topology routing, observability,
 hardening features, deterministic/debug modes, and sanitizer/test harnesses. The
 formal model and generated tables are part of the normal development workflow,
@@ -43,6 +44,12 @@ not after-the-fact documentation.
 - **Allocator core:** request classification, generated size classes, central
   free lists, extent-backed large allocations, `free`, `realloc`, aligned
   allocation, usable-size queries, and zero-size/errno semantics.
+- **Front end:** a per-CPU object cache backed by a transfer cache, served by
+  restartable sequences (`rseq`) where the platform supports them and by a
+  ranked spinlock otherwise, so a small allocation and free stay off the
+  contended central lock. Exact double-free detection is preserved by a
+  per-object residency marker, and cached memory is reported as its own byte
+  class and reclaimable on demand (`topomalloc_cache_flush_all`).
 - **Public ABI:** prefixed C symbols (`topomalloc_*`, `topo_*`), C23 sized frees,
   `topo_*x` flags, opt-in C++ `operator new`/`delete`, and a Rust `GlobalAlloc`
   adapter.

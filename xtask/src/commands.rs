@@ -389,12 +389,19 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     if aarch64_verb == "check" {
         r.note("AArch64: no cross-linker locally — verifying compilation with `cargo check` (CI links + runs under QEMU)");
     }
+    // `--all-targets` so **test** code is compiled for AArch64 too, not just the library.
+    // Without it a portability bug confined to a test — the canonical one being a
+    // hard-coded `i8` where `c_char` belongs, since `c_char` is `i8` on x86-64 and `u8` on
+    // AArch64 — compiles locally and fails only in the remote AArch64 *test* job, which is
+    // the one gate a developer cannot run. The local gate should catch what the remote one
+    // catches; `check` does not link, so this stays cheap on a box with no cross-linker.
     r.run(
-        "build AArch64 (debug)",
+        "build AArch64 (debug, all targets)",
         "cargo",
         &[
             aarch64_verb,
             "--workspace",
+            "--all-targets",
             "--target",
             "aarch64-unknown-linux-gnu",
         ],
@@ -473,6 +480,36 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
             &["test", "-p", "topo-core", "--features", feat, "--lib"],
         );
     }
+    // W19-3 (§30.4): the `deterministic-test` profile flips deterministic mode ON at
+    // compile time (`ENABLED: AtomicBool::new(cfg!(feature = \"deterministic-test\"))`),
+    // which changes real behaviour — the force-slow-path / force-purge gates and the
+    // seeded security samplers. Every other profile feature has a build+test pass; this
+    // one had none, so a change that broke the always-on path would ship green.
+    r.run(
+        "test deterministic-test profile (W19-3)",
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "topo-core",
+            "--features",
+            "deterministic-test",
+            "--lib",
+        ],
+    );
+    // W18 feature **pairs** the single-feature and full-`hardened` runs both miss: a
+    // protection can interact with a sibling in a way the composed profile masks. The
+    // audited case is `junk-fill` + `guard-pages` *without* `secure-scrub`: a guarded
+    // free fills only its object subrange, so claiming the whole extent is canary-filled
+    // aborted a correct program on reuse — invisible under `hardened`, where
+    // `secure-scrub` scrubs (and so disarms the canary) on every large free.
+    for feats in ["junk-fill,guard-pages", "junk-fill,quarantine"] {
+        r.run(
+            &format!("test W18 feature pair: {feats}"),
+            "cargo",
+            &["test", "-p", "topo-core", "--features", feats, "--lib"],
+        );
+    }
     // The W18 hardening integration tests over the **real POSIX provider**: the
     // guarded-allocation `mprotect` death test (overrun/underrun ⇒ SIGSEGV) and the
     // live quarantine control surface, which the in-crate `HostProvider` cannot.
@@ -545,6 +582,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         ],
     );
     global_alloc_smoke_step(&mut r);
+    fuzz_targets_compile_step(&mut r);
 
     // C ABI compile-link-run (§34.1) + rustdoc intra-doc-link check.
     abi_test_steps(&mut r, root);
@@ -927,6 +965,31 @@ fn msan_steps(r: &mut Runner<'_>) {
         ],
     );
     std::env::remove_var("RUSTFLAGS");
+}
+
+/// Type-check the `cargo-fuzz` targets (W19, `fuzz/`).
+///
+/// The fuzz workspace is **standalone** — its own `Cargo.toml`, excluded from the main
+/// workspace so `cargo test` does not drag in `libfuzzer-sys` — which means nothing else
+/// in `ci` compiles it. That is exactly how a change to a signature the targets call
+/// (`topo_stats::redact_summary` gained an `observer_label` parameter in 0.3.0) left them
+/// broken for a release with every other gate green. A `check` is cheap, needs no nightly,
+/// and turns "the fuzz targets no longer build" into a CI failure instead of a discovery
+/// made the next time someone runs a fuzz campaign.
+///
+/// This does not *run* the fuzzers (that needs nightly + `cargo-fuzz`, and is a campaign,
+/// not a gate); it only proves the targets still compile against the current API.
+fn fuzz_targets_compile_step(r: &mut Runner<'_>) {
+    r.run(
+        "fuzz targets compile (W19)",
+        "cargo",
+        &[
+            "check",
+            "--manifest-path",
+            "fuzz/Cargo.toml",
+            "--all-targets",
+        ],
+    );
 }
 
 /// Run the `#[global_allocator]` bootstrap smoke example (the re-entrancy guard,

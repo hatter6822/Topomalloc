@@ -38,7 +38,9 @@ use std::string::String;
 use std::vec::Vec;
 
 use topo_core::{ArenaId, ArenaState};
-use topo_stats::{ArenaLine, NumaNodeLine, Profile, SizeClassLine, Stats, StatsDetail, StatsFlags};
+use topo_stats::{
+    ArenaLine, CpuCacheLine, NumaNodeLine, Profile, SizeClassLine, Stats, StatsDetail, StatsFlags,
+};
 
 use crate::{global, AnyAllocator};
 
@@ -77,7 +79,13 @@ fn checked_flags(flags: u64) -> Option<StatsFlags> {
 /// **redacted** for that low domain (§36.12, W17-6): the cross-domain summary aggregates are
 /// zeroed and only the visible arenas survive. The single place a snapshot is taken, so the
 /// epoch is bumped exactly once per public stats call.
-type Composed = (Stats, Vec<ArenaLine>, Vec<SizeClassLine>, Vec<NumaNodeLine>);
+type Composed = (
+    Stats,
+    Vec<ArenaLine>,
+    Vec<SizeClassLine>,
+    Vec<CpuCacheLine>,
+    Vec<NumaNodeLine>,
+);
 
 fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> Composed {
     let mut s = Stats {
@@ -111,12 +119,13 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> 
     let (summary, visible_arenas, redacting) = match observer_label {
         Some(low) => {
             let visible = topo_stats::redact_arenas(&all_arenas, low);
-            let all_visible = visible.len() == all_arenas.len();
-            (
-                topo_stats::redact_summary(&s, &visible, all_visible),
-                visible,
-                !all_visible,
-            )
+            // Redaction is keyed on the **observer's** label alone, never on which arenas
+            // happen to exist: gating it on "the observer sees every live arena" would let
+            // a high domain flip the low view by creating and destroying a labelled arena
+            // (a covert channel), and would disclose every cross-domain aggregate whenever
+            // no high arena existed. Only the lattice-top observer reads the raw summary.
+            let raw = low == topo_stats::OBSERVER_LABEL_TOP;
+            (topo_stats::redact_summary(&s, &visible, low), visible, !raw)
         }
         None => (s, all_arenas, false),
     };
@@ -147,12 +156,20 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> 
         Vec::new()
     };
     // Per-node NUMA coverage (cross-domain infrastructure ⇒ omitted for a redacted observer).
+    // Front-end residency is cross-domain infrastructure (a per-CPU slot serves whichever
+    // threads run on that core), so a redacted low observer gets none — the same rule the
+    // per-size-class and per-node detail follow.
+    let cpus = if flags.contains(StatsFlags::BY_CPU) && !redacting {
+        cpu_cache_lines()
+    } else {
+        Vec::new()
+    };
     let numa_nodes = if flags.contains(StatsFlags::BY_NUMA) && !redacting {
         numa_node_lines()
     } else {
         Vec::new()
     };
-    (summary, arenas, size_classes, numa_nodes)
+    (summary, arenas, size_classes, cpus, numa_nodes)
 }
 
 /// The §31.2 `BY_NUMA` per-node lines — each node's §19.7 hugepage coverage, from the live
@@ -270,16 +287,34 @@ fn size_class_lines() -> Vec<SizeClassLine> {
     v
 }
 
+/// The §31.2 `BY_CPU` per-core lines (W17-2 / W6): what each core's §11 front-end slots
+/// hold. Cores holding nothing are skipped by the engine's visitor, so an idle or drained
+/// front end yields an empty vector.
+fn cpu_cache_lines() -> Vec<CpuCacheLine> {
+    let mut v = Vec::new();
+    if let Some(eng) = global() {
+        eng.for_each_cpu_cache(|cpu, objects, bytes| {
+            v.push(CpuCacheLine {
+                cpu,
+                objects,
+                bytes,
+            });
+        });
+    }
+    v
+}
+
 /// Compose and render the snapshot as JSON honoring `flags`, redacting arena detail for
 /// `observer_label` if given. `delivering` is false for a length-query (`buf == NULL`) sizing
 /// call, so a `RESET_PEAKS` request does not clear the gauge before the caller's data call reads.
 fn render_json(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> String {
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, observer_label, delivering);
+    let (s, arenas, size_classes, cpus, numa_nodes) = compose(flags, observer_label, delivering);
     s.to_json_with(
         flags,
         &StatsDetail {
             arenas: &arenas,
             size_classes: &size_classes,
+            cpus: &cpus,
             numa_nodes: &numa_nodes,
         },
     )
@@ -446,10 +481,22 @@ pub unsafe extern "C" fn topomalloc_stats_json(buf: *mut c_char, cap: usize, fla
 }
 
 /// `size_t topomalloc_stats_json_for_label(char* buf, size_t cap, uint64_t flags,
-/// uint32_t observer_label)` (§36.12, W17-6): like [`topomalloc_stats_json`], but the
-/// `BY_ARENA` per-arena detail is **redacted** to only the arenas the `observer_label` domain
-/// is authorized to see — a low domain cannot observe a higher domain's arenas. On POSIX every
-/// arena is `PUBLIC` (`0`), so a `PUBLIC` observer sees everything (the identity case).
+/// uint32_t observer_label)` (§36.12, W17-6): like [`topomalloc_stats_json`], but
+/// **redacted** to what the `observer_label` domain is authorized to see — the `BY_ARENA`
+/// detail filtered to the arenas it dominates, and the cross-domain summary aggregates
+/// zeroed with `live_bytes` recomputed from the visible arenas.
+///
+/// Redaction is keyed on the **observer's label alone**. Only
+/// [`OBSERVER_LABEL_TOP`](topo_stats::OBSERVER_LABEL_TOP) receives the raw summary; every
+/// other label — including `PUBLIC` (`0`) — gets the redacted view, even when it happens to
+/// dominate every arena that currently exists. Gating on "this observer sees all live
+/// arenas" would be a covert channel: a high domain could flip the low view by creating and
+/// destroying a labelled arena, and every cross-domain aggregate would be disclosed whenever
+/// no high arena happened to exist.
+///
+/// For ordinary process-wide monitoring (including the all-`PUBLIC` POSIX case) use
+/// [`topomalloc_stats_json`], or pass `OBSERVER_LABEL_TOP` here. Pass a real domain label
+/// only when the restricted view is what you want.
 ///
 /// # Safety
 ///
@@ -520,12 +567,13 @@ pub unsafe extern "C" fn topomalloc_stats_print(out: *mut libc::FILE, flags: u64
     }
     let _op = topo_core::fork::operation_guard();
     // `out` is non-null here, so this call always delivers (RESET_PEAKS, if set, takes effect).
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, None, true);
+    let (s, arenas, size_classes, cpus, numa_nodes) = compose(flags, None, true);
     let json = s.to_json_with(
         flags,
         &StatsDetail {
             arenas: &arenas,
             size_classes: &size_classes,
+            cpus: &cpus,
             numa_nodes: &numa_nodes,
         },
     );

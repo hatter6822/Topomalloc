@@ -2017,3 +2017,988 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   "frees" from the application's view, guards/scrub change only placement/contents, never
   size/alignment/validity); the one model tie is W18-6, whose runtime scrub is the image of the
   pre-existing Lean `scrub_before_downgrade` theorem.
+
+* **Audit — authority checks belong to the observer, not to the observed (0.3.0).**
+  Two defects in this pass shared one shape: a security decision keyed on state the
+  *untrusted side* controls. Label redaction returned the raw, cross-domain stats summary
+  whenever the observer happened to dominate every **currently live** arena — so a high
+  domain could flip the low view by creating and destroying a labelled arena (a covert
+  channel), and every cross-domain aggregate was disclosed whenever no high arena existed.
+  The POSIX provider's `madvise`/`mprotect`/`mbind` ops validated only that a sub-range fit
+  inside the caller-supplied `Region`, never that the region was one of *its own*
+  reservations — so safe code could hand it a foreign `Region` and have live memory zeroed
+  or made inaccessible. Both are now decided from properties the caller cannot forge: the
+  observer's own label against a fixed lattice top, and membership in the provider's owned
+  set. The rule this ratifies: **a check that reads the state being protected is not a
+  check.**
+
+* **Audit — a "randomized" defence is only as good as its seed (0.3.0).**
+  The W18-4 guard-page sampler and the W18-3 quarantine evictor documented
+  unpredictability as the property that makes them useful, and drew from xorshift streams
+  seeded by compile-time constants — identical in every process of a given binary, so the
+  guarded allocation ordinals were offline-computable. "Randomized, not a fixed stride" was
+  true and beside the point. `topo-core` is `no_std` and cannot read the OS, so entropy is
+  now **pushed in** through `harden::set_process_entropy` — the hosted shell reads
+  `AT_RANDOM`/`getrandom(2)` once at start-up (allocation-free, raw `libc`) and the engine
+  re-seeds both samplers from it, with deterministic mode (§30.4) still overriding for
+  replay. The companion rule: environment-derived configuration is skipped under
+  `AT_SECURE`/setuid, as glibc does for `MALLOC_*`, because in a privileged process the
+  environment is attacker input.
+
+* **Audit — a lazily-initialized global must never re-enter its own initializer (0.3.0).**
+  The startup hooks that honour `$TOPOMALLOC_*` ran inside `GLOBAL.get_or_init` and reached
+  the engine through `global()`, which re-entered the still-running `OnceLock`; merely
+  exporting `TOPOMALLOC_QUARANTINE=1` hung the process at its first `malloc`. Nothing set
+  those variables in the tree, so no test noticed. Hooks now take the just-built engine by
+  reference, and `crates/topo-abi/tests/env_startup.rs` re-execs the test binary once per
+  documented variable with a bounded wait, so a reintroduction fails instead of hanging CI.
+  The same shape appeared in the fork gate, whose quiesce window the *forking thread itself*
+  could park on — an allocation from any sibling `pthread_atfork` handler was enough — fixed
+  by exempting that thread for the window.
+
+* **W6/W7 — a front-end cache needs a per-object residency marker, or exact double-free
+  detection dies with it (0.4.0).**
+  Wiring the per-CPU and transfer caches onto the live small path moves a freed object
+  into a slot instead of the central free list, so `central_insert`'s test-and-set — the
+  mechanism that made `free(p); free(p)` return `DoubleFree` — never sees it. The second
+  free would push the same address into the slot again and the cache would hand one object
+  to two callers. Answering "is this address cache-resident?" by scanning is
+  `O(MAX_CPUS × capacity)`, so the object is **marked** instead: a per-span, lock-free
+  `CachedBits` bitmap whose atomic test-and-set *is* the oracle, exactly as the free
+  bitmap's is for the central path. The free path already resolved `(span, index)` through
+  `validate_free`, so the mark costs nothing there; the alloc path pays one pagemap walk to
+  clear it, which is cheaper than the two spinlocks the cache removes. Alternatives were
+  rejected on principle, not effort: leaving cached objects untracked (§8.5 permits it —
+  but it is a real safety regression against a pinned test), storing the marker in the
+  freed object's own bytes (destroys the W18-1b property that free memory holds no
+  allocator metadata), and a central-free-bit "hint cache" (keeps the span lock on every
+  operation, which is the cost the layer exists to remove). The rule: **a fast path may
+  move where state lives, never whether it exists.**
+
+* **W6 — the front end caches one placement tuple, so everything it holds is
+  substitutable (0.4.0).**
+  A per-CPU slot is keyed by `(core, size class)` alone, so whatever it vends must be
+  interchangeable for *any* request of that class. Only the default arena's
+  placement-unhinted spans participate; an explicit arena, a labelled arena, or a
+  cold/hot/short-tagged span keeps the pre-W6 central path byte for byte. That is what
+  keeps §22.7 arena isolation, §36.4 quota exactness, §36.12 label isolation and the W14
+  placement grouping *exact* rather than approximate — none of them becomes a property the
+  cache has to remember, because memory subject to them never enters it. Cacheability
+  cannot change under a cached object either: a span is re-tagged only while empty, and an
+  empty span has no cached objects. The corollary bug this ratifies: the predicate was
+  first written against `PlaceClass::Default`, but an unhinted request computes
+  `Hotness::from_hint(0) == Cold`, so it matched *nothing* and the cache stayed silently
+  dead. The class is now derived by running neutral hints through the same functions the
+  allocation path uses, so the two agree by construction rather than by a named constant
+  someone must remember to keep in step.
+
+* **W6 — front-end residency is its own byte class, not a discount on the others
+  (0.4.0).**
+  A cached object has been freed by the application, so it left `live_bytes`; it never
+  reached the central bitmap, so it is not in `central_free_bytes`. Reporting it in neither
+  would have made the §8.6 covering identity `live + central_free <= active` *weaker* the
+  moment the cache went live — it would still hold, by losing track of memory. `per_cpu_bytes`
+  and `transfer_bytes` are therefore first-class in `AllocatorStats`, the covering identity
+  counts them, and the §21.3 release ladder's "drain caches" rung
+  (`topomalloc_cache_flush_all`) converts them back. Draining had to sweep **both** layers:
+  flushing a core's slots pushes their contents one level *down* into the transfer cache, so
+  a slot-only drain reports success while the spans stay non-empty and their backing stays
+  unreclaimable.
+
+* **W6 — a 360 KiB per-CPU array does not belong inside a value type (0.4.0).**
+  `CpuCache` is `MAX_CPUS` × a slot per size class. Embedding it in `Allocator` by value
+  made every construction materialise that much stack — enough to overflow a test thread —
+  and charged it to every embedding that never touches the front end (a `no_std` profile,
+  an arena-only host). The array is now carved from monotonic metadata on first use, which
+  is the discipline the span/large descriptor pools and the free bitmaps already follow.
+  Zeroing is the initialiser: every field of `PerCpu` is an atomic whose all-zero pattern
+  is its `new()` value, so nothing constructs a temporary — a property that is a fact about
+  the field set rather than about Rust, and is therefore pinned by a test. A failed carve is
+  not an error: the accessors read a null array as "no slots", the front end declines, and
+  the central path serves (§2.4 — a policy layer may degrade, never fail an allocation).
+
+* **W6 — the §13 thread cache is an *alternative* front end, not a layer; deleting the
+  prototype (0.4.0).**
+  `thread_cache.rs` shipped ~850 lines of unit-tested, publicly re-exported code that no
+  allocation ever reached, and it could not be wired as written: its slots were
+  `Vec<usize>`, so `push` would `realloc` through the global allocator on the allocation
+  fast path and the thread-exit flush would `dealloc` through it during TLS teardown —
+  the Appendix-F recursion anti-pattern at both ends. Worse, `pub unsafe fn
+  set_flush_hook(&mut self, hook, ctx: *const ())` carried a contract ("`ctx` must remain
+  valid until the thread exits") that **no caller can discharge**, because the thread that
+  must outlive `ctx` is not the one calling; `Drop` then invoked that raw pointer. Dead
+  code is a cost; dead *public* code with an undischargeable safety contract is a trap.
+
+  Rewriting the storage is not the job. Per-thread state loses four properties per-CPU
+  state has for free: **bounded metadata** (monotonic metadata is never returned and
+  thread count is unbounded, so a per-thread carve needs a registry and a reuse
+  free-list — with its own lock), a **teardown path** that must never touch
+  destructor-registered TLS (`THREAD_CACHE` is `RefCell<ThreadCache>`; re-entering it
+  during its own destruction panics), a **fork story** (a child inherits the caches of
+  threads that no longer exist, so their objects are unreachable forever — per-CPU slots
+  have no analogue, since every CPU still exists in the child), and a third `CachedBits`
+  transition plus a third residency term in every stats/invariant/drain path.
+
+  The spec settles the value question. §13 is titled "**Optional** thread cache fallback"
+  and §13.1 says thread caches "exist for portability and for policy domains that cannot
+  or should not use per-CPU caches" and "are **not** the preferred default on systems with
+  RSEQ" — i.e. §13 *replaces* §11 on such platforms rather than stacking on it. P-003's
+  fallback is already satisfied ("per-thread cache mode **or lock-sharded arena mode**" —
+  the locked per-CPU baseline is the latter, and the `rseq_equivalence` battery proves the
+  two paths observationally identical). §160 cites [R1] that per-CPU caches reduce cache
+  blowup versus per-thread on high-thread-count systems — the spec prefers per-CPU on the
+  very configuration where a thread cache might win latency. And O-002 asks that the byte
+  class be *reported*, which `Stats::thread_cache_bytes` does, as `0`.
+
+  Measurement agrees. The thing a thread cache exists to remove is the per-CPU spinlock;
+  running the same `malloc(64)+free` loop per mode gave RSEQ (lock-free) 69.9–71.6 ns/op,
+  `MODE_LOCKED` (per-CPU spinlock) 66.0–86.2 ns/op, and the central path 94.5 ns/op. The
+  locked baseline is not measurably slower than lock-free — setting up a restartable
+  critical section costs about what an uncontended test-and-set does — so there is no lock
+  cost left for a third layer to remove.
+
+  If a platform ever appears with neither RSEQ nor a per-core oracle *and* threads ≫ cores
+  with heavy migration, the right response is a per-thread front end **replacing** the
+  per-CPU one (§13.1's framing), built on the metadata-carved slot discipline `CpuSlot`
+  already exemplifies, plus the registry/teardown/fork protocol above. The rule this
+  ratifies: **an unwired implementation is not a head start; it is a claim the tree cannot
+  honour.**
+
+* **W6 — wiring a layer makes every "not yet" comment about it a claim to re-check
+  (0.4.0).**
+  Deleting the thread cache surfaced two things the *absence* of a front end had been
+  quietly excusing. `TOPO_TCACHE_NONE` ("bypass local caches", §10.3) decoded into
+  `RequestFlags::CACHE_BYPASS` and had **zero consumers** — harmless while there was no
+  cache to bypass, a broken ABI promise the moment there was one. It is now honoured on
+  `topo_mallocx` (served from central, not a slot) *and* on `topo_dallocx`/`topo_sdallocx`
+  (returned straight to central), through a shared free body so the flagged and unflagged
+  paths cannot drift in their `errno` handling. And the §31.2 `BY_CPU` stats flag rendered
+  a hard-coded `[]` with the comment "front-end per-CPU caches land at M2" — true until
+  they landed; it now renders the real per-core residency and is empty exactly when the
+  front end is.
+
+  Neither was reachable by any test, because both were *correct no-ops* under the old
+  state of the tree. The rule: when a subsystem goes live, every comment that deferred to
+  it is a claim that has just changed truth value, and grepping for those deferrals is
+  part of landing the subsystem — not cleanup for later.
+
+* **CI — a standalone workspace that nothing builds will break and stay broken (0.4.0).**
+  The `fuzz/` workspace is excluded from the main one (so `cargo test` does not drag in
+  `libfuzzer-sys`), which also meant no `xtask ci` step ever compiled it. A signature
+  change in 0.3.0 (`topo_stats::redact_summary` gaining an `observer_label` parameter)
+  left two fuzz targets uncompilable through a release with every other gate green. `ci`
+  now runs `cargo check --manifest-path fuzz/Cargo.toml --all-targets` — cheap, no nightly
+  needed, and it does not *run* the fuzzers (a campaign, not a gate). The general form:
+  **excluding something from the build graph excludes it from the guarantees**, so
+  anything deliberately excluded needs its own explicit gate.
+
+* **ABI — a handle type with no API is a frozen guess, not a reserved name (0.4.0).**
+  `typedef uint32_t topo_tcache_t` sat in the public header with no function accepting
+  it, above a comment saying "the encoding is deferred to its subsystem rather than
+  frozen as a guess" — while `uint32_t` *is* a frozen guess at the width, and
+  `tests/c/abi_smoke.c` pinned it with a `_Static_assert`, so CI enforced a guess the
+  header disclaimed. The same sentence cited `TOPO_TCACHE(id)`/`TOPO_NUMA(node)` as the
+  precedent for deferring, and those are deferred by being *absent*: identical deferrals
+  treated two different ways, one paragraph apart.
+
+  §10.3 does not require it. Its block is a **SHOULD** whose "naming is illustrative" and
+  whose conformance requirement is "equivalent **functionality**" — and the tree already
+  reads it that way, since `topo_arena_purge` and `topo_arena_set_decay` from the same
+  block are not exposed either. Nor would the type be forward-compatible: a handle names
+  an *explicit* cache to route through, and a front end keyed by CPU has nothing for a
+  caller-held handle to name, so whatever such a subsystem eventually needed (a registered
+  id, an opaque pointer) is as likely to differ from `uint32_t` as to match it. Removed,
+  with the header stating why the absence is deliberate. `TOPO_TCACHE_NONE` — *declining*
+  the cache, which needs no handle — is supported and honoured.
+
+  The general rule, the same one that retired the thread-cache prototype: **reserving a
+  name you cannot yet design is not forward compatibility, it is a claim with a version
+  number attached.** Adding a type when its API lands costs nothing; carrying one that
+  documents an API that does not exist costs a reader's trust in the rest of the header.
+
+* **Free path — one authoritative claim per object, not one per route (0.4.1).** The W6
+  front end gave a *cacheable* small object two possible homes and therefore two possible
+  test-and-sets: `SpanDescriptor::try_mark_cached` on the cached route and
+  `central_insert` on the central one. `free_with`'s lock-free
+  `is_free_awaiting_reuse` screen reads both bits, so a *sequential* double free is caught
+  either way — but the screen is advisory (two loads, no claim), and the routes could
+  disagree about *which* atomic settles a concurrent one. `TOPO_TCACHE_NONE` (§10.3) and
+  the deterministic force-slow-path skipped the cached route entirely, so a normal free
+  and a bypassing free of the same live object could both pass the screen, take *different*
+  claims, and both succeed: the address ends up in a per-CPU slot **and** in the central
+  free list, to be vended to two callers.
+
+  The claim is now taken on the object's cacheability alone, before the cache-versus-central
+  decision — so the decision cannot change who wins. The general rule: **when a value can
+  take more than one path to the same terminal state, the exclusion has to live above the
+  branch, not inside each arm.** An oracle chosen per route is not an oracle; the screen
+  that reads every route's bit only papers over it for the non-concurrent case. Pinned by
+  `a_bypassing_free_racing_a_cached_free_cannot_also_succeed`, which reproduces the
+  interleaving exactly (`free_small_screened` is `free_with`'s body *after* the screen, so
+  calling it with the cached bit already set **is** the racing free winning the claim in
+  the window).
+
+* **Hugepage placement — a bounded scan has to count what it skips (0.4.1).** §19.3's
+  approximate-bin cap bounds `HugePageFiller::place` to `SCAN_CAP` hugepages per bin. The
+  scan skipped a *completely full* hugepage without spending budget — reasonable, since it
+  can never fit a run — which quietly made the walk unbounded: §19.4 files a **hot** full
+  hugepage in `HotDense`, the first bin `PACKING_ORDER` scans, not the excluded `Full` one,
+  so a hot workload's full hugepages are all *in* the scanned bin and placement cost grew
+  linearly with the backend's capacity (1024 hugepages by default, more for a custom
+  configuration).
+
+  Counting them fixes the bound but would spend the budget on hugepages with no room, so
+  the fix is both halves: the cap now counts **every** node visited, and `bin_insert` files
+  a full hugepage at the *tail* of its bin (with `refile` moving one between the two ends
+  as its occupancy crosses full, since a hot 7/8-full hugepage filling up does not change
+  bins). Every hugepage that can still fit a run therefore precedes every one that cannot —
+  a B.4 invariant `check_invariants` now asserts, alongside the tail pointer itself.
+  `classify_bin` is untouched: it is the §19.4 observable classification, pinned 1:1 to the
+  Lean `classifyBin` by `hugeBinGate`, and *where in a bin list* a hugepage sits is
+  placement policy that the bin assignment does not speak to. The general rule: **a cap
+  that some inputs are exempt from is not a cap** — the exempt class is exactly what an
+  adversarial (or merely hot) workload will produce.
+
+* **Free-bit-first needs release/acquire, not just program order (0.4.2).** Two §29.3/§29.4
+  handoffs move an object between states recorded in *separate* bitmaps — `cached →
+  central-free` (W6) and `quarantined → central-free` (W18-3) — and both are written
+  "free-bit-first": set the central free bit, *then* clear the other, so a lock-free
+  `held || central_free` double-free oracle is true at every instant. The reader mirrors the
+  order, reading the held bit first, and a comment argued at length why that ordering closes
+  the straddle.
+
+  The argument was a sequential-consistency argument, and all four accesses were `Relaxed`.
+  Program order on the writing core says nothing about the order another core *observes* two
+  independent locations in; on the supported AArch64 build the clear may become visible
+  before the set, and the reader sees neither bit — re-marking and re-caching an object that
+  central can also vend, the exact double-vend the oracle exists to prevent. Load order is
+  necessary but not sufficient. The clear is now a **release** and the paired load an
+  **acquire** (in-map for §27.3: publication/consumption), which is what actually makes the
+  set visible to anyone who observes the clear. Pinned by the loom model
+  `cached_to_central_flush_is_ordered_for_a_lock_free_reader`, which finds the straddle in
+  a few hundred interleavings if either side is reverted to `Relaxed`. The general rule:
+  **an ordering claim about two locations is a claim about atomics, not about statement
+  order** — if the prose says "we do X before Y", the code has to say so in the orderings.
+
+* **A byte bound cannot be re-expressed as an object count (0.4.2).** The §15.4 rebalancer
+  plans a move sized by the donor's `movable_surplus` (`free − own demand`) — a **byte**
+  figure whose entire purpose is that releasing it cannot strand the donor. Execution
+  converted it to a hugepage count with `div_ceil` and released whole hugepages. Because an
+  empty hugepage's committed footprint is anywhere in `(0, HUGEPAGE_SIZE]` (a
+  packed-then-emptied one is only partially committed), that rounding releases more RSS than
+  the surplus: two empties committed 1.5 MiB each against a 1 MiB surplus round to one
+  hugepage and free 1.5 MiB, taking 0.5 MiB the donor's own demand needed. Rounding *down*
+  is safe but forfeits every release smaller than a hugepage even when the real footprints
+  would have fit.
+
+  Neither rounding is right because the quantities are not interconvertible. The new
+  `HugePageBackend::release_empty_within_bytes` selects on each hugepage's actual `committed`
+  count — already returned by `next_empty_backed` and previously discarded — so the release
+  is exactly within surplus. Pinned by
+  `a_byte_budgeted_release_never_overshoots_a_partial_commitment`. The general rule:
+  **when a bound is denominated in one unit, keep it in that unit all the way to the
+  mechanism**; a conversion whose rounding direction changes correctness is a sign the
+  mechanism needs the other denomination, not that the caller needs to pick a direction.
+
+* **A count is not an index (0.4.2).** The W6-5 budget controller walked
+  `0..active_cpus` to adapt per-CPU slots. `active_cpus` is the *count* of online CPUs,
+  while a slot is keyed by the **CPU id** `rseq::current_cpu()` reports — and Linux does not
+  promise those are dense. On a host whose online CPUs are 0 and 4, the count is 2 and the
+  live slots are 0 and 4, so the walk adapted a slot nothing used and never consumed the
+  real slot's miss/overflow counters: its soft capacity frozen at the initial value and its
+  objects missing from the budget total, i.e. a slot the budget did not bound. `adapt` and
+  `compute_total_capacity` now walk all `MAX_CPUS` slots and skip uninitialized ones (the
+  same `is_initialized` test that already guarded the dense walk); the global *allowance* is
+  still sized from the CPU count, which is the figure that genuinely is a population. Pinned
+  by `a_sparse_cpu_id_slot_is_still_adapted`.
+
+* **Check the direction the drift is dangerous in (0.4.2).** The W6 Appendix-B residency
+  checker was cited — in its own name, `front_end_residency_agrees`, and at its
+  `check_invariants` call site — as proving "the cached bits agree with what the front end
+  actually holds". It proved something weaker: that per span, the cached and central-free
+  bitmaps are disjoint. Both are bitmap-side facts. Neither looks at a cache, so an address
+  sitting in a per-CPU slot or transfer bin whose cached marker is *clear* passes — and that
+  object is invisible to `try_mark_cached`, so a second free of it is admitted and the
+  address is vended twice, with the oracle reporting a healthy allocator throughout.
+
+  Split into the two facts it was conflating: `front_end_residency_is_disjoint` (bitmap-side,
+  concurrency-robust, unchanged) and `front_end_markers_name_held_objects`, which walks the
+  caches themselves and resolves each held address exactly as the free path does. Only
+  entry ⇒ marker is asserted: marker ⇒ entry is transiently false by design (a free marks
+  before it pushes, an allocation pops before it unmarks), so the missing direction is not
+  drift. Pinned by `a_held_object_whose_marker_was_cleared_is_caught`, whose middle assertion
+  shows the bitmaps stay disjoint across the injected drift — the checker it replaced sees
+  nothing wrong. The general rule: **a checker's name is a claim; if it names a bijection,
+  it has to walk both sides.**
+
+* **A two-step transition needs a name for the state in between (0.4.3).** Leaving RSEQ
+  mode is not one action but two: stop new restartable sequences from starting, then drain
+  the ones already in flight. `disable_rseq` published `MODE_LOCKED` and *then* issued the
+  membarrier, which makes the drain correct for the disabling thread and wrong for everyone
+  else — a concurrent `flush_front_end_core` observes the fast path already off, skips the
+  W7-4 non-owner fence (itself gated on `rseq_mode()`), takes another CPU's lock, and edits
+  a slot an old sequence can still commit `len` into: a lost object or a double-vend, the
+  exact race the fence exists to prevent. An earlier round added the fence and closed the
+  disabling thread's half; this is the other half.
+
+  The window now has a name. `MODE_DRAINING` is published first and behaves as **locked for
+  anyone starting an operation** (every mode that is not `MODE_RSEQ`/`MODE_PINNED`
+  dispatches to the locked path, so no new sequence begins) and as **RSEQ for the fence**
+  (old sequences may still be in flight). `MODE_LOCKED` is published only after the fence
+  returns, which is the first moment at which "nothing is in flight and nothing can start"
+  is true — so a drainer that observes it may legitimately skip the fence. The general rule:
+  **when a transition has an interior, give the interior a state**; the two questions a mode
+  answers here ("may I start a sequence?" and "must I fence?") are not each other's
+  negation, and collapsing them into one boolean is what created the hole. Pinned by
+  `the_rseq_disable_window_stops_new_sequences_but_keeps_the_fence_armed`, which fails if
+  either question is answered from the other.
+
+* **Hand-over-hand needs a bound, not just an exit condition (0.4.3).** `drain_cpu` popped
+  a chunk under the per-CPU lock, released the lock, then invoked the sink — correct lock
+  discipline, since the per-CPU lock must never be held while the sink takes a middle-end
+  lock. But the loop's exit condition was `len != 0`, and the released window is exactly
+  where a concurrent free can refill the slot. Under sustained frees on the drained CPU
+  there is no reason for `len` ever to be observed zero, so `topomalloc_cache_flush_all` —
+  documented as approximate under concurrency — would not return at all. The transfer-cache
+  half had already been bounded to a snapshot for this reason; the per-CPU half had not, so
+  the API could still hang on its other layer.
+
+  Each slot is now drained by at most its residency when that slot's turn came. Objects
+  pushed during the drain are the next flush's work, which is what "approximate" already
+  promised; under quiescence the bound is the whole slot, so nothing is left behind. The
+  general rule: **a loop that drops its lock is a loop whose termination is a separate
+  argument from its correctness** — "until empty" is an exit condition, not a bound, and
+  progress by the loop does not imply progress toward the exit. Pinned by
+  `a_drain_terminates_even_when_the_slot_is_refilled_underneath_it`, whose sink refills the
+  slot it was just handed; unbounded, the test hangs.
+
+* **Widen a security gate everywhere it applies, not where the bug was reported (0.4.3).**
+  An earlier round widened the authoritative `getauxval(AT_SECURE)` check from
+  `target_env = "gnu"` to gnu *and* musl, since `libc` provides `getauxval` for both and the
+  id-comparison fallback misses file-capability and secure-exec-LSM cases. The identical
+  `target_env = "gnu"` gate on `getauxval(AT_RANDOM)` — in the same module, resting on the
+  same availability fact — was left alone. On musl that discarded the kernel's exec-time
+  entropy, so a host where `getrandom` is denied by seccomp, unavailable, or short fell
+  through to the deliberately weak address-and-clock mix, making the guard-page and
+  quarantine schedules far more predictable than the platform allows (§29.5). Both branches
+  now carry the same cfg. The general rule: **when a fix is "this cfg was too narrow", the
+  unit of repair is every use of that cfg for that reason**, not the line the report names.
+
+* **Only the thread that did the work may publish that the work is done (0.4.3).** Leaving
+  RSEQ mode is two steps — stop new sequences, then drain the in-flight ones — and the
+  previous round introduced a transitional `MODE_DRAINING` so a concurrent non-owner drain
+  fences instead of skipping. The transition itself was still written as an unconditional
+  `swap` then `store`: a second thread calling `disable_rseq` while the first was inside
+  `fence_rseq` observed the transitional mode, skipped the fence, and stored `MODE_LOCKED`
+  anyway. `MODE_LOCKED` is precisely the claim "no sequence is in flight and none can
+  start" — the licence a drainer relies on to skip `fence_if_non_owner` — so the second
+  caller advertised a drain that had not happened, restoring the race the transitional mode
+  was added to close.
+
+  The transition is now a `compare_exchange` from `MODE_RSEQ`: only the caller that wins it
+  fences, and only that caller publishes the terminal state. A caller that finds a
+  transition already under way returns without touching the mode, which is sound because
+  `MODE_DRAINING` is itself a correct resting state (no new sequences, drains still fence),
+  so every caller's postcondition — "the fast path is off on return" — holds regardless of
+  which one it was. The general rule: **a state that means "an operation completed" may
+  only be published by the thread that completed it**; adding a transitional state fixes
+  nothing if any passer-by can still skip to the end. Pinned by
+  `a_second_disable_caller_cannot_publish_the_terminal_mode_early`.
+
+* **Two claims that decide the same race have to exclude each other (0.4.3).** A freed
+  object is claimed exactly once, and that claim is what makes `free(p); free(p)` report a
+  double free instead of vending one address twice. W6 made the cached bit the claim for a
+  front-end-cacheable object; W18-3 made the quarantined bit the claim for an object the
+  quarantine holds. A free chooses between them at runtime — and the two did not exclude
+  each other.
+
+  The quarantine must claim *before* offering an entry to the ring (a concurrent offer may
+  evict and drain that very entry the instant it is published), so a **declined** offer
+  found itself holding a claim it no longer wanted, and released it. That release left the
+  object owned by nobody until the caller took its next marker. A second free of the same
+  address entering that window took the quarantine claim itself, was sampled *in*, and
+  returned `Freed` while the first free also returned `Freed` from the cache path: one
+  address resident in a per-CPU slot **and** in the quarantine ring, vended to a caller
+  while a later drain freed it underneath them. The mirror gap ran the other way — once a
+  free handed its claim to the cached bit, that bit was the object's only marker, and the
+  quarantine never consulted it, so it would happily claim an object already sitting in a
+  slot.
+
+  The claim now travels from one residency marker to the next without a gap: a declined
+  offer reports `ClaimHeld` and the caller releases it only after setting the cached bit
+  (cached-bit-first, mirroring the existing free-bit-first handoff, which `insert_batch_inner`
+  already performs for the central route), and the quarantine rejects an object that is
+  already cached exactly as it already rejected one that is already central-free. The large
+  path carried the same window and is closed the same way, except that there the immediate
+  free retires the descriptor — and every (re)acquire resets the flag — so the claim needs
+  releasing only when that free fails. The general rule: **when two mechanisms can each
+  settle the same race, the handoff between them is itself a critical section** — an object
+  that is briefly claimed by neither is an object that can be freed twice. Pinned by
+  `the_quarantine_cannot_claim_an_object_the_front_end_already_holds` and
+  `a_declined_quarantine_offer_hands_its_claim_to_the_front_end`.
+
+* **A lock excludes the locked path, not the lock-free one (0.4.3).** The Appendix-B
+  front-end sweep (`front_end_markers_name_held_objects`, behind
+  `topomalloc_debug_check_now`) walked each per-CPU slot under that CPU's lock and
+  documented its result as approximate under RSEQ traffic — a pop between the entry read
+  and the marker read can report a spurious violation, which is accepted for an on-demand
+  oracle. That framing understated the problem. The slot buffer is **non-atomic**, and an
+  RSEQ sequence that began before the lock byte was published is still running and still
+  writing it: the walk was a data race, i.e. undefined behaviour, not merely an imprecise
+  reading. `CpuCache::check_invariants` had this right already — it calls
+  `fence_if_non_owner` after taking each CPU lock — and the sweep now does the same.
+
+  Note what the accepted-approximation comment did: it named a *weaker* symptom (a
+  spurious report) of the same underlying fact (the lock does not exclude RSEQ), and by
+  answering that one it read as though the fact had been handled. The general rule:
+  **when a comment concedes a limitation, check that the concession covers the worst
+  consequence of it, not the first one you thought of** — "this read may be stale" and
+  "this read is UB" have the same cause and very different fixes.
+
+* **An unenforceable precondition on a safe function is a bug, not documentation
+  (0.4.3).** The §36.10 pinned-core fast path (W7-5, the seLe4n profile) takes no per-CPU
+  lock: its soundness rests entirely on the pinned-thread contract that one thread is the
+  sole accessor of its core's slot. The non-owner fence does not help — it is armed for
+  `MODE_RSEQ`/`MODE_DRAINING` only, because a pinned sequence is ordinary code with no
+  kernel-visible critical section for `membarrier` to abort. All of this was documented on
+  `enable_pinned_core`, including the sentence that a non-owner drain of an active pinned
+  cache "is the caller's responsibility to serialize".
+
+  But `enable_pinned_core` was safe, and so are `flush_front_end_core` /
+  `flush_front_end_all` / `check_invariants`, every one of which reaches `drain_cpu`. Safe
+  code could therefore drive a drain into a running pinned sequence and get a data race on
+  the non-atomic slot buffer — an object lost or double-vended — without writing `unsafe`
+  anywhere. A responsibility a caller cannot discharge through the type system, on an API
+  that never asks them to accept it, is not a contract; it is an unsound signature. Both
+  `enable_pinned_core` and `Allocator::enable_front_end_pinned` are now `unsafe fn` with
+  the obligation spelled out (one pinned thread per core; no drain against an active
+  core), which a seLe4n runtime can genuinely discharge because it owns core assignment. A
+  POSIX embedding that cannot has two safe alternatives that need no such promise: the
+  RSEQ path or the locked baseline. The general rule: **`unsafe` marks where a human
+  promise substitutes for a machine-checked one** — if the promise is real, the keyword
+  belongs in the signature, not only in the prose above it.
+
+* **Two independent claims are not mutual exclusion (0.4.3).** A small free could reach
+  the quarantine and the front-end cache by two routes that each took *their own* claim —
+  the quarantined bit (a test-and-set under the span lock) and the cached bit (lock-free).
+  Because those are different atomics, each route could read the other's marker before it
+  was set and both frees succeed, leaving one address in a per-CPU slot *and* in the
+  quarantine ring: vendable to a caller while a later drain frees it underneath them. The
+  earlier round had made the *quarantine* consult the cached bit, which closed the
+  interleaving it was shown but not the shape: a plain load is not a claim. Toggling the
+  runtime quarantine switch mid-free walks straight through it, because a free that reads
+  "disabled" claims nothing at all and so has nothing to exclude the free arriving a moment
+  later with the switch on.
+
+  The fix is ordering, not more checks: a cacheable free now takes the **shared** cached
+  claim *before* the quarantine is consulted, so the route chosen afterwards cannot change
+  who won. The quarantine runs holding that claim — skipping the cached-bit check (the mark
+  is the caller's own), performing a quarantined-bit-first handoff if it holds the object,
+  and leaving the mark untouched if it declines. A non-cacheable object has no cached bit,
+  so its quarantine mark stays its only claim and that path is unchanged. The general rule:
+  **when two routes can reach one object, they must contend on one atomic, not check each
+  other's** — "A checks B's flag, B checks A's flag" is the classic two-flag failure, and
+  it looks correct in every trace where the checks happen to be ordered.
+
+* **`MODE_LOCKED` is a claim, so only a fence may publish it (0.4.3).** The RSEQ
+  disable transition was made safe against a second *disabler* (only the caller that wins
+  the `MODE_RSEQ → MODE_DRAINING` CAS fences and publishes the terminal state), but not
+  against a concurrent `enable_rseq`, which stored `MODE_RSEQ` unconditionally. That let
+  the fast path be re-armed mid-drain: new sequences start after the fence has already
+  passed their CPU, and the drainer then stores `MODE_LOCKED` — a state whose entire
+  meaning is "no sequence can be in flight" — over them, handing the next non-owner drain
+  the fence-skip the transition exists to prevent.
+
+  Both publishes are now conditional. The owner's terminal store is a CAS from
+  `MODE_DRAINING`, so an enable that re-armed the path simply wins and the mode stays
+  `MODE_RSEQ` (where drains fence again); the disabler then restarts its transition, since
+  its postcondition is not yet met. `enable_rseq`'s failure path no longer raw-stores
+  `MODE_LOCKED` either — it routes through `disable_rseq`, the only code that can establish
+  that claim. The general rule: **a mode value that licenses other threads to skip a
+  safety step is an assertion about the world, and only the operation that makes the
+  assertion true may write it.**
+
+### Two root causes behind five rounds of concurrency findings (0.4.3)
+
+Five consecutive review rounds landed P1 concurrency findings on the same two
+mechanisms, each one a hole in the previous round's fix. Patching interleavings was not
+converging, because in both cases the defect was a piece of state that meant two
+different things and had no single owner. Both are now fixed at that level.
+
+**1. `CpuCache::mode` was a dispatch selector *and* a safety assertion.** `MODE_LOCKED`
+told an operation "take the locked path" — something any thread may assert at any time —
+and simultaneously told a non-owner drain "no restartable sequence is in flight, you may
+skip the W7-4 fence" — something only a thread that has *fenced* may assert. Because
+enable, disable and pinned-mode all wrote the same word, every pair of concurrent writers
+had to be reasoned about separately, and each fix covered one pair while leaving the next:
+a transitional `MODE_DRAINING` (round 5), then serialising two disablers with a
+compare-exchange (round 6), then stopping `enable_rseq` from clobbering the transition
+(round 8), then the observation that leaving *pinned* mode has the same problem and no
+fence can fix it (round 9).
+
+The fence question is not "is the fast path on right now?" but "could a sequence be in
+flight?", and that is answered by a **monotonic latch**: RSEQ has ever been enabled in
+this process. It is set before `mode` can ever become `MODE_RSEQ` and never cleared, so
+`false` *proves* no sequence has ever started. A latch has no writers to order against —
+no interleaving of enable/disable/pinned can make it lie — so `mode` reverts to a pure
+dispatch selector that anyone may write in any order, and `MODE_DRAINING` plus all the
+choreography is deleted. The precision given up is one membarrier per drained CPU in a
+process that enabled RSEQ and later turned it off (a fork child, on a maintenance path);
+RSEQ-on and never-enabled are both unchanged.
+
+The one transition a latch cannot rescue is leaving **pinned** mode, because pinned
+sequences take no lock and `membarrier` has nothing to abort. That is a genuine
+quiescence obligation, so it moved out of the safe `disable_rseq` (which now leaves
+`MODE_PINNED` alone) into an `unsafe fn disable_pinned_core`, matching the already-unsafe
+entry. A fork child inherits pinned mode safely: it has one thread.
+
+The lesson generalises past this file: **a value that licenses other threads to skip a
+safety step is an assertion about the world, not a mode flag, and the two must not share
+a variable.** Where an assertion is monotonic, prefer a latch — it removes the ordering
+question rather than answering it.
+
+**2. The free path claimed a different atomic depending on which route it took.** A freed
+object is in exactly one residency state (live / claimed / cached / quarantined /
+central-free), but those states live in separate bitmaps, so mutual exclusion is whatever
+the code enforces. When the cache route claimed the cached bit and the quarantine route
+claimed the quarantined bit, two frees of one object could each win *their own* atomic
+and both succeed — the address ending up in a per-CPU slot *and* the quarantine ring.
+Making each route *check* the other's marker first (round 6) did not fix it: a load is not
+a claim, and both checks can precede both sets. Round 8 fixed the small path properly by
+ordering — claim first, choose the route afterwards — and round 9 found the identical hole
+on the large path, which was still branching on the quarantine switch while unclaimed.
+
+The rule is now written down on `QuarantineDisposition` rather than re-derived per path:
+**every route that can free an object contends on one atomic, and does so before choosing
+its route.** The corollary is the part that keeps being missed — any predicate read
+*before* the claim (the quarantine switch, cacheability, `TOPO_TCACHE_NONE`) can be seen
+differently by two concurrent frees, and a free that reached its route without claiming
+anything has nothing to exclude the other with. A runtime toggle is the sharpest case
+because it genuinely changes between the two reads, but it is not itself the bug; it only
+makes the two routes concurrently reachable.
+
+Unifying the three bitmaps into one atomic 2-bit residency state per object was
+considered and **not** done. It would make the exclusion structural rather than
+disciplined, but `free_bitmap` is the central free list's allocation structure and not
+merely a marker, so the rewrite is large and touches every allocation path — real
+regression risk for a property the claim rule already establishes. The remaining
+hand-ordered pair (claim vs free bit, ordered free-bit-first) is one pair, which is
+tractable to keep proved; the failure mode was three pairs and growing.
+
+**Round 11: both rules held, but each had an unenforced edge.** A sixth round landed on
+the same two mechanisms — not on the rules themselves, which stood, but on the boundary
+where each stops being enforced by the compiler and starts being enforced by convention.
+
+For the mode/latch rule, `CpuCache::reset_after_fork` clears the latch, and its own doc
+comment says that is sound only because a `fork` child has one thread. That is a
+quiescence obligation identical to `disable_pinned_core`'s, but the function was **safe**
+and publicly re-exported through `Allocator` and `AnyAllocator`, so nothing stopped an
+embedding from calling it mid-flight and dropping the one condition that makes a
+subsequent non-owner access fence. It is now `unsafe` all the way up, with the obligation
+stated once and forwarded. Separately, the reset covered only *this* layer's copy of the
+fork-invalidated state: `topo_arch::rseq`'s process-global mode decision survived, and
+because `rseq::enable` is idempotent the child would short-circuit on the parent's
+decision without re-registering either the membarrier intent (it lives in the mm) or its
+thread's rseq area. Both halves are now dropped together in one call, so neither can be
+reset without the other.
+
+For the claim rule, "claim before choosing the route" governs *acquisition* and said
+nothing about *release*. Three of the `Settled` exits in `maybe_quarantine_small` — all of
+them double-free **detections** — returned while still holding the caller's cached claim,
+stranding the object in two residency sets at once and inflating `cached_count`. Detecting
+a caller's bug corrupted our own accounting. A single `settled` constructor now performs
+the release, so no exit can forget it, and the new Appendix-B checker
+`cached_and_quarantined_are_disjoint` pins the property with a negative test.
+
+The generalisation: **a safety obligation stated only in a doc comment is not enforced,
+and a rule about acquiring a claim is only half a rule.** Where an obligation cannot be
+discharged by the callee, `unsafe` is the mechanism that carries it — reserve safe
+wrappers for the contexts that genuinely discharge it (here, the `pthread_atfork` child
+handler). Where a resource is claimed on entry, make the release structural — one
+constructor, not one per exit — and add the invariant checker that would catch a leak,
+because early-return paths are exactly the ones review keeps missing.
+
+**Round 12: the pattern broke.** A twelfth round produced five findings, and — for the
+first time since round 4 — four of them were in areas the previous rounds had never
+touched: the §20.2 hugepage release budget, `pthread_atfork` registration failure, the
+POSIX provider's ownership check, and the zero-size environment knob. That is the signal
+the two root-cause fixes were meant to produce: review moving on rather than circling.
+
+Three of the four share a shape worth naming, distinct from the earlier two: **a check
+whose result outlives the state it checked.**
+
+* `PosixBackingProvider` validated a region against its live-reservation set, released the
+  lock, and *then* issued the `madvise`/`mprotect`/`mbind`. A concurrent `release` in that
+  window unmaps the range, and if the kernel reuses the address the syscall lands on
+  memory the provider never owned — the exact hole the check was added to close. The lock
+  is now held across the syscall: the check and the use are one critical section.
+* `HugePageBackend::release_tick` sampled the empty-hugepage count, derived a *reserve*
+  from it, and let `release_empty_excess` walk the population as it stood when it ran.
+  Hugepages emptied by concurrent frees after the sample all fell beyond the reserve, so a
+  tick budgeted for one hugepage could decommit many. A reserve computed from a snapshot
+  is not a budget; the call now takes an explicit `max_release` bound.
+* `alloc_small_cached` refilled the core the pop reported, but a migration between that
+  refill and the next iteration's pop left the batch on a core the loop no longer polled —
+  and if the refill had taken the last central batch, the allocation reported OOM with the
+  objects it had just moved sitting one slot away. The loop now remembers where it parked
+  a batch and reclaims it by name (`fe_pop_on_core`) before conceding.
+
+The generalisation: **validating state under a lock and then acting after releasing it is
+not validation, and a bound derived from a sample is not a bound.** Where a check licenses
+an action, the two belong in one critical section; where a budget bounds work, pass the
+budget to the code doing the work rather than pre-computing a target from a snapshot of a
+population that other threads are still changing.
+
+The remaining two were narrower: `pthread_atfork` failing with `ENOMEM` left
+`ATFORK_REGISTERED` permanently set, so the retry path never fired and every later `fork`
+ran without the quiesce handlers (the flag is now released on failure); and
+`TOPOMALLOC_ZERO_SIZE` was read without the `AT_SECURE` check the other `TOPOMALLOC_*`
+knobs get, because the C entry points read it before `global()` and so outside the phase-5
+gate. Both are the same lesson in miniature — a flag that records an intention rather than
+an outcome, and a gate applied to a list rather than to a property.
+
+**Round 13, and a flake of my own making.** The tsan job went red on the round-12 head,
+and the cause was mine: the round-11 test `fork_reset_makes_enable_re_derive_the_mode`
+mutates **process-global** rseq state, and the Rust harness runs tests as parallel threads
+of one process. A sibling that had already checked `current_cpu() >= 0` and pinned to it
+re-read `-1` inside the reset window, cast it to `usize`, and indexed the per-CPU array
+out of bounds.
+
+The comment I wrote on that test asserted its own safety twice, and was wrong both times:
+it claimed the test "runs last" (the harness guarantees no ordering — the log shows it ran
+*first*) and that "a concurrent test observes one or the other and both are correct" (the
+undecided window is exactly what broke the sibling). The fix is the isolation the file
+already had a precedent for — re-exec into a child process, as `self_registration_path_works`
+does — plus bounds-checking the three `current_cpu() as usize` casts, since -1 becoming
+`usize::MAX` is a panic waiting for any cause, not just this one.
+
+The lesson is narrow and worth keeping: **a comment claiming a test is safe against
+concurrency is not a synchronisation mechanism.** Where a test mutates process-global
+state, isolate it in a process or serialise it with a lock. (This bit twice in one sitting
+— a new deterministic-mode test raced the existing seed round-trip the same way, and took
+the same fix, the `SERIAL` mutex convention already used in `tests/tests/deterministic.rs`.)
+
+**Round 13's findings** were four, and one of them is the round-12 shape recurring in the
+adjacent method: `release_hugepage_runs` walks and releases the runs present when *it*
+runs, while the caller charged a `committed` footprint sampled before the lock was dropped.
+A hugepage reused and re-emptied larger in between overshoots the byte budget — the caller's
+`cost > remaining` screen cannot catch it, because it tests the stale number. The cap now
+lives in the walk, where the state actually is. That the same class surfaced twice in
+adjacent code is the useful signal: the fix for a check-then-act window belongs at the
+point of the act, not at the point of the check.
+
+The other three: `fence_if_non_owner` reported a failed W7-4 membarrier only through a
+`debug_assert!`, so a release build proceeded to touch the non-atomic slot buffer with a
+sequence possibly in flight — it is now `#[must_use]` and every one of its eight call sites
+declines (pop → `Empty`, push → `Full`, batch → `0`, checker → skip), which is always safe
+because declining routes to the central path. The post-fork entropy fallback *replaced* the
+inherited CSPRNG-derived seed with an address/clock/PID mixture instead of combining with
+it, downgrading the seed on exactly the seccomp-restricted hosts that reach that path. And
+disabling deterministic mode left the guard and quarantine samplers on their reproducible
+streams, because `apply_deterministic_seed` is a no-op while the mode is off — the disable
+transition now reseeds from process entropy.
+
+**The re-exec fix, and taking a pattern without its guard.** Isolating the fork-reset test
+in a child process was right on x86-64 and broke the aarch64 job outright: the
+cross-target tests run under qemu binfmt emulation, where re-exec'ing the test binary needs
+an aarch64 dynamic loader the runner does not have (`Could not open
+'/lib/ld-linux-aarch64.so.1'`), so the child could never start and the parent's
+`assert!(status.success())` failed every run.
+
+The precedent I copied — `self_registration_path_works` — is gated
+`#[cfg(target_arch = "x86_64")]` for exactly this reason, and says so in its comment
+("gated to x86-64 native, where re-exec is reliable"). I took the mechanism and left the
+guard behind. That is the more general trap: **when copying an established pattern, copy
+its preconditions too** — the `cfg` gate on that test is not incidental tidiness, it is
+half of what makes the pattern work in this repo.
+
+Gating the fork-reset test the same way costs nothing real: `reset_after_fork` is a plain
+atomic store over process-global mode state, with no assembly and no per-arch path, so one
+architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
+are the part that matters on every target, and those are unconditional.
+
+### Round-18 review: OOM is a claim about everywhere (0.4.3)
+
+One finding, and it is the mirror of round 14's: that round was about objects stranded in a
+per-CPU *slot* nothing would look in, this one about objects stranded in the *transfer
+cache* — one layer down, same consequence.
+
+**The last resort before OOM must have looked everywhere.** `alloc_small`'s fallback
+searched central twice — the requested placement class, then `ANY_PLACE_CLASS` — and then
+returned null. But `cache_ops::refill` *removes a batch from central* and, when the
+per-CPU `push_batch` declines, returns the remainder to the transfer cache rather than
+dropping it (correctly — dropping would leak, §16.4). So an exhausted backend reported OOM
+with reusable objects sitting one layer below the only place it looked.
+
+Two routes reach it, and only the second needs anything exotic:
+
+* A **front-end-bypassing** request (`TOPO_TCACHE_NONE` §10.3, or the §30.4
+  force-slow-path) skips `alloc_small_cached` entirely, so nothing consults the transfer
+  cache on its behalf — no migration, no fence failure, no race.
+* A refill whose `push_batch` is declined because the W7-4 non-owner fence cannot be
+  issued. A thread that migrated after `fe_pop_tracked` and whose seccomp policy denies
+  `membarrier` hits this on every iteration, so the bounded eight-iteration loop gives up
+  having moved up to eight batches from central into the transfer cache.
+
+`alloc_small_from_transfer` is now the step after `ANY_PLACE_CLASS`. Placing it *there*
+matters: it is the one point where the answer would otherwise be null, so no route —
+bypass flag, placement tag, fence failure — can skip it. **A flag or a policy may cost a
+request its preference; it must never cost it its allocation (§2.4).**
+
+**One boundary is not policy.** `TransferCache::try_pop_batch` *ignores its arena
+argument* — the bins are keyed by size class alone — and that is sound only because
+`front_end_cacheable` gates every entry point, so a bin holds default-arena objects and
+nothing else. A new consumer has to re-apply that gate or it hands one arena's memory to
+another (§22.7 isolation, §36.4 quota exactness). Placement class is conceded at this
+point; the arena is not. **When a data structure drops a key because its writers all agree
+on the value, every future reader inherits the obligation to check it.**
+
+**What it deliberately does not reach:** objects in *other cores'* per-CPU slots. No
+allocation path can drain those safely — the non-owner fence is precisely what has failed
+in the second route, and in §36.10 pinned mode draining a core this thread does not own is
+undefined behaviour outright. The running core's own slot is already drained by
+`alloc_small_cached` on every non-bypassing request. That limit is stated in the doc
+comment rather than left to be discovered.
+
+*On verification.* Both fixes were neutered individually. The OOM test drives the bypass
+route (the one an in-process test can reach) and fails without the fix with 8 KiB still
+resident in the transfer cache; the fence-failure route strands objects in the same place
+by the same call, so the test covers the mechanism for both but does not reproduce that
+trigger — a `membarrier` refusal needs a seccomp policy no in-process test can install,
+the same limit noted for the round-16 flush-accounting test. The arena-gate test pins the
+mechanism directly rather than through a starved explicit arena: an explicit arena holds
+its own reservation, so driving it to this last resort would need a second fault-injection
+seam that exists nowhere else.
+
+### Round-17 review: a hint mistaken for an answer (0.4.3)
+
+Three findings, and the two that matter share a shape: a value that was only ever a *hint*
+was used as though it named reality.
+
+**1. An operation that overrides its caller's hint must report what it actually did.**
+`fe_push`'s `core` argument is a hint on both fast paths — RSEQ uses the hardware CPU,
+pinned mode uses the §36.10 oracle — and `free_small_cached` keyed its overflow flush on
+the hint instead. In a no-RSEQ pinned deployment the hint comes from `current_core()`,
+which consults neither oracle, so a worker pinned to core B whose slot filled up flushed
+core *0*: the wrong slot (so the retry failed and the object fell to central for nothing)
+and, far worse, a core this thread does not own — whose pinned worker takes no per-CPU
+lock and cannot be fenced, so the drain raced its non-atomic slot buffer. The pop side had
+already been fixed to report the core it served, twice (rounds 12 and 15), each time for
+this exact failure mode; nobody looked across at the push. `fe_push_tracked` now reports
+it, as `fe_pop_tracked` does. **A follow-up action keyed to a hint the callee is free to
+ignore is a latent bug; when one operation learns to report its real target, check its
+mirror image the same day.**
+
+**2. Honour the contract you ask your callers to uphold.** `enable_pinned_core` is `unsafe`
+because only a core's own pinned worker may touch its slot. Yet in pinned mode both
+`fe_push` and `fe_pop` fell back to a *locked* access keyed on the caller's spreading key
+whenever the oracle could not name a core — the allocator itself doing the thing it demands
+its embedder never do, and reachable in precisely the states where guessing is least
+defensible (the oracle unable to answer, or the thread migrating). They now decline and the
+caller serves from central (§2.4); the lazy slot init that the locked path might have been
+covering for lives inside the pinned sequences already. Round 16's rule was "when adding a
+call to a safe function, check what the callee's callers were promised". **This is the same
+rule pointed inward: check that you are not the one breaking it.**
+
+**3. Defer applying a secret, never acquiring it.** The fork child skipped
+`reseed_after_fork` entirely under deterministic mode, on the reasoning that injecting
+fork-distinct entropy into a reproducible run would break the replay guarantee. True of the
+live samplers — and false of the *stored* `process_entropy`, which is not a stream but the
+per-process secret later re-seeds draw from, and which nothing reads while deterministic
+mode is on. So parent and child held the same value, and the moment both disabled
+deterministic mode — the path whose entire purpose is restoring §29.4/§29.5
+unpredictability — they re-derived the guard coin, the quarantine evictor and the heap
+sampler from one identical secret. The refresh is now unconditional and only the
+application is gated. **A deferral that also skips acquisition converts a temporary
+suspension into a leak at the moment it is lifted.**
+
+**4. Returning early is not the same as not re-entering.** Round 16 marked the thread
+inside `pthread_atfork` so a re-entrant call would not wait for itself. That fixed the
+deadlock and left the consequence: the nested `global()` returned from the registration and
+then walked on into `GLOBAL.get_or_init`, building the entire allocator with no fork
+handlers installed — the #4 hazard the eager `.init_array` ctor exists to close, reached
+whenever that ctor was elided. The registration now runs inside the existing bootstrap
+window, so the allocation is served by the system allocator and `global()` is not called at
+all. **Where a re-entrant call would take a forbidden action, remove the re-entry rather
+than make it return politely.** (The `REGISTERING` marker stays: returning at once is still
+the only safe answer for a claimant that arrives by a route the window does not cover.)
+
+*On verification.* Each fix was neutered **individually** and its test re-run — separately,
+not as a batch, which is what caught a vacuous test last round. The pinned-report test fails
+when the push reports the hint; the pinned-decline test fails when the locked fallback is
+restored; the entropy test fails with the refresh back inside the deterministic guard; the
+bootstrap-window test fails when the installer runs outside it. `BootstrapGuard` was also
+changed to **restore** rather than clear the flag, so an inner window cannot end an outer
+one early — that one is defensive (nothing nests the two windows today) and its test says
+so rather than claiming a reproduced defect.
+
+### Round-16 review: a claim, a ceiling, and two contracts (0.4.3)
+
+Two of this round's four findings landed on the round-15 fix itself — the drain added to
+`cache_budget_tick` — which is worth stating plainly: adding a mechanism to a *safe*
+method inherits every obligation that mechanism carries.
+
+**1. A safe function may not perform an operation an `unsafe` contract excluded.**
+`enable_front_end_pinned` is `unsafe` precisely because pinned sequences take no per-CPU
+lock and no fence can drain one; its caller promises no drain runs against an active
+pinned core, and the contract *enumerates* the drains: `flush_front_end_core`,
+`flush_front_end_all`, `check_invariants`. Round 15 put `flush_front_end_all` inside
+`cache_budget_tick`, which is safe and periodic — so a host that had correctly discharged
+the pinned obligation could now have its slot buffers raced by a call the contract never
+named. The tick declines in pinned mode. The general rule: **when adding a call to a safe
+function, check what the callee's callers were promised — an enumerated precondition list
+is a liability that travels with the mechanism, not with the call site.**
+
+**2. Enforce the quantity you advertise.** The §11.5 budget is a ceiling on front-end
+*residency*, but adaptation shrinks *capacity*, which bounds residency only prospectively
+— a lowered cap refuses future pushes and evicts nothing — and the transfer cache's
+residency is not in the capacity total at all. Round 15's drain therefore triggered on
+`total > budget`, which fires only in the structural case (the floor exceeding the
+ceiling) and misses the ordinary one: lower the allowance, let the workload go idle, and
+residency sits above the ceiling forever with capacity comfortably under it. Trigger on
+the measured quantity.
+
+**3. A pre-check is advisory; only a check under the claim is exact.** `try_mark_cached`
+documents that the caller must first establish "not central-free, not quarantined", and
+`free_with`'s screen does — before the claim, with nothing held in between. The
+interleaving that defeats it is not two simultaneous frees (the claim settles those) but a
+**handoff**: the winner's central insert *releases* the claim as part of the `cached →
+central-free` transition, so a second free that passed the screen earlier and stalled finds
+a clear bit and takes it legitimately, then parks in a per-CPU slot an address the central
+free list already holds. The state a screen reads is only stable once the claim is held, so
+the check belongs after it. Making it exact needed the claim itself to acquire
+(`CachedBits::set` was relaxed): both handoffs publish their replacement marker before
+releasing this one, and only an acquiring claim is guaranteed to see it. **Where a claim can
+be re-taken across a handoff, re-establish its preconditions under the claim, and give the
+claim the ordering that makes the re-check meaningful.**
+
+**4. Not blocking is right for the holder and wrong for everyone else.** The atfork guard
+let *any* thread that found an attempt in flight return immediately. That is mandatory for
+the registering thread — `pthread_atfork` can allocate and re-enter, and waiting there is
+waiting for itself — but for another thread it means proceeding into `GLOBAL.get_or_init`
+with no handlers installed, which is the exact window the eager registration exists to
+close. A thread-local marks the holder; everyone else waits. **"Don't block" derived from a
+re-entrancy argument applies only to the re-entrant caller — identify it rather than
+extending the exemption to all observers.** The wait ends on either terminal state, not on
+success, so a repeatedly failing attempt cannot park a caller forever.
+
+### Round-15 review: the cost of a mapping the count no longer bounds (0.4.3)
+
+Round 14 made the no-RSEQ fallback slot mapping independent of the published CPU count.
+That was right, and two of this round's three findings are the bill for it: the count had
+been doing load-bearing work elsewhere that nothing took over. Recorded together because
+the rule is one rule.
+
+**1. Changing where a lookup points obliges you to move what the old pointer reached.**
+`Allocator::reset_front_end_after_fork` drops the RSEQ registration decision, which is
+correct and necessary — neither `membarrier`'s registration of intent nor the rseq area
+survives `fork`. But it also makes `rseq::current_cpu()` stop answering, so
+`CpuCache::current_core` switches from CPU-id keying to `fallback_core`: the child's single
+thread reaches **one** slot, while the parent's residency sits in as many CPU-indexed slots
+as its threads ran on. Same orphaning shape as finding 1 of round 14, reached by a
+different route — and the sibling `disable_front_end_rseq` is *not* affected, precisely
+because it leaves the registration decision (and so the keying) intact. Its doc comment
+saying cached objects "stay reachable through the locked path" was true of itself and had
+been read as covering both.
+
+The fix is the drain that round 14 rejected at the publication point — and the reason it is
+right here is exactly the reason it was wrong there. A drain only closes the window if no
+one can push into the old mapping afterwards; at the publication point threads are running,
+so it merely narrowed it. `reset_after_fork`'s safety contract *is* a quiesced,
+single-threaded child, so here the drain is complete by construction. **Quiescence is what
+makes a drain a fix rather than a mitigation** — check for it before reaching for one.
+
+**2. A floor that cannot reach the ceiling is not enforcement.** `CacheBudget::adapt`'s
+phase 2 shrank each slot to one batch and stopped. That is the right floor while the
+ceiling is reachable, and unreachable is now ordinary: slots are keyed over the whole
+`MAX_CPUS` array while the allowance is sized from the online CPU count, so more allocator
+threads than CPUs initialize more slots than it was sized for. Past `slots × batch` the
+loop exited over budget with no progress left and no signal but its return value. Narrowing
+the mapping back to the count is not available — that is finding 1 of round 14 again — so
+enforcement gets a second tier down to the structural minimum of one object (`>= 1` is a
+B.2 invariant, which is why the floor is one and not zero), and the engine tick converts a
+residual overage into the §21.3 drain-caches rung, the only mechanism that returns
+residency rather than merely capping future pushes. A squeezed slot grows back through
+phase 1 as soon as its miss counter asks.
+
+**3. Report what happened, not what was asked for.** `flush_front_end_all` returned the
+residency measured *before* the drain. `drain_cpu` declines a core whose in-flight
+sequences it cannot fence (a caller denied `membarrier` by seccomp), so the figure could
+credit a §21.3 pressure controller with memory still cached — it then treats an ineffective
+rung as successful and skips a harsher one it needed. The opening count was chosen to avoid
+double-counting an object that leaves both layers, which is a real hazard; the residency
+*delta* avoids it too and reflects every decline. **A conservation argument justifies a
+derived figure only while every step succeeds; measure the delta instead.**
+
+### Round-14 review: four defects, four missing rules (0.4.3)
+
+Each finding this round was a *rule* that had been stated somewhere in the tree and not
+applied somewhere else. The fixes are at that level rather than at the reported site.
+
+**1. A population count is not an index bound.** `CpuCache::current_core`'s no-RSEQ
+fallback keyed its slot as `thread_key % active_cpus`, so publishing the host's CPU count
+— or later publishing a smaller one — re-mapped every thread into `0..cpus`. Everything
+the previous mapping had cached at a higher index became unreachable to ordinary
+allocation, and those objects had been *removed from central* to get there, so on an
+exhausted backend the allocator returns null with reusable objects parked in slots nothing
+will look at. `CacheBudget::adapt` already turns on exactly this distinction, in a comment
+written for the same array: `active_cpus` counts online CPUs while a slot is keyed by the
+CPU *id* `rseq::current_cpu()` reports, and Linux does not promise those are dense.
+
+Draining the excluded slots at the publication point — the obvious local fix, and the one
+the finding suggested first — only narrows the window: a thread that sampled the old
+mapping can push after the drain, and the count can shrink again. Making the mapping
+*independent* of the count closes it, and costs nothing (the `[PerCpu; MAX_CPUS]` array is
+carved whole either way, and residency is bounded by the global budget, which is still
+sized from the count). The mapping is now an associated function with no `&self`, so it
+cannot read allocator state even by accident — the signature is the invariant.
+
+**2. A self-consuming step beats bookkeeping about a step already taken.** A front-end
+refill *moves* objects: central loses a batch, the target slot gains it. The allocation
+loop refilled the core its pop reported and then looped back to a running-CPU pop,
+carrying the last refilled core forward to a single recovery probe at the OOM point.
+Across two migrations (A → B → C) that forgets A the moment B is refilled, so a concurrent
+consumer draining B turns an exhausted backend into a spurious OOM with a full batch still
+on A. Round 12 fixed the one-migration case by *adding* the parked-core probe; the general
+case is not one more probe but the removal of the bookkeeping: consume each refill in the
+iteration that performed it, from the slot it targeted. No iteration can then end with a
+batch this loop created in a slot the loop will not revisit, whatever the migration
+pattern. **A repair that has to remember what an earlier iteration did is a hint that the
+earlier iteration should have finished its own work.**
+
+**3. "Approximate" is a property of the value, not of the word it lives in.** The guard
+sampler and the quarantine evictor drew from an `AtomicU64` with a relaxed
+load-compute-store, justified — correctly, for sampling — by "a lost update merely re-uses
+a value". But `set_seed` writes that same word, and a draw that loaded the old state can
+land its successor *after* a reseed, putting the stream back on the one the reseed just
+moved it off. That is a security property, not a statistical one: it is how disabling
+deterministic mode re-arms §29.4/§29.5 unpredictability and how a fork moves the child off
+the parent's stream. Both draws are now CAS loops, so a draw that races a reseed re-reads
+it. **Tolerance for lost updates belongs to a reader that only samples the word; it does
+not extend to a word an exact publisher also writes.**
+
+**4. A one-shot guard must record that the effect happened, and its retry must have a
+caller.** `pthread_atfork` registration used one `AtomicBool`, claimed *before* the call
+(claiming rather than blocking is what keeps a re-entrant `pthread_atfork` from
+dead-locking on a `Once`). The same bit therefore meant both "an attempt is in flight" and
+"the handlers are installed", so during the window before a failing store a concurrent
+thread read a registration that never happened. Releasing the flag on failure did not
+repair it either: the retry needs a *later* caller, and once `GLOBAL` is initialized
+`global()` answers from its fast path and no later caller exists — so one transient
+`ENOMEM` (the documented failure when the handler list cannot grow) cost the process its
+fork safety permanently. Three states separate the claim from the outcome, and `global()`'s
+fast path retries on the "installed" predicate — one relaxed load, taken once. **Two
+questions, two states; and a released claim is not a retry until something reaches the
+code that retries.**
+
+*On regression tests.* The refill fix is the one case here with no single-threaded
+witness: both loop shapes pop from the slot they just filled when no migration occurs, so
+no deterministic test can separate them. Its test pins the mechanism instead (a
+core-addressed pop reaches its slot regardless of the running CPU; the running-CPU pop
+cannot see it) and says so, rather than dressing a structural change as a behavioural
+regression test. The other three were verified by neutering the fix and re-running: the
+slot-mapping test fails on the pre-fix modulus, the RNG test reports ~58% of 160 000 draws
+lost across repeated runs, and the guard test's assertions each fail on a two-state flag.
+The atfork test drives a *private* guard instance rather than the process-global one —
+every allocating test now consults that global through `global()`'s fast path, so a test
+that swapped its state would race real registration attempts.

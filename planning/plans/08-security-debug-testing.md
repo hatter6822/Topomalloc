@@ -137,10 +137,12 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > by `CentralCache::verify_free_patterns`, called from the engine oracle) checks that,
 > under `junk-fill`, every central-free object still reads as `FREE_PATTERN` (§29.6) —
 > the on-demand companion to W18 verify-on-reuse (large objects carry the W18 per-extent
-> canary). **B.2 cache** — `CpuCache`, `TransferCache`
-> (object distinctness + non-null, the safety-critical double-free witness), and
-> `ThreadCache` `check_invariants`, plus the `debug::check_b2_cache` group callable and
-> flush/refill count-preservation assertions at the `cache_ops` transition sites.
+> canary). **B.2 cache** — `CpuCache` and `TransferCache` `check_invariants` (object
+> distinctness + non-null, the safety-critical double-free witness) and, since W6 wired the
+> front end, `SpanDescriptor::cached_and_central_free_are_disjoint` (the residency clause
+> the lock-free double-free oracle rests on), plus the `debug::check_b2_cache` group
+> callable and flush/refill count-preservation assertions at the `cache_ops` transition
+> sites.
 > **B.4 hugepage** was already comprehensive (H-001..H-005); **B.5 arena** gained the
 > stale-reuse generation guard (a non-`Destroyed` arena carries a nonzero incarnation
 > generation) and the high-water bound. Each checker has positive **and** negative
@@ -189,10 +191,10 @@ plan (this is the verification apparatus that makes their "Exit" provable). **Mi
 > `topomalloc_debug_check_now()` / `topomalloc_debug_checks_enabled()` surface (the
 > `topo.debug.check_now` the conventions referenced but had not implemented), kept off the
 > hot path per DD-2 failure-mode F1. Every checker gained a **negative test** (central
-> accounting-drift + span-count miscount, per-CPU over-capacity + duplicate, thread
-> duplicate, arena stale-generation reuse). **B.2 distinctness** extended to the per-CPU
-> and thread caches (a duplicate is a double-free, caught at the cache with exact slot
-> context). **B.5** gained the **hook-install referential check** (a live hooked backend's
+> accounting-drift + span-count miscount, per-CPU over-capacity + duplicate, transfer
+> duplicate + null, cached↔central-free overlap, arena stale-generation reuse).
+> **B.2 distinctness** extended to the per-CPU and transfer caches (a duplicate is a
+> double-free, caught at the cache with exact slot context). **B.5** gained the **hook-install referential check** (a live hooked backend's
 > owning arena is registered and still names its slot — the install-order witness with the
 > per-backend extent-tiling walk). **W19-2** gained a load-bearing **asm-disable regression
 > test** (`topo_arch::asm_disabled_for_sanitizer()`, asserted under the ASan/MSan core-lib
