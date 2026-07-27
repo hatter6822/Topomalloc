@@ -389,12 +389,19 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
     if aarch64_verb == "check" {
         r.note("AArch64: no cross-linker locally — verifying compilation with `cargo check` (CI links + runs under QEMU)");
     }
+    // `--all-targets` so **test** code is compiled for AArch64 too, not just the library.
+    // Without it a portability bug confined to a test — the canonical one being a
+    // hard-coded `i8` where `c_char` belongs, since `c_char` is `i8` on x86-64 and `u8` on
+    // AArch64 — compiles locally and fails only in the remote AArch64 *test* job, which is
+    // the one gate a developer cannot run. The local gate should catch what the remote one
+    // catches; `check` does not link, so this stays cheap on a box with no cross-linker.
     r.run(
-        "build AArch64 (debug)",
+        "build AArch64 (debug, all targets)",
         "cargo",
         &[
             aarch64_verb,
             "--workspace",
+            "--all-targets",
             "--target",
             "aarch64-unknown-linux-gnu",
         ],

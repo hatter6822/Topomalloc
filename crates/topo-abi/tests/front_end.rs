@@ -17,7 +17,7 @@
 
 use std::sync::Mutex;
 
-use std::ffi::CStr;
+use std::ffi::{c_char, CStr};
 
 use topo_abi::{
     topo_dallocx, topo_mallocx, topo_sdallocx, topomalloc_cache_budget_tick,
@@ -285,13 +285,17 @@ fn by_cpu_detail_reconciles_with_the_front_end_total() {
     quiesce(&g);
 
     let json = |flags: u64| -> String {
-        let mut buf = vec![0i8; 64 * 1024];
-        // SAFETY: `buf` is a valid writable buffer of `len` bytes; the renderer
-        // NUL-terminates within it.
-        let n = unsafe { topomalloc_stats_json(buf.as_mut_ptr(), buf.len(), flags) };
+        // `Vec<u8>` + an explicit `c_char` cast, never `vec![0i8; _]`: `c_char` is `i8` on
+        // x86-64 but **`u8` on AArch64**, so a hard-coded `i8` buffer compiles on one
+        // supported target and not the other.
+        let mut buf = vec![0u8; 64 * 1024];
+        // SAFETY: `buf` is a valid writable buffer of `buf.len()` bytes; the renderer
+        // writes at most that many and NUL-terminates within it.
+        let n =
+            unsafe { topomalloc_stats_json(buf.as_mut_ptr().cast::<c_char>(), buf.len(), flags) };
         assert!(n > 0, "the renderer must produce output");
-        // SAFETY: the renderer wrote a NUL-terminated string into `buf`.
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
+        CStr::from_bytes_until_nul(&buf)
+            .expect("the renderer NUL-terminates within the buffer")
             .to_string_lossy()
             .into_owned()
     };

@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard};
 
 use topo_abi::{
     topo_align_lg, topo_dallocx, topo_mallocx, topo_nallocx, topo_rallocx, topo_sdallocx,
@@ -17,6 +18,25 @@ use topo_abi::{
     topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
     topomalloc_realloc, topomalloc_reallocarray, TOPO_ZERO,
 };
+
+/// Serializes the tests whose assertions depend on the **extent pool's** state.
+///
+/// These run in parallel against one process-wide engine, and a medium/large in-place
+/// resize asserts that the tail it *just* returned is still the adjacent free extent when
+/// it grows back (§25.2's extent-merge grow). Any sibling that allocates a medium block in
+/// that window can take it, and the grow then correctly reports "could not grow in place"
+/// — a real outcome, wrongly read as a failure. Two tests here allocate exactly 200,000
+/// bytes and shrink, so they compete for the same extents directly.
+///
+/// The lock is taken by every test that *depends on* extent adjacency **and** by every
+/// test that can *perturb* it (any medium/large allocator), because a guard only one side
+/// honours is not a guard. Poison-tolerant: a panicking test must not wedge the rest.
+static EXTENT_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Take [`EXTENT_SERIAL`], tolerating a previous test's panic.
+fn extent_serial() -> MutexGuard<'static, ()> {
+    EXTENT_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Test wrappers: every pointer the tests pass here is test-owned (or a
 /// never-owned probe the entry points are specified to reject) — exactly the
@@ -51,6 +71,7 @@ const EINVAL: i32 = 22;
 
 #[test]
 fn malloc_free_recycles_across_the_full_size_spectrum() {
+    let _serial = extent_serial();
     let mut seen = BTreeSet::new();
     let sizes = [1usize, 7, 16, 24, 100, 4096, 32 * 1024, 100_000, 3 << 20];
     let mut live = Vec::new();
@@ -163,6 +184,7 @@ fn posix_memalign_and_memalign_contracts() {
 
 #[test]
 fn realloc_full_contract_through_the_abi() {
+    let _serial = extent_serial();
     // NULL → malloc.
     let p = realloc(ptr::null_mut(), 40);
     assert!(!p.is_null());
@@ -216,6 +238,7 @@ fn realloc_full_contract_through_the_abi() {
 /// the allocation whole and is covered by the engine tests.
 #[test]
 fn realloc_medium_shrink_returns_the_tail_through_the_abi() {
+    let _serial = extent_serial();
     let p = topomalloc_malloc(200_000); // medium (> SMALL_MAX, < HUGE_THRESHOLD)
     assert!(!p.is_null());
     let big = topomalloc_malloc_usable_size(p);
@@ -257,6 +280,7 @@ fn realloc_medium_shrink_returns_the_tail_through_the_abi() {
 /// path keeps the size and is covered by the engine tests.)
 #[test]
 fn xallocx_resizes_a_large_allocation_in_place() {
+    let _serial = extent_serial();
     let p = topo_mallocx(200_000, 0); // medium (> SMALL_MAX, < HUGE_THRESHOLD)
     assert!(!p.is_null());
     let big = topomalloc_malloc_usable_size(p);
@@ -440,6 +464,7 @@ fn cross_entry_points_share_one_heap() {
 
 #[test]
 fn concurrent_c_abi_use_is_safe_and_conserving() {
+    let _serial = extent_serial();
     let threads: Vec<_> = (0..4)
         .map(|t| {
             std::thread::spawn(move || {
