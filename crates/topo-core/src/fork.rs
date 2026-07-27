@@ -919,17 +919,29 @@ mod tests {
         probe_and_set_sharding();
 
         // Concurrent threads must not all land on shard 0.
+        //
+        // Asserted on the **key** path specifically, which is the one this test is named
+        // for. `shard_index` prefers a real `rseq::current_cpu()` when one is available,
+        // and RSEQ registration is process-global — another test in this binary enabling
+        // it flips this thread onto the CPU path, where 8 short-lived threads on a small
+        // host can genuinely share a core and legitimately collide. Reading the key
+        // directly keeps the regression this test exists for (the probe must succeed, and
+        // the key must spread, with no CPU id in the picture) without depending on
+        // global state no test here controls.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let seen = seen.clone();
                 std::thread::spawn(move || {
-                    let idx = shard_index();
-                    assert!(idx < NUM_SHARDS, "shard index in range");
+                    let key = shard::thread_key().expect("a hosted build has a key");
+                    let idx = key & (NUM_SHARDS - 1);
                     seen.lock().unwrap().insert(idx);
-                    // The key is stable within a thread, so a guard always unwinds the
-                    // shard it incremented.
-                    assert_eq!(idx, shard_index(), "the per-thread key is stable");
+                    // And the composed index is in range and stable within a thread, so a
+                    // guard always unwinds the shard it incremented — whichever path it
+                    // took to get there.
+                    let composed = shard_index();
+                    assert!(composed < NUM_SHARDS, "shard index in range");
+                    assert_eq!(composed, shard_index(), "the per-thread index is stable");
                 })
             })
             .collect();

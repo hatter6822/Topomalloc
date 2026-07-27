@@ -597,9 +597,28 @@ impl CpuCache {
             // stores; a drainer's acquire load of the latch therefore cannot observe
             // `false` after any sequence has begun.
             self.rseq_ever_enabled.store(true, Ordering::Release);
-            self.mode.store(MODE_RSEQ, Ordering::Release);
-        } else {
-            self.mode.store(MODE_LOCKED, Ordering::Release);
+        }
+        let target = if ok { MODE_RSEQ } else { MODE_LOCKED };
+        // **Never transition out of `MODE_PINNED` here.** Leaving pinned mode is the one
+        // change that needs the §36.10 quiescence obligation — pinned sequences take no
+        // per-CPU lock, so publishing any other mode under a running one lets the next
+        // operation touch that slot concurrently, and no fence can drain it. That is why
+        // it lives in the `unsafe` [`disable_pinned_core`](Self::disable_pinned_core); a
+        // safe method must not do it by the back door, and `disable_rseq` already
+        // doesn't. Enabling RSEQ on a pinned cache therefore declines and reports the
+        // fast path as not-enabled, which is the truth: pinned is still the active path.
+        loop {
+            let cur = self.mode.load(Ordering::Acquire);
+            if cur == MODE_PINNED {
+                return false;
+            }
+            if self
+                .mode
+                .compare_exchange_weak(cur, target, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
         ok
     }
@@ -688,6 +707,28 @@ impl CpuCache {
             Ordering::Release,
             Ordering::Relaxed,
         );
+    }
+
+    /// Reset the front end for a freshly forked **child** (§28.1): locked baseline, and
+    /// the "RSEQ has ever run" latch cleared.
+    ///
+    /// Clearing the latch is sound here for a reason that holds nowhere else: `fork`
+    /// creates a process with exactly one thread, so no restartable sequence from the
+    /// parent can be in flight in the child — the fact the latch records is *provably*
+    /// false again, rather than merely believed to be.
+    ///
+    /// It is also necessary, not just permitted. `fence_rseq` is
+    /// `membarrier(PRIVATE_EXPEDITED_RSEQ)`, and membarrier's registration of intent
+    /// lives in the mm and is **not inherited across `fork`** — the child's mm starts
+    /// unregistered, so the call fails with `EPERM`. A child that inherited the latch as
+    /// `true` would therefore fence on every non-owner drain and fail every time, which
+    /// the W7-4 `debug_assert` in the non-owner fence
+    /// correctly reports as a kernel anomaly — it just is not one here. Re-enabling RSEQ
+    /// in the child re-registers the intent and re-arms the latch together, so the two
+    /// can never drift apart.
+    pub fn reset_after_fork(&self) {
+        self.mode.store(MODE_LOCKED, Ordering::Release);
+        self.rseq_ever_enabled.store(false, Ordering::Release);
     }
 
     /// Leave the seLe4n pinned-thread fast path for the locked baseline (§36.10), the
@@ -1621,6 +1662,49 @@ mod tests {
             cc.per_cpu(core).unwrap().slot(sc).unwrap().len(),
             SEEDED as u32
         );
+    }
+
+    /// §36.10: **no safe method may take the cache out of pinned mode.**
+    ///
+    /// Pinned sequences take no per-CPU lock, so publishing any other mode while one is
+    /// running lets the next operation touch that slot concurrently — and unlike the RSEQ
+    /// path there is no fence that can drain it, because a pinned sequence is ordinary
+    /// code with no kernel-visible critical section. That makes leaving pinned mode a
+    /// quiescence obligation, which is why it lives in the `unsafe`
+    /// [`disable_pinned_core`](CpuCache::disable_pinned_core).
+    ///
+    /// The obligation is only worth anything if *every* safe route respects it. It was
+    /// established for `disable_rseq` first and `enable_rseq` still wrote the mode
+    /// unconditionally, so a safe `enable_rseq` could do exactly what the unsafe method
+    /// exists to gate. Both are pinned here so the next one cannot regress alone.
+    #[test]
+    fn no_safe_transition_leaves_pinned_mode() {
+        let cc = CpuCache::new();
+        // SAFETY: §36.10 — test-local cache, single-threaded, never drained concurrently.
+        unsafe { cc.enable_pinned_core(|| 0) };
+        assert!(cc.pinned_mode());
+
+        cc.disable_rseq();
+        assert!(
+            cc.pinned_mode(),
+            "disable_rseq must leave pinned mode alone — it is not RSEQ's to end"
+        );
+
+        let enabled = cc.enable_rseq();
+        assert!(
+            cc.pinned_mode(),
+            "enable_rseq must not take the cache out of pinned mode either"
+        );
+        assert!(
+            !enabled,
+            "and it must report the RSEQ fast path as not enabled, which is the truth"
+        );
+        assert!(!cc.rseq_mode());
+
+        // Only the unsafe, quiesced transition ends it.
+        // SAFETY: nothing is in flight — no pinned operation has ever run on this cache.
+        unsafe { cc.disable_pinned_core() };
+        assert!(!cc.pinned_mode());
     }
 
     /// W7-4, the invariant the fence exists for: **once a restartable sequence could have

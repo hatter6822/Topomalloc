@@ -403,6 +403,13 @@ impl AnyAllocator {
         dispatch!(self, a => a.disable_front_end_rseq())
     }
 
+    /// Reset the front end in a freshly forked child (§28.1): locked baseline **and**
+    /// forget that RSEQ ever ran, since membarrier's registration does not survive
+    /// `fork` and a single-threaded child has no sequence left to fence against.
+    pub fn reset_front_end_after_fork(&self) {
+        dispatch!(self, a => a.reset_front_end_after_fork())
+    }
+
     /// Whether the W7 RSEQ fast path is active.
     pub fn front_end_rseq_active(&self) -> bool {
         dispatch!(self, a => a.front_end_rseq_active())

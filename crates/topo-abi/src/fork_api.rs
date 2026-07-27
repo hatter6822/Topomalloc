@@ -65,14 +65,26 @@ extern "C" fn atfork_parent() {
 extern "C" fn atfork_child() {
     topo_core::fork::postfork_child();
     if let Some(eng) = crate::global_if_init() {
-        eng.disable_front_end_rseq();
+        // Not just "disable": the child must also *forget* that RSEQ ever ran, because
+        // membarrier's registration of intent does not survive `fork` and a child that
+        // still thought it owed a non-owner fence could not issue one. Sound because a
+        // single-threaded child has no in-flight sequence to drain.
+        eng.reset_front_end_after_fork();
         // §29.5: the child inherited the parent's guard-page coin and quarantine-evictor
         // PRNG state byte for byte, so without a re-seed the two processes make the *same*
         // hardening choices for the same allocation sequence — and one of them is
         // observable to whoever can run it. Fresh, fork-distinct entropy, then re-derive
         // the sampler streams from it.
-        crate::entropy::reseed_after_fork();
-        eng.seed_security_samplers();
+        //
+        // **Except in deterministic mode (§30.4)**, whose whole contract is that every
+        // randomized decision derives from the configured global seed so a replay
+        // reproduces exactly. Injecting fork-distinct entropy there would silently break
+        // that guarantee for any workload that forks — the two goals are genuinely
+        // opposed, and determinism is the one the operator asked for explicitly.
+        if !topo_core::deterministic::is_deterministic() {
+            crate::entropy::reseed_after_fork();
+            eng.seed_security_samplers();
+        }
     }
 }
 

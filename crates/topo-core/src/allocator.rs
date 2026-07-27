@@ -1510,7 +1510,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     #[inline]
     fn refill_front_end(&self, core: CoreId, sc: SizeClassId) -> bool {
         let mut on_empty = |span: &SpanDescriptor| self.retire_span(span);
-        cache_ops::refill(
+        let r = cache_ops::refill(
             core,
             NodeId::DEFAULT,
             ArenaId::DEFAULT,
@@ -1526,9 +1526,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             self.pagemap,
             self.meta,
             &mut on_empty,
-        )
-        .filled
-            > 0
+        );
+        // **`need_span`, not `filled > 0`.** They answer different questions, and only
+        // the first is the one the caller is asking ("is central out of objects, so that
+        // making a span is the *only* way forward?").
+        //
+        // A refill can legitimately place nothing in this slot while objects remain
+        // plainly available: another thread sharing the slot can fill it in between, so
+        // `push_batch` accepts zero and the batch this call removed from central is handed
+        // to the transfer cache instead. Reporting that as "central is empty" sends the
+        // caller straight to span creation, and on an exhausted backend it returns OOM
+        // while the objects it just moved sit one layer down. Retrying the pop is both
+        // correct and bounded — the caller's loop is capped, and falls through to the
+        // central path if the alternation really does not settle.
+        !r.need_span
     }
 
     /// Flush a batch out of the running core's slot for `sc` into the transfer cache,
@@ -1757,6 +1768,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// the fork), so they stay reachable through the locked path.
     pub fn disable_front_end_rseq(&self) {
         self.cpu_cache.disable_rseq();
+    }
+
+    /// Reset the front end in a freshly forked **child** (§28.1): the locked baseline,
+    /// and the W7-4 fence latch cleared because a single-threaded child provably has no
+    /// in-flight restartable sequence. See [`CpuCache::reset_after_fork`] — in particular
+    /// for why the child *must* forget, not merely may: membarrier's registration does
+    /// not survive `fork`, so a child that still believed it had to fence could not.
+    pub fn reset_front_end_after_fork(&self) {
+        self.cpu_cache.reset_after_fork();
     }
 
     /// Whether the W7 RSEQ fast path is currently active.
@@ -2663,7 +2683,14 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         if span.is_object_quarantined(idx as usize) {
             return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
         }
-        if !self.quarantine.is_enabled() {
+        // Reading the runtime switch is only safe **once this object is claimed**, so it
+        // is gated on the caller already holding the shared cached claim. A non-cacheable
+        // object holds nothing yet: its claim is the quarantined mark taken below, and it
+        // must be taken before the switch decides the route — otherwise two frees that
+        // straddle a concurrent enable take different routes, and the one that read
+        // "disabled" continues to central (clearing the other's mark and possibly retiring
+        // the span) while the other publishes the same object to the ring.
+        if holds_cached && !self.quarantine.is_enabled() {
             return QuarantineDisposition::NotEngaged;
         }
         // A double free of an object that was already *immediately* freed (now
@@ -2704,6 +2731,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             let sg = span.lock();
             if !sg.mark_quarantined(idx as usize) {
                 return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+            }
+            // The claim is in hand, so the switch can now be consulted safely for the
+            // route this object did *not* pre-claim. Off ⇒ hand the claim to the caller
+            // (`insert_batch_inner` clears it free-bit-first) rather than filling and
+            // offering; the object is claimed throughout either way.
+            if !holds_cached && !self.quarantine.is_enabled() {
+                return QuarantineDisposition::ClaimHeld;
             }
             // §29.4 + §29.6: destroy the contents and arm the use-after-free canary **at
             // hold time**, not at drain. The hold *is* the detection window the quarantine
@@ -4859,6 +4893,70 @@ mod tests {
         assert!(!span.is_central_free(object_index));
         assert!(span.cached_and_central_free_are_disjoint());
         assert!(a.check_invariants());
+    }
+
+    /// The claim rule on the **non-cacheable small** path — the third and last route.
+    ///
+    /// An explicit-arena or placement-hinted small object never enters the front end, so
+    /// it has no cached bit to pre-claim: the quarantine's own mark is its shared claim,
+    /// and it has to be taken before the runtime switch chooses the route. Leaving that
+    /// one branch reading the switch unclaimed is what let two frees straddling a
+    /// concurrent enable both proceed — one continuing to central (clearing the other's
+    /// mark, possibly retiring the span) while the other published the same object to the
+    /// ring, whose later canary check then reads reused or retired backing.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_non_cacheable_free_claims_before_reading_the_switch() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        // A placement-hinted small object: hinted spans are never front-end cacheable, so
+        // this exercises the `holds_cached == false` route.
+        let p = a.allocate(64, MIN_ALIGN, RequestFlags::NONE.with_hotness(255));
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only names descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        assert!(
+            !Allocator::<HostProvider>::front_end_cacheable(span.arena(), span.place_class()),
+            "a hot-hinted span must not be front-end cacheable — otherwise this test is \
+             exercising the cacheable route instead"
+        );
+        let usable = size_class::usable_size(span.size_class());
+        let idx = object_index as u16;
+
+        // Quarantine **off**: the case that used to return unclaimed.
+        assert!(!a.quarantine.is_enabled());
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::ClaimHeld
+            ),
+            "a non-cacheable free must claim before reading the switch, even when off"
+        );
+        assert!(
+            span.is_object_quarantined(object_index),
+            "the claim must actually be held on return"
+        );
+
+        // A second free arriving with the switch now on must lose to that claim.
+        a.set_quarantine_enabled(true);
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "the second free must lose whatever the switch says"
+        );
+
+        a.release_quarantine_claim_small(span, idx);
+        a.set_quarantine_enabled(false);
+        tfree(&a, p);
     }
 
     /// The same claim rule on the **large** path: a free claims the descriptor before it

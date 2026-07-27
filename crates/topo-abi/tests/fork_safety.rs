@@ -315,3 +315,70 @@ fn wait_with_watchdog(pid: libc::pid_t, timeout: Duration, round: i32) {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+/// §28.1 + W7-4: a forked **child** must be able to run front-end maintenance.
+///
+/// The W7-4 non-owner fence is armed by a monotonic "RSEQ has ever run in this process"
+/// latch, which is the right shape for the parent — no interleaving of enable/disable can
+/// make it lie. But it is *process* state, and `fork` makes a new process where two things
+/// change at once: no sequence can be in flight any more (the other threads are gone), and
+/// `membarrier`'s registration of intent is **not inherited**, so `fence_rseq` fails with
+/// `EPERM` no matter what the child believes it owes.
+///
+/// A child that inherited the latch as `true` therefore fences on every non-owner drain
+/// and fails every one — which the fence's `debug_assert` reports as a kernel anomaly, and
+/// a debug build turns into a panic in the middle of `topomalloc_cache_flush_all`. This
+/// drives exactly that path: fork, then flush the whole front end from the child (a drain
+/// of every core, so on any multi-core host most of them are non-owner drains).
+///
+/// It regressed once and CI caught it where a 4-core dev box did not, so it is pinned
+/// here rather than left to chance: the child must exit 0.
+#[test]
+fn a_forked_child_can_drain_the_front_end() {
+    // Warm the front end in the parent so the child inherits populated slots, and let
+    // phase-4 enable RSEQ (the whole point — the latch must be set before the fork).
+    let mut live = Vec::new();
+    for _ in 0..512 {
+        let p = topomalloc_malloc(64);
+        assert!(!p.is_null());
+        live.push(p as usize);
+    }
+    for p in live.drain(..) {
+        // SAFETY: each `p` came from `topomalloc_malloc` above and is still owned here.
+        unsafe { topomalloc_free(p as *mut core::ffi::c_void) };
+    }
+
+    // SAFETY: `fork` in a test that does no async-signal-unsafe work in the child beyond
+    // the allocator's own atfork-installed handlers, which is precisely what is under test.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        // Child. Drain every core's slots plus the transfer cache: on a multi-core host
+        // this is a non-owner drain for all but one core, so it is the fence path.
+        let moved = topo_abi::topomalloc_cache_flush_all();
+        let _ = moved;
+        // And allocate again afterwards, so a child left in a broken front-end state
+        // fails here rather than silently.
+        let p = topomalloc_malloc(64);
+        if p.is_null() {
+            // SAFETY: `_exit` is async-signal-safe and never returns.
+            unsafe { libc::_exit(2) };
+        }
+        // SAFETY: `p` was just returned by `topomalloc_malloc` and is still owned here.
+        unsafe { topomalloc_free(p) };
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(0) };
+    }
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: `pid` is our child; `status` is a live local.
+    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(r, pid, "waitpid");
+    let exited = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    assert!(
+        exited,
+        "the forked child could not drain the front end (status {status:#x}) — it most \
+         likely tried to issue the W7-4 membarrier fence, whose registration does not \
+         survive fork"
+    );
+}
