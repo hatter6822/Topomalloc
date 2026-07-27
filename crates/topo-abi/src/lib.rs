@@ -232,19 +232,28 @@ impl AnyAllocator {
         flags: RequestFlags,
     ) -> *mut u8 {
         let _op = topo_core::fork::operation_guard();
-        // SAFETY: the caller upholds this method's identical contract.
-        let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
         // W17-3: realloc retires the old object and creates a new one — but **only on
         // success**. A failed realloc leaves the original live (§25.1), so retiring its
-        // sampled record here would fold a bogus completed lifetime into the site's
-        // histogram, drop a still-live object from `sampled_live_bytes` /
-        // `internal_sampled_bytes` permanently, and (via the W14 learn→place loop) steer
-        // real placement from corrupted data. Resolving the old address *after* the call
-        // is still correct: the sampled set is keyed by address, and a freed or moved
-        // address is no longer reachable — an in-place resize re-inserts the same address
-        // through `on_alloc` below. No-op when sampling is off.
+        // sampled record would fold a bogus completed lifetime into the site's histogram,
+        // drop a still-live object from `sampled_live_bytes` / `internal_sampled_bytes`
+        // permanently, and (via the W14 learn→place loop) steer real placement from
+        // corrupted data.
+        //
+        // The record is taken **before** the call, not resolved after it. The core frees
+        // `ptr` inside `realloc`, so a post-hoc `on_free(ptr)` races another thread
+        // allocating that same address: the sampled set is keyed by address, so the
+        // removal would retire *that thread's still-live* record instead. Taking it up
+        // front makes the hand-off transactional — retire it on success, put it back on
+        // failure. All three are no-ops when sampling is off.
+        let taken = crate::sampling::take_for_realloc(ptr);
+        // SAFETY: the caller upholds this method's identical contract.
+        let p = dispatch!(self, a => unsafe { a.realloc(ptr, new_size, min_align, flags) });
+        match (p.is_null(), taken) {
+            (false, Some(rec)) => crate::sampling::retire_taken(rec),
+            (true, Some(rec)) => crate::sampling::restore_taken(ptr, rec),
+            _ => {}
+        }
         if !p.is_null() {
-            crate::sampling::on_free(ptr);
             crate::sampling::on_alloc(p, new_size, min_align, flags);
         }
         p

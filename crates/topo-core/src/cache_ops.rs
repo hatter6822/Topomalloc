@@ -418,16 +418,23 @@ pub fn drain_transfer(
     let mut buf = [0usize; MAX_BATCH_LEN];
     for i in 0..size_class::count() {
         let sc = SizeClassId::new(i);
-        // Bounded by construction: each iteration removes `n > 0` objects from a bin
-        // that no concurrent push can grow without a matching free, and the loop ends
-        // the moment a pop comes back empty.
-        loop {
-            let n = transfer.try_pop_batch(arena, sc, &mut buf, MAX_BATCH_LEN, meta);
+        // Drain at most the objects present **when this call started**, snapshotted per
+        // bin. Looping until a pop comes back empty is not a bound: a program that keeps
+        // freeing keeps overflowing its per-CPU slots into this bin, so `try_pop_batch`
+        // can keep returning objects indefinitely and a maintenance call would never
+        // return. Racing pushes are left for the next flush, which is exactly the
+        // "approximate under concurrent load, exact when quiescent" contract (§31.1) —
+        // and under quiescence the snapshot *is* the whole bin, so nothing is left behind.
+        let mut remaining = transfer.bin(sc).map_or(0, |b| b.len() as usize);
+        while remaining > 0 {
+            let want = remaining.min(MAX_BATCH_LEN);
+            let n = transfer.try_pop_batch(arena, sc, &mut buf, want, meta);
             if n == 0 {
-                break;
+                break; // another drainer got there first
             }
             flush_addrs_to_central(&buf[..n], sc, central, pagemap, on_empty);
             moved += n;
+            remaining -= n;
         }
     }
     moved

@@ -343,6 +343,55 @@ fn sample_free_slow(ptr: *mut u8) {
     }
 }
 
+/// Remove `ptr`'s sampled record **without** folding a lifetime — for a `realloc` that is
+/// about to free or move it. `None` when nothing was sampled (the common case).
+///
+/// A `realloc` cannot simply call [`on_free`] after the fact. The core frees `ptr` inside
+/// the call, so between that free and a post-hoc `on_free(ptr)` another thread can allocate
+/// the same address and, if sampled, publish a record for it — `SampledObjects::on_alloc`
+/// overwrites the duplicate address, and the post-hoc removal then retires *that thread's
+/// still-live* allocation, permanently mis-recording sampled live bytes and feeding the W14
+/// learn→place loop from corrupted data. Taking the record **before** the call closes the
+/// window: the address is ours until we hand it back.
+pub(crate) fn take_for_realloc(ptr: *mut u8) -> Option<SampledRecord> {
+    if ptr.is_null() || !ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    if !BLOOM.maybe_contains(ptr as usize) || in_sampler() {
+        return None; // definitely not sampled: no lock, no work.
+    }
+    let _guard = SamplerGuard::enter()?;
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    g.objects.on_free(ptr as usize)
+}
+
+/// Fold a [`take_for_realloc`] record's completed lifetime into its site profile — the
+/// realloc succeeded, so the original object is genuinely gone.
+pub(crate) fn retire_taken(rec: SampledRecord) {
+    let Some(_guard) = SamplerGuard::enter() else {
+        return;
+    };
+    let now = now_ms();
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    let age = now.saturating_sub(rec.alloc_ms);
+    g.profiles.record_free(rec.stack_id, age, rec.bytes, now);
+}
+
+/// Put a [`take_for_realloc`] record back — the realloc **failed**, so §25.1 leaves the
+/// original allocation live and its sample must survive untouched.
+pub(crate) fn restore_taken(ptr: *mut u8, rec: SampledRecord) {
+    let Some(_guard) = SamplerGuard::enter() else {
+        return;
+    };
+    let st = state();
+    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+    if g.objects.on_alloc(ptr as usize, rec) {
+        BLOOM.insert(ptr as usize);
+    }
+}
+
 /// Map a request to its [`SizeClassDist`] bucket: the small size-class index, or the
 /// medium / large sentinel.
 #[inline]

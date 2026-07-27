@@ -584,11 +584,23 @@ int topomalloc_stats_snapshot(topomalloc_stats_t *out, uint64_t flags);
  * flag bit is rejected (writes nothing, returns 0 — Section 10.4). */
 size_t topomalloc_stats_json(char *buf, size_t cap, uint64_t flags);
 
-/* Like topomalloc_stats_json, but the BY_ARENA per-arena detail (and, for a
- * redacted low observer, ALL cross-domain summary aggregates) are REDACTED to
- * only what an observer at `observer_label` is authorized to see (Section 36.12):
- * a low domain cannot observe a higher domain's activity. On POSIX every arena is
- * PUBLIC (0), so a PUBLIC observer sees everything (the identity case). */
+/* Like topomalloc_stats_json, but REDACTED to what an observer at
+ * `observer_label` is authorized to see (Section 36.12): the BY_ARENA detail is
+ * filtered to the arenas it dominates, and the cross-domain summary aggregates
+ * are zeroed with live_bytes recomputed from the visible arenas.
+ *
+ * Redaction is keyed on the OBSERVER'S LABEL ALONE. Only
+ * TOPOMALLOC_OBSERVER_LABEL_TOP receives the raw summary; every other label --
+ * including PUBLIC (0) -- gets the redacted view, even when it happens to
+ * dominate every arena that currently exists. Gating on "this observer sees all
+ * live arenas" would be a covert channel: a high domain could flip the low view
+ * by creating and destroying a labelled arena, and every cross-domain aggregate
+ * would be disclosed whenever no high arena happened to exist.
+ *
+ * So for ordinary process-wide monitoring (including the all-PUBLIC POSIX case)
+ * use topomalloc_stats_json, or pass TOPOMALLOC_OBSERVER_LABEL_TOP here. Pass a
+ * real domain label only when you want that domain's restricted view. */
+#define TOPOMALLOC_OBSERVER_LABEL_TOP ((uint32_t) 0xFFFFFFFFu)
 size_t topomalloc_stats_json_for_label(char *buf, size_t cap, uint64_t flags,
                                        uint32_t observer_label);
 

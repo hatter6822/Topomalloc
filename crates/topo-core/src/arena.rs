@@ -1407,11 +1407,26 @@ impl ArenaTable {
         // child, which keeps its `quota_limit` — letting the subtree allocate past the
         // root quota (the bound the Lean `subtree_used_le_quota` proves). Refuse, so the
         // host destroys the subtree bottom-up.
-        let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
-        if a.live_children.load(Ordering::Acquire) != 0 {
-            return Err(ArenaError::HasLiveChildren);
-        }
-        self.transition(arena, ArenaState::Draining)
+        // The child check and the `Active → Draining` transition must be **one** critical
+        // section. Read separately, the count is a TOCTOU: `delegate` validates the parent
+        // is `Active` and increments `live_children` under this same lock, so a check that
+        // observes zero, then a transition that acquires the lock afterwards, lets a
+        // delegation interleave between them. Both then succeed — the parent is draining
+        // *and* has a live child — and `finish_destroy` returns the parent's whole
+        // reservation to *its* parent while the new child keeps its quota: exactly the
+        // subtree overcommit this counter exists to prevent. Serialized here, one of the
+        // two always loses: either `delegate` sees `Draining` and fails `NotActive`, or the
+        // count is non-zero and the destroy is refused.
+        self.lock.acquire();
+        let r = (|| {
+            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+            if a.live_children.load(Ordering::Acquire) != 0 {
+                return Err(ArenaError::HasLiveChildren);
+            }
+            self.transition_locked(arena, ArenaState::Draining)
+        })();
+        self.lock.release();
+        r
     }
 
     /// Complete a destroy (`Draining → Destroyed`, §36.13 step 7): bump the
@@ -1488,17 +1503,21 @@ impl ArenaTable {
     /// Apply a single guarded lifecycle transition under the lock.
     fn transition(&self, arena: ArenaId, to: ArenaState) -> Result<(), ArenaError> {
         self.lock.acquire();
-        let r = (|| {
-            let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
-            let cur = ArenaState::from_u8(a.state.load(Ordering::Acquire));
-            if !cur.can_transition(to) {
-                return Err(ArenaError::IllegalTransition);
-            }
-            a.state.store(to as u8, Ordering::Release);
-            Ok(())
-        })();
+        let r = self.transition_locked(arena, to);
         self.lock.release();
         r
+    }
+
+    /// [`transition`](Self::transition) with the table lock already held, so a caller can
+    /// compose it with other checks into **one** critical section (see `begin_destroy`).
+    fn transition_locked(&self, arena: ArenaId, to: ArenaState) -> Result<(), ArenaError> {
+        let a = self.slot(arena).ok_or(ArenaError::NotFound)?;
+        let cur = ArenaState::from_u8(a.state.load(Ordering::Acquire));
+        if !cur.can_transition(to) {
+            return Err(ArenaError::IllegalTransition);
+        }
+        a.state.store(to as u8, Ordering::Release);
+        Ok(())
     }
 
     // -- accounting (hot path, §36.17) ----------------------------------------
@@ -2314,6 +2333,52 @@ mod tests {
             t.stats(parent).unwrap().used + t.stats(a).unwrap().used + t.stats(b).unwrap().used;
         assert_eq!(sum, 100, "Σ subtree own-live == parent quota");
         assert!(t.check_invariants());
+    }
+
+    #[test]
+    fn a_racing_delegate_and_destroy_cannot_both_succeed() {
+        // The §36.4 subtree bound rests on "a parent with live children cannot be
+        // destroyed". Checking `live_children` outside the lock that `delegate` increments
+        // it under is a TOCTOU: both can succeed, and `finish_destroy` then returns the
+        // parent's whole reservation to *its* parent while the new child keeps its quota —
+        // the exact overcommit the counter prevents. Race the two on the same parent many
+        // times and assert the outcomes are mutually exclusive.
+        //
+        // A narrow window, so this is a probabilistic detector of a regression rather than
+        // a guaranteed one; the fix is structural (one critical section) and this pins the
+        // invariant it establishes.
+        for _ in 0..200 {
+            let t = ArenaTable::new();
+            let parent = t
+                .create(&ArenaPolicy::explicit().with_quota(1 << 20))
+                .expect("parent");
+            let p0 = t.stats(parent).expect("parent stats");
+            let del = Delegation::inheriting(&p0, 4096, "c");
+            let t = &t;
+            let del = &del;
+            let (d, b) = std::thread::scope(|s| {
+                let dh = s.spawn(move || t.delegate(parent, del));
+                let bh = s.spawn(move || t.begin_destroy(parent));
+                (dh.join().unwrap(), bh.join().unwrap())
+            });
+            if b.is_ok() {
+                assert!(
+                    d.is_err(),
+                    "a delegation must not succeed against a parent whose destroy won"
+                );
+                assert_eq!(
+                    t.stats(parent).map(|st| st.reserved),
+                    Some(0),
+                    "a draining parent reserved nothing for a child that lost the race"
+                );
+            }
+            if d.is_ok() {
+                assert!(
+                    b.is_err(),
+                    "a destroy must not succeed against a parent that gained a child"
+                );
+            }
+        }
     }
 
     #[test]

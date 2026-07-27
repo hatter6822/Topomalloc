@@ -80,10 +80,13 @@ struct LargeSlot {
     /// things. `guarded` is the **geometry** marker: the object is right-aligned
     /// *inside* a larger extent (`desc.base() != extent.base`), which is what makes an
     /// extent-relative in-place resize unsound — so it must stay set whether or not the
-    /// protection took. `guard_armed` is the **protection** marker: the free path
-    /// restores only what was installed, and a `0` here is counted in
-    /// `guard_protect_failures` so the lost protection is observable rather than a
-    /// silent security downgrade. Reset on every (re)acquire.
+    /// protection took. `guard_armed` is the **restore-needed** marker: `1` ⇒ some page of
+    /// this extent is `PROT_NONE` and the free path must restore read-write access before
+    /// the extent recycles. That is *not* the same as "successfully guarded": when one
+    /// install takes and the other fails, the object is vended unguarded (and counted in
+    /// `guard_protect_failures`) — but if rolling the successful one back *also* fails,
+    /// the marker stays `1` so the free path retries, rather than recycling an extent with
+    /// an inaccessible page into the reusable pool. Reset on every (re)acquire.
     guard_armed: u8,
     /// `1` ⇒ this large allocation is **held in the quarantine** (W18-3, §29.4):
     /// app-freed but not yet really freed. The authoritative double-free marker for a
@@ -625,15 +628,37 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
             .extents
             .protect_range(object_base + usable, PAGE_SIZE, false);
         let armed = lead.is_ok() && trail.is_ok();
+        // `guard_armed` is the marker the **free path** acts on: it restores read-write
+        // access before the extent recycles. So it must mean "some page here is still
+        // `PROT_NONE`", not "the allocation was successfully guarded" — those differ
+        // precisely when a rollback fails.
+        //
+        // If one install took and the other did not, the successful one is rolled back so
+        // the extent recycles uniformly read-write. Discarding *that* result (as this used
+        // to) is the dangerous case: a failed restore leaves an inaccessible page in an
+        // extent recorded as unguarded, so the free path never restores it and the extent
+        // returns to the reusable pool with a `PROT_NONE` hole — a later, entirely valid
+        // allocation then faults on its own memory. Keeping the marker set instead makes
+        // the free path retry the restore; restoring an already-read-write page succeeds
+        // and costs nothing, so the retry is safe in every case.
+        let mut needs_restore = armed;
         if !armed {
             self.guard_protect_failures.fetch_add(1, Ordering::Relaxed);
-            if lead.is_ok() {
-                let _ = self.extents.protect_range(ext_base, PAGE_SIZE, true);
-            }
-            if trail.is_ok() {
-                let _ = self
+            if lead.is_ok()
+                && self
                     .extents
-                    .protect_range(object_base + usable, PAGE_SIZE, true);
+                    .protect_range(ext_base, PAGE_SIZE, true)
+                    .is_err()
+            {
+                needs_restore = true;
+            }
+            if trail.is_ok()
+                && self
+                    .extents
+                    .protect_range(object_base + usable, PAGE_SIZE, true)
+                    .is_err()
+            {
+                needs_restore = true;
             }
         }
 
@@ -667,7 +692,7 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 None => (*slot).has_extent = 0,
             }
             (*slot).guarded = 1;
-            (*slot).guard_armed = armed as u8;
+            (*slot).guard_armed = needs_restore as u8;
             (*slot).quarantined = 0; // a fresh guarded allocation is not quarantined
         }
         // SAFETY: `slot` is live and initialised; its descriptor is in never-freed metadata.

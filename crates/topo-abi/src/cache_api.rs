@@ -18,8 +18,14 @@
 //! Front-end *residency* is observable through the ordinary stats surface
 //! (`topomalloc_stats_snapshot`'s `cache_bytes`, and the `cache.per_cpu_bytes` /
 //! `cache.transfer_bytes` keys in the JSON), so this module adds no reporting of its own.
-//! Both entry points are always present and safe to call; each returns `0` when the
-//! allocator has not been initialised.
+//!
+//! Every entry point here is always present, safe to call, and returns `0` when the
+//! allocator has not been initialised — **without initialising it**. They resolve the
+//! engine with `global_if_init()`, never `global()`: the latter *is* the lazy
+//! initializer, so a diagnostic probe or a no-op maintenance tick would reserve the
+//! metadata arena and the span/large regions and bring RSEQ up as a side effect, which is
+//! the opposite of what a "returns 0 if uninitialised" contract promises. There is
+//! nothing to flush, adapt or report before the first allocation anyway.
 
 use topo_core::CoreId;
 
@@ -42,7 +48,7 @@ pub extern "C" fn topomalloc_cache_flush_all() -> usize {
     // no internal lock is held at the fork. A rare host-driven call, so the gate costs
     // nothing that matters.
     let _op = topo_core::fork::operation_guard();
-    crate::global().map_or(0, |a| a.flush_front_end_all())
+    crate::global_if_init().map_or(0, |a| a.flush_front_end_all())
 }
 
 /// `size_t topomalloc_cache_flush_core(unsigned core)` (§11, W6-7): drain **one** core's
@@ -58,7 +64,7 @@ pub extern "C" fn topomalloc_cache_flush_all() -> usize {
 #[no_mangle]
 pub extern "C" fn topomalloc_cache_flush_core(core: u32) -> usize {
     let _op = topo_core::fork::operation_guard();
-    crate::global().map_or(0, |a| a.flush_front_end_core(CoreId(core)))
+    crate::global_if_init().map_or(0, |a| a.flush_front_end_core(CoreId(core)))
 }
 
 /// `size_t topomalloc_cache_budget_tick(void)` (§11.5, W6-5): run one cache-budget
@@ -72,7 +78,7 @@ pub extern "C" fn topomalloc_cache_flush_core(core: u32) -> usize {
 #[no_mangle]
 pub extern "C" fn topomalloc_cache_budget_tick() -> usize {
     let _op = topo_core::fork::operation_guard();
-    crate::global().map_or(0, |a| a.cache_budget_tick())
+    crate::global_if_init().map_or(0, |a| a.cache_budget_tick())
 }
 
 /// `int topomalloc_cache_rseq_active(void)` (§27.4, W7): whether the RSEQ lock-free fast
@@ -86,7 +92,7 @@ pub extern "C" fn topomalloc_cache_budget_tick() -> usize {
 /// (which reverts to the locked baseline, §28.1).
 #[no_mangle]
 pub extern "C" fn topomalloc_cache_rseq_active() -> core::ffi::c_int {
-    crate::global().map_or(0, |a| core::ffi::c_int::from(a.front_end_rseq_active()))
+    crate::global_if_init().map_or(0, |a| core::ffi::c_int::from(a.front_end_rseq_active()))
 }
 
 /// `int topomalloc_cache_register_thread(void)` (§27.6, W7-1): register the calling
@@ -98,5 +104,5 @@ pub extern "C" fn topomalloc_cache_rseq_active() -> core::ffi::c_int {
 /// creates threads without libc's help; calling it is harmless and idempotent otherwise.
 #[no_mangle]
 pub extern "C" fn topomalloc_cache_register_thread() -> core::ffi::c_int {
-    crate::global().map_or(0, |a| core::ffi::c_int::from(a.register_front_end_thread()))
+    crate::global_if_init().map_or(0, |a| core::ffi::c_int::from(a.register_front_end_thread()))
 }
