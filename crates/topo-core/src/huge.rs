@@ -2625,10 +2625,30 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// release controller (plan 04 W12); this is the **mechanism** it drives. Bounds the
     /// HugeCache so a churny workload's empty hugepages do not pin RSS indefinitely.
     pub fn release_empty_excess(&self, reserve: usize) -> usize {
+        self.release_empty_excess_bounded(reserve, usize::MAX)
+    }
+
+    /// [`release_empty_excess`](Self::release_empty_excess) with an explicit upper bound
+    /// on how many hugepages this call may release.
+    ///
+    /// The reserve alone is not a budget. It is derived from a *snapshot* of the empty
+    /// population, but the walk below sees the population as it is **now**: application
+    /// frees running concurrently can empty more hugepages after the snapshot, and every
+    /// one of them lands beyond the reserve and is released. A tick planned and
+    /// rate-capped for a single hugepage can then decommit many, blowing through the
+    /// §20.2 release budget and producing exactly the latency and RSS-refault spike the
+    /// cap exists to prevent. `max_release` bounds the work by what was actually planned,
+    /// so a concurrent emptying defers to the next tick (where the controller's §20.3
+    /// backlog already accounts for it) instead of being swept up by this one.
+    pub fn release_empty_excess_bounded(&self, reserve: usize, max_release: usize) -> usize {
         let mut released = 0usize;
+        let mut releases = 0usize;
         let mut kept = 0usize;
         let mut from = 0u32;
         loop {
+            if releases >= max_release {
+                break;
+            }
             // Find the next empty-backed hugepage (and its committed footprint) under
             // the lock; release it outside (re-acquiring). Advancing `from` past each
             // visited hugepage guarantees the walk terminates and visits each once.
@@ -2652,6 +2672,7 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             );
             let _ = committed;
             released += self.release_hugepage_runs(idx, base);
+            releases += 1;
         }
         released
     }
@@ -2777,7 +2798,14 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             // per-tick overshoot is bounded by one hugepage.
             let release_hp = plan.release_empty_hugepages_bytes.div_ceil(hp) as usize;
             let reserve_hp = empty_hp.saturating_sub(release_hp);
-            self.release_empty_excess(reserve_hp) as u64
+            // Bound the work by the *plan*, not only by the reserve. `empty_hp` is a
+            // snapshot, and `release_empty_excess` walks the population as it stands when
+            // it runs: concurrent frees that empty further hugepages after the sample all
+            // fall beyond `reserve_hp` and would be released too, so one planned and
+            // rate-capped hugepage could become many. Passing `release_hp` as the ceiling
+            // keeps a tick's actual release equal to what the controller budgeted; the
+            // §20.3 backlog carries any remainder to the next tick.
+            self.release_empty_excess_bounded(reserve_hp, release_hp) as u64
         } else {
             0
         };
@@ -4320,6 +4348,50 @@ mod backend_tests {
             cov.empty_backed_bytes, HUGEPAGE_SIZE as u64,
             "one kept as reserve"
         );
+    }
+
+    /// §20.2: the release **budget** bounds a tick's work, not just the reserve.
+    ///
+    /// `release_empty_excess` walks the empty population as it stands when it runs, so a
+    /// reserve computed from an earlier snapshot is not a cap: hugepages emptied by
+    /// concurrent frees after the sample all fall beyond the reserve and would be swept
+    /// up too. Here the reserve is deliberately stale — computed as if only two hugepages
+    /// were empty when four are — which is exactly the shape a concurrent emptying
+    /// produces. Unbounded, that releases three; the plan called for one.
+    #[test]
+    fn a_bounded_release_never_exceeds_the_planned_count() {
+        let b = backend(4);
+        let regions: Vec<Region> = (0..4)
+            .map(|_| {
+                b.allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+                    .expect("whole hugepage")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        assert_eq!(b.coverage().empty_backed_bytes, 4 * HUGEPAGE_SIZE as u64);
+
+        // A plan for one hugepage, with a reserve drawn from a two-hugepage snapshot.
+        let released = b.release_empty_excess_bounded(1, 1);
+        assert_eq!(
+            released, HUGEPAGE_SIZE,
+            "a tick must release exactly what was planned, not everything past the reserve"
+        );
+        assert_eq!(
+            b.coverage().empty_backed_bytes,
+            3 * HUGEPAGE_SIZE as u64,
+            "the hugepages emptied after the snapshot stay for the next tick"
+        );
+
+        // The remainder is still reachable — bounding defers work, it does not drop it.
+        let released = b.release_empty_excess_bounded(1, 8);
+        assert_eq!(
+            released,
+            2 * HUGEPAGE_SIZE,
+            "the reserve still holds one back"
+        );
+        assert_eq!(b.coverage().empty_backed_bytes, HUGEPAGE_SIZE as u64);
         // Idempotent at the reserve.
         assert_eq!(b.release_empty_excess(1), 0);
         assert!(b.check_invariants());

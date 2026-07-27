@@ -161,12 +161,29 @@ impl PosixBackingProvider {
     /// `InvalidRequest` instead of a syscall against arbitrary memory. The cost is one
     /// uncontended mutex on the provider's slow path (commit/decommit/purge/protect are
     /// already syscall-bound), never on the allocation fast path.
-    fn checked_subrange(
+    /// Validate `[offset, offset+len)` against a **live** reservation of ours and run
+    /// `f` with the resolved address, **holding the ownership lock throughout**.
+    ///
+    /// The lock is the lease, and it has to outlive the validation. Releasing it between
+    /// the check and the syscall reintroduces exactly the hole the check exists to close:
+    /// `release` takes the same lock, removes the reservation and `munmap`s it, so a
+    /// concurrent release in that window unmaps the range this caller is about to act on.
+    /// If the kernel then hands the address to an unrelated mapping — another thread's
+    /// reservation, a caller's own `mmap`, a loaded library — the `madvise`, `mprotect` or
+    /// `mbind` lands on memory this provider never owned, which is precisely what a safe
+    /// API must not permit. Holding the lease serialises the two: a release either
+    /// completes before the check (which then fails cleanly with `InvalidRequest`) or
+    /// waits until the syscall is done.
+    ///
+    /// `f` must not re-enter this provider's ownership lock; every caller passes a bare
+    /// syscall wrapper.
+    fn with_owned_subrange<R>(
         &self,
         region: Region,
         offset: usize,
         len: usize,
-    ) -> Result<usize, BackendError> {
+        f: impl FnOnce(usize) -> Result<R, BackendError>,
+    ) -> Result<R, BackendError> {
         let end = offset
             .checked_add(len)
             .ok_or(BackendError::InvalidRequest)?;
@@ -185,7 +202,9 @@ impl PosixBackingProvider {
         {
             return Err(BackendError::InvalidRequest);
         }
-        Ok(base.wrapping_add(offset))
+        let r = f(base.wrapping_add(offset));
+        drop(owned);
+        r
     }
 }
 
@@ -216,50 +235,58 @@ impl TopoBackingProvider for PosixBackingProvider {
         // §20.4 commit / recommit (M-005). Performance mode: a no-op (the mapping is
         // already RW). Guard mode: `mprotect(PROT_READ|WRITE)` so the range is usable
         // again after a guarded decommit.
-        let addr = self.checked_subrange(region, offset, len)?;
         self.commit_calls.fetch_add(1, Ordering::Relaxed);
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: `[offset, offset+len)` is in bounds of `region`'s mapping; `addr`
-        // is OS-page-aligned (extent offsets/lengths are PAGE_SIZE multiples).
-        unsafe { sys::commit(addr, len, self.guard) }
+        self.with_owned_subrange(region, offset, len, |addr| {
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: `[offset, offset+len)` is in bounds of `region`'s mapping; `addr`
+            // is OS-page-aligned (extent offsets/lengths are PAGE_SIZE multiples), and
+            // the ownership lease is held for the duration of this call.
+            unsafe { sys::commit(addr, len, self.guard) }
+        })
     }
 
     fn decommit(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 decommit ≈ MADV_DONTNEED: drop the pages now (RSS falls; a later read
         // faults a fresh zero page). Guard mode also `mprotect(PROT_NONE)`s so a
         // use-after-free faults (§20.5).
-        let addr = self.checked_subrange(region, offset, len)?;
         self.decommit_calls.fetch_add(1, Ordering::Relaxed);
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping.
-        unsafe { sys::decommit(addr, len, self.guard) }
+        self.with_owned_subrange(region, offset, len, |addr| {
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping, with
+            // the ownership lease held for the duration of this call.
+            unsafe { sys::decommit(addr, len, self.guard) }
+        })
     }
 
     fn purge_lazy(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_lazy ≈ MADV_FREE: lazy discard; old contents may persist until
         // the kernel reclaims under pressure (a valid §20.1 muzzy outcome).
-        let addr = self.checked_subrange(region, offset, len)?;
         self.purge_lazy_calls.fetch_add(1, Ordering::Relaxed);
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping.
-        unsafe { sys::purge_lazy(addr, len) }
+        self.with_owned_subrange(region, offset, len, |addr| {
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping, with
+            // the ownership lease held for the duration of this call.
+            unsafe { sys::purge_lazy(addr, len) }
+        })
     }
 
     fn purge_forced(&self, region: Region, offset: usize, len: usize) -> Result<(), BackendError> {
         // §20.4 purge_forced ≈ MADV_DONTNEED: discard contents promptly.
-        let addr = self.checked_subrange(region, offset, len)?;
         self.purge_forced_calls.fetch_add(1, Ordering::Relaxed);
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping.
-        unsafe { sys::purge_forced(addr, len) }
+        self.with_owned_subrange(region, offset, len, |addr| {
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping, with
+            // the ownership lease held for the duration of this call.
+            unsafe { sys::purge_forced(addr, len) }
+        })
     }
 
     fn protect(
@@ -272,12 +299,14 @@ impl TopoBackingProvider for PosixBackingProvider {
         // W18-4 (§29.5): `mprotect` a guard page inaccessible (`PROT_NONE`) or restore
         // it read-write. The address is validated as an in-bounds sub-range; a guard
         // is OS-page-aligned (the caller passes page-aligned offsets/lengths).
-        let addr = self.checked_subrange(region, offset, len)?;
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping.
-        unsafe { sys::protect(addr, len, accessible) }
+        self.with_owned_subrange(region, offset, len, |addr| {
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: in-bounds, OS-page-aligned sub-range of `region`'s mapping, with
+            // the ownership lease held for the duration of this call.
+            unsafe { sys::protect(addr, len, accessible) }
+        })
     }
 
     fn release(&self, _arena: ArenaId, region: Region) -> Result<(), BackendError> {
@@ -304,12 +333,15 @@ impl TopoBackingProvider for PosixBackingProvider {
         self.bind_node_calls.fetch_add(1, Ordering::Relaxed);
         // Ownership-check the whole region first (as the physical-state ops): `mbind`
         // rewrites the NUMA policy of a VA range, so a foreign or stale `Region` would
-        // let safe code repolicy memory this provider does not own.
-        let addr = self.checked_subrange(region, 0, region.len)?;
-        // SAFETY: `addr` is the base of a live reservation of this provider (validated
-        // just above); binding the NUMA policy of its page-aligned VA range performs no
-        // read/write through the pointer.
-        unsafe { sys::bind_node(addr, region.len, os_node) }
+        // let safe code repolicy memory this provider does not own. The lease is held
+        // across the syscall so a concurrent `release` cannot unmap the range in between.
+        self.with_owned_subrange(region, 0, region.len, |addr| {
+            // SAFETY: `addr` is the base of a live reservation of this provider, held
+            // live by the ownership lease for the duration of this call; binding the
+            // NUMA policy of its page-aligned VA range performs no read/write through
+            // the pointer.
+            unsafe { sys::bind_node(addr, region.len, os_node) }
+        })
     }
 
     fn name(&self) -> &'static str {

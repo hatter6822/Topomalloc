@@ -982,6 +982,28 @@ impl CpuCache {
         }
     }
 
+    /// Pop from **a specific core's slot**, whatever core this thread is running on.
+    ///
+    /// The ordinary [`fe_pop`](Self::fe_pop) cannot do this: in RSEQ mode the hardware
+    /// CPU is authoritative and the argument is only a hint, by design. This takes the
+    /// locked path unconditionally, so the core argument is honoured — which is what a
+    /// caller needs when it must reach objects it *itself* placed in a known slot and has
+    /// since migrated away from, rather than whatever the current CPU happens to hold.
+    ///
+    /// Safe against a concurrent RSEQ sequence on that core for the usual reason
+    /// (`fe_pop_locked` issues the W7-4 non-owner fence before touching the slot), so
+    /// this is the same discipline drains and flushes already use — not a new hazard.
+    #[inline]
+    pub fn fe_pop_on_core(
+        &self,
+        core: CoreId,
+        arena: ArenaId,
+        sc: SizeClassId,
+        meta: &dyn MetadataAlloc,
+    ) -> FeOutcome<usize> {
+        self.fe_pop_locked(core, arena, sc, meta)
+    }
+
     /// The locked (spinlock) pop — the RSEQ-free correct baseline (W6-4) and the
     /// RSEQ-mode fallback.
     fn fe_pop_locked(
@@ -2031,6 +2053,26 @@ mod tests {
         // The wrapper is the tracked pop's first component, so the two cannot drift.
         assert!(cc.fe_push(core, A, sc, 0xCD, &m).is_success());
         assert_eq!(cc.fe_pop(core, A, sc, &m).unwrap(), 0xCD);
+    }
+
+    /// `fe_pop_on_core` reaches a *named* slot regardless of the running CPU — the
+    /// capability the allocation loop needs to recover a batch it parked on a core it has
+    /// since migrated away from. The ordinary `fe_pop` cannot do this in RSEQ mode, where
+    /// the hardware CPU is authoritative and the argument is only a hint.
+    #[test]
+    fn a_core_specific_pop_reaches_that_cores_slot() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        let parked = CoreId(7);
+        let here = CoreId(2);
+
+        assert!(cc.fe_push(parked, A, sc, 0x1234, &m).is_success());
+        // The running core's slot is empty, so an ordinary pop finds nothing...
+        assert!(cc.fe_pop(here, A, sc, &m).is_empty());
+        // ...but the batch is still reachable where it was actually left.
+        assert_eq!(cc.fe_pop_on_core(parked, A, sc, &m).unwrap(), 0x1234);
+        assert!(cc.fe_pop_on_core(parked, A, sc, &m).is_empty());
     }
 
     #[test]

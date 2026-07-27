@@ -1409,6 +1409,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// impossible state that would mean the bit and the slot had diverged — and dropped
     /// rather than double-vended.
     fn alloc_small_cached(&self, sc: SizeClassId) -> *mut u8 {
+        // The core this loop last refilled, if any. Only meaningful while the loop runs:
+        // it is how a thread that migrates *after* a refill can still reach the batch it
+        // just moved out of central. See the `Empty` arm.
+        let mut parked: Option<CoreId> = None;
         for _ in 0..Self::FRONT_END_POP_RETRY {
             // Re-read the running core **every iteration**, and refill the core the pop
             // reports rather than this hint, so a refill and the pop that is meant to
@@ -1447,8 +1451,31 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
                 FeOutcome::Empty => {
                     if !self.refill_front_end(served, sc) {
+                        // Central is out of objects. Before concluding that only a new
+                        // span can help, reclaim any batch **this loop itself** parked on
+                        // a core it has since migrated off. A refill moves objects out of
+                        // central, so if that refill took the last batch and the thread
+                        // then migrated, the objects exist but sit on `parked` while this
+                        // iteration polls a different, empty slot — and returning null
+                        // here is a spurious OOM on an exhausted backend. `fe_pop_on_core`
+                        // reaches the specific slot regardless of the running CPU, which
+                        // the RSEQ-mode `fe_pop` cannot do.
+                        if let Some(prev) = parked.filter(|c| *c != served) {
+                            if let FeOutcome::Success(addr) =
+                                self.cpu_cache
+                                    .fe_pop_on_core(prev, ArenaId::DEFAULT, sc, self.meta)
+                            {
+                                let p = self.claim_cached_object(addr, sc);
+                                if !p.is_null() {
+                                    return p;
+                                }
+                            }
+                        }
                         return ptr::null_mut(); // central list is empty: needs a span
                     }
+                    // Remember where the batch went: a migration before the next pop
+                    // makes this the only handle on it.
+                    parked = Some(served);
                 }
                 // `fe_pop` never yields these (`Full` is a push outcome; the RSEQ path
                 // resolves `Abort` internally or falls back to the locked path). Decline

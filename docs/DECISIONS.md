@@ -2617,3 +2617,42 @@ wrappers for the contexts that genuinely discharge it (here, the `pthread_atfork
 handler). Where a resource is claimed on entry, make the release structural — one
 constructor, not one per exit — and add the invariant checker that would catch a leak,
 because early-return paths are exactly the ones review keeps missing.
+
+**Round 12: the pattern broke.** A twelfth round produced five findings, and — for the
+first time since round 4 — four of them were in areas the previous rounds had never
+touched: the §20.2 hugepage release budget, `pthread_atfork` registration failure, the
+POSIX provider's ownership check, and the zero-size environment knob. That is the signal
+the two root-cause fixes were meant to produce: review moving on rather than circling.
+
+Three of the four share a shape worth naming, distinct from the earlier two: **a check
+whose result outlives the state it checked.**
+
+* `PosixBackingProvider` validated a region against its live-reservation set, released the
+  lock, and *then* issued the `madvise`/`mprotect`/`mbind`. A concurrent `release` in that
+  window unmaps the range, and if the kernel reuses the address the syscall lands on
+  memory the provider never owned — the exact hole the check was added to close. The lock
+  is now held across the syscall: the check and the use are one critical section.
+* `HugePageBackend::release_tick` sampled the empty-hugepage count, derived a *reserve*
+  from it, and let `release_empty_excess` walk the population as it stood when it ran.
+  Hugepages emptied by concurrent frees after the sample all fell beyond the reserve, so a
+  tick budgeted for one hugepage could decommit many. A reserve computed from a snapshot
+  is not a budget; the call now takes an explicit `max_release` bound.
+* `alloc_small_cached` refilled the core the pop reported, but a migration between that
+  refill and the next iteration's pop left the batch on a core the loop no longer polled —
+  and if the refill had taken the last central batch, the allocation reported OOM with the
+  objects it had just moved sitting one slot away. The loop now remembers where it parked
+  a batch and reclaims it by name (`fe_pop_on_core`) before conceding.
+
+The generalisation: **validating state under a lock and then acting after releasing it is
+not validation, and a bound derived from a sample is not a bound.** Where a check licenses
+an action, the two belong in one critical section; where a budget bounds work, pass the
+budget to the code doing the work rather than pre-computing a target from a snapshot of a
+population that other threads are still changing.
+
+The remaining two were narrower: `pthread_atfork` failing with `ENOMEM` left
+`ATFORK_REGISTERED` permanently set, so the retry path never fired and every later `fork`
+ran without the quiesce handlers (the flag is now released on failure); and
+`TOPOMALLOC_ZERO_SIZE` was read without the `AT_SECURE` check the other `TOPOMALLOC_*`
+knobs get, because the C entry points read it before `global()` and so outside the phase-5
+gate. Both are the same lesson in miniature — a flag that records an intention rather than
+an outcome, and a gate applied to a list rather than to a property.

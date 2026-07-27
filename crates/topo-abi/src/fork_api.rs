@@ -113,15 +113,27 @@ pub(crate) fn register_atfork_handlers() {
     {
         // SAFETY: the three handlers are `extern "C"` functions with no captured
         // state that only call the allocation-free `topo_core::fork::*` routines;
-        // `pthread_atfork` simply records them. A non-zero return (out of memory
-        // for the handler list) is ignored — the allocator still works, just
-        // without fork hardening, which is the safe degradation.
-        unsafe {
+        // `pthread_atfork` simply records them.
+        let rc = unsafe {
             libc::pthread_atfork(
                 Some(atfork_prepare),
                 Some(atfork_parent),
                 Some(atfork_child),
-            );
+            )
+        };
+        if rc != 0 {
+            // The registration did **not** happen, so the flag must not claim it did.
+            // `pthread_atfork` fails with `ENOMEM` when the handler list cannot grow —
+            // a transient, allocation-pressure condition, not a permanent property of
+            // the process. Leaving the flag set would record a registration that never
+            // occurred: the `global()` fallback path checks this exact flag, so it would
+            // never retry, and every later `fork()` would run without the quiesce
+            // handlers — the child inheriting held allocator locks or a half-built
+            // `OnceLock` and deadlocking on its first allocation. Releasing the flag
+            // makes the next caller (library-load ctor or first `global()`) try again,
+            // which is the difference between a transient failure and a permanent loss
+            // of fork safety.
+            ATFORK_REGISTERED.store(false, Ordering::Release);
         }
     }
 }
@@ -198,6 +210,14 @@ mod tests {
         // `pthread_atfork`, so a re-entrant call (were `pthread_atfork` itself to
         // allocate through this allocator during the load-time ctor) observes the
         // flag and returns at once, where a blocking `Once` would dead-lock (#4).
+        //
+        // The claim is provisional, not final: if `pthread_atfork` reports failure
+        // (`ENOMEM` — the handler list could not grow) the flag is released again, so
+        // the next caller retries rather than inheriting a permanent record of a
+        // registration that never happened. That path cannot be forced from a test
+        // (the failure is an allocation-pressure condition inside libc), so what is
+        // asserted here is the success invariant it preserves: after these calls the
+        // flag is set *and* the handlers really are installed.
         register_atfork_handlers();
         register_atfork_handlers();
         let handles: Vec<_> = (0..8)

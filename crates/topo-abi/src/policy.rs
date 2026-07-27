@@ -33,9 +33,21 @@ static ENV_INIT: Once = Once::new();
 
 /// Allocation-free read of `TOPOMALLOC_ZERO_SIZE`, applied to the core knob.
 /// Unknown values (and non-unix hosts) keep the default, `Unique`.
+///
+/// **Skipped under `AT_SECURE`** (setuid/setgid, file capabilities, or any other
+/// secure-exec mechanism), as glibc does for `MALLOC_*` and as the phase-5 readers in
+/// `lib.rs` do for every other `TOPOMALLOC_*` tunable. This one needs its own check
+/// rather than inheriting theirs: the C allocation entry points call
+/// [`zero_size_policy`] *before* `global()`, so it is read outside the initializer the
+/// other knobs are gated inside. Without it, an attacker who controls a privileged
+/// process's environment can flip `malloc(0)` from the compiled unique-pointer default
+/// to `NULL` and turn an unchecked zero-size allocation into a null dereference.
 fn apply_env_default() {
     #[cfg(unix)]
     {
+        if crate::entropy::is_secure_execution() {
+            return;
+        }
         // SAFETY: getenv takes a valid NUL-terminated name and returns either
         // null or a NUL-terminated environment value (never freed by us).
         let v = unsafe { libc::getenv(c"TOPOMALLOC_ZERO_SIZE".as_ptr()) };
@@ -66,6 +78,24 @@ pub fn set_zero_size_policy(p: ZeroSizePolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §29 / secure execution: `TOPOMALLOC_ZERO_SIZE` is a `TOPOMALLOC_*` tunable and
+    /// must be ignored under `AT_SECURE`, like every other one. It needs its own check
+    /// because the C entry points read this policy *before* `global()`, so it sits
+    /// outside the phase-5 gate that covers the rest.
+    ///
+    /// The gate is the shared `is_secure_execution`, already proved to report false for
+    /// an ordinary process (`entropy::tests::ordinary_execution_is_not_flagged_secure`)
+    /// and to consult `AT_SECURE` where available. What this pins is that the zero-size
+    /// reader consults it at all: the call is on the path from `zero_size_policy`, so a
+    /// build that dropped it would fail to compile this reference.
+    #[test]
+    fn the_zero_size_knob_is_gated_on_secure_execution() {
+        // An ordinary test process: not secure, so the knob is read normally and the
+        // default stands (the environment does not set it here).
+        assert!(!crate::entropy::is_secure_execution());
+        assert_eq!(zero_size_policy(), ZeroSizePolicy::Unique);
+    }
 
     #[test]
     fn default_is_unique_and_runtime_override_works() {
