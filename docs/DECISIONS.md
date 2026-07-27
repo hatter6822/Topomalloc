@@ -2330,3 +2330,56 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   shows the bitmaps stay disjoint across the injected drift — the checker it replaced sees
   nothing wrong. The general rule: **a checker's name is a claim; if it names a bijection,
   it has to walk both sides.**
+
+* **A two-step transition needs a name for the state in between (0.4.3).** Leaving RSEQ
+  mode is not one action but two: stop new restartable sequences from starting, then drain
+  the ones already in flight. `disable_rseq` published `MODE_LOCKED` and *then* issued the
+  membarrier, which makes the drain correct for the disabling thread and wrong for everyone
+  else — a concurrent `flush_front_end_core` observes the fast path already off, skips the
+  W7-4 non-owner fence (itself gated on `rseq_mode()`), takes another CPU's lock, and edits
+  a slot an old sequence can still commit `len` into: a lost object or a double-vend, the
+  exact race the fence exists to prevent. An earlier round added the fence and closed the
+  disabling thread's half; this is the other half.
+
+  The window now has a name. `MODE_DRAINING` is published first and behaves as **locked for
+  anyone starting an operation** (every mode that is not `MODE_RSEQ`/`MODE_PINNED`
+  dispatches to the locked path, so no new sequence begins) and as **RSEQ for the fence**
+  (old sequences may still be in flight). `MODE_LOCKED` is published only after the fence
+  returns, which is the first moment at which "nothing is in flight and nothing can start"
+  is true — so a drainer that observes it may legitimately skip the fence. The general rule:
+  **when a transition has an interior, give the interior a state**; the two questions a mode
+  answers here ("may I start a sequence?" and "must I fence?") are not each other's
+  negation, and collapsing them into one boolean is what created the hole. Pinned by
+  `the_rseq_disable_window_stops_new_sequences_but_keeps_the_fence_armed`, which fails if
+  either question is answered from the other.
+
+* **Hand-over-hand needs a bound, not just an exit condition (0.4.3).** `drain_cpu` popped
+  a chunk under the per-CPU lock, released the lock, then invoked the sink — correct lock
+  discipline, since the per-CPU lock must never be held while the sink takes a middle-end
+  lock. But the loop's exit condition was `len != 0`, and the released window is exactly
+  where a concurrent free can refill the slot. Under sustained frees on the drained CPU
+  there is no reason for `len` ever to be observed zero, so `topomalloc_cache_flush_all` —
+  documented as approximate under concurrency — would not return at all. The transfer-cache
+  half had already been bounded to a snapshot for this reason; the per-CPU half had not, so
+  the API could still hang on its other layer.
+
+  Each slot is now drained by at most its residency when that slot's turn came. Objects
+  pushed during the drain are the next flush's work, which is what "approximate" already
+  promised; under quiescence the bound is the whole slot, so nothing is left behind. The
+  general rule: **a loop that drops its lock is a loop whose termination is a separate
+  argument from its correctness** — "until empty" is an exit condition, not a bound, and
+  progress by the loop does not imply progress toward the exit. Pinned by
+  `a_drain_terminates_even_when_the_slot_is_refilled_underneath_it`, whose sink refills the
+  slot it was just handed; unbounded, the test hangs.
+
+* **Widen a security gate everywhere it applies, not where the bug was reported (0.4.3).**
+  An earlier round widened the authoritative `getauxval(AT_SECURE)` check from
+  `target_env = "gnu"` to gnu *and* musl, since `libc` provides `getauxval` for both and the
+  id-comparison fallback misses file-capability and secure-exec-LSM cases. The identical
+  `target_env = "gnu"` gate on `getauxval(AT_RANDOM)` — in the same module, resting on the
+  same availability fact — was left alone. On musl that discarded the kernel's exec-time
+  entropy, so a host where `getrandom` is denied by seccomp, unavailable, or short fell
+  through to the deliberately weak address-and-clock mix, making the guard-page and
+  quarantine schedules far more predictable than the platform allows (§29.5). Both branches
+  now carry the same cfg. The general rule: **when a fix is "this cfg was too narrow", the
+  unit of repair is every use of that cfg for that reason**, not the line the report names.

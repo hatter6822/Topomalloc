@@ -91,9 +91,17 @@ fn read_entropy() -> u64 {
 }
 
 /// `getauxval(AT_RANDOM)` — a pointer to 16 kernel-seeded random bytes placed in the
-/// auxiliary vector at `execve` (glibc/Linux). `None` off glibc/Linux, or when the
-/// auxv entry is absent (`getauxval` answers `0`).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// auxiliary vector at `execve` (Linux). `None` off Linux, or when the auxv entry is
+/// absent (`getauxval` answers `0`).
+///
+/// Gated on the same libc set as the `AT_SECURE` query in
+/// [`is_secure_execution`] — `getauxval` is provided by gnu and musl alike, and this
+/// module already depends on that for musl. Restricting *this* branch to gnu discarded
+/// the kernel's exec-time entropy on musl, so a host where `getrandom` is denied by
+/// seccomp, unavailable, or short fell through to the deliberately weak
+/// address-and-clock mix — leaving the guard-page and quarantine schedules far more
+/// predictable than the platform actually allows (§29.5).
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
 fn from_auxv() -> Option<u64> {
     const AT_RANDOM: libc::c_ulong = 25;
     // SAFETY: `getauxval` is a pure query of this process's auxiliary vector; it
@@ -114,7 +122,7 @@ fn from_auxv() -> Option<u64> {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
 fn from_auxv() -> Option<u64> {
     None
 }

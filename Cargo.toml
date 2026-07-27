@@ -146,7 +146,7 @@ exclude = ["fuzz", "vendor/sele4n"]
 # `Allocator::large_backing` — all with zero call sites), adds the `ArenaError::HasLiveChildren`
 # variant, and changes `topo_stats::redact_summary`'s signature (its `all_visible` flag was a
 # covert channel). See the "Full-tree audit pass" section of CLAUDE.md for the defects fixed.
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/hatter6822/topomalloc"

@@ -10,7 +10,7 @@
   <a href="https://github.com/hatter6822/topomalloc/actions/workflows/ci.yml">
     <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/hatter6822/topomalloc/ci.yml?branch=main&label=CI" />
   </a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.4.2-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.4.3-blue" />
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.94-dea584" />
   <img alt="Lean" src="https://img.shields.io/badge/Lean-4.28.0-10b981" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-informational" />
@@ -25,7 +25,7 @@ seLe4n integration is isolated behind explicit GPL-3.0-or-later artifacts.
 
 | Attribute | Value |
 |-----------|-------|
-| Project version | `0.4.2` |
+| Project version | `0.4.3` |
 | Rust toolchain | `1.94` stable, pinned by `rust-toolchain.toml` |
 | Lean toolchain | `v4.28.0`, pinned by `lean-toolchain` |
 | Primary platforms | x86-64 and AArch64 |
