@@ -149,17 +149,29 @@ impl CacheBudget {
         self.adapt_interval > 0 && n.is_multiple_of(self.adapt_interval)
     }
 
-    /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for each
-    /// active CPU and size class, adjusts soft capacities, and enforces the
-    /// global budget. Returns the total soft capacity after adaptation.
+    /// Run one adaptation cycle (W6-5). Reads miss/overflow counters for every
+    /// **initialized** slot, adjusts soft capacities, and enforces the global budget.
+    /// Returns the total soft capacity after adaptation.
+    ///
+    /// The walk is over all `MAX_CPUS` slots, not `0..active_cpus`, because those index
+    /// different things: `active_cpus` is the *count* of online CPUs, while a slot is
+    /// keyed by the **CPU id** `rseq::current_cpu()` reports, and Linux does not promise
+    /// those are dense. On a host whose online CPUs are 0 and 4 the count is 2 while the
+    /// live slots are 0 and 4, so a `0..active` walk adapts a slot nothing uses and never
+    /// consumes the real slot 4's miss/overflow counters — its soft capacity frozen at the
+    /// initial value and its objects missing from the budget total. Slots are cheap to
+    /// skip (`is_initialized` is one load) and an unused one is skipped by the same test
+    /// that already guarded the dense walk, so scanning the array costs a bounded scan and
+    /// removes the sparse-CPU hole. The **global allowance** is still sized from the CPU
+    /// count (see [`Allocator::set_front_end_cpus`](crate::Allocator::set_front_end_cpus)),
+    /// which is the figure that genuinely is a population.
     pub fn adapt(&self, cpu_cache: &CpuCache) -> usize {
-        let active = cpu_cache.active_cpus() as usize;
-        if active == 0 {
+        if cpu_cache.active_cpus() == 0 {
             return 0;
         }
 
         // Phase 1: per-slot adaptation based on miss/overflow stats.
-        for cpu_idx in 0..active {
+        for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
             let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
                 Some(c) => c,
                 None => continue,
@@ -208,11 +220,11 @@ impl CacheBudget {
         // (lowest CPU, lowest SC first); a future enhancement could sort by
         // activity to prefer shrinking the least-active slots.
         let budget = self.global_budget();
-        let mut total = self.compute_total_capacity(cpu_cache, active);
+        let mut total = self.compute_total_capacity(cpu_cache);
 
         while total > budget {
             let mut made_progress = false;
-            for cpu_idx in 0..active {
+            for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
                 if total <= budget {
                     break;
                 }
@@ -252,10 +264,12 @@ impl CacheBudget {
         total
     }
 
-    /// Compute the total soft capacity across all active CPUs and SCs.
-    fn compute_total_capacity(&self, cpu_cache: &CpuCache, active: usize) -> usize {
+    /// Compute the total soft capacity across every **initialized** slot and SC. Walks all
+    /// `MAX_CPUS` slots for the sparse-CPU-id reason documented on [`Self::adapt`] — a
+    /// slot the budget does not count is a slot the budget does not bound.
+    fn compute_total_capacity(&self, cpu_cache: &CpuCache) -> usize {
         let mut total = 0usize;
-        for cpu_idx in 0..active {
+        for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
             let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
                 Some(c) => c,
                 None => continue,
@@ -407,6 +421,40 @@ mod tests {
             "soft capacity should shrink on high overflows: was {hard_cap}, now {new_soft}"
         );
         assert!(new_soft >= batch, "should not shrink below batch size");
+    }
+
+    #[test]
+    fn a_sparse_cpu_id_slot_is_still_adapted() {
+        // W6-5 on a host whose *online CPU ids* are sparse. `active_cpus` is a **count**;
+        // a slot is keyed by the CPU **id** `rseq::current_cpu()` reports, and Linux does
+        // not promise those are dense (CPUs 0 and 4 online => count 2, slots 0 and 4). A
+        // walk over `0..active_cpus` would never reach slot 4, leaving its miss counter
+        // unconsumed and its soft capacity frozen at the initial value forever.
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        cc.set_active_cpus(2); // two CPUs online...
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        // ...but the live slot is at id 4, outside the dense `0..2` range.
+        let sparse = CoreId(4);
+        cc.init_slot(sparse, sc, &m, hard_cap);
+        let slot = cc.per_cpu(sparse).unwrap().slot(sc).unwrap();
+        slot.set_soft_capacity(batch);
+        let before = slot.soft_capacity();
+
+        // Drive misses on that slot, then adapt.
+        for _ in 0..100 {
+            cc.fe_pop(sparse, A, sc, &m);
+        }
+        let budget = CacheBudget::new(100_000);
+        budget.adapt(&cc);
+
+        assert!(
+            slot.soft_capacity() > before,
+            "a slot at a sparse CPU id must still adapt: soft capacity stuck at {before}"
+        );
     }
 
     #[test]

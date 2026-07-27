@@ -290,23 +290,21 @@ impl<P: TopoBackingProvider, C: CoreProvider> NodeRouter<P, C> {
 
         let mut plan = Rebalancer::plan(&pressures[..self.n_nodes], &topo)?;
         let src = plan.src.0 as usize;
-        // Release the move's worth of empty hugepages and keep the rest.
+        // Release the move's worth of the donor's empty hugepages, bounded **in bytes**.
         //
-        // `release_empty_excess` takes a hugepage **count** to retain, so the reserve must
-        // be computed from the donor's empty-backed hugepage *count* — not from
-        // `free_bytes / HUGEPAGE_SIZE`. `free_bytes` is `coverage().empty_backed_bytes`,
-        // the *committed* bytes of empty hugepages; a packed-then-emptied hugepage is only
-        // partially committed, so the byte form undercounts the population and the reserve
-        // lands far below the real count, releasing vastly more than the plan asked for
-        // (and evicting the donor's whole warm cache, breaking the `movable_surplus`
-        // bound that exists so a move never strands the donor). Same population-matching
-        // rule `HugePageBackend::release_tick` applies.
+        // `plan.bytes` is the donor's `movable_surplus` (`free − own demand`) — the whole
+        // point of which is that releasing it cannot strand the donor. That bound is a
+        // byte figure, and it must stay one: an empty hugepage's committed footprint is
+        // anywhere in `(0, HUGEPAGE_SIZE]` (a packed-then-emptied one is only partially
+        // committed), so a hugepage **count** cannot express it. Rounding the count up
+        // overshoots — two empties committed 1.5 MiB each against a 1 MiB surplus round to
+        // one whole hugepage and release 1.5 MiB, taking 0.5 MiB the donor's own demand
+        // needed — and rounding down forfeits every release smaller than a hugepage even
+        // when the real footprints would have fit. `release_empty_within_bytes` selects on
+        // each hugepage's actual committed count instead, so the release is exactly within
+        // surplus and the no-stranding guarantee survives contact with partial commitment.
         let released = match self.backend(src) {
-            Some(b) => {
-                let empty_hp = b.empty_backed_hugepages();
-                let release_hp = plan.bytes.div_ceil(HUGEPAGE_SIZE as u64) as usize;
-                b.release_empty_excess(empty_hp.saturating_sub(release_hp)) as u64
-            }
+            Some(b) => b.release_empty_within_bytes(plan.bytes) as u64,
             None => 0,
         };
         plan.bytes = released;

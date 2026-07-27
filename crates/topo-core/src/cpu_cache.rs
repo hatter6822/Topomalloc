@@ -268,6 +268,29 @@ impl CpuSlot {
         true
     }
 
+    /// Visit every address this slot currently holds (W19-1b residency cross-check).
+    ///
+    /// # Safety
+    /// The caller MUST hold the owning per-CPU lock. The scan is bounded by the **buffer
+    /// capacity**, not by the (possibly-corrupted) `len`, so it can never read past the
+    /// `hard_capacity`-sized buffer.
+    pub(crate) unsafe fn for_each_entry(&self, mut f: impl FnMut(usize)) {
+        if !self.is_initialized() {
+            return;
+        }
+        let len = (self.len() as usize).min(self.hard_capacity() as usize);
+        let buf = self.buf_ptr();
+        if buf.is_null() {
+            return;
+        }
+        for i in 0..len {
+            // SAFETY: `i < len <= hard_capacity`; `buf` is a valid array of
+            // `hard_capacity` `usize` from `MetadataAlloc` (never freed) and the caller
+            // holds the per-CPU lock, so there is no concurrent writer.
+            f(unsafe { *buf.add(i) });
+        }
+    }
+
     /// Test-only: force `len` past the capacity bound, to construct a
     /// deliberately-inconsistent slot and prove
     /// [`check_invariants`](Self::check_invariants) catches it (W19-1 negative
@@ -310,7 +333,7 @@ impl PerCpu {
 
     /// Acquire the per-CPU lock (rank `FRONT_END`, routed through the checker).
     #[inline]
-    fn lock(&self) -> CpuGuard<'_> {
+    pub(crate) fn lock(&self) -> CpuGuard<'_> {
         self.locked.acquire();
         CpuGuard { cpu: self }
     }
@@ -323,7 +346,7 @@ impl PerCpu {
 }
 
 /// RAII guard for a locked [`PerCpu`].
-struct CpuGuard<'a> {
+pub(crate) struct CpuGuard<'a> {
     cpu: &'a PerCpu,
 }
 

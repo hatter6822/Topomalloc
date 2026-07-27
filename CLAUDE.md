@@ -6,7 +6,7 @@ This document serves as the engineering manual for TopoMalloc, a safety-first, f
 
 TopoMalloc is a general-purpose memory allocator combining per-CPU caching, topology-aware transfer layers, jemalloc-style policy arenas, Temeraire-style hugepage-aware backing, rigorous observability, a Lean 4 formal model, and a required seLe4n/seL4-style microkernel integration profile. The Rust core is `no_std`-capable on the hot path, with POSIX and the [seLe4n](https://github.com/hatter6822/seLe4n) capability microkernel co-equal behind one backing-provider seam.
 
-**Current Status:** workspace version `0.4.1`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
+**Current Status:** workspace version `0.4.2`. The tree includes the central allocator path, the public C/C++/Rust ABI, arena and extent-hook surfaces, hugepage-aware backing, topology routing, observability, hardening features, deterministic/debug modes, sanitizer/test harnesses, and the Lean/seLe4n formal model bridge. Keep this file focused on engineering rules; detailed design history belongs in `docs/DECISIONS.md` and roadmap sequencing belongs in `planning/`.
 
 ## Essential Build Commands
 
@@ -116,7 +116,7 @@ Each pull request bumps the patch component (semver) unless explicitly stated ot
 
 ```toml
 # Cargo.toml [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 ```
 
 Mechanics: use patch (default) for bug fixes / refactors / tests; minor for new backwards-compatible functionality; major for breaking changes.

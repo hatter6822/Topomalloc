@@ -202,12 +202,36 @@ impl FreeBitmap {
         self.word(w).fetch_and(!bit, Ordering::Relaxed) & bit != 0
     }
 
+    /// Clear object `i` with **release** ordering — the second half of a *free-bit-first*
+    /// handoff (§29.3/§29.4). The first half sets this span's central free bit; releasing
+    /// here publishes that set to any thread whose paired
+    /// [`contains_acquire`](Self::contains_acquire) observes the clear, which is what
+    /// makes the lock-free `held || central_free` double-free oracle hold on a weakly
+    /// ordered target. See [`SpanDescriptor::is_object_quarantined`].
+    #[inline]
+    pub fn remove_release(&self, i: usize) -> bool {
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        self.word(w).fetch_and(!bit, Ordering::Release) & bit != 0
+    }
+
     /// Whether object `i` is central-resident.
     #[inline]
     pub fn contains(&self, i: usize) -> bool {
         debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
         let (w, bit) = (i / 64, 1u64 << (i % 64));
         self.word(w).load(Ordering::Relaxed) & bit != 0
+    }
+
+    /// Read object `i`'s bit with **acquire** ordering — the consuming half of the
+    /// free-bit-first handoff described on [`remove_release`](Self::remove_release). A
+    /// reader that observes the cleared bit is thereby guaranteed to observe the central
+    /// free bit the releasing thread set before it.
+    #[inline]
+    pub fn contains_acquire(&self, i: usize) -> bool {
+        debug_assert!(i < self.capacity_bits(), "object index out of bitmap range");
+        let (w, bit) = (i / 64, 1u64 << (i % 64));
+        self.word(w).load(Ordering::Acquire) & bit != 0
     }
 
     /// Number of central-resident objects (`popcount`). The value
@@ -350,21 +374,30 @@ impl CachedBits {
     }
 
     /// Clear object `i`'s cache residency. `true` iff it was set.
+    ///
+    /// **Release**, and load-bearing: the `cached → central-free` flush sets the central
+    /// free bit and *then* clears this one (free-bit-first), and only a release here
+    /// publishes that set to a lock-free reader whose paired acquire
+    /// [`contains`](Self::contains) observes the clear. With both sides relaxed the two
+    /// stores may reach another core in either order on a weakly ordered target, and the
+    /// `is_cached || is_central_free` oracle has a blind instant in which both read
+    /// `false`. See [`SpanDescriptor::is_free_awaiting_reuse`].
     #[inline]
     pub fn clear(&self, i: usize) -> bool {
         let (w, bit) = (i / 64, 1u64 << (i % 64));
         match self.word(w) {
             None => false,
-            Some(word) => word.fetch_and(!bit, Ordering::Relaxed) & bit != 0,
+            Some(word) => word.fetch_and(!bit, Ordering::Release) & bit != 0,
         }
     }
 
-    /// Whether object `i` is cache-resident (lock-free read).
+    /// Whether object `i` is cache-resident (lock-free read). **Acquire** — the consuming
+    /// half of the publication documented on [`clear`](Self::clear).
     #[inline]
     pub fn contains(&self, i: usize) -> bool {
         let (w, bit) = (i / 64, 1u64 << (i % 64));
         self.word(w)
-            .is_some_and(|word| word.load(Ordering::Relaxed) & bit != 0)
+            .is_some_and(|word| word.load(Ordering::Acquire) & bit != 0)
     }
 
     /// Cache-resident object count over `words` active words (§16.4
@@ -1121,6 +1154,18 @@ impl SpanDescriptor {
     /// between the loads, i.e. the pointer now belongs to another caller: a stale-pointer
     /// free, which this method's callers exclude by contract and which the pre-front-end
     /// `central_insert` test-and-set could not detect either.
+    ///
+    /// **The load order is necessary but not sufficient**, and the missing half is
+    /// ordering, not sequencing. "Free-bit-first clears cached only after setting the free
+    /// bit" is a statement about the flushing core's *program* order; the two bits are
+    /// independent locations, so on a weakly ordered target (the supported AArch64 build)
+    /// another core may observe the clear before the set even though this core issued them
+    /// the other way round. Relaxed on both sides therefore reopens exactly the straddle
+    /// the load order closes. What rules it out is the release/acquire pair:
+    /// [`CachedBits::clear`] releases and [`CachedBits::contains`] acquires, so observing
+    /// `cached == false` *happens-after* the free bit was set and the following
+    /// `is_central_free` load cannot miss it. Pinned by
+    /// `cached_to_central_flush_is_ordered_for_a_lock_free_reader`.
     #[inline]
     pub fn is_free_awaiting_reuse(&self, i: usize) -> bool {
         self.is_cached(i) || self.is_central_free(i)
@@ -1136,11 +1181,17 @@ impl SpanDescriptor {
     /// Always `false` without the `quarantine` feature (the bitmap does not exist).
     /// Distinct from the whole-span [`is_quarantined`](Self::is_quarantined) flag — this
     /// is the per-**object** W18-3 state.
+    ///
+    /// Program order alone does not carry that guarantee to another core: the drain's two
+    /// stores are independent locations, so on a weakly ordered target the clear may land
+    /// first and a reader see neither bit. The **acquire** load here pairs with the
+    /// drain's release clear ([`FreeBitmap::remove_release`]) to order them — the same
+    /// pairing the front-end residency bit uses (see [`CachedBits::clear`]).
     #[inline]
     pub fn is_object_quarantined(&self, i: usize) -> bool {
         #[cfg(feature = "quarantine")]
         {
-            self.quarantined_bitmap.contains(i)
+            self.quarantined_bitmap.contains_acquire(i)
         }
         #[cfg(not(feature = "quarantine"))]
         {
@@ -1408,15 +1459,17 @@ impl SpanGuard<'_> {
     /// W18-3 (§29.4): clear object `i`'s **quarantined** bit (the second half of the
     /// drain transition; the first half — `central_insert`, setting the free bit — MUST
     /// run first under this same lock so a lock-free `is_quarantined || is_central_free`
-    /// check never sees a gap). A no-op when not quarantined (so the normal free path
-    /// may call it unconditionally). `true` if a bit was cleared.
+    /// check never sees a gap — and the clear is a **release** so that ordering is what
+    /// another core observes, not merely what this one executes). A no-op when not
+    /// quarantined (so the normal free path may call it unconditionally). `true` if a bit
+    /// was cleared.
     #[cfg(feature = "quarantine")]
     #[inline]
     pub fn clear_quarantined(&self, i: usize) -> bool {
         if i >= self.span.object_count() as usize {
             return false;
         }
-        self.span.quarantined_bitmap.remove(i)
+        self.span.quarantined_bitmap.remove_release(i)
     }
 
     /// Whether object `i` is quarantined (consistent under the lock).

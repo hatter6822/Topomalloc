@@ -1758,7 +1758,11 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// span's own lock, so this is a conjunction of individually-exact checks rather than
     /// a global count that a racing operation could tear. Total + side-effect-free,
     /// O(span slots).
-    fn front_end_residency_agrees(&self) -> bool {
+    ///
+    /// Disjointness is *one* of the two facts the oracle needs; the other — that a marker
+    /// names an object the front end really holds — is
+    /// [`front_end_markers_name_held_objects`](Self::front_end_markers_name_held_objects).
+    fn front_end_residency_is_disjoint(&self) -> bool {
         self.span_lock.acquire();
         // SAFETY: span lock held ⇒ exclusive pool head-state access.
         let high_water = unsafe { (*self.spans.inner.get()).high_water };
@@ -1774,6 +1778,79 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             }
         }
         true
+    }
+
+    /// Appendix B (W6, §16.4): **every object the front end holds carries its cached
+    /// marker** — walked from the caches to the markers, the direction disjointness cannot
+    /// see.
+    ///
+    /// Disjointness alone is a weaker fact than the double-free oracle needs. It says the
+    /// cached and central-free sets do not overlap; it says nothing about whether a cached
+    /// *bit* corresponds to a real cache entry, or — the dangerous direction — whether an
+    /// address sitting in a per-CPU slot or transfer bin is marked at all. An unmarked
+    /// held object is invisible to `try_mark_cached`, so a second free of it is admitted
+    /// and the same address is vended twice (§29.3), and a bitmap-only check reports a
+    /// healthy allocator throughout. This walks the caches themselves: resolve each held
+    /// address to its span and object index exactly as the free path does
+    /// ([`validate_free`]), and require the marker to be set.
+    ///
+    /// **Direction and quiescence.** Only entry ⇒ marker is asserted, because only that
+    /// direction is a violation. Marker ⇒ entry is *transiently false by design*: a free
+    /// marks before it pushes and an allocation pops before it unmarks, so a marker with
+    /// no entry is the ordinary mid-operation state, not drift. Each per-CPU slot and
+    /// transfer bin is read under its own lock, which excludes the locked path but not the
+    /// W7 RSEQ sequences (they take no lock, §27.4) — so under RSEQ traffic a pop between
+    /// the entry read and the marker read can report a spurious violation. Exact when the
+    /// front end is quiescent, which is how the oracle is used
+    /// ([`check_invariants`](Self::check_invariants) is the on-demand sweep behind
+    /// `topomalloc_debug_check_now`, not a per-transition assert). Total +
+    /// side-effect-free, O(cache entries).
+    fn front_end_markers_name_held_objects(&self) -> bool {
+        let mut ok = true;
+        let mut check = |addr: usize| {
+            if !ok {
+                return;
+            }
+            if addr == 0 {
+                ok = false;
+                return;
+            }
+            // A cached address must still resolve as a small object of a live span; the
+            // free path resolves it exactly this way. Anything else means the front end is
+            // holding an address the pagemap no longer calls a small object — a retired or
+            // rewritten span, which is itself the drift this check exists to catch.
+            match validate_free(self.pagemap, self.meta_region, addr) {
+                Ok(FreeTarget::Small { span, object_index }) => {
+                    // SAFETY: the pagemap only ever names descriptors in never-freed
+                    // metadata (§27.5), so the descriptor stays readable.
+                    let span = unsafe { &*span };
+                    if !span.is_cached(object_index) {
+                        ok = false;
+                    }
+                }
+                _ => ok = false,
+            }
+        };
+        for c in 0..crate::cpu_cache::MAX_CPUS {
+            let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) else {
+                continue;
+            };
+            let _guard = cpu.lock();
+            for i in 0..SIZE_CLASSES.len() {
+                if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
+                    // SAFETY: this CPU's lock is held for the whole walk.
+                    unsafe { slot.for_each_entry(&mut check) };
+                }
+            }
+        }
+        for i in 0..SIZE_CLASSES.len() {
+            if let Some(bin) = self.transfer.bin(SizeClassId::new(i)) {
+                let _guard = bin.lock();
+                // SAFETY: this bin's lock is held for the whole walk.
+                unsafe { bin.for_each_entry(&mut check) };
+            }
+        }
+        ok
     }
 
     /// Objects currently resident in the front end: the per-CPU slots plus the transfer
@@ -3705,8 +3782,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             && self.transfer.check_invariants()
             // W6 (§16.4): the per-object cached bits agree with what the front end
             // actually holds — the residency marker cannot drift from the slots it
-            // describes without breaking the double-free oracle built on it.
-            && self.front_end_residency_agrees();
+            // describes without breaking the double-free oracle built on it. Both
+            // directions of "agree", since they are separate facts: no object is
+            // simultaneously cached and central-free (bitmap-side, concurrency-robust),
+            // *and* every address the caches hold is actually marked (cache-side, the
+            // direction in which drift double-vends).
+            && self.front_end_residency_is_disjoint()
+            && self.front_end_markers_name_held_objects();
         if self.hooks.count.load(Ordering::Acquire) > 0 {
             self.hooks.lock.acquire();
             for i in 0..MAX_HOOK_BACKENDS {
@@ -4375,6 +4457,56 @@ mod tests {
             "the object reached central"
         );
         assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert!(a.check_invariants());
+    }
+
+    /// Appendix B (W6, §16.4): the residency checker must actually walk the caches, not
+    /// only the bitmaps. Disjointness is blind to an object *held* by the front end whose
+    /// cached marker is clear — and that object is invisible to `try_mark_cached`, so a
+    /// second free of it is admitted and the address is vended twice (§29.3).
+    ///
+    /// Constructs exactly that drift: free an object so it lands in a per-CPU slot (marker
+    /// set, entry present), then clear the marker behind the checker's back. The two
+    /// bitmaps stay disjoint throughout, so a disjointness-only check still reports a
+    /// healthy allocator; the cache-side walk is what catches it.
+    #[test]
+    fn a_held_object_whose_marker_was_cleared_is_caught() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(
+            span.is_cached(object_index),
+            "the freed object is held by the front end and marked"
+        );
+        assert!(
+            a.check_invariants(),
+            "healthy before the drift is introduced"
+        );
+
+        // The drift: the front end still holds the address, but the marker is gone.
+        assert!(span.unmark_cached(object_index));
+        assert!(
+            span.cached_and_central_free_are_disjoint(),
+            "the bitmaps are still disjoint — this is precisely what disjointness misses"
+        );
+        assert!(
+            !a.check_invariants(),
+            "a held object with no cached marker must fail the residency check"
+        );
+
+        // Restore, so the allocator is well-formed again at drop.
+        assert!(span.try_mark_cached(object_index));
         assert!(a.check_invariants());
     }
 

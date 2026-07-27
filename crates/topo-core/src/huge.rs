@@ -2651,28 +2651,82 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
                 "next_empty_backed only yields backed empties"
             );
             let _ = committed;
-            // Release **every maximal committed run** of this hugepage (its RSS).
-            // `subrelease` takes a contiguous run, and a committed set is not in
-            // general the prefix `[0, popcount)` — an over-aligned placement leaves
-            // stride holes and a subrelease-then-partial-refill leaves a released hole
-            // — so passing the popcount as a run length made `subrelease` refuse and
-            // reclaim nothing. Walking the runs reclaims exactly the backed pages,
-            // whatever their layout. A guard or revoke refusal returns 0; skip that run
-            // and keep reclaiming the others (a concurrent change just makes the
-            // subrelease a re-validated no-op). `search_from` advances past each run
-            // examined, so the walk is O(PAGES_PER_HUGEPAGE) and always terminates.
-            let mut search_from = 0usize;
-            loop {
-                let run = {
-                    let g = self.lock();
-                    g.inner.filler.next_committed_run(idx, search_from)
-                };
-                let Some((off, pages)) = run else { break };
-                search_from = off + pages;
-                match self.subrelease(base + off * PAGE_SIZE, pages, true) {
-                    0 => continue,
-                    bytes => released += bytes,
-                }
+            released += self.release_hugepage_runs(idx, base);
+        }
+        released
+    }
+
+    /// **Demand-reserve shrink bounded by bytes**, the byte-denominated counterpart of
+    /// [`release_empty_excess`](Self::release_empty_excess): release whole empty-backed
+    /// hugepages while the **committed bytes released so far** stay within `budget`.
+    /// Returns the bytes actually released (always `<= budget`).
+    ///
+    /// A caller whose bound is a byte figure cannot express it as a `reserve` count
+    /// without overshooting. An empty hugepage's committed footprint is anywhere in
+    /// `(0, HUGEPAGE_SIZE]` — a packed-then-emptied one is only partially committed — so
+    /// converting a byte budget to a hugepage count has no correct rounding: rounding up
+    /// releases more than the budget, and rounding down forfeits every release below one
+    /// hugepage even when the actual footprints would fit. Selecting on each hugepage's
+    /// real `committed` count is exact, and it is already in hand — `next_empty_backed`
+    /// returns it. Used by the §15.4 rebalancer, whose move size is a `movable_surplus`
+    /// **byte** bound that exists precisely so a move never strands the donor.
+    ///
+    /// Skips (rather than stops at) a hugepage too large for the remaining budget, so a
+    /// fully-committed hugepage at the head does not mask smaller releasable ones behind
+    /// it; the walk is by ascending slot index and visits each hugepage once.
+    pub fn release_empty_within_bytes(&self, budget: u64) -> usize {
+        let mut released = 0usize;
+        let mut from = 0u32;
+        loop {
+            let next = {
+                let g = self.lock();
+                g.inner.filler.next_empty_backed(from)
+            };
+            let (idx, base, committed) = match next {
+                Some(t) => t,
+                None => break,
+            };
+            from = idx + 1;
+            // Charge the hugepage's committed footprint against what is left. `committed`
+            // is a page count; a release can only ever return that many pages' RSS.
+            let cost = (committed as u64).saturating_mul(PAGE_SIZE as u64);
+            let remaining = budget.saturating_sub(released as u64);
+            if cost > remaining {
+                continue;
+            }
+            released += self.release_hugepage_runs(idx, base);
+        }
+        debug_assert!(
+            released as u64 <= budget,
+            "byte-budgeted release overshot: {released} > {budget}"
+        );
+        released
+    }
+
+    /// Release **every maximal committed run** of empty hugepage `idx` (its RSS),
+    /// returning the bytes released.
+    ///
+    /// `subrelease` takes a contiguous run, and a committed set is not in general the
+    /// prefix `[0, popcount)` — an over-aligned placement leaves stride holes and a
+    /// subrelease-then-partial-refill leaves a released hole — so passing the popcount as
+    /// a run length made `subrelease` refuse and reclaim nothing. Walking the runs
+    /// reclaims exactly the backed pages, whatever their layout. A guard or revoke refusal
+    /// returns 0; skip that run and keep reclaiming the others (a concurrent change just
+    /// makes the subrelease a re-validated no-op). `search_from` advances past each run
+    /// examined, so the walk is O(`PAGES_PER_HUGEPAGE`) and always terminates.
+    fn release_hugepage_runs(&self, idx: u32, base: usize) -> usize {
+        let mut released = 0usize;
+        let mut search_from = 0usize;
+        loop {
+            let run = {
+                let g = self.lock();
+                g.inner.filler.next_committed_run(idx, search_from)
+            };
+            let Some((off, pages)) = run else { break };
+            search_from = off + pages;
+            match self.subrelease(base + off * PAGE_SIZE, pages, true) {
+                0 => continue,
+                bytes => released += bytes,
             }
         }
         released
@@ -4185,6 +4239,52 @@ mod backend_tests {
             "decommit followed a successful revoke"
         );
         assert!(b.free_region(a));
+        assert!(b.check_invariants());
+    }
+
+    #[test]
+    fn a_byte_budgeted_release_never_overshoots_a_partial_commitment() {
+        // W13-3 no-stranding: the rebalancer's move size is a `movable_surplus` **byte**
+        // bound, and partially-committed empty hugepages are what make a hugepage *count*
+        // unable to express it. Build empties whose committed footprint is a fraction of a
+        // hugepage (allocate a sub-hugepage region, then free it), and check the
+        // byte-budgeted release stays within budget where rounding a count up would not.
+        let b = backend(4);
+        let part = HUGEPAGE_SIZE / 4;
+        let regions: Vec<Region> = (0..3)
+            .map(|_| {
+                b.allocate(part, PAGE_SIZE, PlaceHints::default())
+                    .expect("sub-hugepage region")
+            })
+            .collect();
+        for r in &regions {
+            assert!(b.free_region(*r));
+        }
+        let backed = b.coverage().empty_backed_bytes;
+        assert!(
+            backed > 0 && backed < 3 * HUGEPAGE_SIZE as u64,
+            "empties are only partially committed ({backed} bytes), the case under test"
+        );
+
+        // A budget below the smallest footprint releases nothing — and in particular does
+        // not round up to one whole hugepage.
+        assert!(
+            b.empty_backed_hugepages() > 0,
+            "there are empty-backed hugepages to release"
+        );
+        assert_eq!(
+            b.release_empty_within_bytes(1),
+            0,
+            "a 1-byte budget must not release a whole partially-committed hugepage"
+        );
+
+        // A budget of the full backed footprint releases at most that many bytes. The
+        // pre-fix `div_ceil` path would have released whole hugepages regardless.
+        let released = b.release_empty_within_bytes(backed) as u64;
+        assert!(
+            released <= backed,
+            "byte-budgeted release overshot its budget: {released} > {backed}"
+        );
         assert!(b.check_invariants());
     }
 

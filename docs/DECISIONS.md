@@ -2258,3 +2258,75 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   placement policy that the bin assignment does not speak to. The general rule: **a cap
   that some inputs are exempt from is not a cap** — the exempt class is exactly what an
   adversarial (or merely hot) workload will produce.
+
+* **Free-bit-first needs release/acquire, not just program order (0.4.2).** Two §29.3/§29.4
+  handoffs move an object between states recorded in *separate* bitmaps — `cached →
+  central-free` (W6) and `quarantined → central-free` (W18-3) — and both are written
+  "free-bit-first": set the central free bit, *then* clear the other, so a lock-free
+  `held || central_free` double-free oracle is true at every instant. The reader mirrors the
+  order, reading the held bit first, and a comment argued at length why that ordering closes
+  the straddle.
+
+  The argument was a sequential-consistency argument, and all four accesses were `Relaxed`.
+  Program order on the writing core says nothing about the order another core *observes* two
+  independent locations in; on the supported AArch64 build the clear may become visible
+  before the set, and the reader sees neither bit — re-marking and re-caching an object that
+  central can also vend, the exact double-vend the oracle exists to prevent. Load order is
+  necessary but not sufficient. The clear is now a **release** and the paired load an
+  **acquire** (in-map for §27.3: publication/consumption), which is what actually makes the
+  set visible to anyone who observes the clear. Pinned by the loom model
+  `cached_to_central_flush_is_ordered_for_a_lock_free_reader`, which finds the straddle in
+  a few hundred interleavings if either side is reverted to `Relaxed`. The general rule:
+  **an ordering claim about two locations is a claim about atomics, not about statement
+  order** — if the prose says "we do X before Y", the code has to say so in the orderings.
+
+* **A byte bound cannot be re-expressed as an object count (0.4.2).** The §15.4 rebalancer
+  plans a move sized by the donor's `movable_surplus` (`free − own demand`) — a **byte**
+  figure whose entire purpose is that releasing it cannot strand the donor. Execution
+  converted it to a hugepage count with `div_ceil` and released whole hugepages. Because an
+  empty hugepage's committed footprint is anywhere in `(0, HUGEPAGE_SIZE]` (a
+  packed-then-emptied one is only partially committed), that rounding releases more RSS than
+  the surplus: two empties committed 1.5 MiB each against a 1 MiB surplus round to one
+  hugepage and free 1.5 MiB, taking 0.5 MiB the donor's own demand needed. Rounding *down*
+  is safe but forfeits every release smaller than a hugepage even when the real footprints
+  would have fit.
+
+  Neither rounding is right because the quantities are not interconvertible. The new
+  `HugePageBackend::release_empty_within_bytes` selects on each hugepage's actual `committed`
+  count — already returned by `next_empty_backed` and previously discarded — so the release
+  is exactly within surplus. Pinned by
+  `a_byte_budgeted_release_never_overshoots_a_partial_commitment`. The general rule:
+  **when a bound is denominated in one unit, keep it in that unit all the way to the
+  mechanism**; a conversion whose rounding direction changes correctness is a sign the
+  mechanism needs the other denomination, not that the caller needs to pick a direction.
+
+* **A count is not an index (0.4.2).** The W6-5 budget controller walked
+  `0..active_cpus` to adapt per-CPU slots. `active_cpus` is the *count* of online CPUs,
+  while a slot is keyed by the **CPU id** `rseq::current_cpu()` reports — and Linux does not
+  promise those are dense. On a host whose online CPUs are 0 and 4, the count is 2 and the
+  live slots are 0 and 4, so the walk adapted a slot nothing used and never consumed the
+  real slot's miss/overflow counters: its soft capacity frozen at the initial value and its
+  objects missing from the budget total, i.e. a slot the budget did not bound. `adapt` and
+  `compute_total_capacity` now walk all `MAX_CPUS` slots and skip uninitialized ones (the
+  same `is_initialized` test that already guarded the dense walk); the global *allowance* is
+  still sized from the CPU count, which is the figure that genuinely is a population. Pinned
+  by `a_sparse_cpu_id_slot_is_still_adapted`.
+
+* **Check the direction the drift is dangerous in (0.4.2).** The W6 Appendix-B residency
+  checker was cited — in its own name, `front_end_residency_agrees`, and at its
+  `check_invariants` call site — as proving "the cached bits agree with what the front end
+  actually holds". It proved something weaker: that per span, the cached and central-free
+  bitmaps are disjoint. Both are bitmap-side facts. Neither looks at a cache, so an address
+  sitting in a per-CPU slot or transfer bin whose cached marker is *clear* passes — and that
+  object is invisible to `try_mark_cached`, so a second free of it is admitted and the
+  address is vended twice, with the oracle reporting a healthy allocator throughout.
+
+  Split into the two facts it was conflating: `front_end_residency_is_disjoint` (bitmap-side,
+  concurrency-robust, unchanged) and `front_end_markers_name_held_objects`, which walks the
+  caches themselves and resolves each held address exactly as the free path does. Only
+  entry ⇒ marker is asserted: marker ⇒ entry is transiently false by design (a free marks
+  before it pushes, an allocation pops before it unmarks), so the missing direction is not
+  drift. Pinned by `a_held_object_whose_marker_was_cleared_is_caught`, whose middle assertion
+  shows the bitmaps stay disjoint across the injected drift — the checker it replaced sees
+  nothing wrong. The general rule: **a checker's name is a claim; if it names a bijection,
+  it has to walk both sides.**
