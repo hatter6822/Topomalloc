@@ -2299,12 +2299,69 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                                 let span = unsafe { &*batch.span() };
                                 self.hand_out_object(span, batch.index(0))
                             }
-                            RemoveResult::NeedSpan => ptr::null_mut(),
+                            RemoveResult::NeedSpan => self.alloc_small_from_transfer(arena, sc),
                         };
                     }
                 }
             }
         }
+    }
+
+    /// The last thing tried before an allocation reports OOM: take one object back out of
+    /// the **transfer cache** (§11.4).
+    ///
+    /// Central is not the only place this allocator parks a free small object, and the
+    /// fallback above searched nowhere else. Two routes leave objects here that no central
+    /// lookup can see:
+    ///
+    /// * A refill whose `push_batch` is **declined**. `cache_ops::refill` removes a batch
+    ///   from central, and when the per-CPU push declines it returns the remainder to the
+    ///   transfer cache — deliberately, since dropping it would leak (§16.4). The push
+    ///   declines whenever the W7-4 non-owner fence cannot be issued, which a thread that
+    ///   migrated after `fe_pop_tracked` and cannot call `membarrier` (a seccomp policy
+    ///   denying it) hits every time. `alloc_small_cached`'s bounded loop then gives up
+    ///   and the objects it moved out of central stay in the transfer cache.
+    /// * A **front-end-bypassing** request (`TOPO_TCACHE_NONE` §10.3, or the §30.4
+    ///   force-slow-path) never calls `alloc_small_cached` at all, so it never consults
+    ///   the transfer cache even in the ordinary case.
+    ///
+    /// Either way an exhausted backend turned into a spurious OOM with reusable objects
+    /// one layer down. **Availability before policy (§2.4)** — the same trade the
+    /// `ANY_PLACE_CLASS` retry just above makes, and made in the same place, so a bypass
+    /// flag or a placement tag can cost a request its *preference* but never its
+    /// allocation. Reached only when a span could not be created **and** no partial span
+    /// of any class exists, so an ordinary workload never executes it.
+    ///
+    /// **Arena is not negotiable.** [`TransferCache::try_pop_batch`] ignores its arena
+    /// argument — the bins are keyed by size class alone — which is sound only because
+    /// [`front_end_cacheable`](Self::front_end_cacheable) gates every *entry* point, so a
+    /// bin holds default-arena objects and nothing else. A new consumer has to re-apply
+    /// that gate or it hands one arena's memory to another, breaking §22.7 isolation and
+    /// §36.4 quota exactness. Placement class is conceded here (as above); the arena is
+    /// not.
+    ///
+    /// **What this deliberately does not reach:** objects resident in *other cores'*
+    /// per-CPU slots. No allocation path can drain those safely — the non-owner fence is
+    /// exactly what has failed in the first route above, and in §36.10 pinned mode
+    /// draining a core this thread does not own is undefined behaviour outright. The
+    /// running core's own slot is already drained by `alloc_small_cached` on every
+    /// non-bypassing request. That boundary is a real limit, not an oversight.
+    fn alloc_small_from_transfer(&self, arena: ArenaId, sc: SizeClassId) -> *mut u8 {
+        if arena != ArenaId::DEFAULT {
+            return ptr::null_mut();
+        }
+        let mut buf = [0usize; 1];
+        if self
+            .transfer
+            .try_pop_batch(arena, sc, &mut buf, 1, self.meta)
+            != 1
+        {
+            return ptr::null_mut();
+        }
+        // The object carries the `cached` mark `refill`/`flush` set on it, so it is
+        // claimed exactly as a slot entry is — same `cached → live` transition, same
+        // test-and-clear exclusivity, same junk-fill verify-on-reuse.
+        self.claim_cached_object(buf[0], sc)
     }
 
     /// Hand object `index` out of `span`: resolve its pointer ([`object_ptr`](Self::object_ptr))
@@ -4492,6 +4549,11 @@ mod tests {
             /// capability-revoke failure so the arena-destroy drain quarantines
             /// (§36.13), the partial-failure path POSIX cannot otherwise reach.
             fail_revoke: AtomicBool,
+            /// When set, `reserve` fails — modeling an exhausted backend, so
+            /// `create_span` cannot make progress and the allocation path has to
+            /// fall back on whatever free objects already exist. Behind an `Arc` so a
+            /// test can flip it *after* the allocator has built its spans.
+            fail_reserve: Arc<AtomicBool>,
             /// Count of `revoke_descendants` calls — lets a test observe that the
             /// recycle discipline (§36.6) revokes on *every* retirement, including
             /// the normal empty-span path, where POSIX/SIM revoke is a silent
@@ -4505,6 +4567,7 @@ mod tests {
                 Self {
                     owned: Mutex::new(Vec::new()),
                     fail_revoke: AtomicBool::new(false),
+                    fail_reserve: Arc::new(AtomicBool::new(false)),
                     revokes: Arc::new(AtomicU64::new(0)),
                 }
             }
@@ -4513,6 +4576,13 @@ mod tests {
             /// arena-drain quarantine path).
             pub(super) fn fail_revoke(&self) {
                 self.fail_revoke.store(true, Ordering::Relaxed);
+            }
+
+            /// A handle to the "backend is exhausted" switch, cloned *before* the
+            /// provider is moved into the allocator so a test can flip it once the
+            /// spans it wants already exist (§A.2).
+            pub(super) fn fail_reserve_handle(&self) -> Arc<AtomicBool> {
+                Arc::clone(&self.fail_reserve)
             }
 
             /// A handle to the revoke counter — cloned *before* the provider is
@@ -4531,6 +4601,9 @@ mod tests {
             ) -> Result<Region, BackendError> {
                 if size == 0 || !align.is_power_of_two() {
                     return Err(BackendError::InvalidRequest);
+                }
+                if self.fail_reserve.load(Ordering::Relaxed) {
+                    return Err(BackendError::OutOfMemory);
                 }
                 let layout = Layout::from_size_align(size, align.max(PAGE_SIZE))
                     .map_err(|_| BackendError::InvalidRequest)?;
@@ -4727,6 +4800,152 @@ mod tests {
         for p in &seen {
             assert_eq!(tfree(&a, *p as *mut u8), FreeOutcome::Freed);
         }
+        assert!(a.check_invariants());
+    }
+
+    /// §2.4 / §A.2: an allocation may report OOM only once **every** place this allocator
+    /// parked a free object of the class has been looked in. The central fallback searched
+    /// central twice (class-tagged, then any class) and stopped — but the transfer cache
+    /// holds objects that were *removed from central* to get there, so an exhausted
+    /// backend returned null with reusable memory one layer down.
+    ///
+    /// Driven through a **front-end-bypassing** request (`TOPO_TCACHE_NONE`, §10.3), which
+    /// is one of the two routes into the gap and the one an in-process test can reach: it
+    /// skips `alloc_small_cached` entirely, so `alloc_small` is the only consumer and the
+    /// transfer cache is never otherwise consulted.
+    ///
+    /// The other route — a refill whose `push_batch` is declined because the W7-4
+    /// non-owner fence cannot be issued — needs a seccomp policy denying `membarrier`,
+    /// which no in-process test can provoke. It strands objects in the *same* place by the
+    /// *same* call (`refill`'s return-the-remainder path), so this covers the mechanism
+    /// for both; what it does not do is reproduce that trigger.
+    ///
+    /// Fails without the fix: the first bypassing allocation to return null does so with
+    /// `transfer_bytes` still above zero.
+    #[test]
+    fn an_oom_is_reported_only_after_the_transfer_cache_has_been_drained_too() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let span_p = HostProvider::new();
+        let exhausted = span_p.fail_reserve_handle();
+        let a = Allocator::new(
+            span_p,
+            HostProvider::new(),
+            &m,
+            &m,
+            &pm,
+            ArenaId::DEFAULT,
+            AllocatorConfig::small(),
+        )
+        .expect("allocator");
+
+        // Park a batch in the transfer cache the way the front end does: fill the running
+        // core's slot past its soft capacity so a free overflows one batch down (W6-3b).
+        let sc = size_class(64, 8).expect("class");
+        let batch = crate::size_class::batch(sc);
+        let live: Vec<*mut u8> = (0..batch * 4).map(|_| a.malloc(64)).collect();
+        assert!(live.iter().all(|p| !p.is_null()));
+        for p in &live {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        let parked = a.stats().transfer_bytes;
+        assert!(
+            parked > 0,
+            "precondition: the frees must overflow a batch into the transfer cache"
+        );
+
+        // The backend is now exhausted, so `create_span` cannot make progress and every
+        // request must be served from objects that already exist.
+        exhausted.store(true, Ordering::Relaxed);
+
+        // Bypassing requests never consult the front end, so they drain central and then
+        // face the choice this fix is about.
+        let flags = RequestFlags::NONE.with_cache_bypass();
+        let mut got: Vec<*mut u8> = Vec::new();
+        loop {
+            let p = a.allocate(64, 8, flags);
+            if p.is_null() {
+                break;
+            }
+            got.push(p);
+        }
+
+        assert_eq!(
+            a.stats().transfer_bytes,
+            0,
+            "OOM was reported with {} bytes still resident in the transfer cache — \
+             objects that had been removed from central to get there",
+            a.stats().transfer_bytes
+        );
+        assert!(
+            !got.is_empty(),
+            "sanity: the drain must have served something"
+        );
+        for p in got {
+            assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        }
+        assert!(a.check_invariants());
+    }
+
+    /// §22.7 / §36.4: the transfer-cache last resort is gated on the **arena**, and that
+    /// gate is load-bearing rather than defensive.
+    ///
+    /// `TransferCache::try_pop_batch` ignores its arena argument — the bins are keyed by
+    /// size class alone — which is sound only because `front_end_cacheable` gates every
+    /// entry point, so a bin holds default-arena objects and nothing else. A consumer that
+    /// does not re-apply that gate hands one arena's memory to another: isolation broken,
+    /// and the receiving arena charged for an object it never reserved.
+    ///
+    /// Placement class *is* conceded at this point (the `ANY_PLACE_CLASS` retry just above
+    /// already does), so this is specifically about the boundary that is not policy.
+    ///
+    /// Pins the mechanism directly rather than through a starved explicit arena: an
+    /// explicit arena holds its own reservation, so driving it to the point where this
+    /// last resort is the only thing left would take a second fault-injection seam that
+    /// exists nowhere else. Fails with the arena check removed — the explicit arena's call
+    /// returns a default-arena object.
+    #[test]
+    fn the_transfer_last_resort_never_vends_across_an_arena_boundary() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let id = a.arena_create(&ArenaPolicy::explicit()).unwrap();
+        assert_ne!(id, ArenaId::DEFAULT);
+
+        // Park default-arena objects in the transfer cache: fill the running core's slot
+        // past its soft capacity so a free overflows one batch down (W6-3b).
+        let sc = size_class(64, 8).expect("class");
+        let batch = crate::size_class::batch(sc);
+        let live: Vec<*mut u8> = (0..batch * 4).map(|_| a.malloc(64)).collect();
+        assert!(live.iter().all(|p| !p.is_null()));
+        for p in &live {
+            assert_eq!(tfree(&a, *p), FreeOutcome::Freed);
+        }
+        let parked = a.stats().transfer_bytes;
+        assert!(
+            parked > 0,
+            "precondition: objects parked in the transfer cache"
+        );
+
+        // The explicit arena must get nothing, and must disturb nothing.
+        assert!(
+            a.alloc_small_from_transfer(id, sc).is_null(),
+            "an explicit arena was served from the default arena's transfer cache"
+        );
+        assert_eq!(
+            a.stats().transfer_bytes,
+            parked,
+            "the default arena's parked objects must be untouched"
+        );
+
+        // The gate is a boundary, not a blanket refusal: the owning arena is served.
+        let p = a.alloc_small_from_transfer(ArenaId::DEFAULT, sc);
+        assert!(
+            !p.is_null(),
+            "the default arena must be able to recover its own objects"
+        );
+        assert!(a.stats().transfer_bytes < parked);
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
     }
 

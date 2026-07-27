@@ -2717,6 +2717,59 @@ atomic store over process-global mode state, with no assembly and no per-arch pa
 architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
 are the part that matters on every target, and those are unconditional.
 
+### Round-18 review: OOM is a claim about everywhere (0.4.3)
+
+One finding, and it is the mirror of round 14's: that round was about objects stranded in a
+per-CPU *slot* nothing would look in, this one about objects stranded in the *transfer
+cache* — one layer down, same consequence.
+
+**The last resort before OOM must have looked everywhere.** `alloc_small`'s fallback
+searched central twice — the requested placement class, then `ANY_PLACE_CLASS` — and then
+returned null. But `cache_ops::refill` *removes a batch from central* and, when the
+per-CPU `push_batch` declines, returns the remainder to the transfer cache rather than
+dropping it (correctly — dropping would leak, §16.4). So an exhausted backend reported OOM
+with reusable objects sitting one layer below the only place it looked.
+
+Two routes reach it, and only the second needs anything exotic:
+
+* A **front-end-bypassing** request (`TOPO_TCACHE_NONE` §10.3, or the §30.4
+  force-slow-path) skips `alloc_small_cached` entirely, so nothing consults the transfer
+  cache on its behalf — no migration, no fence failure, no race.
+* A refill whose `push_batch` is declined because the W7-4 non-owner fence cannot be
+  issued. A thread that migrated after `fe_pop_tracked` and whose seccomp policy denies
+  `membarrier` hits this on every iteration, so the bounded eight-iteration loop gives up
+  having moved up to eight batches from central into the transfer cache.
+
+`alloc_small_from_transfer` is now the step after `ANY_PLACE_CLASS`. Placing it *there*
+matters: it is the one point where the answer would otherwise be null, so no route —
+bypass flag, placement tag, fence failure — can skip it. **A flag or a policy may cost a
+request its preference; it must never cost it its allocation (§2.4).**
+
+**One boundary is not policy.** `TransferCache::try_pop_batch` *ignores its arena
+argument* — the bins are keyed by size class alone — and that is sound only because
+`front_end_cacheable` gates every entry point, so a bin holds default-arena objects and
+nothing else. A new consumer has to re-apply that gate or it hands one arena's memory to
+another (§22.7 isolation, §36.4 quota exactness). Placement class is conceded at this
+point; the arena is not. **When a data structure drops a key because its writers all agree
+on the value, every future reader inherits the obligation to check it.**
+
+**What it deliberately does not reach:** objects in *other cores'* per-CPU slots. No
+allocation path can drain those safely — the non-owner fence is precisely what has failed
+in the second route, and in §36.10 pinned mode draining a core this thread does not own is
+undefined behaviour outright. The running core's own slot is already drained by
+`alloc_small_cached` on every non-bypassing request. That limit is stated in the doc
+comment rather than left to be discovered.
+
+*On verification.* Both fixes were neutered individually. The OOM test drives the bypass
+route (the one an in-process test can reach) and fails without the fix with 8 KiB still
+resident in the transfer cache; the fence-failure route strands objects in the same place
+by the same call, so the test covers the mechanism for both but does not reproduce that
+trigger — a `membarrier` refusal needs a seccomp policy no in-process test can install,
+the same limit noted for the round-16 flush-accounting test. The arena-gate test pins the
+mechanism directly rather than through a starved explicit arena: an explicit arena holds
+its own reservation, so driving it to this last resort would need a second fault-injection
+seam that exists nowhere else.
+
 ### Round-17 review: a hint mistaken for an answer (0.4.3)
 
 Three findings, and the two that matter share a shape: a value that was only ever a *hint*
