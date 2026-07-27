@@ -2717,6 +2717,54 @@ atomic store over process-global mode state, with no assembly and no per-arch pa
 architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
 are the part that matters on every target, and those are unconditional.
 
+### Round-15 review: the cost of a mapping the count no longer bounds (0.4.3)
+
+Round 14 made the no-RSEQ fallback slot mapping independent of the published CPU count.
+That was right, and two of this round's three findings are the bill for it: the count had
+been doing load-bearing work elsewhere that nothing took over. Recorded together because
+the rule is one rule.
+
+**1. Changing where a lookup points obliges you to move what the old pointer reached.**
+`Allocator::reset_front_end_after_fork` drops the RSEQ registration decision, which is
+correct and necessary — neither `membarrier`'s registration of intent nor the rseq area
+survives `fork`. But it also makes `rseq::current_cpu()` stop answering, so
+`CpuCache::current_core` switches from CPU-id keying to `fallback_core`: the child's single
+thread reaches **one** slot, while the parent's residency sits in as many CPU-indexed slots
+as its threads ran on. Same orphaning shape as finding 1 of round 14, reached by a
+different route — and the sibling `disable_front_end_rseq` is *not* affected, precisely
+because it leaves the registration decision (and so the keying) intact. Its doc comment
+saying cached objects "stay reachable through the locked path" was true of itself and had
+been read as covering both.
+
+The fix is the drain that round 14 rejected at the publication point — and the reason it is
+right here is exactly the reason it was wrong there. A drain only closes the window if no
+one can push into the old mapping afterwards; at the publication point threads are running,
+so it merely narrowed it. `reset_after_fork`'s safety contract *is* a quiesced,
+single-threaded child, so here the drain is complete by construction. **Quiescence is what
+makes a drain a fix rather than a mitigation** — check for it before reaching for one.
+
+**2. A floor that cannot reach the ceiling is not enforcement.** `CacheBudget::adapt`'s
+phase 2 shrank each slot to one batch and stopped. That is the right floor while the
+ceiling is reachable, and unreachable is now ordinary: slots are keyed over the whole
+`MAX_CPUS` array while the allowance is sized from the online CPU count, so more allocator
+threads than CPUs initialize more slots than it was sized for. Past `slots × batch` the
+loop exited over budget with no progress left and no signal but its return value. Narrowing
+the mapping back to the count is not available — that is finding 1 of round 14 again — so
+enforcement gets a second tier down to the structural minimum of one object (`>= 1` is a
+B.2 invariant, which is why the floor is one and not zero), and the engine tick converts a
+residual overage into the §21.3 drain-caches rung, the only mechanism that returns
+residency rather than merely capping future pushes. A squeezed slot grows back through
+phase 1 as soon as its miss counter asks.
+
+**3. Report what happened, not what was asked for.** `flush_front_end_all` returned the
+residency measured *before* the drain. `drain_cpu` declines a core whose in-flight
+sequences it cannot fence (a caller denied `membarrier` by seccomp), so the figure could
+credit a §21.3 pressure controller with memory still cached — it then treats an ineffective
+rung as successful and skips a harsher one it needed. The opening count was chosen to avoid
+double-counting an object that leaves both layers, which is a real hazard; the residency
+*delta* avoids it too and reflects every decline. **A conservation argument justifies a
+derived figure only while every step succeeds; measure the delta instead.**
+
 ### Round-14 review: four defects, four missing rules (0.4.3)
 
 Each finding this round was a *rule* that had been stated somewhere in the tree and not

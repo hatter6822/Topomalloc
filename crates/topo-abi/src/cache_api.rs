@@ -33,14 +33,18 @@ use topo_core::CoreId;
 /// every core's per-CPU slots *and* the transfer cache — back into the central free
 /// lists, retiring every span that empties.
 ///
-/// Returns the number of objects that were resident in the front end when the drain
-/// began, i.e. how much residency it returned to central. Approximate under concurrent
-/// load (a free racing the drain may repopulate a slot behind it), exact when quiescent —
-/// the §31.1 convention.
+/// Returns how much residency the drain **actually** returned to central — the observed
+/// delta, not the opening count. The difference matters to a caller sizing its next
+/// pressure response: a core whose in-flight RSEQ sequences cannot be fenced (a caller
+/// denied `membarrier` by seccomp, say) is safely declined and keeps its objects, and the
+/// figure reflects that rather than crediting memory still cached. Approximate under
+/// concurrent load (a free racing the drain may repopulate a slot behind it), exact when
+/// quiescent — the §31.1 convention.
 ///
-/// This is the §21.3 "drain caches" rung. It moves no live object and can never fail: a
-/// cached object is one the application has already freed, so returning it to central is
-/// always safe and always reversible by the next allocation.
+/// This is the §21.3 "drain caches" rung. It moves no live object and cannot fail
+/// destructively: a cached object is one the application has already freed, so returning
+/// it to central is always safe and always reversible by the next allocation. A declined
+/// core is a smaller return value, never a lost object.
 #[no_mangle]
 pub extern "C" fn topomalloc_cache_flush_all() -> usize {
     // W16-5: the drain takes the front-end, transfer, central, span and backend locks

@@ -1838,16 +1838,45 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// believed it had to fence could not, and one that still believed RSEQ was enabled
     /// would run the fast path over kernel state that no longer exists.
     ///
+    /// **The reset re-routes the child's slot selection, so it must also drain.** Unlike
+    /// [`disable_front_end_rseq`](Self::disable_front_end_rseq) — which leaves
+    /// `rseq::current_cpu()` answering, so a slot stays keyed by CPU id and every
+    /// inherited object stays reachable over the locked path — dropping the registration
+    /// decision makes `current_cpu()` report "no id". [`CpuCache::current_core`] then
+    /// keys by [`fallback_core`](CpuCache::fallback_core), so the child's single thread
+    /// reaches **one** slot while the parent's residency sits in however many CPU-indexed
+    /// slots its threads happened to run on. Those objects were *removed from central* to
+    /// get there, so leaving them parked is the same spurious-OOM shape as a mapping that
+    /// moves under the host's feet: an exhausted backing provider returns null with
+    /// reusable objects in slots nothing will look at. Draining every slot back to
+    /// central restores reachability whatever the child later routes to, and is the
+    /// §28.1 conservative-mode choice besides — a fresh child has no use for the parent's
+    /// front-end residency, and the drain retires any span it empties.
+    ///
+    /// Draining is sound *here* for precisely the reason it was the wrong answer at the
+    /// CPU-count publication point (see [`CpuCache::current_core`]): there, a thread that
+    /// had already sampled the old mapping could push after the drain, so it only
+    /// narrowed the window; here the caller's safety obligation **is** quiescence, so a
+    /// drain is complete by construction. The reset happens first, so the drain finds the
+    /// fence latch already cleared and never attempts the `membarrier` whose registration
+    /// did not survive the fork.
+    ///
     /// # Safety
     ///
     /// Inherited verbatim from [`CpuCache::reset_after_fork`]: the caller must guarantee
     /// a **quiesced single-threaded context** (a `fork` child, from the `pthread_atfork`
     /// child handler). Clearing the fence latch with an RSEQ operation in flight lets a
     /// subsequent non-owner locked access skip the fence that would have aborted it and
-    /// race the sequence's commit.
+    /// race the sequence's commit. That same obligation is what makes the drain total.
     pub unsafe fn reset_front_end_after_fork(&self) {
         // SAFETY: the caller's identical obligation, forwarded.
         unsafe { self.cpu_cache.reset_after_fork() }
+        // Then return the inherited residency to central, where it is reachable from
+        // whichever slot the child now routes to. Ordered after the reset so no
+        // non-owner fence is attempted (the latch is clear); safe to run from the child
+        // handler because the parent quiesced every operation before `fork`, so the
+        // structures this walks are consistent and unlocked (§28.1).
+        let _ = self.flush_front_end_all();
     }
 
     /// Whether the W7 RSEQ fast path is currently active.
@@ -1879,8 +1908,32 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// budget. Host-driven (the W12 release pump's natural cadence) and **never** called
     /// from the allocation path — the same pure-policy/host-driven split as the release
     /// controller. Returns the total soft capacity after adaptation, in objects.
+    ///
+    /// **Falls back to draining when capacity alone cannot reach the ceiling.** Shrinking
+    /// soft capacities bounds residency only prospectively — a push is refused once a
+    /// slot is at its soft cap, but objects already resident above a freshly lowered cap
+    /// stay until something pops or flushes them. That is a fine approximation while the
+    /// ceiling is reachable. It stops being one when it is not: with more allocator
+    /// threads than online CPUs, more slots are initialized than the CPU-count-sized
+    /// allowance was sized for (see [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)),
+    /// and even the structural floor of one object per slot can exceed the budget. Then
+    /// the advertised §11.5 ceiling is not enforced by capacity at all, so this converts
+    /// the overage into the one mechanism that genuinely returns residency — the §21.3
+    /// "drain caches" rung.
+    ///
+    /// Both layers, via [`flush_front_end_all`](Self::flush_front_end_all): flushing
+    /// cores alone pushes their contents into the transfer cache, which is front-end
+    /// residency too, so it would move the overage rather than return it. The trigger is
+    /// the *floor* exceeding the ceiling — an over-subscribed configuration in which
+    /// honouring the advertised ceiling and keeping a warm front end are genuinely
+    /// incompatible — so this is not a cost an ordinary workload pays: a front end whose
+    /// minimum fits under the budget never reaches this branch.
     pub fn cache_budget_tick(&self) -> usize {
-        self.budget.adapt(&self.cpu_cache)
+        let total = self.budget.adapt(&self.cpu_cache);
+        if total > self.budget.global_budget() {
+            let _ = self.flush_front_end_all();
+        }
+        total
     }
 
     /// Flush every front-end slot of `core` down to the transfer cache, overflowing to
@@ -1906,21 +1959,28 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
 
     /// Drain the **whole** front end — every core's slots *and* the transfer cache —
     /// back into the central free lists, retiring every span that empties (W6-7).
-    /// Returns the number of objects that were resident in the front end when the drain
-    /// began, i.e. how much residency it returned to central.
+    /// Returns how much residency the drain **actually** returned to central.
     ///
     /// Both layers, in that order, is what makes this a real drain: `flush_idle_cpu`
     /// pushes a core's slots one level *down* into the transfer cache, so draining the
     /// slots alone would leave the objects in the front end and their spans non-empty.
-    /// The count is taken up front rather than summed from the two passes, because an
-    /// object drained all the way through leaves both layers and would otherwise be
-    /// counted twice. Approximate under concurrent load (a free racing the drain may
-    /// repopulate a slot behind it), exact when quiescent — the §31.1 convention.
+    ///
+    /// **The figure is the residency delta, not the pre-drain residency.** Summing the
+    /// two passes would double-count an object drained all the way through (it leaves
+    /// both layers), but reporting the opening count assumes the drain always succeeds —
+    /// and it does not: [`CpuCache::drain_cpu`] declines a core whose in-flight RSEQ
+    /// sequences it cannot fence (a caller denied `membarrier` by seccomp, say), leaving
+    /// that core's objects resident and safely untouched. Returning the opening count
+    /// there tells a §21.3 memory-pressure controller it recovered memory that is in fact
+    /// still cached, so it credits an ineffective rung and skips a harsher one it needed.
+    /// Measuring what left counts each object once *and* reflects every decline.
+    /// Approximate under concurrent load (a free racing the drain may repopulate a slot
+    /// behind it), exact when quiescent — the §31.1 convention.
     ///
     /// Sweeps all `MAX_CPUS`, not just the announced active count, so a slot left behind
     /// on a core that went offline is drained too.
     pub fn flush_front_end_all(&self) -> usize {
-        let resident = self.front_end_objects();
+        let before = self.front_end_objects();
         for c in 0..crate::cpu_cache::MAX_CPUS {
             self.flush_front_end_core(CoreId(c as u32));
         }
@@ -1933,7 +1993,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             self.meta,
             &mut on_empty,
         );
-        resident
+        before.saturating_sub(self.front_end_objects())
     }
 
     /// Objects currently resident in the front end, over every core and size class
@@ -4472,6 +4532,77 @@ mod tests {
         // SAFETY: ptr is a valid, owned allocation of `len` bytes from Box,
         // leaked for the test's (process) lifetime.
         unsafe { BumpArena::new(ptr, len) }
+    }
+
+    /// §28.1: the fork reset drops the RSEQ registration decision, so
+    /// `rseq::current_cpu()` stops answering and `CpuCache::current_core` keys by
+    /// `fallback_core` — **one** slot for the child's single thread, while the parent's
+    /// residency sits in however many CPU-indexed slots its threads ran on. Those objects
+    /// were removed from central to get there, so leaving them parked is a spurious OOM
+    /// waiting for an exhausted backing provider. The reset must therefore drain, and can:
+    /// its safety contract *is* quiescence.
+    ///
+    /// Fails without the drain — the inherited nine stay resident.
+    #[test]
+    fn a_fork_reset_parks_no_residency_in_slots_the_child_cannot_reach() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+
+        // The parent ran on CPUs 1, 5 and 9; the child will route to exactly one slot.
+        for (i, core) in [CoreId(1), CoreId(5), CoreId(9)].into_iter().enumerate() {
+            let base = 0x1_0000 + i * 0x1000;
+            a.cpu_cache.init_slot(core, sc, &m, 32);
+            a.cpu_cache
+                .push_batch(core, sc, &[base, base + 0x10, base + 0x20]);
+        }
+        assert_eq!(a.front_end_objects(), 9, "test setup");
+
+        // SAFETY: a single-threaded test with no RSEQ operation in flight — exactly the
+        // quiesced-child context this method requires of its caller.
+        unsafe { a.reset_front_end_after_fork() };
+
+        assert_eq!(
+            a.front_end_objects(),
+            0,
+            "inherited residency left parked in slots the child cannot route to"
+        );
+    }
+
+    /// `flush_front_end_all` reports what the drain **returned**, not what was resident
+    /// when it started: `drain_cpu` declines a core whose in-flight sequences it cannot
+    /// fence, and crediting a §21.3 memory-pressure controller for memory still cached
+    /// makes it skip a harsher rung it needed.
+    ///
+    /// **This pins the mechanism, it is not a behavioural regression test.** The decline
+    /// needs a `membarrier` refusal (a seccomp policy denying the syscall), which no
+    /// in-process test can provoke, and absent one the two formulations agree — a complete
+    /// drain returns the opening residency either way. What it does hold is the identity
+    /// the old code assumed rather than measured, so a future partial drain is counted.
+    #[test]
+    fn flush_front_end_all_reports_the_residency_it_actually_returned() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(1);
+
+        for (i, core) in [CoreId(0), CoreId(3)].into_iter().enumerate() {
+            let base = 0x2_0000 + i * 0x1000;
+            a.cpu_cache.init_slot(core, sc, &m, 32);
+            a.cpu_cache.push_batch(core, sc, &[base, base + 0x20]);
+        }
+
+        let before = a.front_end_objects();
+        let returned = a.flush_front_end_all();
+        let after = a.front_end_objects();
+
+        assert_eq!(
+            returned,
+            before - after,
+            "the figure must be the residency delta, not the opening count"
+        );
+        assert_eq!(after, 0, "a quiesced drain is complete (§31.1)");
     }
 
     /// A fresh engine with guard sampling armed at `rate` and **no** entropy re-seed —

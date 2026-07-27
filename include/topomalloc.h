@@ -343,8 +343,10 @@ size_t topo_max_hook_backends(void);
 /* Drain the whole front end — every core's per-CPU slots and the transfer
  * cache — back into the central free lists, retiring the spans that empty.
  * This is the release ladder's "drain caches" rung: it moves no live object,
- * cannot fail, and is undone by the next allocation. Returns the number of
- * objects that were resident when the drain began (exact when quiescent). */
+ * loses none, and is undone by the next allocation. Returns how much residency
+ * the drain actually returned to central, not the count resident when it began
+ * — a core whose in-flight sequences cannot be fenced is safely declined and
+ * keeps its objects, and the figure reflects that (exact when quiescent). */
 size_t topomalloc_cache_flush_all(void);
 
 /* Drain one core's per-CPU slots into the transfer cache, overflowing to the

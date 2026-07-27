@@ -223,14 +223,50 @@ impl CacheBudget {
             }
         }
 
-        // Phase 2: enforce the global budget. Repeatedly shrink slots that
-        // are above the minimum batch size until the total is within budget
-        // or no further reduction is possible. Iteration is in index order
-        // (lowest CPU, lowest SC first); a future enhancement could sort by
-        // activity to prefer shrinking the least-active slots.
+        // Phase 2: enforce the global budget, in two tiers. The first shrinks every slot
+        // to one batch — the point past which a slot stops being a useful cache, so it is
+        // the right place to stop *while the ceiling is still reachable*. The second only
+        // runs when it is not, and goes to the structural minimum of one object.
+        //
+        // The second tier is not hypothetical, and it is the front end's own doing: a
+        // slot is keyed over the whole `MAX_CPUS` array (`CpuCache::fallback_core` spreads
+        // by thread key when no CPU id is readable, deliberately independent of the
+        // published count), while the allowance is sized from that count
+        // (`Allocator::set_front_end_cpus`). More allocator threads than online CPUs
+        // therefore initialise far more slots than the ceiling was sized for, and once
+        // `initialised_slots × batch` alone exceeds it a one-batch floor makes the loop
+        // exit **over budget with no progress left** — silently, since the only signal is
+        // the returned total. Freed objects then stay resident past the ceiling the
+        // allocator advertises, which is the one state the §11.5 budget exists to bound.
+        // Narrowing the mapping to the count instead is not an option: that is exactly
+        // the orphaning bug `current_core` documents.
         let budget = self.global_budget();
         let mut total = self.compute_total_capacity(cpu_cache);
+        total = self.shrink_to_floor(cpu_cache, budget, total, true);
+        if total > budget {
+            total = self.shrink_to_floor(cpu_cache, budget, total, false);
+        }
 
+        total
+    }
+
+    /// One tier of phase-2 budget enforcement: repeatedly shrink initialized slots by a
+    /// batch until `total <= budget` or nothing can give. The floor is one batch when
+    /// `batch_floor`, else one object — the structural minimum, since
+    /// [`PerCpuSlot::set_soft_capacity`](crate::cpu_cache::PerCpuSlot::set_soft_capacity)
+    /// clamps to `>= 1` and the Appendix-B.2 checker requires it. Returns the new total.
+    ///
+    /// Iteration is in index order (lowest CPU, lowest SC first); a future enhancement
+    /// could sort by activity to prefer shrinking the least-active slots. A slot driven
+    /// to the floor is not stranded there — phase 1 grows it back by a batch as soon as
+    /// its miss counter says it is needed and the budget allows.
+    fn shrink_to_floor(
+        &self,
+        cpu_cache: &CpuCache,
+        budget: usize,
+        mut total: usize,
+        batch_floor: bool,
+    ) -> usize {
         while total > budget {
             let mut made_progress = false;
             for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
@@ -255,9 +291,10 @@ impl CacheBudget {
                     }
 
                     let batch = size_class::batch(sc) as u32;
+                    let floor = if batch_floor { batch } else { 1 };
                     let cur_soft = slot.soft_capacity();
-                    if cur_soft > batch {
-                        let new_soft = cur_soft.saturating_sub(batch).max(batch);
+                    if cur_soft > floor {
+                        let new_soft = cur_soft.saturating_sub(batch).max(floor);
                         let reduction = (cur_soft - new_soft) as usize;
                         slot.set_soft_capacity(new_soft);
                         total = total.saturating_sub(reduction);
@@ -269,7 +306,6 @@ impl CacheBudget {
                 break;
             }
         }
-
         total
     }
 
@@ -504,6 +540,87 @@ mod tests {
                 "cpu {cpu_idx} should be at minimum batch size"
             );
         }
+    }
+
+    /// The one-batch floor is the right place to stop only while the ceiling is still
+    /// reachable. A slot is keyed over the whole `MAX_CPUS` array (`fallback_core` spreads
+    /// by thread key, deliberately independent of the published CPU count) while the
+    /// allowance is sized from that count, so more allocator threads than online CPUs
+    /// initialize more slots than it was sized for. Once `slots × batch` alone exceeds the
+    /// budget, a one-batch floor makes phase 2 exit **over budget with no progress left**,
+    /// and freed objects stay resident past the ceiling §11.5 exists to bound.
+    ///
+    /// Fails on the single-tier floor: it stops at `slots * batch`, twice the budget here.
+    #[test]
+    fn budget_enforcement_goes_below_a_batch_when_that_floor_would_exceed_it() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        // Two online CPUs — but sixteen threads spread over sixteen slots.
+        cc.set_active_cpus(2);
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        let slots = 16u32;
+        for cpu_idx in 0..slots {
+            cc.init_slot(CoreId(cpu_idx), sc, &m, hard_cap);
+        }
+
+        // A ceiling the one-batch floor cannot reach: half of `slots * batch`.
+        let target = (batch as usize) * (slots as usize) / 2;
+        let budget = CacheBudget::new(target);
+        let total = budget.adapt(&cc);
+
+        assert!(
+            total <= target,
+            "enforcement stopped over budget: total {total} > budget {target}"
+        );
+        // ... and every slot is still structurally well-formed (B.2 requires `soft >= 1`,
+        // which is why one object, not zero, is the floor).
+        for cpu_idx in 0..slots {
+            let cpu = cc.per_cpu(CoreId(cpu_idx)).unwrap();
+            let slot = cpu.slot(sc).unwrap();
+            assert!(
+                slot.soft_capacity() >= 1 && slot.check_invariants(sc),
+                "cpu {cpu_idx} left malformed by budget enforcement"
+            );
+        }
+    }
+
+    /// A slot driven to the sub-batch floor is not stranded there: phase 1 grows it back
+    /// as soon as its miss counter asks and the budget allows.
+    #[test]
+    fn a_slot_at_the_sub_batch_floor_recovers_when_the_budget_allows() {
+        let m = meta(8 * 1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        let hard_cap = size_class::max_local_capacity(sc) as u32;
+        let batch = size_class::batch(sc) as u32;
+
+        let slots = 16u32;
+        for cpu_idx in 0..slots {
+            cc.init_slot(CoreId(cpu_idx), sc, &m, hard_cap);
+        }
+
+        let budget = CacheBudget::new((batch as usize) * (slots as usize) / 2);
+        budget.adapt(&cc);
+        let slot = cc.per_cpu(CoreId(0)).unwrap().slot(sc).unwrap();
+        let squeezed = slot.soft_capacity();
+        assert!(
+            squeezed < batch,
+            "expected a sub-batch floor, got {squeezed}"
+        );
+
+        // The host raises the ceiling and the slot starts missing.
+        budget.set_global_budget(100_000);
+        for _ in 0..100 {
+            cc.fe_pop(CoreId(0), A, sc, &m);
+        }
+        budget.adapt(&cc);
+        assert!(
+            slot.soft_capacity() > squeezed,
+            "a squeezed slot must grow back: still at {squeezed}"
+        );
     }
 
     #[test]
