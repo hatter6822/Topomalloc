@@ -310,6 +310,11 @@ impl Stats {
         self.allocated_bytes_total = a.allocated_bytes_total;
         self.freed_bytes_total = a.freed_bytes_total;
         self.central_free_bytes = a.central_free_bytes;
+        // §16.4 front-end residency (W6): objects the per-CPU slots and the transfer
+        // cache hold. Freed by the application (so out of `live_bytes`) but not yet in
+        // the central bitmap (so out of `central_free_bytes`) — their own byte class.
+        self.per_cpu_bytes = a.per_cpu_bytes;
+        self.transfer_bytes = a.transfer_bytes;
         self.metadata_bytes = a.pagemap_metadata_bytes;
         self.exact_internal_fragmentation_bytes = a.live_internal_fragmentation_bytes;
         self.quarantine_bytes = a.quarantine_bytes;
@@ -1127,6 +1132,8 @@ mod tests {
             allocated_bytes_total: 1500,
             freed_bytes_total: 500,
             central_free_bytes: 256,
+            per_cpu_bytes: 640,
+            transfer_bytes: 128,
             span_backend: topo_core::StateBytes {
                 reserved: 10,
                 active: 20,
@@ -1171,6 +1178,10 @@ mod tests {
         assert_eq!(s.allocated_bytes_total, 1500);
         assert_eq!(s.freed_bytes_total, 500);
         assert_eq!(s.central_free_bytes, 256);
+        // §16.4 front-end residency (W6): the per-CPU and transfer terms map through as
+        // their own byte classes — neither live nor central-free.
+        assert_eq!(s.per_cpu_bytes, 640);
+        assert_eq!(s.transfer_bytes, 128);
         assert_eq!(s.metadata_bytes, 8192);
         // The cumulative destroyed-arena count maps through (§31.1, W17-1a).
         assert_eq!(s.arenas_destroyed, 4);

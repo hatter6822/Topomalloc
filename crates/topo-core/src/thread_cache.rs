@@ -22,6 +22,35 @@
 //! **Budget tracking.** The thread cache tracks a global budget (total objects
 //! across all SCs). Push operations that would exceed the budget fail, forcing
 //! a flush to the transfer cache.
+//!
+//! # Deliberately **not** on the live allocation path
+//!
+//! The W6 front end the engine wires up is the **per-CPU cache + transfer cache**
+//! (`cpu_cache`, `transfer_cache`, driven by `cache_ops` from
+//! [`Allocator`](crate::Allocator)); this module is not part of it, and
+//! `AllocatorStats` reports its residency as zero. That is a decision, not an
+//! oversight, for two reasons:
+//!
+//! 1. **Its storage allocates through the allocator.** A slot is a `Vec<usize>` that
+//!    grows on `push`, so putting it on the fast path would have `malloc` allocate
+//!    through `malloc` — the Appendix-F "no recursion through TopoMalloc" anti-pattern —
+//!    and its thread-exit `Drop` would then *free* through the allocator during TLS
+//!    teardown, in the one window where the engine may already be gone. Wiring it is
+//!    therefore blocked on re-basing its slots on metadata storage (the discipline
+//!    [`CpuSlot`](crate::cpu_cache::CpuSlot) already uses: a fixed, metadata-carved
+//!    buffer, never freed), which is a rewrite of the storage layer rather than a
+//!    wiring change.
+//! 2. **There is little left for it to save.** A thread cache exists to avoid the
+//!    per-CPU lock; the W7 RSEQ fast path already removes that lock entirely on the
+//!    hot path (the restartable sequence commits with a single store, no lock byte
+//!    taken), and the locked baseline's acquisition is per-CPU and uncontended by
+//!    construction. A third residency layer would add a third place an object can hide
+//!    from the §16.4 conservation law and a third `cached`-bit transition to keep
+//!    correct, for a saving RSEQ already banks.
+//!
+//! It remains a complete, unit-tested implementation of the §11.2 layer for the day
+//! either premise changes (a platform with no RSEQ where profiling shows the per-CPU
+//! lock hurting, or a `no_std` host with cheap TLS and no per-CPU id).
 
 use crate::ids::SizeClassId;
 

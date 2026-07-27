@@ -175,7 +175,7 @@ fn shard_index() -> usize {
 /// available. Costs one Local-Exec TLS read on the hot path (the same class of access the
 /// re-entrancy depth already makes).
 #[cfg(any(test, feature = "std"))]
-mod shard {
+pub(crate) mod shard {
     use core::cell::Cell;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -189,8 +189,14 @@ mod shard {
     }
 
     /// This thread's key, assigned on first use.
+    ///
+    /// Shared with the W6 front end ([`CpuCache::current_core`](crate::cpu_cache::CpuCache::current_core)),
+    /// which needs the same "cheap, stable, well-spread per-thread integer" when no
+    /// per-CPU id is readable. One TLS slot serves both, and a thread's fork shard and
+    /// its cache core then agree — the two hot-path spreading decisions stay correlated
+    /// instead of interleaving independently.
     #[inline]
-    pub(super) fn thread_key() -> Option<usize> {
+    pub(crate) fn thread_key() -> Option<usize> {
         KEY.try_with(|k| {
             let v = k.get();
             if v != 0 {
@@ -209,11 +215,12 @@ mod shard {
 }
 
 #[cfg(not(any(test, feature = "std")))]
-mod shard {
+pub(crate) mod shard {
     /// No thread-local without `std`: the gate runs single-shard, which is always correct
-    /// (a `no_std` kernel profile typically has a real per-CPU id anyway).
+    /// (a `no_std` kernel profile typically has a real per-CPU id anyway). The W6 front
+    /// end falls back to core 0 for the same reason.
     #[inline(always)]
-    pub(super) fn thread_key() -> Option<usize> {
+    pub(crate) fn thread_key() -> Option<usize> {
         None
     }
 }

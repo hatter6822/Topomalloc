@@ -66,6 +66,67 @@ fn drain_all(cache: &CentralCache, sc: SizeClassId) -> Vec<u16> {
     all
 }
 
+/// §30.4 (W19-3) × W6: `force_slow_path` must bypass the **front end** too, so a
+/// deterministic replay exercises the central path on every allocation and free rather
+/// than whichever objects a per-CPU slot happened to be holding — the front end's
+/// slot selection depends on the running CPU, which is exactly the nondeterminism the
+/// mode exists to remove.
+///
+/// Lives in this (serialized, separate-process) binary because the flag is a
+/// process-global read on the allocation hot path.
+#[test]
+fn force_slow_path_bypasses_the_front_end() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let meta_provider = PosixBackingProvider::new();
+    let meta = topo_core::MetaArena::reserve(meta_provider, ArenaId::DEFAULT, 32 * 1024 * 1024)
+        .expect("metadata arena");
+    let pm = PageMap::new();
+    let a = topo_core::Allocator::new(
+        PosixBackingProvider::new(),
+        PosixBackingProvider::new(),
+        &meta,
+        &meta,
+        &pm,
+        ArenaId::DEFAULT,
+        topo_core::AllocatorConfig::small(),
+    )
+    .expect("allocator");
+
+    // Baseline: with the flag off, a freed small object is held in the front end.
+    let p = a.malloc(64);
+    assert!(!p.is_null());
+    // SAFETY: `p` was just returned by this allocator and is still owned here.
+    assert_eq!(unsafe { a.free(p) }, topo_core::FreeOutcome::Freed);
+    assert_eq!(
+        a.stats().per_cpu_bytes,
+        64,
+        "with the flag off the free is absorbed by the front end"
+    );
+    a.flush_front_end_all();
+
+    // Forced: the same sequence goes straight to the central free list.
+    deterministic::set_force_slow_path(true);
+    let before = a.stats();
+    let q = a.malloc(64);
+    assert!(!q.is_null());
+    // SAFETY: as above.
+    assert_eq!(unsafe { a.free(q) }, topo_core::FreeOutcome::Freed);
+    let after = a.stats();
+    deterministic::set_force_slow_path(false); // leave the global clean
+
+    assert_eq!(
+        after.per_cpu_bytes, 0,
+        "the forced free bypassed the front end"
+    );
+    assert_eq!(after.transfer_bytes, 0);
+    assert_eq!(
+        after.central_free_bytes, before.central_free_bytes,
+        "…and the object went back to central, where it came from"
+    );
+    assert!(a.check_invariants());
+}
+
 #[test]
 fn force_slow_path_declines_empty_span_cache_reuse() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -187,17 +248,20 @@ fn force_slow_path_bypasses_the_transfer_cache_in_refill() {
     // Forced slow path: refill pulls from *central*, leaving the transfer cache
     // untouched (the fast-path source is bypassed).
     deterministic::set_force_slow_path(true);
+    let mut no_retire = |_: &topo_core::SpanDescriptor| {};
     let r = refill(
         core,
         NodeId::DEFAULT,
         ArenaId::DEFAULT,
         Label::PUBLIC,
         sc,
+        ANY_PLACE_CLASS,
         &cpu,
         &transfer,
         &central,
         &pm,
         m,
+        &mut no_retire,
     );
     assert!(r.filled > 0, "the forced refill pulled from central");
     assert!(!r.need_span);

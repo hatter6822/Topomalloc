@@ -38,6 +38,7 @@ use topo_core::{
 
 mod arena_api;
 mod c_api;
+mod cache_api;
 mod debug_api;
 mod deterministic_api;
 mod entropy;
@@ -63,6 +64,10 @@ pub use c_api::{
     topomalloc_malloc_usable_size, topomalloc_memalign, topomalloc_posix_memalign,
     topomalloc_pvalloc, topomalloc_realloc, topomalloc_reallocarray, topomalloc_valloc,
     topomalloc_version,
+};
+pub use cache_api::{
+    topomalloc_cache_budget_tick, topomalloc_cache_flush_all, topomalloc_cache_flush_core,
+    topomalloc_cache_register_thread, topomalloc_cache_rseq_active,
 };
 pub use debug_api::{topomalloc_debug_check_now, topomalloc_debug_checks_enabled};
 pub use deterministic_api::{
@@ -354,6 +359,58 @@ impl AnyAllocator {
     /// when no entropy source answered or the hardening feature is not compiled in.
     pub fn seed_security_samplers(&self) {
         dispatch!(self, a => a.seed_security_samplers())
+    }
+
+    // -- the §11 front end (plan 05 W6/W7) -----------------------------------
+
+    /// Publish the host's CPU count to the front end and size the §11.5 cache budget
+    /// from it (W6-4/W6-5).
+    pub fn set_front_end_cpus(&self, cpus: u32) {
+        dispatch!(self, a => a.set_front_end_cpus(cpus))
+    }
+
+    /// Enable the W7 RSEQ fast path if the platform supports it; `false` leaves the
+    /// front end on the always-correct locked baseline (P-003).
+    pub fn enable_front_end_rseq(&self) -> bool {
+        dispatch!(self, a => a.enable_front_end_rseq())
+    }
+
+    /// Revert the front end to the locked baseline — the §28.1 child-fork
+    /// conservative mode.
+    pub fn disable_front_end_rseq(&self) {
+        dispatch!(self, a => a.disable_front_end_rseq())
+    }
+
+    /// Whether the W7 RSEQ fast path is active.
+    pub fn front_end_rseq_active(&self) -> bool {
+        dispatch!(self, a => a.front_end_rseq_active())
+    }
+
+    /// Register the calling thread with the RSEQ fast path (§27.6, W7-1).
+    pub fn register_front_end_thread(&self) -> bool {
+        dispatch!(self, a => a.register_front_end_thread())
+    }
+
+    /// Run one W6-5 cache-budget adaptation cycle; returns the total soft capacity
+    /// after adaptation, in objects. Host-driven, never on the allocation path.
+    pub fn cache_budget_tick(&self) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.cache_budget_tick())
+    }
+
+    /// Drain the whole front end — every core's slots *and* the transfer cache — back
+    /// into the central free lists (W6-7), the §21.3 "drain caches" rung. Returns the
+    /// objects that were resident when the drain began.
+    pub fn flush_front_end_all(&self) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.flush_front_end_all())
+    }
+
+    /// Drain **one** core's front-end slots into the transfer cache, overflowing to
+    /// central (W6-7 idle-CPU flush). Returns the objects moved out of that core.
+    pub fn flush_front_end_core(&self, core: topo_core::CoreId) -> usize {
+        let _op = topo_core::fork::operation_guard();
+        dispatch!(self, a => a.flush_front_end_core(core))
     }
 
     /// Run the **full Appendix-B invariant check** over the live engine on demand
@@ -732,9 +789,25 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                 // Phase 3: the engine exists, so the arena registry + default arena
                 // (§22, §35.4 phase 3) are now live.
                 INIT_PHASE.advance_to(InitPhase::ArenaRegistry);
-                // Phase 4: per-CPU / RSEQ front-end setup. Enable the per-CPU sharded
-                // fork gate iff a cheap per-CPU id is available (the glibc/rseq area);
-                // a safe no-op otherwise (single-shard).
+                // Phase 4: per-CPU / RSEQ front-end setup (§35.4).
+                if let Some(eng) = allocator.as_ref() {
+                    // W7-1: bring up the RSEQ fast path *first*. It is what makes
+                    // `rseq::current_cpu()` answer, so everything downstream that wants a
+                    // cheap per-CPU id — the fork gate's sharding immediately below, and
+                    // the front end's own slot selection — gets a real CPU id instead of
+                    // falling back to a per-thread key. On a platform without RSEQ this
+                    // is a no-op returning `false` and the locked baseline stands (P-003).
+                    eng.enable_front_end_rseq();
+                    // The thread performing the very first allocation is also the first
+                    // user of the fast path; later threads register on their own first
+                    // touch (a no-op beyond a presence check in glibc mode).
+                    eng.register_front_end_thread();
+                    // W6-4/W6-5: publish the online CPU count so the front end spreads
+                    // over the real machine and the §11.5 budget is sized to it.
+                    eng.set_front_end_cpus(topo_backend_posix::online_cpus());
+                }
+                // Enable the per-CPU sharded fork gate iff a cheap per-CPU id is
+                // available (the glibc/rseq area); a safe no-op otherwise (single-shard).
                 topo_core::probe_and_set_sharding();
                 INIT_PHASE.advance_to(InitPhase::PerCpuSetup);
                 // W18 (§29.4/§29.5): install real OS entropy for the randomized

@@ -314,6 +314,49 @@ topo_arena_t topo_arena_create_hooked(const topo_extent_hooks_t *hooks, void *ct
 size_t topo_max_hook_backends(void);
 
 /* ------------------------------------------------------------------------
+ * Front-end cache control surface (per-CPU + transfer caches, plan 05 W6/W7)
+ *
+ * Caching is automatic: every small allocation and free that carries no
+ * explicit arena or placement hint goes through the running core's per-CPU
+ * slot, backed by a transfer cache, without touching the contended central
+ * lock. These are the host-driven *maintenance* operations (off the alloc fast
+ * path, no background thread). Front-end residency is reported as
+ * topomalloc_stats_t::cache_bytes and as cache.per_cpu_bytes /
+ * cache.transfer_bytes in the stats JSON. Each entry point returns 0 before
+ * the allocator is initialised.
+ * --------------------------------------------------------------------- */
+
+/* Drain the whole front end — every core's per-CPU slots and the transfer
+ * cache — back into the central free lists, retiring the spans that empty.
+ * This is the release ladder's "drain caches" rung: it moves no live object,
+ * cannot fail, and is undone by the next allocation. Returns the number of
+ * objects that were resident when the drain began (exact when quiescent). */
+size_t topomalloc_cache_flush_all(void);
+
+/* Drain one core's per-CPU slots into the transfer cache, overflowing to the
+ * central free lists (the idle-CPU flush). Returns the objects moved out of
+ * that core. Note this drains one layer only — use topomalloc_cache_flush_all
+ * to return residency all the way to central. */
+size_t topomalloc_cache_flush_core(unsigned core);
+
+/* Run one cache-budget adaptation cycle: grow the size classes this workload
+ * keeps missing on, shrink the ones it keeps overflowing, then enforce the
+ * global budget (sized from the host's CPU count at start-up). Returns the
+ * total per-CPU soft capacity afterwards, in objects. */
+size_t topomalloc_cache_budget_tick(void);
+
+/* 1 if the restartable-sequence (rseq) lock-free fast path is serving the
+ * front end, 0 if it is on the locked baseline. Diagnostic only: both modes
+ * are correct and observationally identical. Reads 0 on a platform without
+ * rseq support, under ASan/MSan, and in a forked child. */
+int topomalloc_cache_rseq_active(void);
+
+/* Register the calling thread with the rseq fast path; returns whether it can
+ * use it. A no-op beyond a presence check under glibc (which registers every
+ * thread before it runs user code); harmless and idempotent to call. */
+int topomalloc_cache_register_thread(void);
+
+/* ------------------------------------------------------------------------
  * NUMA control surface (topology awareness, plan 04 W13)
  *
  * Placement is automatic: every large/medium allocation routes through the

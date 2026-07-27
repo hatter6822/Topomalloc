@@ -963,6 +963,13 @@ impl CentralCache {
                 // at least one bit set. A no-op for a normal (never-quarantined) free.
                 #[cfg(feature = "quarantine")]
                 sg.clear_quarantined(idx);
+                // W6 (§16.4): the same discipline for the front-end residency bit — a
+                // *flush* moves objects `cached → central-free`, and clearing the cached
+                // bit **after** the free bit is set keeps the lock-free
+                // `is_cached || is_central_free` double-free oracle true at every
+                // instant. A no-op for an object that was never cached (a direct free,
+                // an explicit-arena free, or a quarantine drain).
+                span.unmark_cached(idx);
             } else {
                 // central_insert returns false for two reasons:
                 //   (a) idx >= object_count (out-of-range index), or

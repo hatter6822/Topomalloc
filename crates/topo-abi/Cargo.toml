@@ -20,14 +20,14 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # re-entrancy guard — in the real allocator, not just in topo-core's own tests.
 # The `no_std` hot-path capability is preserved for the kernel/seLe4n target,
 # which builds topo-core *without* this feature.
-topo-core = { path = "../topo-core", version = "0.3.0", features = ["std"] }
-topo-backend-posix = { path = "../topo-backend-posix", version = "0.3.0" }
+topo-core = { path = "../topo-core", version = "0.4.0", features = ["std"] }
+topo-backend-posix = { path = "../topo-backend-posix", version = "0.4.0" }
 # The pure stats renderer (Appendix-D JSON / §31.6 explain / §36.12 redaction). The C
 # `topomalloc_stats_*` surface composes a live snapshot and hands it to this renderer.
-topo-stats = { path = "../topo-stats", version = "0.3.0" }
+topo-stats = { path = "../topo-stats", version = "0.4.0" }
 # GPL backend is optional and OFF by default; enabling `sele4n-sim` produces a
 # GPL-3.0-or-later artifact (libtopomalloc-sele4n, §36.3.2). See NOTICE.
-topo-backend-sele4n = { path = "../topo-backend-sele4n", version = "0.3.0", optional = true }
+topo-backend-sele4n = { path = "../topo-backend-sele4n", version = "0.4.0", optional = true }
 
 # errno + allocation-free getenv for the §10.1 errno protocol and the W8-4
 # zero-size policy (unix only; the same MIT/Apache-2.0 dep topo-backend-posix

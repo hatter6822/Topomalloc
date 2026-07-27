@@ -13,8 +13,9 @@ TopoMalloc is a general-purpose allocator built around three constraints:
 
 ## Current status
 
-The workspace version is **0.3.0**. The tree includes the central allocation
-path, C/C++/Rust ABI surfaces, arena and extent-hook support, hugepage and NUMA
+The workspace version is **0.4.0**. The tree includes the central allocation
+path, the per-CPU/transfer front end and its restartable-sequence fast path,
+C/C++/Rust ABI surfaces, arena and extent-hook support, hugepage and NUMA
 placement infrastructure, stats/observability, opt-in hardening, debug invariant
 checkers, deterministic replay support, and sanitizer/fuzz/loom gates.
 

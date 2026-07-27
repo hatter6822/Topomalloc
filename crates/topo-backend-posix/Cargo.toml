@@ -10,7 +10,7 @@ authors.workspace = true
 license = "MIT"
 
 [dependencies]
-topo-core = { path = "../topo-core", version = "0.3.0" }
+topo-core = { path = "../topo-core", version = "0.4.0" }
 
 # Real `mmap`/`madvise`/`mprotect`/`munmap` on unix (plan 04 W4-3). MIT/Apache-2.0,
 # within the deny.toml license allow-list; from crates.io (a known registry).

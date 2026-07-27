@@ -2055,3 +2055,64 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   The same shape appeared in the fork gate, whose quiesce window the *forking thread itself*
   could park on — an allocation from any sibling `pthread_atfork` handler was enough — fixed
   by exempting that thread for the window.
+
+* **W6/W7 — a front-end cache needs a per-object residency marker, or exact double-free
+  detection dies with it (0.4.0).**
+  Wiring the per-CPU and transfer caches onto the live small path moves a freed object
+  into a slot instead of the central free list, so `central_insert`'s test-and-set — the
+  mechanism that made `free(p); free(p)` return `DoubleFree` — never sees it. The second
+  free would push the same address into the slot again and the cache would hand one object
+  to two callers. Answering "is this address cache-resident?" by scanning is
+  `O(MAX_CPUS × capacity)`, so the object is **marked** instead: a per-span, lock-free
+  `CachedBits` bitmap whose atomic test-and-set *is* the oracle, exactly as the free
+  bitmap's is for the central path. The free path already resolved `(span, index)` through
+  `validate_free`, so the mark costs nothing there; the alloc path pays one pagemap walk to
+  clear it, which is cheaper than the two spinlocks the cache removes. Alternatives were
+  rejected on principle, not effort: leaving cached objects untracked (§8.5 permits it —
+  but it is a real safety regression against a pinned test), storing the marker in the
+  freed object's own bytes (destroys the W18-1b property that free memory holds no
+  allocator metadata), and a central-free-bit "hint cache" (keeps the span lock on every
+  operation, which is the cost the layer exists to remove). The rule: **a fast path may
+  move where state lives, never whether it exists.**
+
+* **W6 — the front end caches one placement tuple, so everything it holds is
+  substitutable (0.4.0).**
+  A per-CPU slot is keyed by `(core, size class)` alone, so whatever it vends must be
+  interchangeable for *any* request of that class. Only the default arena's
+  placement-unhinted spans participate; an explicit arena, a labelled arena, or a
+  cold/hot/short-tagged span keeps the pre-W6 central path byte for byte. That is what
+  keeps §22.7 arena isolation, §36.4 quota exactness, §36.12 label isolation and the W14
+  placement grouping *exact* rather than approximate — none of them becomes a property the
+  cache has to remember, because memory subject to them never enters it. Cacheability
+  cannot change under a cached object either: a span is re-tagged only while empty, and an
+  empty span has no cached objects. The corollary bug this ratifies: the predicate was
+  first written against `PlaceClass::Default`, but an unhinted request computes
+  `Hotness::from_hint(0) == Cold`, so it matched *nothing* and the cache stayed silently
+  dead. The class is now derived by running neutral hints through the same functions the
+  allocation path uses, so the two agree by construction rather than by a named constant
+  someone must remember to keep in step.
+
+* **W6 — front-end residency is its own byte class, not a discount on the others
+  (0.4.0).**
+  A cached object has been freed by the application, so it left `live_bytes`; it never
+  reached the central bitmap, so it is not in `central_free_bytes`. Reporting it in neither
+  would have made the §8.6 covering identity `live + central_free <= active` *weaker* the
+  moment the cache went live — it would still hold, by losing track of memory. `per_cpu_bytes`
+  and `transfer_bytes` are therefore first-class in `AllocatorStats`, the covering identity
+  counts them, and the §21.3 release ladder's "drain caches" rung
+  (`topomalloc_cache_flush_all`) converts them back. Draining had to sweep **both** layers:
+  flushing a core's slots pushes their contents one level *down* into the transfer cache, so
+  a slot-only drain reports success while the spans stay non-empty and their backing stays
+  unreclaimable.
+
+* **W6 — a 360 KiB per-CPU array does not belong inside a value type (0.4.0).**
+  `CpuCache` is `MAX_CPUS` × a slot per size class. Embedding it in `Allocator` by value
+  made every construction materialise that much stack — enough to overflow a test thread —
+  and charged it to every embedding that never touches the front end (a `no_std` profile,
+  an arena-only host). The array is now carved from monotonic metadata on first use, which
+  is the discipline the span/large descriptor pools and the free bitmaps already follow.
+  Zeroing is the initialiser: every field of `PerCpu` is an atomic whose all-zero pattern
+  is its `new()` value, so nothing constructs a temporary — a property that is a fact about
+  the field set rather than about Rust, and is therefore pinned by a test. A failed carve is
+  not an error: the accessors read a null array as "no slots", the front end declines, and
+  the central path serves (§2.4 — a policy layer may degrade, never fail an allocation).

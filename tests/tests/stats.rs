@@ -72,11 +72,20 @@ fn assert_reconciles(s: &Stats, quiescent: bool) {
     if quiescent {
         // The active backing covers every live + central-resident object byte; the slack is
         // slab-packing residual (the documented §8.6 convention).
+        // W6: the front end is a *third* byte class — an object it holds has been freed
+        // (so it left `live`) but has not reached the central bitmap (so it is not in
+        // `central_free`). The covering identity must count it, or wiring the cache would
+        // silently shrink both sides and make this assertion weaker instead of catching a
+        // real leak.
         assert!(
-            s.live_bytes + s.central_free_bytes <= s.active_bytes,
-            "live ({}) + central_free ({}) must fit in active backing ({})",
+            s.live_bytes + s.central_free_bytes + s.per_cpu_bytes + s.transfer_bytes
+                <= s.active_bytes,
+            "live ({}) + central_free ({}) + front end ({} + {}) must fit in active \
+             backing ({})",
             s.live_bytes,
             s.central_free_bytes,
+            s.per_cpu_bytes,
+            s.transfer_bytes,
             s.active_bytes
         );
         assert_eq!(

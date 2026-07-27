@@ -18,6 +18,8 @@
 //! The controller is designed to run periodically (e.g. on a timer or on
 //! every N-th allocation) and is not on the allocation fast path.
 
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use crate::cpu_cache::CpuCache;
 use crate::generated::tables::SIZE_CLASSES;
 use crate::ids::SizeClassId;
@@ -54,7 +56,13 @@ pub struct CacheBudget {
     /// Global budget: maximum total soft capacity across all CPUs and SCs
     /// (in objects). When the total exceeds this, slots above the minimum are
     /// shrunk in index order (lowest CPU, lowest SC first).
-    global_budget: usize,
+    ///
+    /// Atomic (and settable through [`set_global_budget`](CacheBudget::set_global_budget))
+    /// because the right value is a property of the *machine*, which the engine learns
+    /// only when the host publishes its CPU count — after the controller has been
+    /// `const`-constructed. Relaxed: a policy knob read once per adaptation cycle, never
+    /// used for synchronisation.
+    global_budget: AtomicUsize,
     /// Miss threshold for growing a slot.
     miss_threshold: u64,
     /// Overflow threshold for shrinking a slot.
@@ -62,25 +70,35 @@ pub struct CacheBudget {
     /// Number of allocations between `adapt` calls (count-based invocation).
     adapt_interval: u64,
     /// Per-instance allocation counter for `should_adapt`.
-    alloc_counter: core::sync::atomic::AtomicU64,
+    alloc_counter: AtomicU64,
 }
 
 impl CacheBudget {
     /// Create a budget controller with the given global budget.
     pub const fn new(global_budget: usize) -> Self {
         Self {
-            global_budget,
+            global_budget: AtomicUsize::new(global_budget),
             miss_threshold: DEFAULT_MISS_THRESHOLD,
             overflow_threshold: DEFAULT_OVERFLOW_THRESHOLD,
             adapt_interval: DEFAULT_ADAPT_INTERVAL,
-            alloc_counter: core::sync::atomic::AtomicU64::new(0),
+            alloc_counter: AtomicU64::new(0),
         }
     }
 
     /// The global budget (total objects across all CPUs and SCs).
     #[inline]
     pub fn global_budget(&self) -> usize {
-        self.global_budget
+        self.global_budget.load(Ordering::Relaxed)
+    }
+
+    /// Set the global budget — the §11.5 ceiling on total front-end residency, in
+    /// objects. The engine sizes it from the host's CPU count
+    /// ([`Allocator::set_front_end_cpus`](crate::Allocator::set_front_end_cpus)), since a
+    /// budget fixed at construction would either starve a many-core machine or let a
+    /// small one hold caches out of proportion to its heap.
+    #[inline]
+    pub fn set_global_budget(&self, objects: usize) {
+        self.global_budget.store(objects, Ordering::Relaxed);
     }
 
     /// The miss threshold (misses above this trigger a grow).
@@ -127,9 +145,7 @@ impl CacheBudget {
     /// Returns `false` unconditionally when `adapt_interval` is 0.
     #[inline]
     pub fn should_adapt(&self) -> bool {
-        let n = self
-            .alloc_counter
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let n = self.alloc_counter.fetch_add(1, Ordering::Relaxed);
         self.adapt_interval > 0 && n.is_multiple_of(self.adapt_interval)
     }
 
@@ -191,12 +207,13 @@ impl CacheBudget {
         // or no further reduction is possible. Iteration is in index order
         // (lowest CPU, lowest SC first); a future enhancement could sort by
         // activity to prefer shrinking the least-active slots.
+        let budget = self.global_budget();
         let mut total = self.compute_total_capacity(cpu_cache, active);
 
-        while total > self.global_budget {
+        while total > budget {
             let mut made_progress = false;
             for cpu_idx in 0..active {
-                if total <= self.global_budget {
+                if total <= budget {
                     break;
                 }
                 let cpu = match cpu_cache.per_cpu(crate::fe::CoreId(cpu_idx as u32)) {
@@ -204,7 +221,7 @@ impl CacheBudget {
                     None => continue,
                 };
                 for sc_idx in 0..NUM_SIZE_CLASSES {
-                    if total <= self.global_budget {
+                    if total <= budget {
                         break;
                     }
                     let sc = SizeClassId::new(sc_idx);

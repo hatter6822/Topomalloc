@@ -43,12 +43,30 @@ extern "C" fn atfork_parent() {
     topo_core::fork::postfork_parent();
 }
 
-/// `pthread_atfork` child handler (post-fork in the child): reset lock/gate state
-/// and disable background threads until the host re-arms them (§28.1). The
-/// parent's pre-fork quiesce guarantees the child's structures are consistent.
+/// `pthread_atfork` child handler (post-fork in the child): reset lock/gate state,
+/// revert the front end to its locked baseline, and disable background threads until
+/// the host re-arms them (§28.1). The parent's pre-fork quiesce guarantees the child's
+/// structures are consistent.
+///
+/// **The W7 fast path goes off in the child.** Only the forking thread survives, and
+/// its RSEQ registration is the kernel's per-*thread* state, not the process's — the
+/// registrations of every other thread died with them, so a child that later spawns
+/// threads would have them running unregistered while the cache still believed the fast
+/// path was live. Reverting to the locked baseline is the §28.1 conservative-mode rule
+/// and costs nothing but the spinlock; a host that wants the fast path back in the child
+/// re-enables it explicitly, which is also where the child's own threads register.
+/// Cached objects are untouched: the child inherited the slots, their contents, and the
+/// per-object cached bits as one consistent copy, and the locked path reaches all of it.
+///
+/// Reached through `global()` only if the engine is already built. If the fork raced the
+/// very first allocation, there is no engine to revert — and none of its state to be
+/// stale either, since a later `global()` in the child builds it fresh.
 #[cfg(unix)]
 extern "C" fn atfork_child() {
     topo_core::fork::postfork_child();
+    if let Some(eng) = crate::global_if_init() {
+        eng.disable_front_end_rseq();
+    }
 }
 
 #[cfg(unix)]

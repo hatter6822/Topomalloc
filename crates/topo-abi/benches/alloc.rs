@@ -36,10 +36,19 @@ fn bench_classify_flags(c: &mut Criterion) {
 }
 
 fn bench_malloc_free(c: &mut Criterion) {
-    // The W8 engine reclaims on free, so the natural steady-state benchmark is
-    // a malloc/free round-trip against the process-wide allocator (the M1
-    // central path under its locks; the M2/M3 caches will drop this number).
-    c.bench_function("malloc(64)+free [central path]", |b| {
+    // The engine reclaims on free, so the natural steady-state benchmark is a malloc/free
+    // round-trip against the process-wide allocator. Since W6/W7 this is the **front-end**
+    // path: the free lands in the running core's per-CPU slot and the malloc pops it
+    // straight back, so neither touches the central bin lock (and under RSEQ neither takes
+    // a lock at all). Wiring the front end moved this line from ~162 ns to ~104 ns on the
+    // development host — uncontended and single-threaded, i.e. the case that flatters the
+    // central path most, since the lock it removes is the one nobody else is holding.
+    //
+    // There is deliberately no paired "central path" line: the only ways to force it from
+    // here either measure a full cache drain per iteration (thousands of times the cost of
+    // the thing being measured) or flip deterministic mode, which changes the central path
+    // as well. The honest comparison is a before/after of this line across the change.
+    c.bench_function("malloc(64)+free [front end]", |b| {
         b.iter(|| {
             let p = topomalloc_malloc(black_box(64));
             // SAFETY: `p` was just returned by `topomalloc_malloc` and is

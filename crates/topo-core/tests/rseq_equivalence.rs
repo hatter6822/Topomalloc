@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use topo_core::{
     flush_idle_cpu, size_class, ArenaId, BumpArena, CacheBudget, CentralCache, CoreId, CpuCache,
-    FeOutcome, PageMap, SizeClassId, TransferCache,
+    FeOutcome, PageMap, SizeClassId, SpanDescriptor, TransferCache,
 };
 
 const A: ArenaId = ArenaId::DEFAULT;
@@ -481,7 +481,20 @@ fn flush_idle_cpu_vs_fastpath_conserves() {
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
                     let c = (rng as usize) % ncpu;
-                    flush_idle_cpu(CoreId(c as u32), A, &cc, &tc, &central, &pm, m);
+                    // This test's tokens are synthetic addresses with no spans behind
+                    // them, so no span can empty; the callback exists for the live
+                    // engine, which retires what it reports.
+                    let mut no_retire = |_: &SpanDescriptor| {};
+                    flush_idle_cpu(
+                        CoreId(c as u32),
+                        A,
+                        &cc,
+                        &tc,
+                        &central,
+                        &pm,
+                        m,
+                        &mut no_retire,
+                    );
                 }
                 stop.store(true, Ordering::Relaxed);
             });

@@ -783,7 +783,11 @@ pub fn discover_topology() -> Topology {
 }
 
 /// The number of online CPUs (`sysconf(_SC_NPROCESSORS_ONLN)`), at least 1.
-fn online_cpus() -> u32 {
+///
+/// Public because the front end needs it too: `topo-abi` publishes it to the W6 per-CPU
+/// cache at §35.4 phase 4, so the cache spreads over the real machine and its §11.5
+/// budget is sized to it.
+pub fn online_cpus() -> u32 {
     // SAFETY: `sysconf` with a valid name is always safe; `-1`/`0` ⇒ the 1-CPU floor.
     let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if v >= 1 {

@@ -21,7 +21,9 @@
 //! `hard_capacity`; push operations that would breach it return
 //! [`FeOutcome::Full`].
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 
 use topo_arch::rseq;
 
@@ -85,6 +87,11 @@ pub struct CpuSlot {
 }
 
 impl CpuSlot {
+    /// The canonical initial slot. Retained as the **specification** of the all-zero
+    /// pattern `CpuCache::ensure_cpus` relies on (see
+    /// `a_zeroed_per_cpu_block_is_the_const_initialiser`); the live carve zeroes rather
+    /// than materialising a 360 KiB temporary, so nothing constructs one at run time.
+    #[cfg(test)]
     const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
@@ -291,6 +298,9 @@ pub struct PerCpu {
 }
 
 impl PerCpu {
+    /// The canonical initial per-CPU entry — see [`CpuSlot::new`] for why it is
+    /// test-only.
+    #[cfg(test)]
     const fn new() -> Self {
         Self {
             locked: RankedLock::new(),
@@ -410,7 +420,26 @@ impl crate::pinned::CoreProvider for FnCoreProvider {
 /// operations `fe_pop` and `fe_push` lock the target CPU, operate on the slot,
 /// and unlock -- the transfer and central locks are never held.
 pub struct CpuCache {
-    cpus: [PerCpu; MAX_CPUS],
+    /// The `MAX_CPUS`-entry per-CPU array, carved from monotonic metadata on first
+    /// use and never freed; null until then.
+    ///
+    /// **Not inline.** The array is ~360 KiB (`MAX_CPUS` × [`PerCpu`], each holding a
+    /// slot per size class), which is far too large to sit by value inside an engine
+    /// that is constructed and moved as a value, and is pure waste for a program that
+    /// never touches the front end (a `no_std` profile, an arena-only embedding, a test
+    /// that exercises only the central path). Carving it lazily makes the cost
+    /// proportional to use, exactly as the span/large descriptor pools and the free
+    /// bitmaps already are.
+    ///
+    /// A failed carve is **not** an error: every accessor treats a null array as "no
+    /// slots", so the front end simply declines and the caller falls back to the central
+    /// path (§2.4 — a policy layer may degrade, it may never fail an allocation).
+    cpus: AtomicPtr<PerCpu>,
+    /// Serialises the one-shot array carve so a race cannot leak a second 360 KiB block.
+    /// Rank [`LockRank::FRONT_END`], like the per-CPU locks it guards the creation of;
+    /// it is always released before any per-CPU lock is taken, so the §27.2 order (which
+    /// requires each acquisition be *strictly* rank-increasing) still holds.
+    cpus_init: RankedLock<{ LockRank::FRONT_END }>,
     /// Number of active (online) CPUs. Operations on a core beyond this
     /// count are valid but will always miss (no slots initialized).
     active_cpus: AtomicU32,
@@ -433,11 +462,69 @@ impl CpuCache {
     /// fast path after the cache is wired up.
     pub const fn new() -> Self {
         Self {
-            cpus: [const { PerCpu::new() }; MAX_CPUS],
+            cpus: AtomicPtr::new(core::ptr::null_mut()),
+            cpus_init: RankedLock::new(),
             active_cpus: AtomicU32::new(0),
             mode: AtomicU8::new(MODE_LOCKED),
             pinned_core_fn: AtomicUsize::new(0),
         }
+    }
+
+    /// The per-CPU array if it has been carved, else `None`. Lock-free (one acquire
+    /// load), and the accessor every read-only path uses — a `None` simply means the
+    /// front end holds nothing.
+    #[inline]
+    fn cpus(&self) -> Option<&[PerCpu; MAX_CPUS]> {
+        let p = self.cpus.load(Ordering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null `cpus` was published by `ensure_cpus` with a release store
+        // after the block was fully zero-initialised, and it points at `MAX_CPUS`
+        // `PerCpu`s in monotonic metadata (never freed), so the reference is valid for
+        // the process lifetime and this acquire load synchronises with that release.
+        Some(unsafe { &*p.cast::<[PerCpu; MAX_CPUS]>() })
+    }
+
+    /// The per-CPU entry for `core`, carving the array from `meta` if this is its first
+    /// use. `None` when the carve fails (an exhausted metadata arena) — the caller then
+    /// declines to the central path.
+    fn cpu_for(&self, core: CoreId, meta: &dyn MetadataAlloc) -> Option<&PerCpu> {
+        if let Some(cpus) = self.cpus() {
+            return cpus.get(core.index());
+        }
+        self.ensure_cpus(meta)?.get(core.index())
+    }
+
+    /// Carve the per-CPU array from `meta` (idempotent). An all-zero block **is** the
+    /// correct initial state — every field of [`PerCpu`] is an atomic whose zero pattern
+    /// is its `new()` value (an unlocked [`RankedLock`], an uninitialised slot with a
+    /// null buffer and zero length/capacities/counters) — so this zeroes rather than
+    /// materialising a 360 KiB temporary, the same discipline `SpanPool::new` uses.
+    #[cold]
+    fn ensure_cpus(&self, meta: &dyn MetadataAlloc) -> Option<&[PerCpu; MAX_CPUS]> {
+        self.cpus_init.acquire();
+        let existing = self.cpus.load(Ordering::Acquire);
+        if existing.is_null() {
+            let bytes = core::mem::size_of::<[PerCpu; MAX_CPUS]>();
+            match meta.alloc(bytes, core::mem::align_of::<PerCpu>()) {
+                Some(block) => {
+                    // SAFETY: `block` is a fresh, exclusively-owned, correctly-aligned
+                    // region of exactly `bytes` bytes; zeroing it yields `MAX_CPUS` valid
+                    // `PerCpu`s (see the zero-pattern argument above). Nothing else can
+                    // observe the block until the release store below publishes it.
+                    unsafe { core::ptr::write_bytes(block.as_ptr(), 0, bytes) };
+                    self.cpus
+                        .store(block.as_ptr().cast::<PerCpu>(), Ordering::Release);
+                }
+                None => {
+                    self.cpus_init.release();
+                    return None;
+                }
+            }
+        }
+        self.cpus_init.release();
+        self.cpus()
     }
 
     /// Enable the RSEQ fast path if the platform supports it (W7). Idempotent:
@@ -513,10 +600,47 @@ impl CpuCache {
         self.active_cpus.load(Ordering::Relaxed)
     }
 
+    /// The [`CoreId`] the calling thread should use for its front-end operations
+    /// (W6-4): the **running CPU** when a cheap per-CPU id is readable
+    /// (`rseq::current_cpu()`, available once [`enable_rseq`](Self::enable_rseq) has
+    /// run), else a stable per-thread spreading key, else core 0.
+    ///
+    /// **Any** value is *correct* — a slot is just a keyed object pool, and every
+    /// cached object of a class is interchangeable, so a thread that migrates (or
+    /// shares a core id with another) still pops and pushes valid objects. The choice
+    /// only decides *which* slot is touched, i.e. how well the front-end lock spreads;
+    /// in [`rseq_mode`](Self::rseq_mode) it is a hint the restartable sequence ignores
+    /// in favour of the hardware CPU (§27.4).
+    ///
+    /// The per-thread fallback matters: without it a build whose `rseq::enable()`
+    /// failed (no kernel support, a sanitizer build, a non-Linux target) would land
+    /// every thread on core 0 and turn the front end into one process-wide spinlock —
+    /// strictly worse than the per-size-class-binned central path it fronts. This is
+    /// the same reasoning (and the same golden-ratio key) as the fork gate's shard
+    /// selection; see [`crate::fork`].
+    #[inline]
+    pub fn current_core(&self) -> CoreId {
+        let cpu = rseq::current_cpu();
+        if cpu >= 0 && (cpu as usize) < MAX_CPUS {
+            return CoreId(cpu as u32);
+        }
+        // No per-CPU id: spread by thread instead. Modulo the active-CPU count when
+        // the host published one (so slot metadata stays proportional to the machine),
+        // else the whole array.
+        let span = match self.active_cpus.load(Ordering::Relaxed) {
+            0 => MAX_CPUS,
+            n => (n as usize).min(MAX_CPUS),
+        };
+        match crate::fork::shard::thread_key() {
+            Some(k) => CoreId((k % span) as u32),
+            None => CoreId::DEFAULT,
+        }
+    }
+
     /// The per-CPU entry for a core (bounds-checked).
     #[inline]
     pub fn per_cpu(&self, core: CoreId) -> Option<&PerCpu> {
-        self.cpus.get(core.index())
+        self.cpus()?.get(core.index())
     }
 
     /// Appendix B.2 (cache invariants, W19-1b): **every** per-CPU slot is within
@@ -534,7 +658,10 @@ impl CpuCache {
     /// capacity bounds plus the per-slot **distinctness** check (a duplicate is a
     /// double-freed object, §29.3) are the B.2 per-CPU clauses.
     pub fn check_invariants(&self) -> bool {
-        for (cpu_idx, cpu) in self.cpus.iter().enumerate() {
+        let Some(cpus) = self.cpus() else {
+            return true; // never used ⇒ nothing to violate
+        };
+        for (cpu_idx, cpu) in cpus.iter().enumerate() {
             let _g = cpu.lock();
             // W7-4: the sweep reads another CPU's slots, so drain any in-flight sequence
             // there before reading `len`/`buf` — otherwise the checker can observe a
@@ -563,7 +690,7 @@ impl CpuCache {
         meta: &dyn MetadataAlloc,
         initial_soft_cap: u32,
     ) -> bool {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpu_for(core, meta) {
             Some(c) => c,
             None => return false,
         };
@@ -626,7 +753,7 @@ impl CpuCache {
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<usize> {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpu_for(core, meta) {
             Some(c) => c,
             None => return FeOutcome::Empty,
         };
@@ -715,7 +842,7 @@ impl CpuCache {
         addr: usize,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<()> {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpu_for(core, meta) {
             Some(c) => c,
             None => return FeOutcome::Full,
         };
@@ -765,7 +892,7 @@ impl CpuCache {
     /// per-CPU lock-byte base (offset 0) and the per-CPU stride base for the asm.
     #[inline]
     fn cpus_base(&self) -> *const u8 {
-        core::ptr::addr_of!(self.cpus).cast::<u8>()
+        self.cpus.load(Ordering::Acquire).cast::<u8>()
     }
 
     /// The effective core for the locked fallback in RSEQ mode: the hardware CPU
@@ -783,7 +910,11 @@ impl CpuCache {
     /// Increment the miss counter for `(cpu, sc)` (approximate stats; Relaxed).
     #[inline]
     fn bump_miss(&self, cpu: usize, sc: SizeClassId) {
-        if let Some(s) = self.cpus.get(cpu).and_then(|c| c.slots.get(sc.index())) {
+        if let Some(s) = self
+            .cpus()
+            .and_then(|c| c.get(cpu))
+            .and_then(|c| c.slots.get(sc.index()))
+        {
             s.misses.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -791,7 +922,11 @@ impl CpuCache {
     /// Increment the overflow counter for `(cpu, sc)` (approximate; Relaxed).
     #[inline]
     fn bump_overflow(&self, cpu: usize, sc: SizeClassId) {
-        if let Some(s) = self.cpus.get(cpu).and_then(|c| c.slots.get(sc.index())) {
+        if let Some(s) = self
+            .cpus()
+            .and_then(|c| c.get(cpu))
+            .and_then(|c| c.slots.get(sc.index()))
+        {
             s.overflows.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -830,8 +965,15 @@ impl CpuCache {
             return None;
         }
         let base = self.cpus_base();
-        // SAFETY: `slots_off + sc*slot_stride` lies within one `PerCpu`, so this
-        // is the base of the per-`sc` slot column the asm indexes by CPU.
+        // The per-CPU array is carved lazily from metadata, and the restartable
+        // sequence cannot allocate: divert to the locked path, which carves it (and
+        // the slot buffer) before this class is ever pushed to.
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: `base` is the non-null per-CPU array, and
+        // `slots_off + sc*slot_stride` lies within one `PerCpu`, so this is the base of
+        // the per-`sc` slot column the asm indexes by CPU.
         let slot_base = unsafe { base.add(PERCPU_SLOTS_OFF + sc.index() * SLOT_STRIDE) };
         for _ in 0..RSEQ_ABORT_RETRY {
             // SAFETY: `area` is this thread's registered area; `base`/`slot_base`/
@@ -872,6 +1014,10 @@ impl CpuCache {
             return None;
         }
         let base = self.cpus_base();
+        // As `fe_pop_rseq`: an uncarved array diverts to the locked path.
+        if base.is_null() {
+            return None;
+        }
         // SAFETY: as `fe_pop_rseq`.
         let slot_base = unsafe { base.add(PERCPU_SLOTS_OFF + sc.index() * SLOT_STRIDE) };
         for _ in 0..RSEQ_ABORT_RETRY {
@@ -989,7 +1135,7 @@ impl CpuCache {
         if provider.current_core() != expected {
             return FeOutcome::Abort;
         }
-        let cpu = match self.cpus.get(expected.index()) {
+        let cpu = match self.cpu_for(expected, meta) {
             Some(c) => c,
             None => return FeOutcome::Empty,
         };
@@ -1040,7 +1186,7 @@ impl CpuCache {
         if provider.current_core() != expected {
             return FeOutcome::Abort;
         }
-        let cpu = match self.cpus.get(expected.index()) {
+        let cpu = match self.cpu_for(expected, meta) {
             Some(c) => c,
             None => return FeOutcome::Full,
         };
@@ -1087,7 +1233,7 @@ impl CpuCache {
     /// need no fence: only a thread running on that CPU can mutate its slot via
     /// RSEQ, and it is this thread.
     pub fn pop_batch(&self, core: CoreId, sc: SizeClassId, out: &mut [usize], max: usize) -> usize {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpus().and_then(|c| c.get(core.index())) {
             Some(c) => c,
             None => return 0,
         };
@@ -1110,7 +1256,7 @@ impl CpuCache {
     /// if the slot hits hard capacity). Used by refill operations (cache_ops
     /// W6-3a).
     pub fn push_batch(&self, core: CoreId, sc: SizeClassId, addrs: &[usize]) -> usize {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpus().and_then(|c| c.get(core.index())) {
             Some(c) => c,
             None => return 0,
         };
@@ -1163,7 +1309,7 @@ impl CpuCache {
     where
         F: FnMut(SizeClassId, &[usize]),
     {
-        let cpu = match self.cpus.get(core.index()) {
+        let cpu = match self.cpus().and_then(|c| c.get(core.index())) {
             Some(c) => c,
             None => return 0,
         };
@@ -1218,6 +1364,7 @@ unsafe impl Send for CpuCache {}
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::bootstrap::BumpArena;
     use crate::ids::ArenaId;
@@ -1230,6 +1377,66 @@ mod tests {
         let ptr = Box::into_raw(buf).cast::<u8>();
         // SAFETY: ptr is a valid, owned allocation of `len` bytes from Box.
         unsafe { BumpArena::new(ptr, len) }
+    }
+
+    /// `ensure_cpus` carves the per-CPU array by **zeroing** a metadata block rather
+    /// than materialising a 360 KiB `[PerCpu; MAX_CPUS]` temporary, which is sound only
+    /// because the all-zero bit pattern *is* `PerCpu::new()`. That is a property of the
+    /// field set, not of the language, so it is pinned here: adding a field whose
+    /// initial value is not zero (a non-zero capacity, a `true` flag, a sentinel
+    /// pointer) silently breaks the carve, and this test is what catches it.
+    #[test]
+    fn a_zeroed_per_cpu_block_is_the_const_initialiser() {
+        let fresh = PerCpu::new();
+        // SAFETY: `PerCpu` is `#[repr(C)]` over a `RankedLock` (one `AtomicBool`) and an
+        // array of `CpuSlot`s, each of which is entirely atomics — every field's all-zero
+        // pattern is a valid value, which is exactly the claim under test.
+        let zeroed: PerCpu = unsafe { core::mem::zeroed() };
+        // The lock byte: a zeroed lock must be *unlocked*, or the first acquisition on a
+        // freshly carved array would spin forever.
+        let g = zeroed.lock();
+        drop(g);
+        assert_eq!(fresh.slots.len(), zeroed.slots.len());
+        for (a, b) in fresh.slots.iter().zip(zeroed.slots.iter()) {
+            assert_eq!(a.is_initialized(), b.is_initialized());
+            assert_eq!(a.len(), b.len());
+            assert_eq!(a.soft_capacity(), b.soft_capacity());
+            assert_eq!(a.hard_capacity(), b.hard_capacity());
+            assert_eq!(a.misses(), b.misses());
+            assert_eq!(a.overflows(), b.overflows());
+            assert_eq!(
+                a.buf.load(Ordering::Relaxed),
+                b.buf.load(Ordering::Relaxed),
+                "a zeroed slot must carry the same (null) buffer as a fresh one"
+            );
+        }
+    }
+
+    /// The whole point of the lazy carve: a cache nobody has used holds no metadata, so
+    /// an engine embedding that never touches the front end pays nothing for it.
+    #[test]
+    fn an_unused_cache_carves_no_metadata_and_reads_as_empty() {
+        let cc = CpuCache::new();
+        assert!(cc.per_cpu(CoreId::DEFAULT).is_none());
+        assert_eq!(
+            cc.pop_batch(CoreId::DEFAULT, SizeClassId::new(0), &mut [0; 4], 4),
+            0
+        );
+        assert_eq!(
+            cc.push_batch(CoreId::DEFAULT, SizeClassId::new(0), &[1, 2]),
+            0
+        );
+        assert!(cc.check_invariants());
+        // ... and a starved metadata arena degrades to "declines", never to a panic or a
+        // wrong answer (§2.4): the caller falls back to the central path.
+        let starved = meta(0);
+        assert!(cc
+            .fe_pop(CoreId::DEFAULT, A, SizeClassId::new(0), &starved)
+            .is_empty());
+        assert!(cc
+            .fe_push(CoreId::DEFAULT, A, SizeClassId::new(0), 0x1000, &starved)
+            .is_full());
+        assert!(cc.per_cpu(CoreId::DEFAULT).is_none());
     }
 
     #[test]
@@ -1324,14 +1531,18 @@ mod tests {
         let core = CoreId::DEFAULT;
         let sc = SizeClassId::new(0);
 
-        // Slot is not initialized before first use.
-        let cpu = cc.per_cpu(core).unwrap();
-        let slot = cpu.slot(sc).unwrap();
-        assert!(!slot.is_initialized());
+        // Nothing is carved before first use — neither the per-CPU array nor the slot
+        // buffer inside it.
+        assert!(cc.per_cpu(core).is_none());
 
-        // First push triggers lazy init.
+        // The first push carves the array *and* initializes the slot's buffer.
         assert!(cc.fe_push(core, A, sc, 42, &m).is_success());
-        assert!(slot.is_initialized());
+        let cpu = cc
+            .per_cpu(core)
+            .expect("the push must have carved the array");
+        assert!(cpu.slot(sc).unwrap().is_initialized());
+        // Only the size class that was used has a buffer; the rest stay uninitialized.
+        assert!(!cpu.slot(SizeClassId::new(1)).unwrap().is_initialized());
     }
 
     #[test]
