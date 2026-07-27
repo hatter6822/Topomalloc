@@ -96,10 +96,23 @@ pub(crate) fn install_process_entropy() {
 /// Allocation-free and syscall-only, as it must be in a `pthread_atfork` child handler.
 pub(crate) fn reseed_after_fork() {
     let e = from_getrandom().unwrap_or_else(|| {
+        // `getrandom` was denied (seccomp), unavailable, interrupted, or short. Mix
+        // fork-distinct inputs *into the inherited seed* rather than replacing it.
+        //
+        // The inherited value is CSPRNG-derived (`AT_RANDOM` or a startup `getrandom`)
+        // and remains unknown to an attacker; the address/clock/PID mixture is not — PID
+        // and coarse timing are frequently observable, and the address contribution is
+        // weak by construction. Overwriting therefore *downgrades* the seed on exactly
+        // the restricted hosts that reach this path. Combining keeps the inherited
+        // strength and adds the fork-distinctness, which is all this reseed owes: the
+        // PID alone guarantees parent and child diverge.
+        //
         // SAFETY: `getpid` is a pure query with no failure mode.
         let pid = unsafe { libc::getpid() } as u64;
-        let mixed =
-            from_address_and_clock() ^ pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17);
+        let inherited = topo_core::harden::process_entropy();
+        let mixed = inherited
+            ^ from_address_and_clock()
+            ^ pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17);
         if mixed == 0 {
             1
         } else {

@@ -2037,7 +2037,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // **non-atomic** buffer. Reading it without draining them is a data race
             // (UB), not merely the approximate read the doc below describes. Fence
             // exactly as `CpuCache::check_invariants` does, under the same lock.
-            self.cpu_cache.fence_if_non_owner(core);
+            if !self.cpu_cache.fence_if_non_owner(core) {
+                // Cannot drain this CPU's in-flight sequences, so its buffer cannot be
+                // read without racing them. Skip the core rather than commit the UB the
+                // fence exists to prevent; the walk is already documented as an
+                // approximate, best-effort read.
+                continue;
+            }
             for i in 0..SIZE_CLASSES.len() {
                 if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
                     // SAFETY: this CPU's lock is held for the whole walk, and any

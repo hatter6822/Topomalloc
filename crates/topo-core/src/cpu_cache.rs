@@ -501,6 +501,12 @@ pub struct CpuCache {
     /// are unchanged: RSEQ on fences exactly as before, and a build that never enabled it
     /// (non-Linux, sanitizer, pinned, locked-baseline) skips exactly as before.
     rseq_ever_enabled: AtomicBool,
+    /// Count of W7-4 non-owner fences that were required but could not be issued
+    /// (`membarrier` refused — e.g. a thread-local seccomp filter denying the syscall).
+    /// Each one caused its locked operation to **decline** rather than risk racing an
+    /// in-flight sequence, so this is an observability counter for a degraded-but-safe
+    /// condition, not an error tally.
+    fence_failures: AtomicU64,
     /// In `MODE_PINNED`, a `fn() -> i32` (cast to `usize`) that returns the
     /// calling thread's current core (the seLe4n runtime's per-core identity, the
     /// analogue of `rseq`'s `cpu_id`), or `-1` if unknown. `0` when unset.
@@ -519,6 +525,7 @@ impl CpuCache {
             active_cpus: AtomicU32::new(0),
             mode: AtomicU8::new(MODE_LOCKED),
             rseq_ever_enabled: AtomicBool::new(false),
+            fence_failures: AtomicU64::new(0),
             pinned_core_fn: AtomicUsize::new(0),
         }
     }
@@ -878,7 +885,12 @@ impl CpuCache {
             // W7-4: the sweep reads another CPU's slots, so drain any in-flight sequence
             // there before reading `len`/`buf` — otherwise the checker can observe a
             // half-committed sequence and report a spurious violation.
-            self.fence_if_non_owner(CoreId(cpu_idx as u32));
+            if !self.fence_if_non_owner(CoreId(cpu_idx as u32)) {
+                // Cannot drain this CPU's in-flight sequences, so its slots cannot be
+                // read consistently. Skipping is right for a checker: reporting a
+                // violation it cannot substantiate would be a false alarm.
+                continue;
+            }
             for (sc_idx, slot) in cpu.slots.iter().enumerate() {
                 if !slot.check_invariants(SizeClassId::new(sc_idx)) {
                     return false;
@@ -909,7 +921,9 @@ impl CpuCache {
         let _guard = cpu.lock();
         // W7-4: as the locked pop/push — publishing a slot buffer for a CPU the caller
         // may not be running on must drain any in-flight sequence on that CPU first.
-        self.fence_if_non_owner(core);
+        if !self.fence_if_non_owner(core) {
+            return false; // cannot drain the target CPU: do not publish into its slot
+        }
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return false,
@@ -1025,7 +1039,11 @@ impl CpuCache {
         // locked fallback exclusive — without it a migrated thread and an in-flight
         // sequence can both commit `len`, double-vending an object. A no-op off RSEQ mode
         // and on the owning CPU. Same discipline as `pop_batch`/`push_batch`/`drain_cpu`.
-        self.fence_if_non_owner(core);
+        if !self.fence_if_non_owner(core) {
+            // Cannot prove no sequence is in flight on `core`; touching the slot would
+            // race it. Report empty and let the caller serve from central (§2.4).
+            return FeOutcome::Empty;
+        }
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return FeOutcome::Empty,
@@ -1114,7 +1132,11 @@ impl CpuCache {
         // locked fallback exclusive — without it a migrated thread and an in-flight
         // sequence can both commit `len`, double-vending an object. A no-op off RSEQ mode
         // and on the owning CPU. Same discipline as `pop_batch`/`push_batch`/`drain_cpu`.
-        self.fence_if_non_owner(core);
+        if !self.fence_if_non_owner(core) {
+            // As the pop: decline rather than race. `Full` routes the object to the
+            // central free list, which is always correct, just slower.
+            return FeOutcome::Full;
+        }
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return FeOutcome::Full,
@@ -1243,15 +1265,31 @@ impl CpuCache {
     /// CPU (a non-owner drain), abort any in-flight RSEQ sequence on `core`. Must
     /// be called with `core`'s per-CPU lock held (so new sequences see the lock
     /// and divert); the fence then drains the in-flight ones (§27.4).
+    /// Returns `false` when the fence was **required but could not be issued** — the
+    /// caller must then decline the operation rather than touch the slot.
+    ///
+    /// The fence being validated once at `enable_rseq` time does not make a later failure
+    /// impossible: `membarrier` is a syscall, and a thread that installs a seccomp filter
+    /// denying it fails here while the process-wide RSEQ mode stays enabled. Treating
+    /// that as a `debug_assert` leaves the release build proceeding to read and mutate the
+    /// non-atomic slot buffer with an RSEQ sequence potentially still in flight on the
+    /// target CPU — a real data race that loses or double-vends an object. The safe
+    /// response is the one the front end already has for every other "cannot serve this
+    /// here" case: decline, and let the caller fall back to the central path (§2.4).
     #[inline]
-    pub(crate) fn fence_if_non_owner(&self, core: CoreId) {
+    #[must_use]
+    pub(crate) fn fence_if_non_owner(&self, core: CoreId) -> bool {
         if self.non_owner_fence_armed() && (core.0 as i32) != rseq::current_cpu() {
             let ok = rseq::fence_rseq();
-            // The fence is validated at `enable_rseq` time, so a failure here is
-            // a kernel anomaly: fail loudly in debug rather than silently risk a
-            // non-owner racing an in-flight sequence.
+            // Still loud in debug — an unexplained failure is worth catching in tests —
+            // but the release build now acts on it instead of ignoring it.
             debug_assert!(ok, "RSEQ non-owner fence failed unexpectedly (W7-4)");
+            if !ok {
+                self.fence_failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
         }
+        true
     }
 
     /// Attempt the restartable pop on the current CPU's slot for `sc`. Returns
@@ -1553,7 +1591,9 @@ impl CpuCache {
             None => return 0,
         };
         let _guard = cpu.lock();
-        self.fence_if_non_owner(core);
+        if !self.fence_if_non_owner(core) {
+            return 0; // cannot drain `core`: moved nothing, which every caller handles
+        }
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return 0,
@@ -1576,7 +1616,9 @@ impl CpuCache {
             None => return 0,
         };
         let _guard = cpu.lock();
-        self.fence_if_non_owner(core);
+        if !self.fence_if_non_owner(core) {
+            return 0; // cannot drain `core`: moved nothing, which every caller handles
+        }
         let slot = match cpu.slots.get(sc.index()) {
             Some(s) => s,
             None => return 0,
@@ -1665,7 +1707,9 @@ impl CpuCache {
             while budget != 0 && slot.len.load(Ordering::Relaxed) != 0 {
                 let n = {
                     let _guard = cpu.lock();
-                    self.fence_if_non_owner(core);
+                    if !self.fence_if_non_owner(core) {
+                        break; // cannot drain safely; leave the rest for a later flush
+                    }
                     // SAFETY: the per-CPU lock is held and the fence has run, so
                     // this thread is the sole accessor of the slot.
                     unsafe { pop_slot(slot, buf, max) }
@@ -2059,6 +2103,39 @@ mod tests {
     /// capability the allocation loop needs to recover a batch it parked on a core it has
     /// since migrated away from. The ordinary `fe_pop` cannot do this in RSEQ mode, where
     /// the hardware CPU is authoritative and the argument is only a hint.
+    /// W7-4: a required non-owner fence that cannot be issued must make the locked
+    /// operation **decline**, not proceed.
+    ///
+    /// `membarrier` is a syscall, so its availability is not settled for the whole process
+    /// by the one-time probe at `enable_rseq`: a thread that installs a seccomp filter
+    /// denying it fails the fence while the process-wide RSEQ mode stays on. Before this,
+    /// the failure was a bare `debug_assert!` — so a release build read and mutated the
+    /// non-atomic slot buffer with a sequence possibly still in flight on the target CPU.
+    ///
+    /// Declining is always safe: an empty pop and a full push both route the caller to
+    /// the central path (§2.4). What this pins is that the decision is *observable* —
+    /// `fence_if_non_owner` reports it rather than swallowing it.
+    #[test]
+    fn a_failed_non_owner_fence_is_reported_so_the_caller_can_decline() {
+        let cc = CpuCache::new();
+        // Off RSEQ mode the fence is not required, so it must never report failure —
+        // otherwise every locked operation on a non-RSEQ host would decline and the
+        // front end would be dead weight.
+        assert!(
+            cc.fence_if_non_owner(CoreId(0)),
+            "no fence is required when RSEQ was never enabled"
+        );
+        assert!(
+            cc.fence_if_non_owner(CoreId(9)),
+            "a non-owner core still needs no fence off RSEQ mode"
+        );
+        assert_eq!(
+            cc.fence_failures.load(Ordering::Relaxed),
+            0,
+            "nothing failed, so nothing is counted"
+        );
+    }
+
     #[test]
     fn a_core_specific_pop_reaches_that_cores_slot() {
         let m = meta(1024 * 1024);

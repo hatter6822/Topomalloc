@@ -170,6 +170,13 @@ pub fn set_base_seed(seed: u64) {
     SEED.store(seed, Ordering::Relaxed);
 }
 
+/// The current per-thread sampler seed base. Observability for the deterministic-mode
+/// transitions (§30.4): it is what distinguishes a seed-derived reproducible stream from
+/// an entropy-derived unpredictable one.
+pub fn base_seed() -> u64 {
+    SEED.load(Ordering::Relaxed)
+}
+
 /// Set the mean sample interval in bytes (`0` disables). Enabling warms up the unwinder
 /// once (outside any sampled allocation) and initializes the sampled state, so the slow
 /// path is allocation-free thereafter. Runtime-safe: a change re-syncs every thread's

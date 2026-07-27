@@ -2671,7 +2671,9 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
                 "next_empty_backed only yields backed empties"
             );
             let _ = committed;
-            released += self.release_hugepage_runs(idx, base);
+            // Count-bounded, not byte-bounded: this variant's contract is "at most
+            // `max_release` hugepages", so each one releases in full.
+            released += self.release_hugepage_runs(idx, base, u64::MAX);
             releases += 1;
         }
         released
@@ -2715,7 +2717,10 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
             if cost > remaining {
                 continue;
             }
-            released += self.release_hugepage_runs(idx, base);
+            // Pass `remaining`, not `cost`: `cost` came from a sample taken before the
+            // lock was dropped, and the hugepage may hold more now. The budget is the
+            // real bound, and it is the one the contract below asserts.
+            released += self.release_hugepage_runs(idx, base, remaining);
         }
         debug_assert!(
             released as u64 <= budget,
@@ -2735,16 +2740,41 @@ impl<P: TopoBackingProvider> HugePageBackend<P> {
     /// returns 0; skip that run and keep reclaiming the others (a concurrent change just
     /// makes the subrelease a re-validated no-op). `search_from` advances past each run
     /// examined, so the walk is O(`PAGES_PER_HUGEPAGE`) and always terminates.
-    fn release_hugepage_runs(&self, idx: u32, base: usize) -> usize {
+    /// Release the committed runs of hugepage `idx`, returning at most `max_bytes`.
+    ///
+    /// The cap is not redundant with the caller's accounting. The caller samples a
+    /// hugepage's committed footprint under the lock and then drops it, but this walk
+    /// releases the runs present when *it* runs: a page-light empty can be sampled at one
+    /// committed page, reused for a much larger allocation, and be empty again by the time
+    /// the release reaches it — at which point an uncapped walk decommits the whole
+    /// hugepage against a one-page charge. That breaks the byte-budget contract the
+    /// §20.2 rate cap depends on, and can take back memory a NUMA donor's
+    /// `movable_surplus` had reserved for its own demand. Capping here enforces the bound
+    /// against the state that actually exists at release time rather than a stale sample.
+    fn release_hugepage_runs(&self, idx: u32, base: usize, max_bytes: u64) -> usize {
         let mut released = 0usize;
         let mut search_from = 0usize;
         loop {
+            let remaining = max_bytes.saturating_sub(released as u64);
+            if remaining == 0 {
+                break;
+            }
             let run = {
                 let g = self.lock();
                 g.inner.filler.next_committed_run(idx, search_from)
             };
-            let Some((off, pages)) = run else { break };
+            let Some((off, mut pages)) = run else { break };
             search_from = off + pages;
+            // Trim the run to what the budget still allows. A partial release is a valid
+            // §20.1 outcome (the remainder stays committed for a later tick); releasing
+            // the whole run because it *started* inside the budget is not.
+            let budget_pages = (remaining / PAGE_SIZE as u64) as usize;
+            if budget_pages == 0 {
+                break;
+            }
+            if pages > budget_pages {
+                pages = budget_pages;
+            }
             match self.subrelease(base + off * PAGE_SIZE, pages, true) {
                 0 => continue,
                 bytes => released += bytes,
@@ -4347,6 +4377,47 @@ mod backend_tests {
         assert_eq!(
             cov.empty_backed_bytes, HUGEPAGE_SIZE as u64,
             "one kept as reserve"
+        );
+    }
+
+    /// §20.2: `release_hugepage_runs` honours its own byte cap.
+    ///
+    /// The caller samples a hugepage's committed footprint under the lock, drops the
+    /// lock, and only then walks the runs — so the footprint at release time can exceed
+    /// the sample (the hugepage was reused and re-emptied larger in between). The
+    /// caller's `cost > remaining` screen cannot catch that, because it tests the stale
+    /// number. The cap therefore has to live in the walk, and this exercises it directly:
+    /// a hugepage with a *full* commitment, released under a one-page cap.
+    ///
+    /// Driving the private walk is deliberate. Going through `release_empty_within_bytes`
+    /// would prove nothing — its screen rejects the hugepage before the walk ever runs,
+    /// which is exactly why the uncapped version passed that route unchanged.
+    #[test]
+    fn the_hugepage_run_walk_honours_its_byte_cap() {
+        let b = backend(4);
+        let r = b
+            .allocate(HUGEPAGE_SIZE, PAGE_SIZE, PlaceHints::default())
+            .expect("whole hugepage");
+        assert!(b.free_region(r));
+
+        let (idx, base, committed) = {
+            let g = b.lock();
+            g.inner
+                .filler
+                .next_empty_backed(0)
+                .expect("an empty-backed hugepage")
+        };
+        assert!(
+            committed * PAGE_SIZE > PAGE_SIZE,
+            "the hugepage must hold more than the cap for this to test anything \
+             (committed = {committed} pages)"
+        );
+
+        let cap = PAGE_SIZE as u64;
+        let released = b.release_hugepage_runs(idx, base, cap);
+        assert!(
+            released as u64 <= cap,
+            "the walk released {released} bytes against a {cap}-byte cap"
         );
     }
 

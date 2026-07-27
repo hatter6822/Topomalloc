@@ -2656,3 +2656,44 @@ ran without the quiesce handlers (the flag is now released on failure); and
 knobs get, because the C entry points read it before `global()` and so outside the phase-5
 gate. Both are the same lesson in miniature — a flag that records an intention rather than
 an outcome, and a gate applied to a list rather than to a property.
+
+**Round 13, and a flake of my own making.** The tsan job went red on the round-12 head,
+and the cause was mine: the round-11 test `fork_reset_makes_enable_re_derive_the_mode`
+mutates **process-global** rseq state, and the Rust harness runs tests as parallel threads
+of one process. A sibling that had already checked `current_cpu() >= 0` and pinned to it
+re-read `-1` inside the reset window, cast it to `usize`, and indexed the per-CPU array
+out of bounds.
+
+The comment I wrote on that test asserted its own safety twice, and was wrong both times:
+it claimed the test "runs last" (the harness guarantees no ordering — the log shows it ran
+*first*) and that "a concurrent test observes one or the other and both are correct" (the
+undecided window is exactly what broke the sibling). The fix is the isolation the file
+already had a precedent for — re-exec into a child process, as `self_registration_path_works`
+does — plus bounds-checking the three `current_cpu() as usize` casts, since -1 becoming
+`usize::MAX` is a panic waiting for any cause, not just this one.
+
+The lesson is narrow and worth keeping: **a comment claiming a test is safe against
+concurrency is not a synchronisation mechanism.** Where a test mutates process-global
+state, isolate it in a process or serialise it with a lock. (This bit twice in one sitting
+— a new deterministic-mode test raced the existing seed round-trip the same way, and took
+the same fix, the `SERIAL` mutex convention already used in `tests/tests/deterministic.rs`.)
+
+**Round 13's findings** were four, and one of them is the round-12 shape recurring in the
+adjacent method: `release_hugepage_runs` walks and releases the runs present when *it*
+runs, while the caller charged a `committed` footprint sampled before the lock was dropped.
+A hugepage reused and re-emptied larger in between overshoots the byte budget — the caller's
+`cost > remaining` screen cannot catch it, because it tests the stale number. The cap now
+lives in the walk, where the state actually is. That the same class surfaced twice in
+adjacent code is the useful signal: the fix for a check-then-act window belongs at the
+point of the act, not at the point of the check.
+
+The other three: `fence_if_non_owner` reported a failed W7-4 membarrier only through a
+`debug_assert!`, so a release build proceeded to touch the non-atomic slot buffer with a
+sequence possibly in flight — it is now `#[must_use]` and every one of its eight call sites
+declines (pop → `Empty`, push → `Full`, batch → `0`, checker → skip), which is always safe
+because declining routes to the central path. The post-fork entropy fallback *replaced* the
+inherited CSPRNG-derived seed with an address/clock/PID mixture instead of combining with
+it, downgrading the seed on exactly the seccomp-restricted hosts that reach that path. And
+disabling deterministic mode left the guard and quarantine samplers on their reproducible
+streams, because `apply_deterministic_seed` is a no-op while the mode is off — the disable
+transition now reseeds from process entropy.
