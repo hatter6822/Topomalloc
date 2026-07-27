@@ -709,8 +709,9 @@ impl CpuCache {
         );
     }
 
-    /// Reset the front end for a freshly forked **child** (§28.1): locked baseline, and
-    /// the "RSEQ has ever run" latch cleared.
+    /// Reset the front end for a freshly forked **child** (§28.1): locked baseline, the
+    /// "RSEQ has ever run" latch cleared, and the architecture layer's registration
+    /// decision dropped.
     ///
     /// Clearing the latch is sound here for a reason that holds nowhere else: `fork`
     /// creates a process with exactly one thread, so no restartable sequence from the
@@ -726,9 +727,31 @@ impl CpuCache {
     /// correctly reports as a kernel anomaly — it just is not one here. Re-enabling RSEQ
     /// in the child re-registers the intent and re-arms the latch together, so the two
     /// can never drift apart.
-    pub fn reset_after_fork(&self) {
+    ///
+    /// The same argument applies one layer down, which is why this also calls
+    /// [`rseq::reset_after_fork`]: `rseq::enable` is idempotent and would otherwise
+    /// short-circuit on the *parent's* decided mode, re-registering neither the
+    /// membarrier intent nor the child thread's rseq area. Resetting only this layer
+    /// would leave the child able to re-enter RSEQ mode over kernel state that no longer
+    /// exists. Both halves of the fork-invalidated RSEQ state are dropped here, together,
+    /// so neither can be reset without the other.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee this runs in a **quiesced single-threaded context** —
+    /// in practice, a `fork` child, from the `pthread_atfork` child handler. Every claim
+    /// above rests on "no restartable sequence can be in flight", which only `fork`'s
+    /// single-threadedness establishes. Called with an RSEQ operation in flight it
+    /// publishes `MODE_LOCKED` *and* clears the very latch that would have made the next
+    /// non-owner locked access fence (W7-4), so that access can mutate a slot while the
+    /// in-flight sequence commits — losing an object or vending one twice. This is the
+    /// same obligation, for the same reason, as
+    /// [`disable_pinned_core`](Self::disable_pinned_core); `disable_rseq` is by contrast
+    /// safe precisely because it leaves the latch armed.
+    pub unsafe fn reset_after_fork(&self) {
         self.mode.store(MODE_LOCKED, Ordering::Release);
         self.rseq_ever_enabled.store(false, Ordering::Release);
+        rseq::reset_after_fork();
     }
 
     /// Leave the seLe4n pinned-thread fast path for the locked baseline (§36.10), the
@@ -916,20 +939,46 @@ impl CpuCache {
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<usize> {
+        self.fe_pop_tracked(core, arena, sc, meta).0
+    }
+
+    /// [`fe_pop`](Self::fe_pop), additionally reporting **which core's slot it actually
+    /// operated on** — the authoritative answer, resolved inside the pop rather than
+    /// guessed by the caller beforehand.
+    ///
+    /// A caller that reacts to `Empty` by refilling needs this. `core` is only a *hint*
+    /// in RSEQ mode (§27.4): the sequence ignores it and uses the hardware CPU, so a
+    /// thread that migrated between the caller's `current_core()` and the pop pops from
+    /// its new CPU while a refill keyed to the hint fills the old one. That refill
+    /// *moves* objects — central loses a batch, a slot the caller will never read gains
+    /// it — so on an exhausted backend the allocation can report OOM with free objects
+    /// parked on another core. Refilling the core reported here keeps the two halves
+    /// keyed to the same CPU, so a migration costs at most a retry instead of a spurious
+    /// failure. (Migrating again after this read is harmless: the objects land in a real
+    /// slot either way, and the caller's loop is bounded.)
+    #[inline]
+    pub fn fe_pop_tracked(
+        &self,
+        core: CoreId,
+        arena: ArenaId,
+        sc: SizeClassId,
+        meta: &dyn MetadataAlloc,
+    ) -> (FeOutcome<usize>, CoreId) {
         match self.mode.load(Ordering::Acquire) {
             MODE_RSEQ => {
                 if let Some(out) = self.fe_pop_rseq(sc) {
                     return out;
                 }
-                self.fe_pop_locked(self.effective_core(core), arena, sc, meta)
+                let eff = self.effective_core(core);
+                (self.fe_pop_locked(eff, arena, sc, meta), eff)
             }
             MODE_PINNED => {
                 if let Some(out) = self.fe_pop_pinned_dispatch(arena, sc, meta) {
                     return out;
                 }
-                self.fe_pop_locked(core, arena, sc, meta)
+                (self.fe_pop_locked(core, arena, sc, meta), core)
             }
-            _ => self.fe_pop_locked(core, arena, sc, meta),
+            _ => (self.fe_pop_locked(core, arena, sc, meta), core),
         }
     }
 
@@ -1086,6 +1135,21 @@ impl CpuCache {
 
     /// The effective core for the locked fallback in RSEQ mode: the hardware CPU
     /// the thread runs on, or the caller's hint if RSEQ cannot report it.
+    /// The core an RSEQ sequence ran on: the area's current `cpu_id`, falling back to
+    /// `at_entry` (the value read before the sequence) if that read is out of range.
+    /// Both are valid slot keys — a slot is a keyed object pool, so *any* core id is
+    /// correct — this just picks the one most likely to match the next pop.
+    #[inline]
+    fn area_core(area: *mut rseq::Rseq, at_entry: i32) -> CoreId {
+        let now = rseq::cpu_of(area);
+        let cpu = if now >= 0 && (now as usize) < MAX_CPUS {
+            now
+        } else {
+            at_entry
+        };
+        CoreId(cpu.max(0) as u32)
+    }
+
     #[inline]
     fn effective_core(&self, hint: CoreId) -> CoreId {
         let cpu = rseq::current_cpu();
@@ -1173,7 +1237,7 @@ impl CpuCache {
     /// signal the caller to take the locked path (uninitialised slot, a
     /// non-owner holding the lock, or the abort bound exceeded).
     #[inline]
-    fn fe_pop_rseq(&self, sc: SizeClassId) -> Option<FeOutcome<usize>> {
+    fn fe_pop_rseq(&self, sc: SizeClassId) -> Option<(FeOutcome<usize>, CoreId)> {
         if sc.index() >= NUM_SIZE_CLASSES {
             return None;
         }
@@ -1210,10 +1274,16 @@ impl CpuCache {
                     MAX_CPUS,
                 )
             } {
-                rseq::Pop::Success(addr) => return Some(FeOutcome::Success(addr)),
+                rseq::Pop::Success(addr) => {
+                    return Some((FeOutcome::Success(addr), Self::area_core(area, cpu)))
+                }
                 rseq::Pop::Empty => {
+                    // Re-read the area's `cpu_id` rather than reuse the pre-loop `cpu`:
+                    // the kernel updates it on migration, and this is the CPU whose slot
+                    // the sequence just found empty — the one a refill must target.
+                    // `cpu` stays the stat key (approximate by construction).
                     self.bump_miss(cpu as usize, sc);
-                    return Some(FeOutcome::Empty);
+                    return Some((FeOutcome::Empty, Self::area_core(area, cpu)));
                 }
                 rseq::Pop::Abort => continue,
                 rseq::Pop::Fallback => return None,
@@ -1294,7 +1364,7 @@ impl CpuCache {
         arena: ArenaId,
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
-    ) -> Option<FeOutcome<usize>> {
+    ) -> Option<(FeOutcome<usize>, CoreId)> {
         let oracle = self.pinned_oracle()?;
         let provider = FnCoreProvider(oracle);
         for _ in 0..RSEQ_ABORT_RETRY {
@@ -1302,9 +1372,10 @@ impl CpuCache {
             if cpu < 0 || (cpu as usize) >= MAX_CPUS {
                 return None;
             }
-            match self.fe_pop_pinned(CoreId(cpu as u32), arena, sc, &provider, meta) {
+            let core = CoreId(cpu as u32);
+            match self.fe_pop_pinned(core, arena, sc, &provider, meta) {
                 FeOutcome::Abort => continue,
-                other => return Some(other),
+                other => return Some((other, core)),
             }
         }
         None
@@ -1920,6 +1991,46 @@ mod tests {
         let slot = cpu.slot(sc).unwrap();
         assert!(slot.len() <= slot.hard_capacity());
         assert_eq!(slot.len(), hard_cap);
+    }
+
+    /// `fe_pop_tracked` reports the core whose slot it actually touched — the value a
+    /// refill must be keyed to, so the batch it moves out of central lands where the
+    /// consuming pop will look for it.
+    ///
+    /// In locked and pinned modes the served core is the requested one, which is what
+    /// this asserts exactly. In RSEQ mode the hardware CPU is authoritative and the
+    /// argument is only a hint, which is precisely why the caller cannot compute this
+    /// itself: the reported value comes from inside the pop, after any migration that
+    /// preceded it. The forced-migration battery (`tests/rseq_equivalence.rs`) covers
+    /// that mode; here the point is that the reported core is a real slot key and that
+    /// the plain `fe_pop` wrapper still agrees with it.
+    #[test]
+    fn a_tracked_pop_reports_the_core_it_served() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        let core = CoreId(3);
+
+        // Empty slot: the outcome is `Empty` and the served core is still reported, since
+        // that is the case a refill reacts to.
+        let (out, served) = cc.fe_pop_tracked(core, A, sc, &m);
+        assert!(out.is_empty());
+        assert_eq!(served, core, "the locked path serves the requested core");
+
+        // And on a hit: push to a *different* core, then confirm each pop is attributed
+        // to the slot it actually drained rather than to whichever core was asked last.
+        let other = CoreId(5);
+        assert!(cc.fe_push(other, A, sc, 0xAB, &m).is_success());
+        let (out, served) = cc.fe_pop_tracked(other, A, sc, &m);
+        assert_eq!(out.unwrap(), 0xAB);
+        assert_eq!(served, other);
+        let (out, served) = cc.fe_pop_tracked(core, A, sc, &m);
+        assert!(out.is_empty(), "core 3's slot was never filled");
+        assert_eq!(served, core, "an empty pop is attributed to its own core");
+
+        // The wrapper is the tracked pop's first component, so the two cannot drift.
+        assert!(cc.fe_push(core, A, sc, 0xCD, &m).is_success());
+        assert_eq!(cc.fe_pop(core, A, sc, &m).unwrap(), 0xCD);
     }
 
     #[test]

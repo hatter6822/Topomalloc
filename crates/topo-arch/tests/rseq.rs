@@ -634,3 +634,44 @@ fn forced_migration_conserves_tokens() {
         "token multiset conserved under migration"
     );
 }
+
+/// §28.1: `reset_after_fork` drops the process-global registration decision so the next
+/// `enable` re-derives it, rather than short-circuiting on a decision whose kernel
+/// registrations `fork` invalidated.
+///
+/// `enable` is idempotent by design — it returns from a fast path once a mode is
+/// decided, so the detection syscalls run once per process. That is exactly wrong in a
+/// fork child: the child inherits the decided mode but neither the membarrier intent
+/// (it lives in the mm) nor its thread's rseq area registration. Without this reset the
+/// child re-enters RSEQ mode over kernel state that no longer exists, and its non-owner
+/// fences (W7-4) fail every call.
+///
+/// The observable contract, and all this can portably assert: after a reset the mode
+/// reads back as undecided, and a fresh `enable` re-derives the same answer (detection
+/// is deterministic on a given host). A `reset` that did nothing would leave
+/// `available()` true on an RSEQ-capable host and fail here.
+///
+/// Runs last and takes no locks: it mutates process-global state, but only ever between
+/// a decided mode and the same decided mode, so a concurrent test observes one or the
+/// other and both are correct. The window where `available()` is false is the same one
+/// any pre-`enable` caller already tolerates (P-003 locked baseline).
+#[test]
+fn fork_reset_makes_enable_re_derive_the_mode() {
+    let first = rseq::enable();
+    assert_eq!(rseq::available(), first);
+
+    rseq::reset_after_fork();
+    assert!(
+        !rseq::available(),
+        "a reset mode must read as undecided, not as the parent's decision"
+    );
+
+    // And the decision is genuinely re-derivable, not destroyed: detection re-runs and
+    // reaches the same conclusion, re-registering the membarrier intent on the way.
+    let second = rseq::enable();
+    assert_eq!(
+        second, first,
+        "re-enabling after a fork reset must re-derive the same mode"
+    );
+    assert_eq!(rseq::available(), first);
+}

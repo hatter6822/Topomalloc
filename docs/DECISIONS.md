@@ -2584,3 +2584,36 @@ merely a marker, so the rewrite is large and touches every allocation path — r
 regression risk for a property the claim rule already establishes. The remaining
 hand-ordered pair (claim vs free bit, ordered free-bit-first) is one pair, which is
 tractable to keep proved; the failure mode was three pairs and growing.
+
+**Round 11: both rules held, but each had an unenforced edge.** A sixth round landed on
+the same two mechanisms — not on the rules themselves, which stood, but on the boundary
+where each stops being enforced by the compiler and starts being enforced by convention.
+
+For the mode/latch rule, `CpuCache::reset_after_fork` clears the latch, and its own doc
+comment says that is sound only because a `fork` child has one thread. That is a
+quiescence obligation identical to `disable_pinned_core`'s, but the function was **safe**
+and publicly re-exported through `Allocator` and `AnyAllocator`, so nothing stopped an
+embedding from calling it mid-flight and dropping the one condition that makes a
+subsequent non-owner access fence. It is now `unsafe` all the way up, with the obligation
+stated once and forwarded. Separately, the reset covered only *this* layer's copy of the
+fork-invalidated state: `topo_arch::rseq`'s process-global mode decision survived, and
+because `rseq::enable` is idempotent the child would short-circuit on the parent's
+decision without re-registering either the membarrier intent (it lives in the mm) or its
+thread's rseq area. Both halves are now dropped together in one call, so neither can be
+reset without the other.
+
+For the claim rule, "claim before choosing the route" governs *acquisition* and said
+nothing about *release*. Three of the `Settled` exits in `maybe_quarantine_small` — all of
+them double-free **detections** — returned while still holding the caller's cached claim,
+stranding the object in two residency sets at once and inflating `cached_count`. Detecting
+a caller's bug corrupted our own accounting. A single `settled` constructor now performs
+the release, so no exit can forget it, and the new Appendix-B checker
+`cached_and_quarantined_are_disjoint` pins the property with a negative test.
+
+The generalisation: **a safety obligation stated only in a doc comment is not enforced,
+and a rule about acquiring a claim is only half a rule.** Where an obligation cannot be
+discharged by the callee, `unsafe` is the mechanism that carries it — reserve safe
+wrappers for the contexts that genuinely discharge it (here, the `pthread_atfork` child
+handler). Where a resource is claimed on entry, make the release structural — one
+constructor, not one per exit — and add the invariant checker that would catch a leak,
+because early-return paths are exactly the ones review keeps missing.

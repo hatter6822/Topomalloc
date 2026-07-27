@@ -66,10 +66,16 @@ extern "C" fn atfork_child() {
     topo_core::fork::postfork_child();
     if let Some(eng) = crate::global_if_init() {
         // Not just "disable": the child must also *forget* that RSEQ ever ran, because
-        // membarrier's registration of intent does not survive `fork` and a child that
-        // still thought it owed a non-owner fence could not issue one. Sound because a
-        // single-threaded child has no in-flight sequence to drain.
-        eng.reset_front_end_after_fork();
+        // neither membarrier's registration of intent nor the rseq area survives `fork`,
+        // so a child that still thought it owed a non-owner fence could not issue one,
+        // and one that still thought RSEQ was enabled would run the fast path over
+        // kernel state that no longer exists.
+        //
+        // SAFETY: this is the `pthread_atfork` **child** handler — the one context that
+        // discharges the quiesced-single-threaded obligation by construction. `fork`
+        // returns a process with exactly one thread, so no restartable sequence from the
+        // parent is in flight to race the mode publish or the latch clear.
+        unsafe { eng.reset_front_end_after_fork() };
         // §29.5: the child inherited the parent's guard-page coin and quarantine-evictor
         // PRNG state byte for byte, so without a re-seed the two processes make the *same*
         // hardening choices for the same allocation sequence — and one of them is

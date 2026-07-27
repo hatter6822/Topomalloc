@@ -1410,21 +1410,33 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// rather than double-vended.
     fn alloc_small_cached(&self, sc: SizeClassId) -> *mut u8 {
         for _ in 0..Self::FRONT_END_POP_RETRY {
-            // Re-read the running core **every iteration**, so a refill and the pop that
-            // is meant to consume it target the same slot.
+            // Re-read the running core **every iteration**, and refill the core the pop
+            // reports rather than this hint, so a refill and the pop that is meant to
+            // consume it always target the same slot.
             //
-            // Hoisting this out of the loop is wrong in RSEQ mode, where `fe_pop` ignores
-            // the hint and operates on the hardware-current CPU: a thread that migrated
-            // after the snapshot would pop from its new CPU's slot while `refill_front_end`
-            // kept pushing batches into the old one. The allocation then cannot see the
-            // objects it just pulled out of central — and because the refill *moved* them
-            // (central loses them, a slot the pop never reads gains them), an allocation
-            // that should have succeeded can report OOM with free objects sitting in
-            // another core's slot. Re-reading converges instead: the refill follows the
-            // thread, and a migration mid-iteration costs at most one more turn of a
-            // bounded loop.
-            let core = self.cpu_cache.current_core();
-            match self.cpu_cache.fe_pop(core, ArenaId::DEFAULT, sc, self.meta) {
+            // Both halves matter, and neither alone is enough. In RSEQ mode `fe_pop`
+            // ignores the hint and operates on the hardware-current CPU, so a thread that
+            // migrated after the snapshot pops from its new CPU's slot while a refill
+            // keyed to the hint pushes batches into the old one. The allocation then
+            // cannot see the objects it just pulled out of central — and because the
+            // refill *moved* them (central loses them, a slot the pop never reads gains
+            // them), an allocation that should have succeeded can report OOM with free
+            // objects sitting on another core. Re-reading each iteration alone does not
+            // fix that: if the misdirected refill took the *last* central batch, the next
+            // iteration finds its slot empty, `refill_front_end` reports central empty,
+            // and the loop returns null with the batch parked where nothing will look for
+            // it. Taking the served core from the pop closes the window instead of
+            // narrowing it.
+            let hint = self.cpu_cache.current_core();
+            // `served` is the core the pop *actually* used, which in RSEQ mode is the
+            // hardware CPU and not necessarily `hint` — a thread that migrated in
+            // between differs. Refilling `served` rather than `hint` is what keeps the
+            // batch and the pop that must consume it on the same slot; see
+            // `CpuCache::fe_pop_tracked`.
+            let (outcome, served) =
+                self.cpu_cache
+                    .fe_pop_tracked(hint, ArenaId::DEFAULT, sc, self.meta);
+            match outcome {
                 FeOutcome::Success(addr) => {
                     let p = self.claim_cached_object(addr, sc);
                     if !p.is_null() {
@@ -1434,7 +1446,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // already accounted for there, so simply try the next one.
                 }
                 FeOutcome::Empty => {
-                    if !self.refill_front_end(core, sc) {
+                    if !self.refill_front_end(served, sc) {
                         return ptr::null_mut(); // central list is empty: needs a span
                     }
                 }
@@ -1771,12 +1783,24 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     }
 
     /// Reset the front end in a freshly forked **child** (§28.1): the locked baseline,
-    /// and the W7-4 fence latch cleared because a single-threaded child provably has no
-    /// in-flight restartable sequence. See [`CpuCache::reset_after_fork`] — in particular
-    /// for why the child *must* forget, not merely may: membarrier's registration does
-    /// not survive `fork`, so a child that still believed it had to fence could not.
-    pub fn reset_front_end_after_fork(&self) {
-        self.cpu_cache.reset_after_fork();
+    /// the W7-4 fence latch cleared because a single-threaded child provably has no
+    /// in-flight restartable sequence, and the architecture layer's registration decision
+    /// dropped so the child re-derives it. See [`CpuCache::reset_after_fork`] — in
+    /// particular for why the child *must* forget, not merely may: neither membarrier's
+    /// registration of intent nor the rseq area survives `fork`, so a child that still
+    /// believed it had to fence could not, and one that still believed RSEQ was enabled
+    /// would run the fast path over kernel state that no longer exists.
+    ///
+    /// # Safety
+    ///
+    /// Inherited verbatim from [`CpuCache::reset_after_fork`]: the caller must guarantee
+    /// a **quiesced single-threaded context** (a `fork` child, from the `pthread_atfork`
+    /// child handler). Clearing the fence latch with an RSEQ operation in flight lets a
+    /// subsequent non-owner locked access skip the fence that would have aborted it and
+    /// race the sequence's commit.
+    pub unsafe fn reset_front_end_after_fork(&self) {
+        // SAFETY: the caller's identical obligation, forwarded.
+        unsafe { self.cpu_cache.reset_after_fork() }
     }
 
     /// Whether the W7 RSEQ fast path is currently active.
@@ -1885,11 +1909,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         n
     }
 
-    /// Appendix B (W6, §16.4): every span this allocator owns keeps its **cache-resident
-    /// and central-free sets disjoint** — the structural fact the lock-free double-free
-    /// oracle rests on (see
-    /// [`SpanDescriptor::cached_and_central_free_are_disjoint`], which is where the
-    /// per-span check and its concurrency argument live).
+    /// Appendix B (W6/W18-3, §16.4): every span this allocator owns keeps its
+    /// **cache-resident set disjoint from both the central-free and the quarantined
+    /// sets** — the structural fact the lock-free double-free oracle rests on (see
+    /// [`SpanDescriptor::cached_and_central_free_are_disjoint`] and
+    /// [`SpanDescriptor::cached_and_quarantined_are_disjoint`], which is where the
+    /// per-span checks and their concurrency arguments live).
     ///
     /// Robust under concurrent load: each span's two bitmaps are read together under that
     /// span's own lock, so this is a conjunction of individually-exact checks rather than
@@ -1911,6 +1936,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // never-used slot's are zero-sized).
             let desc = unsafe { &(*self.spans.slot_ptr(i)).desc };
             if !desc.cached_and_central_free_are_disjoint() {
+                return false;
+            }
+            // The same disjointness over the third residency set. Catches a free path
+            // that returned early still holding the shared cached claim — the failure
+            // mode the `settled` helper in `maybe_quarantine_small` exists to prevent.
+            if !desc.cached_and_quarantined_are_disjoint() {
                 return false;
             }
         }
@@ -2673,6 +2704,24 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         usable: usize,
         holds_cached: bool,
     ) -> QuarantineDisposition {
+        // **Every `Settled` exit releases the caller's shared claim first.** The claim
+        // rule (see `free_small_screened`) says the cached bit is taken before the route
+        // is chosen, so that two frees of one object cannot claim independently. That
+        // makes acquisition safe but says nothing about *release*, and a `Settled` return
+        // ends the free right here — the caller does not reach `insert_batch_inner`, the
+        // one place that otherwise clears the bit (free-bit-first). Returning `Settled`
+        // while still holding the mark strands it: the object is then simultaneously
+        // marked cached and (usually) quarantined, no front-end slot holds it, and
+        // `cached_count` over-reports until something else happens to clear it — a
+        // residency corruption produced by the *detection* of a caller's bug rather than
+        // by the bug itself. `settled` is the only way to build a `Settled` here so that
+        // no exit can forget; the `cached ∩ quarantined = ∅` checker below pins it.
+        let settled = |outcome: FreeOutcome| {
+            if holds_cached {
+                span.unmark_cached(idx as usize);
+            }
+            QuarantineDisposition::Settled(outcome)
+        };
         // A double free of a **held** object: the authoritative per-object quarantined
         // bit says so (lock-free atomic read, W18-3). Checked FIRST and unconditionally
         // — even when the runtime switch is off, held objects may still be draining, and
@@ -2681,7 +2730,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // lock, so a concurrent double free of an evicted-but-not-yet-drained object is
         // still caught here (it is not in the ring, but its bit is set).
         if span.is_object_quarantined(idx as usize) {
-            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+            return settled(FreeOutcome::DoubleFree);
         }
         // Reading the runtime switch is only safe **once this object is claimed**, so it
         // is gated on the caller already holding the shared cached claim. A non-cacheable
@@ -2698,7 +2747,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // double free without holding — holding a central-free object could let a
         // concurrent reuse and the deferred drain collide (§2.4: never corrupt).
         if span.is_central_free(idx as usize) {
-            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+            return settled(FreeOutcome::DoubleFree);
         }
         // W6 (§29.3): and the same for an object already awaiting reuse in a **front-end
         // cache** — unless that mark is the caller's own. For a cacheable object the
@@ -2708,7 +2757,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // report. For a non-cacheable object nothing takes that bit, so the check stands
         // as the guard it always was.
         if !holds_cached && span.is_cached(idx as usize) {
-            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+            return settled(FreeOutcome::DoubleFree);
         }
         let entry = crate::harden::QuarantineEntry {
             user_ptr: ptr,
@@ -2729,8 +2778,10 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // authoritative double-free check: losing it means the object is already held.
         {
             let sg = span.lock();
+            // `settled` clears the cached bit, a lock-free bitmap store on a different
+            // word than the span lock guards, so taking this exit under `sg` is fine.
             if !sg.mark_quarantined(idx as usize) {
-                return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+                return settled(FreeOutcome::DoubleFree);
             }
             // The claim is in hand, so the switch can now be consulted safely for the
             // route this object did *not* pre-claim. Off ⇒ hand the claim to the caller
@@ -5176,6 +5227,111 @@ mod tests {
         let q = a.malloc(64);
         assert!(!q.is_null());
         assert_eq!(tfree(&a, q), FreeOutcome::Freed);
+        assert!(a.check_invariants());
+    }
+
+    /// The claim rule's *release* half: a `Settled` return ends the free without ever
+    /// reaching `insert_batch_inner`, so it has to give back the shared cached claim it
+    /// took before the route was chosen. Detecting a caller's double free must not
+    /// corrupt our own residency accounting.
+    ///
+    /// The sequence is the reachable one: with the quarantine on, the first free of a
+    /// cacheable object takes the cached claim and hands it to the quarantine's marker
+    /// (quarantined-bit-first), leaving the object quarantined and *not* cached. A second
+    /// free then passes the caller's central/cached screen, successfully re-takes the
+    /// cached bit, and only then does `maybe_quarantine_small` see the quarantined marker
+    /// and settle as a double free — with that fresh claim outstanding. Without the
+    /// release the object sits in both residency sets at once while no slot holds it, and
+    /// `cached_count` over-reports until the ring happens to drain.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_quarantine_hit_double_free_releases_the_claim_it_took() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+
+        assert_eq!(tfree(&a, p), FreeOutcome::Freed);
+        assert!(
+            span.is_object_quarantined(object_index),
+            "the first free hands the claim to the quarantine's marker"
+        );
+        assert!(
+            !span.is_cached(object_index),
+            "and clears the cached bit as it does so"
+        );
+        let cached_before = span.cached_count();
+
+        // The double free is reported...
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        // ...without stranding the claim it took to get there.
+        assert!(
+            !span.is_cached(object_index),
+            "a settled double free must release the shared claim it took"
+        );
+        assert_eq!(
+            span.cached_count(),
+            cached_before,
+            "residency accounting is unchanged by detecting a double free"
+        );
+        assert!(
+            span.cached_and_quarantined_are_disjoint(),
+            "the object must not be cached and quarantined at once"
+        );
+        // Repeatable: each detection is self-contained, so the leak cannot accumulate.
+        assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert_eq!(span.cached_count(), cached_before);
+        assert!(span.cached_and_quarantined_are_disjoint());
+        assert!(a.check_invariants());
+    }
+
+    /// The Appendix-B checker that pins the property above, proved to be load-bearing:
+    /// a span with an object in both residency sets must fail it. Without a negative
+    /// test a checker that silently returned `true` would look identical in CI.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn cached_and_quarantined_overlap_is_caught() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: as above.
+        let span = unsafe { &*span };
+        assert!(span.cached_and_quarantined_are_disjoint());
+
+        // Force exactly the state a leaked claim produces.
+        assert!(span.lock().mark_quarantined(object_index));
+        assert!(span.try_mark_cached(object_index));
+        assert!(
+            !span.cached_and_quarantined_are_disjoint(),
+            "the checker must catch an object held in both residency sets"
+        );
+        assert!(
+            !a.check_invariants(),
+            "and the allocator-wide sweep must surface it"
+        );
+
+        // Restore, so the allocator is left consistent for teardown.
+        span.unmark_cached(object_index);
+        span.lock().clear_quarantined(object_index);
+        assert!(span.cached_and_quarantined_are_disjoint());
         assert!(a.check_invariants());
     }
 

@@ -265,6 +265,12 @@ pub(super) fn mode() -> Mode {
     mode_to_enum(MODE.load(Ordering::Acquire))
 }
 
+/// Drop the process-global mode decision so the next [`enable`] re-derives it
+/// (§28.1). See the wrapper in the parent module for why a fork child must.
+pub(super) fn reset_after_fork() {
+    MODE.store(MODE_UNKNOWN, Ordering::Release);
+}
+
 /// Whether the RSEQ fast path is usable (after [`enable`]).
 pub(super) fn available() -> bool {
     // W19-2 (§30.3): never usable under Address/MemorySanitizer — the restartable

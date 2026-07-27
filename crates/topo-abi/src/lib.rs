@@ -404,10 +404,17 @@ impl AnyAllocator {
     }
 
     /// Reset the front end in a freshly forked child (§28.1): locked baseline **and**
-    /// forget that RSEQ ever ran, since membarrier's registration does not survive
-    /// `fork` and a single-threaded child has no sequence left to fence against.
-    pub fn reset_front_end_after_fork(&self) {
-        dispatch!(self, a => a.reset_front_end_after_fork())
+    /// forget that RSEQ ever ran, since neither membarrier's registration of intent nor
+    /// the rseq area survives `fork` and a single-threaded child has no sequence left to
+    /// fence against.
+    ///
+    /// # Safety
+    ///
+    /// Inherited from [`topo_core::Allocator::reset_front_end_after_fork`]: only valid in
+    /// a quiesced single-threaded `fork` child.
+    pub unsafe fn reset_front_end_after_fork(&self) {
+        // SAFETY: the caller's identical obligation, forwarded.
+        unsafe { dispatch!(self, a => a.reset_front_end_after_fork()) }
     }
 
     /// Whether the W7 RSEQ fast path is active.

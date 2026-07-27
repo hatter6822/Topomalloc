@@ -1126,6 +1126,43 @@ impl SpanDescriptor {
         true
     }
 
+    /// Appendix B (W6/W18-3, §16.4): **no object of this span is simultaneously
+    /// cache-resident and quarantined**. The companion to
+    /// [`cached_and_central_free_are_disjoint`](Self::cached_and_central_free_are_disjoint)
+    /// over the third residency set, and the one that pins the claim-release half of the
+    /// shared-claim rule: the cached bit is taken before the free's route is chosen, so
+    /// every path that ends the free early — including the double-free *detections* in
+    /// `maybe_quarantine_small` — has to give it back. An exit that returned while still
+    /// holding the mark would leave the object in both sets at once with no front-end
+    /// slot holding it, inflating `cached_count` until something unrelated cleared it.
+    ///
+    /// Checked **under the span lock**, exactly as its companion and for the same reason.
+    /// The `cached → quarantined` handoff sets the quarantined bit before clearing the
+    /// cached one (quarantined-bit-first, mirroring free-bit-first), and that deliberate
+    /// momentary overlap lives inside the lock, so a checker holding the lock cannot
+    /// observe it.
+    ///
+    /// Total + side-effect-free. Vacuously `true` without the `quarantine` feature,
+    /// where there is no quarantined set to overlap (the bitmap is not even built).
+    pub fn cached_and_quarantined_are_disjoint(&self) -> bool {
+        #[cfg(feature = "quarantine")]
+        {
+            let _guard = self.lock();
+            let words = self.free_bitmap.active_words();
+            for w in 0..words {
+                let quarantined = self.quarantined_bitmap.word(w).load(Ordering::Relaxed);
+                let cached = match self.cached_bitmap.word(w) {
+                    Some(c) => c.load(Ordering::Relaxed),
+                    None => 0,
+                };
+                if quarantined & cached != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Whether object `i` has been freed and is **awaiting reuse** — either sitting in
     /// the central free list ([`is_central_free`](Self::is_central_free)) or held in a
     /// front-end cache ([`is_cached`](Self::is_cached)).
