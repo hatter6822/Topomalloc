@@ -589,7 +589,35 @@ impl CpuCache {
     /// *not* the RSEQ membarrier fence. A non-owner [`drain`](Self::drain_cpu) of
     /// an *active* pinned cache is therefore the caller's responsibility to
     /// serialize (the idle-flush path operates on quiesced cores).
-    pub fn enable_pinned_core(&self, current_core: fn() -> i32) {
+    ///
+    /// # Safety
+    ///
+    /// That hand-off contract is a real obligation, and it cannot be checked here, which
+    /// is why this is `unsafe`. The pinned sequences deliberately take **no per-CPU
+    /// lock** — their soundness rests entirely on the §36.10 guarantee that the pinned
+    /// thread is the sole accessor of its core's slot — and the non-owner fence does not
+    /// cover them: it is armed for `MODE_RSEQ`/`MODE_DRAINING` only, because a pinned
+    /// sequence is ordinary code with no kernel-visible critical section for
+    /// `membarrier` to abort. A drain of a core whose pinned thread is running would
+    /// therefore read and rewrite that slot's *non-atomic* buffer concurrently with it:
+    /// undefined behaviour, and an object lost or double-vended.
+    ///
+    /// The caller must guarantee, for as long as pinned mode is active, that:
+    ///
+    /// * each core's slot is accessed by at most one pinned thread (the §36.10 pinning
+    ///   contract itself), and
+    /// * no [`drain_cpu`](Self::drain_cpu) — including the
+    ///   [`flush_front_end_core`](crate::Allocator::flush_front_end_core) /
+    ///   [`flush_front_end_all`](crate::Allocator::flush_front_end_all) /
+    ///   [`check_invariants`](crate::Allocator::check_invariants) paths that reach it —
+    ///   runs against a core whose pinned thread is active. Draining a *quiesced* core
+    ///   (ownership already handed off) is exactly what the contract permits.
+    ///
+    /// A seLe4n runtime can discharge both: it owns core assignment and knows when a
+    /// cache has been handed off. A general POSIX embedding that cannot should use the
+    /// RSEQ path ([`enable_rseq`](Self::enable_rseq)) or the locked baseline, both of
+    /// which are safe against a concurrent drain.
+    pub unsafe fn enable_pinned_core(&self, current_core: fn() -> i32) {
         self.pinned_core_fn
             .store(current_core as usize, Ordering::Release);
         self.mode.store(MODE_PINNED, Ordering::Release);
@@ -1051,7 +1079,7 @@ impl CpuCache {
     /// be called with `core`'s per-CPU lock held (so new sequences see the lock
     /// and divert); the fence then drains the in-flight ones (§27.4).
     #[inline]
-    fn fence_if_non_owner(&self, core: CoreId) {
+    pub(crate) fn fence_if_non_owner(&self, core: CoreId) {
         if self.non_owner_fence_armed() && (core.0 as i32) != rseq::current_cpu() {
             let ok = rseq::fence_rseq();
             // The fence is validated at `enable_rseq` time, so a failure here is

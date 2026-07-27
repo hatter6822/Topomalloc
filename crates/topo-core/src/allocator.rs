@@ -1718,8 +1718,19 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// Enable the seLe4n pinned-thread per-core fast path (W7-5, §36.10) using the
     /// runtime's per-core identity oracle. The RSEQ and pinned paths are mutually
     /// exclusive deployment choices.
-    pub fn enable_front_end_pinned(&self, current_core: fn() -> i32) {
-        self.cpu_cache.enable_pinned_core(current_core);
+    ///
+    /// # Safety
+    ///
+    /// Forwards [`CpuCache::enable_pinned_core`]'s obligation unchanged: the pinned
+    /// sequences take no per-CPU lock and the non-owner fence does not cover them, so the
+    /// caller must uphold the §36.10 hand-off contract — one pinned thread per core, and
+    /// no drain (`flush_front_end_core`, `flush_front_end_all`, `check_invariants`)
+    /// against a core whose pinned thread is active. See that method for the full
+    /// contract and for why the RSEQ path needs no such promise.
+    pub unsafe fn enable_front_end_pinned(&self, current_core: fn() -> i32) {
+        // SAFETY: this method's own contract is `enable_pinned_core`'s, forwarded
+        // unchanged to our caller.
+        unsafe { self.cpu_cache.enable_pinned_core(current_core) };
     }
 
     /// Run one W6-5 cache-budget adaptation cycle: grow the slots a workload keeps
@@ -1891,10 +1902,19 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) else {
                 continue;
             };
+            let core = CoreId(c as u32);
             let _guard = cpu.lock();
+            // W7-4: the lock alone does not exclude an RSEQ sequence that began *before*
+            // the lock byte was published — and those sequences write the slot's
+            // **non-atomic** buffer. Reading it without draining them is a data race
+            // (UB), not merely the approximate read the doc below describes. Fence
+            // exactly as `CpuCache::check_invariants` does, under the same lock.
+            self.cpu_cache.fence_if_non_owner(core);
             for i in 0..SIZE_CLASSES.len() {
                 if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
-                    // SAFETY: this CPU's lock is held for the whole walk.
+                    // SAFETY: this CPU's lock is held for the whole walk, and any
+                    // sequence that started before the lock was taken has been drained by
+                    // the fence above, so this thread is the only accessor.
                     unsafe { slot.for_each_entry(&mut check) };
                 }
             }

@@ -387,7 +387,10 @@ pub(crate) fn restore_taken(ptr: *mut u8, rec: SampledRecord) {
     };
     let st = state();
     let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
-    if g.objects.on_alloc(ptr as usize, rec) {
+    // `on_alloc_restore`, not `on_alloc`: this record was already tracked and its object
+    // is still live, so the load-cap drop that is correct for a *new* sample would here
+    // erase a live allocation from sampled accounting for good.
+    if g.objects.on_alloc_restore(ptr as usize, rec) {
         BLOOM.insert(ptr as usize);
     }
 }

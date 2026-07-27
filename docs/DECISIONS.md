@@ -2436,3 +2436,44 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   that is briefly claimed by neither is an object that can be freed twice. Pinned by
   `the_quarantine_cannot_claim_an_object_the_front_end_already_holds` and
   `a_declined_quarantine_offer_hands_its_claim_to_the_front_end`.
+
+* **A lock excludes the locked path, not the lock-free one (0.4.3).** The Appendix-B
+  front-end sweep (`front_end_markers_name_held_objects`, behind
+  `topomalloc_debug_check_now`) walked each per-CPU slot under that CPU's lock and
+  documented its result as approximate under RSEQ traffic — a pop between the entry read
+  and the marker read can report a spurious violation, which is accepted for an on-demand
+  oracle. That framing understated the problem. The slot buffer is **non-atomic**, and an
+  RSEQ sequence that began before the lock byte was published is still running and still
+  writing it: the walk was a data race, i.e. undefined behaviour, not merely an imprecise
+  reading. `CpuCache::check_invariants` had this right already — it calls
+  `fence_if_non_owner` after taking each CPU lock — and the sweep now does the same.
+
+  Note what the accepted-approximation comment did: it named a *weaker* symptom (a
+  spurious report) of the same underlying fact (the lock does not exclude RSEQ), and by
+  answering that one it read as though the fact had been handled. The general rule:
+  **when a comment concedes a limitation, check that the concession covers the worst
+  consequence of it, not the first one you thought of** — "this read may be stale" and
+  "this read is UB" have the same cause and very different fixes.
+
+* **An unenforceable precondition on a safe function is a bug, not documentation
+  (0.4.3).** The §36.10 pinned-core fast path (W7-5, the seLe4n profile) takes no per-CPU
+  lock: its soundness rests entirely on the pinned-thread contract that one thread is the
+  sole accessor of its core's slot. The non-owner fence does not help — it is armed for
+  `MODE_RSEQ`/`MODE_DRAINING` only, because a pinned sequence is ordinary code with no
+  kernel-visible critical section for `membarrier` to abort. All of this was documented on
+  `enable_pinned_core`, including the sentence that a non-owner drain of an active pinned
+  cache "is the caller's responsibility to serialize".
+
+  But `enable_pinned_core` was safe, and so are `flush_front_end_core` /
+  `flush_front_end_all` / `check_invariants`, every one of which reaches `drain_cpu`. Safe
+  code could therefore drive a drain into a running pinned sequence and get a data race on
+  the non-atomic slot buffer — an object lost or double-vended — without writing `unsafe`
+  anywhere. A responsibility a caller cannot discharge through the type system, on an API
+  that never asks them to accept it, is not a contract; it is an unsound signature. Both
+  `enable_pinned_core` and `Allocator::enable_front_end_pinned` are now `unsafe fn` with
+  the obligation spelled out (one pinned thread per core; no drain against an active
+  core), which a seLe4n runtime can genuinely discharge because it owns core assignment. A
+  POSIX embedding that cannot has two safe alternatives that need no such promise: the
+  RSEQ path or the locked baseline. The general rule: **`unsafe` marks where a human
+  promise substitutes for a machine-checked one** — if the promise is real, the keyword
+  belongs in the signature, not only in the prose above it.

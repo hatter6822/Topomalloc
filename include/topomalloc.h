@@ -366,8 +366,15 @@ size_t topomalloc_cache_budget_tick(void);
 int topomalloc_cache_rseq_active(void);
 
 /* Register the calling thread with the rseq fast path; returns whether it can
- * use it. A no-op beyond a presence check under glibc (which registers every
- * thread before it runs user code); harmless and idempotent to call. */
+ * use it. Harmless and idempotent to call.
+ *
+ * Under glibc >= 2.35 this is a no-op beyond a presence check: the C library
+ * registers every thread's rseq area before it runs user code, so threads are
+ * already set up. Where TopoMalloc self-registers instead (musl, older glibc),
+ * only threads that call this use the restartable sequences -- registration is
+ * a syscall and the allocation path does not attempt it lazily. An unregistered
+ * thread still allocates correctly, on the locked baseline; call this once at
+ * thread start to get the fast path. */
 int topomalloc_cache_register_thread(void);
 
 /* ------------------------------------------------------------------------

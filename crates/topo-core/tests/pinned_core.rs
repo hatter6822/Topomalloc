@@ -252,7 +252,9 @@ fn pinned_mode_dispatch_routes_fe_pop_push() {
     // points run the pinned sequence (behind the same FeOutcome contract).
     let m = meta(2 * 1024 * 1024);
     let cc = CpuCache::new();
-    cc.enable_pinned_core(getcpu_oracle);
+    // SAFETY: §36.10 hand-off contract — this cache is local to the test, only this
+    // thread ever touches it, and nothing drains it concurrently.
+    unsafe { cc.enable_pinned_core(getcpu_oracle) };
     assert!(cc.pinned_mode());
     assert!(!cc.rseq_mode());
 
@@ -283,7 +285,8 @@ fn pinned_dispatch_matches_locked() {
     let m = meta(4 * 1024 * 1024);
     let locked = CpuCache::new();
     let pinned = CpuCache::new();
-    pinned.enable_pinned_core(getcpu_oracle);
+    // SAFETY: as above — a test-local cache, single-threaded, never drained concurrently.
+    unsafe { pinned.enable_pinned_core(getcpu_oracle) };
 
     let cpu = getcpu_oracle();
     if cpu < 0 || !pin_to(cpu as usize) {

@@ -826,9 +826,25 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
                     // falling back to a per-thread key. On a platform without RSEQ this
                     // is a no-op returning `false` and the locked baseline stands (P-003).
                     eng.enable_front_end_rseq();
-                    // The thread performing the very first allocation is also the first
-                    // user of the fast path; later threads register on their own first
-                    // touch (a no-op beyond a presence check in glibc mode).
+                    // Register the thread performing the very first allocation — it is
+                    // also the first user of the fast path.
+                    //
+                    // What happens to *later* threads depends on the registration model
+                    // (§27.6), and only one of the two is automatic:
+                    //
+                    // * **glibc ≥ 2.35** registers every thread's rseq area itself, so
+                    //   this call is a presence check and later threads are already set
+                    //   up — nothing else to do.
+                    // * **self-registered** (musl, older glibc): `topo-arch` registers at
+                    //   the point it is asked to and never lazily, and the allocation
+                    //   fast path deliberately does not attempt it (registration is a
+                    //   syscall; retrying it per allocation on every unregistered thread
+                    //   would cost more than the path saves). A thread that has not
+                    //   called `topomalloc_cache_register_thread` therefore runs the
+                    //   **locked baseline** — always correct (P-003), just without the
+                    //   restartable sequences. §27.6 makes that the embedder's call to
+                    //   make at thread start, and the C surface exposes it for exactly
+                    //   this.
                     eng.register_front_end_thread();
                     // W6-4/W6-5: publish the online CPU count so the front end spreads
                     // over the real machine and the §11.5 budget is sized to it.
