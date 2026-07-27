@@ -727,6 +727,18 @@ static GLOBAL: OnceLock<Option<AnyAllocator>> = OnceLock::new();
 /// The selected backend name: `$TOPOMALLOC_BACKEND` or `"posix"`. An unknown or
 /// unavailable name falls back to POSIX so the default artifact is always usable.
 fn selected_backend_name() -> String {
+    // §29 / the glibc `MALLOC_*` convention: environment-derived configuration is ignored
+    // in a **secure execution** (setuid/setgid, file capabilities, `AT_SECURE=1`). The
+    // backend is configuration like any other knob, and a more consequential one than the
+    // sampling and hardening knobs already gated: in a build carrying an alternate backend
+    // (`sele4n-sim`), this variable lets whoever controls the environment replace a
+    // privileged process's allocator wholesale — changing its backing semantics, or
+    // selecting a bounded simulation backend to force allocation failure at a chosen
+    // moment. The gate has to sit *here*, before selection, because the allocator is built
+    // from this name well before the phase-5 env handling runs.
+    if crate::entropy::is_secure_execution() {
+        return "posix".into();
+    }
     std::env::var("TOPOMALLOC_BACKEND").unwrap_or_else(|_| "posix".into())
 }
 

@@ -2477,3 +2477,43 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   RSEQ path or the locked baseline. The general rule: **`unsafe` marks where a human
   promise substitutes for a machine-checked one** — if the promise is real, the keyword
   belongs in the signature, not only in the prose above it.
+
+* **Two independent claims are not mutual exclusion (0.4.3).** A small free could reach
+  the quarantine and the front-end cache by two routes that each took *their own* claim —
+  the quarantined bit (a test-and-set under the span lock) and the cached bit (lock-free).
+  Because those are different atomics, each route could read the other's marker before it
+  was set and both frees succeed, leaving one address in a per-CPU slot *and* in the
+  quarantine ring: vendable to a caller while a later drain frees it underneath them. The
+  earlier round had made the *quarantine* consult the cached bit, which closed the
+  interleaving it was shown but not the shape: a plain load is not a claim. Toggling the
+  runtime quarantine switch mid-free walks straight through it, because a free that reads
+  "disabled" claims nothing at all and so has nothing to exclude the free arriving a moment
+  later with the switch on.
+
+  The fix is ordering, not more checks: a cacheable free now takes the **shared** cached
+  claim *before* the quarantine is consulted, so the route chosen afterwards cannot change
+  who won. The quarantine runs holding that claim — skipping the cached-bit check (the mark
+  is the caller's own), performing a quarantined-bit-first handoff if it holds the object,
+  and leaving the mark untouched if it declines. A non-cacheable object has no cached bit,
+  so its quarantine mark stays its only claim and that path is unchanged. The general rule:
+  **when two routes can reach one object, they must contend on one atomic, not check each
+  other's** — "A checks B's flag, B checks A's flag" is the classic two-flag failure, and
+  it looks correct in every trace where the checks happen to be ordered.
+
+* **`MODE_LOCKED` is a claim, so only a fence may publish it (0.4.3).** The RSEQ
+  disable transition was made safe against a second *disabler* (only the caller that wins
+  the `MODE_RSEQ → MODE_DRAINING` CAS fences and publishes the terminal state), but not
+  against a concurrent `enable_rseq`, which stored `MODE_RSEQ` unconditionally. That let
+  the fast path be re-armed mid-drain: new sequences start after the fence has already
+  passed their CPU, and the drainer then stores `MODE_LOCKED` — a state whose entire
+  meaning is "no sequence can be in flight" — over them, handing the next non-owner drain
+  the fence-skip the transition exists to prevent.
+
+  Both publishes are now conditional. The owner's terminal store is a CAS from
+  `MODE_DRAINING`, so an enable that re-armed the path simply wins and the mode stays
+  `MODE_RSEQ` (where drains fence again); the disabler then restarts its transition, since
+  its postcondition is not yet met. `enable_rseq`'s failure path no longer raw-stores
+  `MODE_LOCKED` either — it routes through `disable_rseq`, the only code that can establish
+  that claim. The general rule: **a mode value that licenses other threads to skip a
+  safety step is an assertion about the world, and only the operation that makes the
+  assertion true may write it.**

@@ -603,10 +603,23 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         let object_base = trailing_guard_start - usable;
         let restore_and_free = |me: &Self, backing, region| {
             // Restore both guards so the recycled extent is fully usable, then free.
-            let _ = me.extents.protect_range(ext_base, PAGE_SIZE, true);
-            let _ = me
+            let lead_ok = me.extents.protect_range(ext_base, PAGE_SIZE, true).is_ok();
+            let trail_ok = me
                 .extents
-                .protect_range(object_base + usable, PAGE_SIZE, true);
+                .protect_range(object_base + usable, PAGE_SIZE, true)
+                .is_ok();
+            if !(lead_ok && trail_ok) {
+                // This is the **abort** path: no descriptor has been published yet, so
+                // there is no `guard_armed` marker for a later free to act on — the
+                // mechanism that makes a failed restore recoverable further down (see
+                // `needs_restore` below) does not exist here. Returning the extent anyway
+                // would put a `PROT_NONE` page back into the reusable pool, where a later,
+                // entirely valid allocation faults on its own memory. Withhold it instead:
+                // losing one extent is bounded and counted, and strictly better than
+                // handing out backing that traps (§2.4, never corrupt).
+                me.guard_protect_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             // A guarded reservation being undone was never canary-filled (not eligible).
             me.return_backing(backing, region, &NO_REGION_CACHE, None, false);
         };

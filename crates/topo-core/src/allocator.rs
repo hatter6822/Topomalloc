@@ -1569,17 +1569,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         usable: usize,
         cache_bypass: bool,
     ) -> FreeOutcome {
-        // W18-3 (§29.4): when the quarantine is active it may *hold* this freed object
-        // out of circulation (delaying reuse) or detect a quarantine-hit double free —
-        // returning the final outcome; a true no-op (always `None`) without the
-        // `quarantine` feature.
-        let quarantine_claim = match self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
-            QuarantineDisposition::Settled(outcome) => return outcome,
-            // The quarantine declined but still owns this object's claim: it is ours
-            // to release, and only once the marker that replaces it is set.
-            QuarantineDisposition::ClaimHeld => true,
-            QuarantineDisposition::NotEngaged => false,
-        };
         // W6 (§29.3): for a **front-end-cacheable** object the cached marker is the
         // authoritative free-path claim — its test-and-set is what decides between two
         // concurrent frees, exactly as `central_insert`'s does for an object that reaches
@@ -1588,29 +1577,42 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // deterministic force-slow-path. A route that skipped it would insert into a
         // bitmap a cached free never touches, so a concurrent normal free and a bypassing
         // one could each succeed — one address sitting in a per-CPU slot *and* in the
-        // central free list, to be vended to two callers. The claim is taken **before**
-        // the cache-versus-central decision precisely so the decision cannot change who
-        // wins the race.
+        // central free list, to be vended to two callers.
+        //
+        // It is taken **first**, ahead of the quarantine decision, because it is the one
+        // claim every route to this object shares. Consulting the quarantine first left
+        // the two claims independent — they are different atomics (the quarantined bit is
+        // a test-and-set under the span lock, the cached bit is lock-free), so each route
+        // could read the other's marker before that marker was set and both succeed,
+        // leaving one address in a per-CPU slot *and* in the quarantine ring. Toggling the
+        // runtime quarantine switch mid-free reaches it directly: a free that read
+        // "disabled" took no claim at all, so it had nothing to exclude the free that
+        // arrived a moment later with the switch on. Claiming the shared marker before the
+        // route is chosen makes the choice irrelevant to who wins.
         let cacheable = Self::front_end_cacheable(arena, span.place_class());
         if cacheable && !span.try_mark_cached(idx as usize) {
-            // Unreachable while we hold the quarantine claim — no other free can be in
-            // this region, and an already-cached object was rejected before the claim was
-            // taken — but releasing it costs nothing and stranding the object marked
-            // quarantined forever (every later free reporting a hit) is the alternative.
-            if quarantine_claim {
-                self.release_quarantine_claim_small(span, idx);
-            }
             return FreeOutcome::DoubleFree;
         }
-        // Hand the claim over to the cached bit, **cached-bit-first**: the mark above is
-        // set before the quarantined bit is cleared here, so `is_quarantined || is_cached`
-        // is true at every instant and the reader's acquire on the cleared bit is what
-        // publishes the mark it must observe instead. On the central route the handoff is
-        // the same shape and already done inside `insert_batch_inner` — free bit set, then
-        // `clear_quarantined` — so only the cacheable side needs doing here.
-        if quarantine_claim && cacheable {
-            self.release_quarantine_claim_small(span, idx);
-        }
+        // W18-3 (§29.4): when the quarantine is active it may *hold* this freed object
+        // out of circulation (delaying reuse) or detect a quarantine-hit double free —
+        // returning the final outcome; a true no-op (always `NotEngaged`) without the
+        // `quarantine` feature. `cacheable` tells it the shared claim is already held, so
+        // it neither re-checks the cached bit (that mark is ours) nor asks the caller to
+        // release anything: on a hold it performs the quarantined-bit-first handoff
+        // itself, and on a decline it leaves our mark exactly as it found it.
+        let quarantine_claim =
+            match self.maybe_quarantine_small(ptr, span, idx, arena, usable, cacheable) {
+                QuarantineDisposition::Settled(outcome) => return outcome,
+                // A **non-cacheable** object has no cached bit, so the quarantine's own
+                // mark is its only claim, and the caller releases it once the central
+                // insert has replaced it (free-bit-first, in `insert_batch_inner`).
+                QuarantineDisposition::ClaimHeld => true,
+                QuarantineDisposition::NotEngaged => false,
+            };
+        debug_assert!(
+            !(quarantine_claim && cacheable),
+            "a cacheable object's quarantine claim is settled inside maybe_quarantine_small"
+        );
         // W6/W7: absorb the free into the running core's slot unless this call declined
         // the cache. `None` ⇒ the front end declined and the central path below completes
         // the free (the object stays marked cached until `insert_batch_inner` clears it
@@ -2601,6 +2603,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         idx: u16,
         arena: ArenaId,
         usable: usize,
+        holds_cached: bool,
     ) -> QuarantineDisposition {
         // A double free of a **held** object: the authoritative per-object quarantined
         // bit says so (lock-free atomic read, W18-3). Checked FIRST and unconditionally
@@ -2623,13 +2626,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
         }
         // W6 (§29.3): and the same for an object already awaiting reuse in a **front-end
-        // cache**. This is the other half of making the two claims mutually exclusive:
-        // once a free hands its quarantine claim over to the cached bit (below, in
-        // `free_small_screened`), the cached bit is the *only* marker that object carries,
-        // so a quarantine that did not consult it would happily claim an object already
-        // sitting in a per-CPU slot — putting the same address in a slot and in the ring,
-        // vended to a caller while a later drain frees it underneath them.
-        if span.is_cached(idx as usize) {
+        // cache** — unless that mark is the caller's own. For a cacheable object the
+        // cached bit *is* the shared claim, taken in `free_small_screened` before this
+        // call precisely so the two routes cannot claim independently; treating our own
+        // claim as someone else's would turn every cacheable free into a double-free
+        // report. For a non-cacheable object nothing takes that bit, so the check stands
+        // as the guard it always was.
+        if !holds_cached && span.is_cached(idx as usize) {
             return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
         }
         let entry = crate::harden::QuarantineEntry {
@@ -2669,6 +2672,18 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
             crate::harden::Offer::Held => {
+                // The quarantine owns the object now, so hand the shared claim over to its
+                // marker: **quarantined-bit-first**, mirroring the free-bit-first handoff
+                // `insert_batch_inner` performs. The quarantined bit was set above, before
+                // the entry could be published, and the cached bit is cleared only here —
+                // so `is_quarantined || is_cached` is true at every instant, and no reader
+                // that observes the clear can miss the mark that replaced it. The bit must
+                // come off: a quarantined object is *not* front-end-resident, and leaving
+                // it set would corrupt `cached_count`'s §16.4 meaning and the residency
+                // stats, besides making a later legitimate free look like a double free.
+                if holds_cached {
+                    span.unmark_cached(idx as usize);
+                }
                 // Account the app-free and drain any evicted objects (their bits are
                 // cleared by the drain's `insert_batch`, free-bit-first).
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
@@ -2686,6 +2701,15 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             // free also returns `Freed` from the cache or central path. One address, two
             // successful frees, resident in a front-end slot and in the ring at once.
             crate::harden::Offer::Declined | crate::harden::Offer::AlreadyQuarantined => {
+                if holds_cached {
+                    // The caller's cached mark never left its hand, so this object was
+                    // claimed throughout and there is nothing to hand over — just drop the
+                    // quarantine's own mark (safe in this order: the cached bit is still
+                    // set, so the residency union never goes empty) and let the caller
+                    // finish on the ordinary cache-or-central path.
+                    self.release_quarantine_claim_small(span, idx);
+                    return QuarantineDisposition::NotEngaged;
+                }
                 QuarantineDisposition::ClaimHeld
             }
         }
@@ -2700,6 +2724,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         _idx: u16,
         _arena: ArenaId,
         _usable: usize,
+        _holds_cached: bool,
     ) -> QuarantineDisposition {
         QuarantineDisposition::NotEngaged
     }
@@ -4773,6 +4798,82 @@ mod tests {
         assert!(a.check_invariants());
     }
 
+    /// A **cacheable** free holds one claim from start to finish, whatever the quarantine
+    /// decides — and the runtime switch cannot open a window between the two routes.
+    ///
+    /// The quarantined bit (a test-and-set under the span lock) and the cached bit
+    /// (lock-free) are different atomics, so while each route claimed its own, two frees of
+    /// one object could each read the other's marker before it was set and both succeed —
+    /// leaving the address in a per-CPU slot *and* in the ring, to be vended while a later
+    /// drain frees it underneath the new owner. Toggling the switch mid-free reaches it
+    /// directly: a free that reads "disabled" claims nothing at all, so it has nothing to
+    /// exclude the free that arrives a moment later with the switch on.
+    ///
+    /// The fix is that a cacheable free takes the *shared* cached claim before the
+    /// quarantine is consulted at all. This checks it at the seam, in both directions: a
+    /// declined offer leaves that claim untouched and reports nothing outstanding, and a
+    /// second free arriving at any point after it loses.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_cacheable_free_keeps_its_claim_across_a_declined_offer() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        // Every offer declined, so the free falls through to the cache-or-central path
+        // while the quarantine is genuinely engaged.
+        a.set_quarantine_policy(crate::harden::QuarantinePolicy {
+            max_bytes: u64::MAX,
+            max_objects: 0,
+            per_arena_bytes: 0,
+            random_evict: false,
+            sample_shift: 0,
+        });
+        a.set_quarantine_enabled(true);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only names descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let usable = size_class::usable_size(span.size_class());
+        let idx = object_index as u16;
+        // The caller takes the shared claim first, exactly as `free_small_screened` does.
+        assert!(
+            span.try_mark_cached(object_index),
+            "the object is live and unclaimed"
+        );
+        let disposition = a.maybe_quarantine_small(p, span, idx, span.arena(), usable, true);
+        // Declined *and* nothing left outstanding: the cached mark never left our hand, so
+        // there is no second claim for the caller to release.
+        assert!(
+            matches!(disposition, QuarantineDisposition::NotEngaged),
+            "a declined offer on a cacheable object owes the caller nothing"
+        );
+        assert!(
+            span.is_cached(object_index),
+            "the shared claim must survive the quarantine declining it"
+        );
+        assert!(
+            !span.is_object_quarantined(object_index),
+            "the quarantine's own mark must not be stranded on a declined offer"
+        );
+
+        // And the exclusion the whole ordering exists for: a second free of this object,
+        // arriving now with the switch on, must lose. Before the reorder it would pass the
+        // cached probe against a bit the first free had not yet set and be sampled in.
+        assert!(
+            matches!(
+                a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "a second free must lose to the claim the first one already holds"
+        );
+    }
+
     /// The other half of the handoff: a **declined** offer must pass its claim on rather
     /// than drop it, and must not strand it either.
     ///
@@ -4816,7 +4917,13 @@ mod tests {
         // over. Clearing it here instead — reporting "not engaged" with the bit already
         // dropped — is what leaves the object owned by nobody until the caller's next
         // marker, the window a second free of the same address slips into.
-        let disposition = a.maybe_quarantine_small(p, span, idx, span.arena(), usable);
+        // `holds_cached: false` is the **non-cacheable** route, which is the one this
+        // contract still governs: there the quarantine's own mark is the object's only
+        // claim, so a decline has to hand it to the caller rather than drop it. (A
+        // cacheable free now takes the shared cached claim before this call and keeps it
+        // throughout, so its decline reports `NotEngaged` with nothing outstanding — the
+        // case `a_cacheable_free_keeps_its_claim_across_a_declined_offer` covers.)
+        let disposition = a.maybe_quarantine_small(p, span, idx, span.arena(), usable, false);
         assert!(
             matches!(disposition, QuarantineDisposition::ClaimHeld),
             "a declined offer must hand its claim to the caller, not drop it"

@@ -572,8 +572,16 @@ impl CpuCache {
     /// (§27.6) — a no-op beyond a presence check in glibc mode.
     pub fn enable_rseq(&self) -> bool {
         let ok = rseq::enable();
-        self.mode
-            .store(if ok { MODE_RSEQ } else { MODE_LOCKED }, Ordering::Release);
+        if ok {
+            self.mode.store(MODE_RSEQ, Ordering::Release);
+        } else {
+            // Never publish `MODE_LOCKED` with a raw store. It is the claim *no RSEQ
+            // sequence can be in flight*, and only the drain transition
+            // ([`disable_rseq`](Self::disable_rseq)) can establish it — a raw store here,
+            // on a cache that was already in `MODE_RSEQ`, would hand a concurrent
+            // non-owner drain exactly the fence-skip that transition exists to prevent.
+            self.disable_rseq();
+        }
         ok
     }
 
@@ -658,25 +666,66 @@ impl CpuCache {
     /// new sequences cannot start in it and drains still fence, so the postcondition
     /// every caller relies on ("the RSEQ fast path is off on return") holds either way.
     pub fn disable_rseq(&self) {
-        match self.mode.compare_exchange(
-            MODE_RSEQ,
-            MODE_DRAINING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            // We own the transition: drain the sequences that started before the swap,
-            // and only then publish the state that lets a drainer skip its fence.
-            Ok(_) => {
-                let _ = rseq::fence_rseq();
-                self.mode.store(MODE_LOCKED, Ordering::Release);
+        loop {
+            match self.mode.compare_exchange(
+                MODE_RSEQ,
+                MODE_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // We own the transition: drain the sequences that started before the swap,
+                // and only then publish the state that lets a drainer skip its fence.
+                Ok(_) => {
+                    let _ = rseq::fence_rseq();
+                    // Publish the terminal state **only while the transition is still
+                    // ours**. A concurrent [`enable_rseq`](Self::enable_rseq) can re-arm
+                    // the fast path while this fence runs; an unconditional store would
+                    // then claim "nothing is in flight" over sequences that started
+                    // *after* the fence passed their CPU — the same fence-skip this
+                    // transition exists to prevent, reached through a different door.
+                    if self
+                        .mode
+                        .compare_exchange(
+                            MODE_DRAINING,
+                            MODE_LOCKED,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    // An `enable_rseq` re-armed the path mid-fence. The mode it published
+                    // is correct and safe (drains fence again in `MODE_RSEQ`), but this
+                    // call's postcondition — the fast path is off on return — is not met
+                    // yet, so start the transition over.
+                    continue;
+                }
+                // Another caller owns an in-progress transition and will publish the
+                // terminal state once its fence returns. Publishing it here would be a lie.
+                Err(MODE_DRAINING) => return,
+                // Already locked: nothing to do.
+                Err(MODE_LOCKED) => return,
+                // Pinned, which runs no RSEQ sequences (§36.10 uses the hand-off contract,
+                // not the fence), so the terminal state needs no fence — but only while it
+                // really is still pinned, hence a CAS rather than a store. If that raced,
+                // re-examine the mode from the top.
+                Err(_) => {
+                    if self
+                        .mode
+                        .compare_exchange(
+                            MODE_PINNED,
+                            MODE_LOCKED,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    continue;
+                }
             }
-            // Another caller owns an in-progress transition and will publish the terminal
-            // state once its fence returns. Publishing it here would be a lie.
-            Err(MODE_DRAINING) => {}
-            // Already locked, or pinned (which runs no RSEQ sequences — §36.10 uses the
-            // hand-off contract, not the fence), so nothing can be in flight and the
-            // terminal state is publishable without a fence.
-            Err(_) => self.mode.store(MODE_LOCKED, Ordering::Release),
         }
     }
 

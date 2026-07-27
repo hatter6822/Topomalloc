@@ -166,9 +166,18 @@ impl CacheBudget {
     /// count (see [`Allocator::set_front_end_cpus`](crate::Allocator::set_front_end_cpus)),
     /// which is the figure that genuinely is a population.
     pub fn adapt(&self, cpu_cache: &CpuCache) -> usize {
-        if cpu_cache.active_cpus() == 0 {
-            return 0;
-        }
+        // A zero CPU count means "the host has not published one yet", **not** "there is
+        // nothing to adapt". Front-end allocation does not wait for that announcement:
+        // `current_core` deliberately spreads threads over `MAX_CPUS` (a per-thread key
+        // when no CPU id is readable), so a multithreaded embedding that constructs an
+        // allocator directly and never calls `set_front_end_cpus` initialises slots and
+        // accumulates cache residency from its first allocation. Returning early here
+        // skipped the scan *and* the global-budget enforcement for exactly that case, so
+        // those slots kept their initial soft capacities and their residency sat outside
+        // the ceiling the allocator advertises — the one state the §11.5 budget exists to
+        // bound. Adapt anyway; the count only sizes the global allowance (which
+        // `Allocator::new` initialises to the single-core figure for this reason), and
+        // every slot is skipped by the same `is_initialized` test as always.
 
         // Phase 1: per-slot adaptation based on miss/overflow stats.
         for cpu_idx in 0..crate::cpu_cache::MAX_CPUS {
