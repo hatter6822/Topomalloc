@@ -78,6 +78,37 @@ pub(crate) fn install_process_entropy() {
     topo_core::harden::set_process_entropy(e);
 }
 
+/// Re-seed the randomized **security** samplers in a freshly forked child (§29.5).
+///
+/// `fork()` copies the guard-page coin and the quarantine evictor's PRNG state exactly,
+/// so without this a parent and child run *identical* hardening schedules: the same
+/// allocations get guard pages, the same held objects are evicted, in the same order.
+/// An attacker who can observe one process — or simply run the child themselves — then
+/// predicts the other's protections, which is precisely the per-process unpredictability
+/// the entropy install exists to provide.
+///
+/// [`install_process_entropy`]'s ordinary source cannot be reused here: it prefers
+/// `AT_RANDOM`, and the auxiliary vector is *inherited* across `fork`, so re-reading it
+/// yields the parent's value. This asks `getrandom` first (fresh bytes on every call, so
+/// genuinely fork-distinct) and otherwise mixes the PID — the one value guaranteed to
+/// differ between parent and child — into the address/clock fallback.
+///
+/// Allocation-free and syscall-only, as it must be in a `pthread_atfork` child handler.
+pub(crate) fn reseed_after_fork() {
+    let e = from_getrandom().unwrap_or_else(|| {
+        // SAFETY: `getpid` is a pure query with no failure mode.
+        let pid = unsafe { libc::getpid() } as u64;
+        let mixed =
+            from_address_and_clock() ^ pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17);
+        if mixed == 0 {
+            1
+        } else {
+            mixed
+        }
+    });
+    topo_core::harden::set_process_entropy(e);
+}
+
 /// Best-effort per-process entropy; `0` when nothing could be read (the
 /// "not installed" sentinel the core understands).
 fn read_entropy() -> u64 {

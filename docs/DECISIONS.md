@@ -2517,3 +2517,70 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   that claim. The general rule: **a mode value that licenses other threads to skip a
   safety step is an assertion about the world, and only the operation that makes the
   assertion true may write it.**
+
+### Two root causes behind five rounds of concurrency findings (0.4.3)
+
+Five consecutive review rounds landed P1 concurrency findings on the same two
+mechanisms, each one a hole in the previous round's fix. Patching interleavings was not
+converging, because in both cases the defect was a piece of state that meant two
+different things and had no single owner. Both are now fixed at that level.
+
+**1. `CpuCache::mode` was a dispatch selector *and* a safety assertion.** `MODE_LOCKED`
+told an operation "take the locked path" — something any thread may assert at any time —
+and simultaneously told a non-owner drain "no restartable sequence is in flight, you may
+skip the W7-4 fence" — something only a thread that has *fenced* may assert. Because
+enable, disable and pinned-mode all wrote the same word, every pair of concurrent writers
+had to be reasoned about separately, and each fix covered one pair while leaving the next:
+a transitional `MODE_DRAINING` (round 5), then serialising two disablers with a
+compare-exchange (round 6), then stopping `enable_rseq` from clobbering the transition
+(round 8), then the observation that leaving *pinned* mode has the same problem and no
+fence can fix it (round 9).
+
+The fence question is not "is the fast path on right now?" but "could a sequence be in
+flight?", and that is answered by a **monotonic latch**: RSEQ has ever been enabled in
+this process. It is set before `mode` can ever become `MODE_RSEQ` and never cleared, so
+`false` *proves* no sequence has ever started. A latch has no writers to order against —
+no interleaving of enable/disable/pinned can make it lie — so `mode` reverts to a pure
+dispatch selector that anyone may write in any order, and `MODE_DRAINING` plus all the
+choreography is deleted. The precision given up is one membarrier per drained CPU in a
+process that enabled RSEQ and later turned it off (a fork child, on a maintenance path);
+RSEQ-on and never-enabled are both unchanged.
+
+The one transition a latch cannot rescue is leaving **pinned** mode, because pinned
+sequences take no lock and `membarrier` has nothing to abort. That is a genuine
+quiescence obligation, so it moved out of the safe `disable_rseq` (which now leaves
+`MODE_PINNED` alone) into an `unsafe fn disable_pinned_core`, matching the already-unsafe
+entry. A fork child inherits pinned mode safely: it has one thread.
+
+The lesson generalises past this file: **a value that licenses other threads to skip a
+safety step is an assertion about the world, not a mode flag, and the two must not share
+a variable.** Where an assertion is monotonic, prefer a latch — it removes the ordering
+question rather than answering it.
+
+**2. The free path claimed a different atomic depending on which route it took.** A freed
+object is in exactly one residency state (live / claimed / cached / quarantined /
+central-free), but those states live in separate bitmaps, so mutual exclusion is whatever
+the code enforces. When the cache route claimed the cached bit and the quarantine route
+claimed the quarantined bit, two frees of one object could each win *their own* atomic
+and both succeed — the address ending up in a per-CPU slot *and* the quarantine ring.
+Making each route *check* the other's marker first (round 6) did not fix it: a load is not
+a claim, and both checks can precede both sets. Round 8 fixed the small path properly by
+ordering — claim first, choose the route afterwards — and round 9 found the identical hole
+on the large path, which was still branching on the quarantine switch while unclaimed.
+
+The rule is now written down on `QuarantineDisposition` rather than re-derived per path:
+**every route that can free an object contends on one atomic, and does so before choosing
+its route.** The corollary is the part that keeps being missed — any predicate read
+*before* the claim (the quarantine switch, cacheability, `TOPO_TCACHE_NONE`) can be seen
+differently by two concurrent frees, and a free that reached its route without claiming
+anything has nothing to exclude the other with. A runtime toggle is the sharpest case
+because it genuinely changes between the two reads, but it is not itself the bug; it only
+makes the two routes concurrently reachable.
+
+Unifying the three bitmaps into one atomic 2-bit residency state per object was
+considered and **not** done. It would make the exclusion structural rather than
+disciplined, but `free_bitmap` is the central free list's allocation structure and not
+merely a marker, so the rewrite is large and touches every allocation path — real
+regression risk for a property the claim rule already establishes. The remaining
+hand-ordered pair (claim vs free bit, ordered free-bit-first) is one pair, which is
+tractable to keep proved; the failure mode was three pairs and growing.

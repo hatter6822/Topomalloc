@@ -66,6 +66,13 @@ extern "C" fn atfork_child() {
     topo_core::fork::postfork_child();
     if let Some(eng) = crate::global_if_init() {
         eng.disable_front_end_rseq();
+        // §29.5: the child inherited the parent's guard-page coin and quarantine-evictor
+        // PRNG state byte for byte, so without a re-seed the two processes make the *same*
+        // hardening choices for the same allocation sequence — and one of them is
+        // observable to whoever can run it. Fresh, fork-distinct entropy, then re-derive
+        // the sampler streams from it.
+        crate::entropy::reseed_after_fork();
+        eng.seed_security_samplers();
     }
 }
 

@@ -53,17 +53,6 @@ const RSEQ_ABORT_RETRY: u32 = 128;
 const MODE_LOCKED: u8 = 0;
 const MODE_RSEQ: u8 = 1;
 const MODE_PINNED: u8 = 2;
-/// Transitional state published by [`CpuCache::disable_rseq`] for the duration of its
-/// drain (W7-4). It is *not* a deployment choice: it exists because leaving RSEQ mode is
-/// a two-step operation — stop new sequences, then drain the in-flight ones — and the
-/// window between those steps has to be visible to non-owner drains. It behaves like
-/// `MODE_LOCKED` for anyone starting an operation (no new restartable sequence begins,
-/// since `fe_pop`/`fe_push` dispatch everything that is not `MODE_RSEQ`/`MODE_PINNED` to
-/// the locked path) and like `MODE_RSEQ` for
-/// [`fence_if_non_owner`](CpuCache::fence_if_non_owner), which must keep fencing until
-/// the drain has actually completed.
-const MODE_DRAINING: u8 = 3;
-
 /// Per-size-class slot within a [`PerCpu`]: a lazily-allocated LIFO stack of
 /// object addresses.
 ///
@@ -480,9 +469,38 @@ pub struct CpuCache {
     /// `MODE_LOCKED` is the baseline (W6-4); [`enable_rseq`](Self::enable_rseq)
     /// and [`enable_pinned_core`](Self::enable_pinned_core) select the fast
     /// paths; [`disable_rseq`](Self::disable_rseq) reverts to conservative
-    /// (locked) mode (e.g. the child fork handler, §28.1), passing through the
-    /// transitional draining mode for the duration of its drain.
+    /// (locked) mode (e.g. the child fork handler, §28.1).
+    ///
+    /// **This is a dispatch selector and nothing more.** It says which path an
+    /// operation should take; it is deliberately *not* consulted to decide whether a
+    /// non-owner drain must fence — that is [`rseq_ever_enabled`](Self::rseq_ever_enabled).
+    /// Keeping those two questions apart is what makes concurrent mode changes
+    /// uninteresting: every value of this field dispatches correctly, so racing writers
+    /// can produce any interleaving without threatening safety.
     mode: AtomicU8,
+    /// Whether the RSEQ fast path has **ever** been enabled in this process — a
+    /// monotonic latch, set before `mode` ever becomes `MODE_RSEQ` and never cleared.
+    ///
+    /// This, not `mode`, is what arms the W7-4 non-owner fence. The question a drainer
+    /// actually has to answer is *"could a restartable sequence be in flight?"*, and a
+    /// sequence runs only in `MODE_RSEQ`, which is only reachable after this latch is
+    /// set. So `false` here is a sound proof that no sequence has ever started, and
+    /// `true` is a conservative "fence to be sure".
+    ///
+    /// Deriving the answer from the *current* mode instead is what produced three
+    /// consecutive rounds of concurrency bugs. It made `MODE_LOCKED` mean two different
+    /// things — "dispatch to the locked path", which any thread may assert, and "no
+    /// sequence is in flight", which only a thread that has fenced may assert — so every
+    /// pair of concurrent mode writers had to be reasoned about separately, and each fix
+    /// covered one pair while leaving the next. A monotonic latch has no writers to order
+    /// against: it is set once, before the fact it describes can become true, so no
+    /// interleaving of enable/disable/pinned can make it lie.
+    ///
+    /// The cost is one membarrier per drained CPU in a process that enabled RSEQ and then
+    /// turned it off — a fork child, on a host-driven maintenance path. The common cases
+    /// are unchanged: RSEQ on fences exactly as before, and a build that never enabled it
+    /// (non-Linux, sanitizer, pinned, locked-baseline) skips exactly as before.
+    rseq_ever_enabled: AtomicBool,
     /// In `MODE_PINNED`, a `fn() -> i32` (cast to `usize`) that returns the
     /// calling thread's current core (the seLe4n runtime's per-core identity, the
     /// analogue of `rseq`'s `cpu_id`), or `-1` if unknown. `0` when unset.
@@ -500,6 +518,7 @@ impl CpuCache {
             cpus_init: RankedLock::new(),
             active_cpus: AtomicU32::new(0),
             mode: AtomicU8::new(MODE_LOCKED),
+            rseq_ever_enabled: AtomicBool::new(false),
             pinned_core_fn: AtomicUsize::new(0),
         }
     }
@@ -573,14 +592,14 @@ impl CpuCache {
     pub fn enable_rseq(&self) -> bool {
         let ok = rseq::enable();
         if ok {
+            // Arm the fence **before** publishing the mode that lets sequences start, so
+            // the latch is never behind the fact it describes. Both orderings are release
+            // stores; a drainer's acquire load of the latch therefore cannot observe
+            // `false` after any sequence has begun.
+            self.rseq_ever_enabled.store(true, Ordering::Release);
             self.mode.store(MODE_RSEQ, Ordering::Release);
         } else {
-            // Never publish `MODE_LOCKED` with a raw store. It is the claim *no RSEQ
-            // sequence can be in flight*, and only the drain transition
-            // ([`disable_rseq`](Self::disable_rseq)) can establish it — a raw store here,
-            // on a cache that was already in `MODE_RSEQ`, would hand a concurrent
-            // non-owner drain exactly the fence-skip that transition exists to prevent.
-            self.disable_rseq();
+            self.mode.store(MODE_LOCKED, Ordering::Release);
         }
         ok
     }
@@ -634,99 +653,66 @@ impl CpuCache {
     /// Disable any fast path, reverting to the locked baseline (§28.1 child fork
     /// handler / conservative mode). Already-cached objects are unaffected.
     ///
-    /// Leaving RSEQ mode is inherently **two** steps — stop new sequences from starting,
-    /// then drain the ones already in flight — and the state between them needs a name.
-    /// Publishing `MODE_LOCKED` up front and fencing afterwards gets the drain right but
-    /// opens a window in which a concurrent non-owner drain
-    /// (`flush_front_end_core`/`flush_front_end_all`) observes `rseq_mode() == false`,
-    /// skips the W7-4 non-owner fence, takes another CPU's lock
-    /// and edits a slot that an old sequence can still commit `len` into — losing an
-    /// object or double-vending one, the exact race the fence exists to prevent. Because
-    /// this is a safe public method with no stated quiescence precondition (the
-    /// `pthread_atfork` child caller happens to be quiesced; a Rust embedding need not
-    /// be), it has to establish the property itself.
+    /// A plain store, deliberately. Leaving RSEQ mode used to be a two-step transition
+    /// with a transitional mode, a fence, and compare-exchange choreography to decide who
+    /// was allowed to publish the terminal state — all of it in service of keeping
+    /// `MODE_LOCKED` honest, because that value doubled as the licence for a non-owner
+    /// drain to skip its fence. That coupling is gone: the fence is armed by a monotonic
+    /// "RSEQ was ever enabled" latch, which no mode change can falsify. `mode` now only selects a dispatch path, every value of it
+    /// dispatches correctly, and concurrent callers — two disablers, a disabler racing an
+    /// enabler, an atfork child racing anything — can interleave in any order without
+    /// producing an unsafe state.
     ///
-    /// A transitional `MODE_DRAINING` is that name. It stops new sequences (every mode that is not
-    /// `MODE_RSEQ`/`MODE_PINNED` dispatches to the locked path) while still forcing
-    /// non-owner drains to fence, so the window is covered from both sides: a drainer
-    /// that observes `MODE_DRAINING` fences, and one that observes `MODE_LOCKED` is
-    /// guaranteed no sequence is in flight, because `MODE_LOCKED` is published only after
-    /// the fence returned and no sequence could have started meanwhile.
+    /// It also cannot block, which matters: this runs from the `pthread_atfork` child
+    /// handler, where a child that inherited a transitional state (or a lock) from a
+    /// thread that no longer exists would have no way to make progress.
     ///
-    /// Costs one membarrier on a mode switch that happens a handful of times in a
-    /// process's life.
-    ///
-    /// **Concurrent callers.** Only the caller that takes the mode *out of* `MODE_RSEQ`
-    /// owns the transition, and it alone publishes the terminal `MODE_LOCKED`. A second
-    /// caller that arrives mid-transition must not publish it: `MODE_LOCKED` is exactly
-    /// the claim "no sequence is in flight", and storing it while the owner's fence is
-    /// still running hands a concurrent non-owner drain the fence-skip this transition
-    /// exists to prevent — reintroducing the race through the back door. It returns
-    /// instead, which is sound because `MODE_DRAINING` is itself a correct resting state:
-    /// new sequences cannot start in it and drains still fence, so the postcondition
-    /// every caller relies on ("the RSEQ fast path is off on return") holds either way.
+    /// **It leaves `MODE_PINNED` alone**, and not merely because of the name. Moving
+    /// *out* of pinned mode is the one mode change that is genuinely unsafe on its own:
+    /// the pinned sequences deliberately ignore the per-CPU lock (§36.10 makes the pinned
+    /// thread the slot's sole accessor), so publishing `MODE_LOCKED` under a running
+    /// pinned operation lets the very next locked operation take that lock and touch the
+    /// slot concurrently — a data race no fence can repair, because pinned mode has no
+    /// kernel-visible critical section to abort. Leaving pinned mode therefore carries the
+    /// same quiescence obligation as entering it and lives in
+    /// [`disable_pinned_core`](Self::disable_pinned_core), which is `unsafe` for exactly
+    /// that reason. A fork child inherits pinned mode and is safe by construction: it has
+    /// one thread, so no pinned operation can be in flight on another.
     pub fn disable_rseq(&self) {
-        loop {
-            match self.mode.compare_exchange(
-                MODE_RSEQ,
-                MODE_DRAINING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                // We own the transition: drain the sequences that started before the swap,
-                // and only then publish the state that lets a drainer skip its fence.
-                Ok(_) => {
-                    let _ = rseq::fence_rseq();
-                    // Publish the terminal state **only while the transition is still
-                    // ours**. A concurrent [`enable_rseq`](Self::enable_rseq) can re-arm
-                    // the fast path while this fence runs; an unconditional store would
-                    // then claim "nothing is in flight" over sequences that started
-                    // *after* the fence passed their CPU — the same fence-skip this
-                    // transition exists to prevent, reached through a different door.
-                    if self
-                        .mode
-                        .compare_exchange(
-                            MODE_DRAINING,
-                            MODE_LOCKED,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        return;
-                    }
-                    // An `enable_rseq` re-armed the path mid-fence. The mode it published
-                    // is correct and safe (drains fence again in `MODE_RSEQ`), but this
-                    // call's postcondition — the fast path is off on return — is not met
-                    // yet, so start the transition over.
-                    continue;
-                }
-                // Another caller owns an in-progress transition and will publish the
-                // terminal state once its fence returns. Publishing it here would be a lie.
-                Err(MODE_DRAINING) => return,
-                // Already locked: nothing to do.
-                Err(MODE_LOCKED) => return,
-                // Pinned, which runs no RSEQ sequences (§36.10 uses the hand-off contract,
-                // not the fence), so the terminal state needs no fence — but only while it
-                // really is still pinned, hence a CAS rather than a store. If that raced,
-                // re-examine the mode from the top.
-                Err(_) => {
-                    if self
-                        .mode
-                        .compare_exchange(
-                            MODE_PINNED,
-                            MODE_LOCKED,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        }
+        // RSEQ → locked only. A failure is a no-op and needs no retry: every mode this
+        // can observe already dispatches correctly, and the fence latch is independent of
+        // all of them.
+        let _ = self.mode.compare_exchange(
+            MODE_RSEQ,
+            MODE_LOCKED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Leave the seLe4n pinned-thread fast path for the locked baseline (§36.10), the
+    /// counterpart to [`enable_pinned_core`](Self::enable_pinned_core).
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that **no pinned operation is in flight on any core**
+    /// when this is called. A pinned sequence takes no per-CPU lock, so the moment
+    /// `MODE_LOCKED` is published the next locked operation may acquire that lock and
+    /// access the same non-atomic slot buffer the pinned sequence is still reading or
+    /// writing — losing an object or vending one twice. Unlike the RSEQ path there is no
+    /// fence that can drain them: `membarrier` aborts kernel-registered critical sections,
+    /// and a pinned sequence is ordinary code.
+    ///
+    /// A seLe4n runtime discharges this the same way it discharges
+    /// [`enable_pinned_core`](Self::enable_pinned_core)'s obligation — it owns core
+    /// assignment, so it knows when a core's pinned worker is parked.
+    pub unsafe fn disable_pinned_core(&self) {
+        let _ = self.mode.compare_exchange(
+            MODE_PINNED,
+            MODE_LOCKED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 
     /// Whether the RSEQ fast path is currently active.
@@ -1095,26 +1081,29 @@ impl CpuCache {
 
     /// Whether a non-owner drain must issue the W7-4 fence.
     ///
-    /// True for `MODE_RSEQ` and — the part that is easy to get wrong — for the
-    /// transitional [`MODE_DRAINING`]. That mode is published by
-    /// [`disable_rseq`](Self::disable_rseq) *before* its drain runs, so a sequence started
-    /// under the old mode may still be in flight; treating it as "locked" here would let a
-    /// non-owner skip the fence and edit a slot such a sequence can still commit `len`
-    /// into. It is deliberately **not** the negation of
-    /// [`rseq_mode`](Self::rseq_mode): the fast path is off during the transition (no new
-    /// sequence starts) while the fence stays armed (old ones may remain), and those two
-    /// facts are what make the window safe from both sides.
+    /// The question this has to answer is **"could a restartable sequence be in flight
+    /// right now?"**, and the honest answer is derived from the monotonic
+    /// [`rseq_ever_enabled`](Self::rseq_ever_enabled) latch rather than from the current
+    /// mode. A sequence runs only in `MODE_RSEQ`, which is reachable only after that latch
+    /// is set, so `false` here *proves* no sequence has ever started and `true` is a
+    /// conservative "fence to be sure".
+    ///
+    /// Reading the live mode instead is what made this fragile. It answered a subtly
+    /// different question — "is the fast path on *at this instant*" — and the gap between
+    /// the two is every in-flight sequence belonging to a mode that has just been changed
+    /// out from under it. Patching that gap mode-by-mode (a transitional draining state,
+    /// then serialising two disablers, then serialising an enabler against a disabler)
+    /// treated each pair of racing writers as its own problem, and there was always
+    /// another pair. A monotonic latch has no writers to order against.
+    ///
+    /// The precision lost is narrow and cold: a process that enabled RSEQ and later turned
+    /// it off now fences on a non-owner drain where it previously would not. That is a
+    /// fork child on a host-driven maintenance path. Nothing changes for RSEQ-on (it
+    /// fenced already) or for a build that never enabled it (it skipped already, and still
+    /// does — the latch is false).
     #[inline]
     fn non_owner_fence_armed(&self) -> bool {
-        let mode = self.mode.load(Ordering::Acquire);
-        mode == MODE_RSEQ || mode == MODE_DRAINING
-    }
-
-    /// Test-only: publish a raw mode value, to observe the transitional state that
-    /// [`disable_rseq`](Self::disable_rseq) passes through atomically from the outside.
-    #[cfg(test)]
-    pub(crate) fn set_mode_for_test(&self, mode: u8) {
-        self.mode.store(mode, Ordering::Release);
+        self.rseq_ever_enabled.load(Ordering::Acquire)
     }
 
     /// Test-only accessor for [`non_owner_fence_armed`](Self::non_owner_fence_armed).
@@ -1634,97 +1623,74 @@ mod tests {
         );
     }
 
-    /// W7-4: leaving RSEQ mode is two steps — stop new sequences, then drain the in-flight
-    /// ones — and the state between them must be safe for a concurrent non-owner drain.
+    /// W7-4, the invariant the fence exists for: **once a restartable sequence could have
+    /// run in this process, a non-owner drain fences — whatever the mode does afterwards.**
     ///
-    /// Publishing `MODE_LOCKED` up front and fencing afterwards makes the drain correct
-    /// for the *disabling* thread while opening a window for everyone else: a concurrent
-    /// `flush_front_end_core` sees the fast path already off, skips the non-owner fence,
-    /// takes another CPU's lock, and edits a slot an old sequence can still commit into.
+    /// This replaces two tests that pinned the *mechanism* instead (a transitional
+    /// draining mode; which of two concurrent disablers was entitled to publish the
+    /// terminal state). Both were faithful to the implementation of the day, and both
+    /// missed the next mode pair, because the fragility was never in any particular pair —
+    /// it was that `MODE_LOCKED` meant two different things: "dispatch to the locked path",
+    /// which any thread may assert, and "no sequence is in flight", which only a thread
+    /// that has fenced may assert. Deriving the fence from a monotonic latch separates
+    /// them, so what is worth pinning is the property, not the choreography.
     ///
-    /// The transitional mode has to be off for the fast path and on for the fence at the
-    /// same time — the two questions are not each other's negation. That is what this
-    /// pins; conflating them (returning the transitional mode from `rseq_mode`, or
-    /// gating the fence on `rseq_mode`) fails one assertion or the other.
+    /// Every transition is exercised, including the ones that were the last three rounds'
+    /// bugs — enable racing disable, disable racing disable, pinned in the middle — and
+    /// the fence must stay armed through all of them.
     #[test]
-    fn the_rseq_disable_window_stops_new_sequences_but_keeps_the_fence_armed() {
+    fn the_non_owner_fence_stays_armed_once_rseq_has_ever_run() {
         let cc = CpuCache::new();
 
-        cc.set_mode_for_test(super::MODE_RSEQ);
-        assert!(cc.rseq_mode(), "fast path on");
-        assert!(cc.non_owner_fence_armed_for_test(), "fence armed");
+        // A cache that has never enabled RSEQ owes no fence: no sequence can ever have
+        // started, so this is a proof, not an optimism.
+        assert!(!cc.non_owner_fence_armed_for_test());
+        cc.disable_rseq();
+        assert!(!cc.non_owner_fence_armed_for_test(), "still never enabled");
 
-        // The window `disable_rseq` passes through.
-        cc.set_mode_for_test(super::MODE_DRAINING);
-        assert!(
-            !cc.rseq_mode(),
-            "no new restartable sequence may start during the drain"
-        );
-        assert!(
-            !cc.pinned_mode(),
-            "the transitional mode is not a deployment mode"
-        );
+        // `enable_rseq` returns false where the platform has no RSEQ (CI runs both), and
+        // then nothing can be in flight and the latch must stay clear.
+        if !cc.enable_rseq() {
+            assert!(
+                !cc.non_owner_fence_armed_for_test(),
+                "a failed enable starts no sequences, so it must not arm the fence"
+            );
+            return;
+        }
+        assert!(cc.rseq_mode());
+        assert!(cc.non_owner_fence_armed_for_test());
+
+        // The transition that was round 5's bug: the fast path goes off, but a sequence
+        // that started before it may still be committing, so the fence stays armed.
+        cc.disable_rseq();
+        assert!(!cc.rseq_mode(), "no new sequence may start");
         assert!(
             cc.non_owner_fence_armed_for_test(),
-            "a non-owner drain must still fence: sequences from the old mode may be in flight"
+            "leaving RSEQ mode does not retire the sequences already in flight"
         );
 
-        // After the drain, neither holds: nothing is in flight and nothing can start.
-        cc.set_mode_for_test(super::MODE_LOCKED);
-        assert!(!cc.rseq_mode());
-        assert!(!cc.non_owner_fence_armed_for_test());
-
-        // And the real transition lands in the terminal state.
-        cc.set_mode_for_test(super::MODE_RSEQ);
+        // Round 6's: a second disabler, arriving in any state, cannot clear it.
         cc.disable_rseq();
-        assert!(!cc.rseq_mode());
-        assert!(
-            !cc.non_owner_fence_armed_for_test(),
-            "disable_rseq must not leave the cache parked in the transitional mode"
-        );
-    }
-
-    /// W7-4: `MODE_LOCKED` is the claim *"no sequence is in flight and none can start"* —
-    /// the whole reason a drainer that observes it may skip `fence_if_non_owner`. Only the
-    /// caller that actually completed the fence is in a position to make that claim.
-    ///
-    /// A second thread calling `disable_rseq` while the first is still inside its fence
-    /// must therefore leave the mode alone. Storing the terminal value unconditionally —
-    /// which is what a `swap`-then-store does — advertises a drain that has not happened,
-    /// and a concurrent `flush_front_end_core` takes another CPU's lock, skips its fence,
-    /// and edits a slot an old sequence can still commit `len` into: an object lost or
-    /// vended twice.
-    #[test]
-    fn a_second_disable_caller_cannot_publish_the_terminal_mode_early() {
-        let cc = CpuCache::new();
-
-        // A transition is already under way: another caller took the mode out of
-        // MODE_RSEQ and is inside `fence_rseq`.
-        cc.set_mode_for_test(super::MODE_DRAINING);
         cc.disable_rseq();
+        assert!(cc.non_owner_fence_armed_for_test());
 
+        // Round 8's: an enable racing a disable, in either order. Every ordering leaves a
+        // mode that dispatches correctly and a fence that is still armed.
+        cc.enable_rseq();
+        cc.disable_rseq();
+        assert!(cc.non_owner_fence_armed_for_test());
+        cc.disable_rseq();
+        cc.enable_rseq();
+        assert!(cc.non_owner_fence_armed_for_test());
+
+        // And pinned mode, which runs no RSEQ sequences of its own but cannot un-run the
+        // ones that already happened.
+        // SAFETY: §36.10 — this cache is test-local, single-threaded, never drained.
+        unsafe { cc.enable_pinned_core(|| 0) };
         assert!(
             cc.non_owner_fence_armed_for_test(),
-            "a caller that did not own the transition published the terminal mode while \
-             the owner's fence was still running"
+            "switching to pinned mode does not retire in-flight RSEQ sequences either"
         );
-        assert!(
-            !cc.rseq_mode(),
-            "the fast path is still off for new sequences"
-        );
-
-        // The owner finishing is what publishes it, and the mode is terminal thereafter.
-        cc.set_mode_for_test(super::MODE_RSEQ);
-        cc.disable_rseq();
-        assert!(!cc.non_owner_fence_armed_for_test());
-
-        // A caller arriving when there is nothing to drain still reaches the terminal
-        // state (locked and pinned run no restartable sequences, so no fence is owed).
-        cc.set_mode_for_test(super::MODE_PINNED);
-        cc.disable_rseq();
-        assert!(!cc.rseq_mode());
-        assert!(!cc.pinned_mode());
-        assert!(!cc.non_owner_fence_armed_for_test());
     }
 
     /// `ensure_cpus` carves the per-CPU array by **zeroing** a metadata block rather

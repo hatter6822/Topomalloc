@@ -234,6 +234,41 @@ pub enum FreeOutcome {
 /// a later drain frees it again. The claim is therefore handed **from one residency
 /// marker to the next** without a gap, and this type is what carries that obligation
 /// back to the caller.
+///
+/// # The free-path claim rule
+///
+/// Every bug this type exists to prevent has been the same bug on a different path, so
+/// the rule is written here rather than re-derived at each call site:
+///
+/// > **Every route that can free an object must contend on *one* atomic, and must do so
+/// > before choosing its route.**
+///
+/// A freed object is in exactly one of a small number of residency states — live,
+/// claimed, front-end-cached, quarantined, central-free — and the ones that are
+/// separately-addressable bits are only mutually exclusive because the code makes them
+/// so. Two properties follow, and both have been violated in turn:
+///
+/// * **One claim, not one per route.** If the cache route claims the cached bit and the
+///   quarantine route claims the quarantined bit, two frees of one object can each win
+///   *their own* atomic and both succeed. Checking the other route's marker first does
+///   not fix it: a load is not a claim, and the two checks can both precede the two sets.
+/// * **Claim before you branch.** Any predicate consulted *before* the claim — the
+///   quarantine's runtime switch, front-end cacheability, `TOPO_TCACHE_NONE` — can be
+///   observed differently by two concurrent frees, and a free that read its way to a
+///   route without claiming anything has nothing to exclude the other with. The runtime
+///   switch is the sharpest case, because it can genuinely change between the two reads.
+///
+/// Concretely: a cacheable small free claims the cached bit before consulting the
+/// quarantine at all; a non-cacheable small free and every large free claim the
+/// quarantined mark before reading the switch. In each case the *first* thing any free of
+/// that object does is contend on the same word as every other free of it, and everything
+/// after that runs under an exclusive claim.
+///
+/// The transition into central-free is the one marker that stays separate, because
+/// `free_bitmap` is the central list's allocation structure and not merely a marker. It
+/// is ordered free-bit-first against the claim it replaces, so a lock-free
+/// `claimed || central_free` observer never sees both clear — one hand-ordered pair,
+/// which is tractable to keep proved.
 // Without the `quarantine` feature the helpers collapse to `NotEngaged` and the other two
 // variants are never produced — but the callers still match all three, so they are live
 // code in exactly the builds that have a quarantine to hold anything.
@@ -1374,8 +1409,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// impossible state that would mean the bit and the slot had diverged — and dropped
     /// rather than double-vended.
     fn alloc_small_cached(&self, sc: SizeClassId) -> *mut u8 {
-        let core = self.cpu_cache.current_core();
         for _ in 0..Self::FRONT_END_POP_RETRY {
+            // Re-read the running core **every iteration**, so a refill and the pop that
+            // is meant to consume it target the same slot.
+            //
+            // Hoisting this out of the loop is wrong in RSEQ mode, where `fe_pop` ignores
+            // the hint and operates on the hardware-current CPU: a thread that migrated
+            // after the snapshot would pop from its new CPU's slot while `refill_front_end`
+            // kept pushing batches into the old one. The allocation then cannot see the
+            // objects it just pulled out of central — and because the refill *moved* them
+            // (central loses them, a slot the pop never reads gains them), an allocation
+            // that should have succeeded can report OOM with free objects sitting in
+            // another core's slot. Re-reading converges instead: the refill follows the
+            // thread, and a migration mid-iteration costs at most one more turn of a
+            // bounded loop.
+            let core = self.cpu_cache.current_core();
             match self.cpu_cache.fe_pop(core, ArenaId::DEFAULT, sc, self.meta) {
                 FeOutcome::Success(addr) => {
                     let p = self.claim_cached_object(addr, sc);
@@ -2763,8 +2811,31 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         if owner.is_quarantined(ptr) {
             return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
         }
+        // **Claim the descriptor before reading the switch**, so that every route out of
+        // this function has already contended on one atomic.
+        //
+        // The claim serves two purposes at once, and it is the second that dictates the
+        // ordering. It is the quarantine's exclusive hold (a racing evict + drain retires
+        // the descriptor and may decommit the backing, so a scrub sequenced after `offer`
+        // could write through an unmapped pointer). But it is *also* the free path's
+        // shared claim — the one thing both the quarantine route and the immediate-free
+        // route below contend on. Reading `is_enabled()` first, and returning unclaimed
+        // when it was off, is what let two frees of one pointer take different routes and
+        // both proceed: one through the immediate free that retires and decommits, the
+        // other marking and scrubbing the same bytes. The toggle is not really the bug —
+        // it is what makes the two routes reachable concurrently, and a free that claims
+        // nothing has nothing to exclude the other with.
+        //
+        // The test-and-set under the pool lock is also the authoritative double-free check.
+        if !owner.mark_quarantined(ptr) {
+            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
+        }
         if !self.quarantine.is_enabled() || usable == 0 {
-            return QuarantineDisposition::NotEngaged;
+            // Not going to hold it — but the claim is taken, so hand it to the caller
+            // rather than dropping it here. `ClaimHeld` is exactly that contract: the
+            // immediate free that follows retires the descriptor (every reacquire resets
+            // the flag), and releases the claim explicitly only if that free fails.
+            return QuarantineDisposition::ClaimHeld;
         }
         let entry = crate::harden::QuarantineEntry {
             user_ptr: ptr,
@@ -2773,14 +2844,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             arena,
             bytes: usable as u64,
         };
-        // Claim the descriptor **before** the entry can be published to the ring — see
-        // `maybe_quarantine_small` for why. The stakes are higher here: a racing evict +
-        // drain retires the descriptor and returns (possibly decommits) the backing, so a
-        // scrub sequenced after `offer` could write through an unmapped pointer. The
-        // test-and-set under the pool lock is also the authoritative double-free check.
-        if !owner.mark_quarantined(ptr) {
-            return QuarantineDisposition::Settled(FreeOutcome::DoubleFree);
-        }
         // Destroy the contents at hold time, mirroring the non-quarantined large free
         // (`free_scrubbing`): a §36.12 label downgrade zeroes, otherwise the junk-fill
         // canary is armed. Without this the hold window — the window the quarantine exists
@@ -4796,6 +4859,59 @@ mod tests {
         assert!(!span.is_central_free(object_index));
         assert!(span.cached_and_central_free_are_disjoint());
         assert!(a.check_invariants());
+    }
+
+    /// The same claim rule on the **large** path: a free claims the descriptor before it
+    /// reads the quarantine switch, so the switch flipping mid-free cannot let two frees
+    /// of one allocation take different routes and both proceed.
+    ///
+    /// This is the small-object finding one path over, and the reason it is worth its own
+    /// test: the fix there was "claim before you branch", and the large path had been left
+    /// branching on `is_enabled()` while still unclaimed. The consequence is worse than
+    /// for a small object — the losing interleaving has one thread scrubbing bytes the
+    /// other is concurrently retiring and decommitting, and a ring entry left pointing at
+    /// a retired descriptor.
+    #[cfg(feature = "quarantine")]
+    #[test]
+    fn a_large_free_claims_its_descriptor_before_reading_the_switch() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let usable = 3 * PAGE_SIZE;
+        let p = a.malloc(usable);
+        assert!(!p.is_null());
+
+        // The quarantine is **off** — the case that used to return unclaimed. The free
+        // must still take the descriptor claim and hand it back, because the immediate
+        // free that follows is the other route this has to exclude.
+        assert!(!a.quarantine.is_enabled());
+        let disposition = a.maybe_quarantine_large(p, ArenaId::DEFAULT, usable);
+        assert!(
+            matches!(disposition, QuarantineDisposition::ClaimHeld),
+            "a large free must claim before reading the switch, even when it is off"
+        );
+        let owner = a.large_owner_for(ArenaId::DEFAULT);
+        assert!(
+            owner.is_quarantined(p),
+            "the claim must actually be held on return"
+        );
+
+        // A second free arriving now — with the switch flipped on, which is exactly the
+        // window the report describes — must lose to the claim already held, rather than
+        // marking and scrubbing memory the first free is about to retire.
+        a.set_quarantine_enabled(true);
+        assert!(
+            matches!(
+                a.maybe_quarantine_large(p, ArenaId::DEFAULT, usable),
+                QuarantineDisposition::Settled(FreeOutcome::DoubleFree)
+            ),
+            "the second free must lose whatever the switch says"
+        );
+
+        // Release the claim and let the object go, so the test leaves no held descriptor.
+        a.release_quarantine_claim_large(owner, p);
+        a.set_quarantine_enabled(false);
+        tfree(&a, p);
     }
 
     /// A **cacheable** free holds one claim from start to finish, whatever the quarantine
