@@ -369,7 +369,19 @@ impl CachedBits {
                 debug_assert!(false, "cached bit {i} has no backing word");
                 false
             }
-            Some(word) => word.fetch_or(bit, Ordering::Relaxed) & bit == 0,
+            // **Acquire**, and load-bearing on the *reclaim* direction. This RMW is the
+            // free path's authoritative claim, and a claim that succeeds by reading the
+            // clear a `cached → central-free` (or `→ quarantined`) handoff published must
+            // also see the bit that handoff set *first*, so the claimant can revalidate
+            // and decline. Reading a value written by `clear`'s release makes this RMW
+            // part of that release sequence, and acquiring on it orders the releasing
+            // thread's earlier stores before everything after this call. Relaxed here left
+            // the revalidation unsound on a weakly ordered target: the claim could observe
+            // the cleared cached bit and *not* the central free bit that preceded it, so
+            // an object already in the central free list would be pushed into a per-CPU
+            // slot as well, and vended twice. Free on x86-64 (`lock or` is already a full
+            // barrier); a `ldsetal`-class instruction on AArch64.
+            Some(word) => word.fetch_or(bit, Ordering::Acquire) & bit == 0,
         }
     }
 

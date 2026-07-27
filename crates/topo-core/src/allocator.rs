@@ -1698,8 +1698,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // arrived a moment later with the switch on. Claiming the shared marker before the
         // route is chosen makes the choice irrelevant to who wins.
         let cacheable = Self::front_end_cacheable(arena, span.place_class());
-        if cacheable && !span.try_mark_cached(idx as usize) {
-            return FreeOutcome::DoubleFree;
+        if cacheable {
+            if !span.try_mark_cached(idx as usize) {
+                return FreeOutcome::DoubleFree;
+            }
+            // **Revalidate under the claim.** `try_mark_cached`'s own contract asks the
+            // caller to establish "not central-free, not quarantined" first, and
+            // `free_with`'s screen does — but that screen runs *before* the claim, so it
+            // is advisory: nothing holds between the two. The interleaving it misses is a
+            // **handoff**, not a simultaneous free. Two frees of one live object both pass
+            // the screen; the first wins this claim, completes down the central path, and
+            // `insert_batch_inner` releases the claim as part of the `cached →
+            // central-free` transition (free-bit-first). The second then arrives at a
+            // *cleared* cached bit, takes the claim legitimately, and — with the
+            // quarantine off, so nothing else re-checks — pushes an address that is
+            // already in the central free list into a per-CPU slot. Both layers then vend
+            // it: the double free the claim exists to catch, admitted by the claim itself.
+            //
+            // The state the screen looked at is only stable once the claim is held, so the
+            // check belongs here, after it. It is exact rather than advisory for the same
+            // reason: both handoffs publish their replacement marker *before* releasing
+            // this one (free-bit-first in `insert_batch_inner`, quarantined-bit-first in
+            // the quarantine hold), and `try_mark_cached` acquires (see [`CachedBits::set`]),
+            // so a claim that observed the release must observe the marker too. Releasing
+            // our mark restores exactly the pre-claim state.
+            if span.is_central_free(idx as usize) || span.is_object_quarantined(idx as usize) {
+                span.unmark_cached(idx as usize);
+                return FreeOutcome::DoubleFree;
+            }
         }
         // W18-3 (§29.4): when the quarantine is active it may *hold* this freed object
         // out of circulation (delaying reuse) or detect a quarantine-hit double free —
@@ -1909,28 +1935,42 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// from the allocation path — the same pure-policy/host-driven split as the release
     /// controller. Returns the total soft capacity after adaptation, in objects.
     ///
-    /// **Falls back to draining when capacity alone cannot reach the ceiling.** Shrinking
-    /// soft capacities bounds residency only prospectively — a push is refused once a
-    /// slot is at its soft cap, but objects already resident above a freshly lowered cap
-    /// stay until something pops or flushes them. That is a fine approximation while the
-    /// ceiling is reachable. It stops being one when it is not: with more allocator
-    /// threads than online CPUs, more slots are initialized than the CPU-count-sized
-    /// allowance was sized for (see [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)),
-    /// and even the structural floor of one object per slot can exceed the budget. Then
-    /// the advertised §11.5 ceiling is not enforced by capacity at all, so this converts
-    /// the overage into the one mechanism that genuinely returns residency — the §21.3
-    /// "drain caches" rung.
+    /// **Then drains if measured residency is still above the ceiling.** Shrinking soft
+    /// capacities bounds residency only *prospectively* — a push is refused once a slot
+    /// is at its cap, but objects already resident above a freshly lowered cap stay until
+    /// something pops or flushes them, and the transfer cache's residency is not in the
+    /// capacity total at all. So a tick that lowers caps (after `set_front_end_cpus`
+    /// reduces the allowance, say) can report a total *within* budget while the front end
+    /// holds more than the advertised §11.5 ceiling — and an idle workload keeps holding
+    /// it, because nothing pops. Triggering on **residency** covers that and the
+    /// structural case (more initialized slots than the CPU-count-sized allowance was
+    /// sized for, so even the floor exceeds the budget — see
+    /// [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)); a capacity trigger
+    /// covers only the second, which is why this asks the question it actually means.
     ///
-    /// Both layers, via [`flush_front_end_all`](Self::flush_front_end_all): flushing
-    /// cores alone pushes their contents into the transfer cache, which is front-end
-    /// residency too, so it would move the overage rather than return it. The trigger is
-    /// the *floor* exceeding the ceiling — an over-subscribed configuration in which
-    /// honouring the advertised ceiling and keeping a warm front end are genuinely
-    /// incompatible — so this is not a cost an ordinary workload pays: a front end whose
-    /// minimum fits under the budget never reaches this branch.
+    /// Both layers, via [`flush_front_end_all`](Self::flush_front_end_all), and
+    /// necessarily all of it: flushing cores alone pushes their contents into the
+    /// transfer cache, which is front-end residency too, so it would move the overage
+    /// rather than return it. Draining to *exactly* the ceiling is not expressible with
+    /// these mechanisms — the transfer drain is per-class all-or-nothing — so this
+    /// returns the whole front end when it fires. It fires only above the ceiling the
+    /// host asked to be enforced, and a steady-state front end sits under it (each push
+    /// is capped and the caps sum to the budget).
+    ///
+    /// **Declines in pinned mode**, which is a safety obligation, not a policy
+    /// preference. A pinned sequence takes no per-CPU lock — §36.10 makes the pinned
+    /// thread its slot's sole accessor — and no fence can drain one, so a concurrent
+    /// drain would read and rewrite a slot buffer under a running pinned worker. That is
+    /// precisely the hazard [`enable_front_end_pinned`](Self::enable_front_end_pinned)
+    /// makes its caller promise to avoid, and *this* method is **safe**, so it may not
+    /// introduce a drain the pinned contract's enumerated list (`flush_front_end_core` /
+    /// `flush_front_end_all` / `check_invariants`) does not name — a safe periodic tick
+    /// would otherwise silently violate an `unsafe` precondition the host had discharged.
+    /// A pinned runtime owns core assignment and can drain at a hand-off point itself;
+    /// skipping the rung here costs a ceiling overshoot, never soundness (§2.4).
     pub fn cache_budget_tick(&self) -> usize {
         let total = self.budget.adapt(&self.cpu_cache);
-        if total > self.budget.global_budget() {
+        if !self.cpu_cache.pinned_mode() && self.front_end_objects() > self.budget.global_budget() {
             let _ = self.flush_front_end_all();
         }
         total
@@ -5063,6 +5103,147 @@ mod tests {
         );
         assert!(span.cached_and_central_free_are_disjoint());
         assert!(a.check_invariants());
+    }
+
+    /// W6 (§29.3): the racing free that arrives **after** the winner completed, i.e.
+    /// across the `cached → central-free` handoff rather than before it.
+    ///
+    /// `try_mark_cached` asks its caller to establish "not central-free, not quarantined"
+    /// first, and `free_with`'s screen does — but before the claim, so nothing holds
+    /// between the two. The winner's central insert *releases* the claim as part of the
+    /// transition, so a second free that passed the screen earlier and stalled arrives at
+    /// a cleared bit and takes it legitimately. Without a revalidation under the claim it
+    /// then pushes an address that is already in the central free list into a per-CPU
+    /// slot, and both layers vend it.
+    ///
+    /// Fails without the revalidation: the second free returns `Freed`, the object is
+    /// cached *and* central-free, and the B.3 disjointness checker trips.
+    #[test]
+    fn a_free_delayed_across_the_cached_to_central_handoff_is_detected() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let idx = object_index as u16;
+        let usable = size_class::usable_size(span.size_class());
+
+        // The winner: a bypassing free that goes all the way to central, releasing the
+        // cached claim free-bit-first on the way.
+        assert_eq!(
+            a.free_small_screened(p, span, idx, span.arena(), usable, true),
+            FreeOutcome::Freed
+        );
+        assert!(span.is_central_free(object_index));
+        assert!(
+            !span.is_cached(object_index),
+            "the handoff releases the claim — that is what makes it re-takeable"
+        );
+
+        // The loser passed `free_with`'s screen before any of that and stalled. It now
+        // finds a clear cached bit and claims it legitimately; only the revalidation
+        // under the claim can catch it.
+        let before = a.stats();
+        let outcome = a.free_small_screened(p, span, idx, span.arena(), usable, false);
+        assert_eq!(outcome, FreeOutcome::DoubleFree);
+        assert!(
+            !span.is_cached(object_index),
+            "the losing free must release the claim it took"
+        );
+        assert_eq!(a.front_end_objects(), 0, "and must not park it in a slot");
+        assert!(span.cached_and_central_free_are_disjoint());
+        let after = a.stats();
+        assert_eq!(
+            after.freed_bytes_total, before.freed_bytes_total,
+            "the losing free must account nothing"
+        );
+        assert!(a.check_invariants());
+    }
+
+    /// §11.5: the budget ceiling is on *residency*, and adaptation bounds it only
+    /// prospectively — a lowered cap refuses future pushes but evicts nothing, and the
+    /// transfer cache is not in the capacity total at all. A tick whose capacity total
+    /// lands within budget can therefore leave residency above it indefinitely.
+    ///
+    /// Fails on the capacity trigger: `adapt` squeezes the one slot to a capacity of 1
+    /// (within the budget of 2), so a `total > budget` test never fires and the five
+    /// resident objects stay.
+    #[test]
+    fn a_budget_tick_drains_residency_above_the_ceiling_not_just_capacity() {
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+        let core = CoreId(2);
+
+        a.cpu_cache.init_slot(core, sc, &m, 32);
+        a.cpu_cache.push_batch(
+            core,
+            sc,
+            &[0x3_0000, 0x3_0020, 0x3_0040, 0x3_0060, 0x3_0080],
+        );
+        assert_eq!(a.front_end_objects(), 5, "test setup");
+
+        // A ceiling below residency, but one adaptation can bring *capacity* under.
+        a.budget.set_global_budget(2);
+        let total = a.cache_budget_tick();
+        assert!(
+            total <= 2,
+            "adaptation should reach the ceiling on capacity: {total}"
+        );
+        assert_eq!(
+            a.front_end_objects(),
+            0,
+            "residency above the advertised ceiling must be returned, not just capped"
+        );
+    }
+
+    /// §36.10: `cache_budget_tick` is **safe**, so it may not perform a drain the pinned
+    /// contract's caller promised would not happen. A pinned sequence takes no per-CPU
+    /// lock and no fence can drain one, so draining under a running pinned worker races
+    /// its non-atomic slot buffer. Skipping the rung overshoots the ceiling; performing
+    /// it is undefined behaviour (§2.4 — safety before policy).
+    ///
+    /// Fails without the `pinned_mode` guard: the tick drains all five objects.
+    #[test]
+    fn a_budget_tick_declines_to_drain_in_pinned_mode() {
+        fn core_zero() -> i32 {
+            0
+        }
+
+        let m = meta(16 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+        let sc = SizeClassId::new(0);
+        let core = CoreId(2);
+
+        a.cpu_cache.init_slot(core, sc, &m, 32);
+        a.cpu_cache.push_batch(
+            core,
+            sc,
+            &[0x4_0000, 0x4_0020, 0x4_0040, 0x4_0060, 0x4_0080],
+        );
+        a.budget.set_global_budget(2);
+
+        // SAFETY: a single-threaded test — no pinned operation is in flight, which is
+        // `enable_pinned_core`'s obligation. The mode flag is per-instance, so this
+        // cannot disturb another test.
+        unsafe { a.enable_front_end_pinned(core_zero) };
+
+        let _ = a.cache_budget_tick();
+        assert_eq!(
+            a.front_end_objects(),
+            5,
+            "a safe tick must not drain slots a pinned worker may own"
+        );
     }
 
     /// W6 + W18-3 (§29.3/§29.4): the quarantine claim and the cached claim have to be

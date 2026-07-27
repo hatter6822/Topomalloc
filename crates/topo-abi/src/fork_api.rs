@@ -135,8 +135,8 @@ impl AtforkGuard {
     }
 
     /// Claim the right to attempt the effect. `false` for both "already done" and
-    /// "someone else is mid-attempt" — the caller returns either way rather than
-    /// blocking, which is what keeps a re-entrant `pthread_atfork` from dead-locking.
+    /// "someone else is mid-attempt" — what the caller does about the latter depends on
+    /// *who* it is; see [`register_atfork_handlers`].
     #[inline]
     fn try_claim(&self) -> bool {
         self.0
@@ -147,6 +147,12 @@ impl AtforkGuard {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Whether an attempt is in flight right now. One acquire load.
+    #[inline]
+    fn in_progress(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::IN_PROGRESS
     }
 
     /// Publish an attempt's outcome: `DONE` on success, back to `IDLE` on failure so
@@ -177,30 +183,85 @@ pub(crate) fn atfork_registered() -> bool {
     }
 }
 
-/// Install the `pthread_atfork` handlers exactly once (W16-5). Idempotent and
-/// **re-entrancy-safe**: the claim is taken *before* `pthread_atfork` is called, so if
-/// that call itself allocates — re-entering this function through the global allocator
-/// during the load-time ctor — the nested call observes the claim and returns without a
-/// second registration. (A blocking `Once` would instead dead-lock on such re-entry, and
-/// so would *waiting* for the in-progress attempt to finish, which is why an observer
-/// returns rather than spins.) Installed eagerly at load by [`REGISTER_ATFORK_CTOR`],
-/// on the first `global()` call as a fallback, and retried from `global()`'s fast path
-/// while [`atfork_registered`] is false — see [`AtforkGuard`] for why a two-state flag
-/// makes one transient failure permanent. A no-op on non-unix hosts (no `fork`).
+#[cfg(unix)]
+thread_local! {
+    /// Set while *this thread* is inside `pthread_atfork`, so a nested call can tell
+    /// "I am the registering thread, re-entered through the allocator" from "another
+    /// thread is registering". The two need opposite answers and the guard word cannot
+    /// distinguish them: it records that *someone* is attempting, not who.
+    ///
+    /// `const`-initialised `Cell<bool>` with no destructor, so touching it allocates
+    /// nothing and cannot re-enter the allocator — the same discipline as the fork
+    /// gate's depth TLS.
+    static REGISTERING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Install the `pthread_atfork` handlers exactly once (W16-5). Idempotent,
+/// **re-entrancy-safe**, and — for a *concurrent* caller — synchronous: it does not
+/// return until the handlers are installed or the in-flight attempt has failed.
+///
+/// The claim is taken *before* `pthread_atfork` is called, so if that call itself
+/// allocates and re-enters this function through the global allocator, the nested call
+/// finds the claim taken. Two callers can find that, and they must be treated
+/// differently:
+///
+/// * **The registering thread, re-entered.** Returning at once is the only option — it
+///   is waiting for itself, so blocking (a `Once`, or a spin) dead-locks. `REGISTERING`
+///   identifies it.
+/// * **Another thread.** Returning at once leaves it free to walk straight into
+///   `GLOBAL.get_or_init` with no handlers installed, which is the exact window this
+///   call exists to close: a `fork()` in it strands the child on a half-constructed
+///   `OnceLock` with no quiesce handler. It waits instead. The wait is bounded by one
+///   `pthread_atfork` call — the holder is running, not blocked on anything this thread
+///   holds (the caller has taken no lock and not yet entered the init) — and it is the
+///   cold first-allocation path, reached only where the load-time ctor was elided.
+///
+/// Installed eagerly at load by [`REGISTER_ATFORK_CTOR`], on the first `global()` call as
+/// a fallback, and retried from `global()`'s fast path while [`atfork_registered`] is
+/// false — see [`AtforkGuard`] for why a two-state flag makes one transient failure
+/// permanent. A no-op on non-unix hosts (no `fork`).
 pub(crate) fn register_atfork_handlers() {
     #[cfg(unix)]
-    if ATFORK.try_claim() {
-        // SAFETY: the three handlers are `extern "C"` functions with no captured
-        // state that only call the allocation-free `topo_core::fork::*` routines;
-        // `pthread_atfork` simply records them.
-        let rc = unsafe {
-            libc::pthread_atfork(
-                Some(atfork_prepare),
-                Some(atfork_parent),
-                Some(atfork_child),
-            )
-        };
-        ATFORK.publish(rc == 0);
+    {
+        if ATFORK.try_claim() {
+            REGISTERING.with(|r| r.set(true));
+            // SAFETY: the three handlers are `extern "C"` functions with no captured
+            // state that only call the allocation-free `topo_core::fork::*` routines;
+            // `pthread_atfork` simply records them.
+            let rc = unsafe {
+                libc::pthread_atfork(
+                    Some(atfork_prepare),
+                    Some(atfork_parent),
+                    Some(atfork_child),
+                )
+            };
+            REGISTERING.with(|r| r.set(false));
+            ATFORK.publish(rc == 0);
+        } else {
+            await_attempt(&ATFORK, REGISTERING.with(core::cell::Cell::get));
+        }
+    }
+}
+
+/// Wait out an in-flight registration attempt — unless this *is* the thread making it,
+/// which would be waiting for itself.
+///
+/// Takes both the guard and the "am I the registering thread" answer as parameters so the
+/// two branches are testable against a private guard; driving the process-global one from
+/// a test would race the registration every other test depends on.
+///
+/// The loop ends on either terminal state, not on success: a failed attempt returns the
+/// guard to `IDLE`, and the caller then proceeds with `atfork_registered()` false, which
+/// `global()`'s fast path retries later. Spinning until `DONE` would instead wait forever
+/// on an attempt that keeps failing.
+#[cfg(unix)]
+#[inline]
+fn await_attempt(guard: &AtforkGuard, is_registering_thread: bool) {
+    if is_registering_thread {
+        return;
+    }
+    while guard.in_progress() {
+        core::hint::spin_loop();
     }
 }
 
@@ -339,6 +400,64 @@ mod tests {
         // Terminal: a later caller neither re-registers nor can disturb the state.
         assert!(!guard.try_claim());
         assert!(guard.registered());
+    }
+
+    /// W16-5 (#4): an observer that finds an attempt in flight must **wait**, not
+    /// proceed — proceeding walks straight into `GLOBAL.get_or_init` with no handlers
+    /// installed, which is the window this registration exists to close. The one
+    /// exception is the registering thread itself, re-entered through the allocator by
+    /// `pthread_atfork`: it would be waiting for itself.
+    ///
+    /// Both branches are driven against a **private** guard. The process-global one is
+    /// consulted by `global()`'s fast path on every allocating test, so a test that
+    /// parked it in `IN_PROGRESS` would stall every sibling that allocates.
+    ///
+    /// Fails without the fix, which returned immediately in both cases: the observer
+    /// thread would finish while the claim was still held.
+    #[cfg(unix)]
+    #[test]
+    fn a_concurrent_observer_waits_out_an_attempt_but_the_registering_thread_does_not() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Arc;
+
+        let guard = Arc::new(AtforkGuard::new());
+        assert!(
+            guard.try_claim(),
+            "this thread is now 'inside pthread_atfork'"
+        );
+
+        // The registering thread, re-entered: it must return at once. A regression here
+        // hangs the test rather than failing it — which is the correct shape, since the
+        // defect it guards against is a self-deadlock.
+        await_attempt(&guard, true);
+
+        // A different thread must not get past the window.
+        let observed = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let (g, done) = (Arc::clone(&guard), Arc::clone(&observed));
+            std::thread::spawn(move || {
+                await_attempt(&g, false);
+                done.store(true, O::Release);
+            })
+        };
+
+        // Give the observer room to run and (incorrectly) finish. Not a race: the
+        // assertion is that it has *not* completed, so a slow thread cannot make this
+        // pass spuriously — only the fix keeps it parked.
+        for _ in 0..1000 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !observed.load(O::Acquire),
+            "an observer proceeded while registration was still in flight"
+        );
+
+        // Settling the attempt releases it — on failure as well as success, so an
+        // attempt that keeps failing cannot park a caller forever.
+        guard.publish(false);
+        handle.join().expect("observer thread");
+        assert!(observed.load(O::Acquire));
+        assert!(!guard.registered(), "a failed attempt installs nothing");
     }
 
     #[test]

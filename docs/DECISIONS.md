@@ -2717,6 +2717,56 @@ atomic store over process-global mode state, with no assembly and no per-arch pa
 architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
 are the part that matters on every target, and those are unconditional.
 
+### Round-16 review: a claim, a ceiling, and two contracts (0.4.3)
+
+Two of this round's four findings landed on the round-15 fix itself — the drain added to
+`cache_budget_tick` — which is worth stating plainly: adding a mechanism to a *safe*
+method inherits every obligation that mechanism carries.
+
+**1. A safe function may not perform an operation an `unsafe` contract excluded.**
+`enable_front_end_pinned` is `unsafe` precisely because pinned sequences take no per-CPU
+lock and no fence can drain one; its caller promises no drain runs against an active
+pinned core, and the contract *enumerates* the drains: `flush_front_end_core`,
+`flush_front_end_all`, `check_invariants`. Round 15 put `flush_front_end_all` inside
+`cache_budget_tick`, which is safe and periodic — so a host that had correctly discharged
+the pinned obligation could now have its slot buffers raced by a call the contract never
+named. The tick declines in pinned mode. The general rule: **when adding a call to a safe
+function, check what the callee's callers were promised — an enumerated precondition list
+is a liability that travels with the mechanism, not with the call site.**
+
+**2. Enforce the quantity you advertise.** The §11.5 budget is a ceiling on front-end
+*residency*, but adaptation shrinks *capacity*, which bounds residency only prospectively
+— a lowered cap refuses future pushes and evicts nothing — and the transfer cache's
+residency is not in the capacity total at all. Round 15's drain therefore triggered on
+`total > budget`, which fires only in the structural case (the floor exceeding the
+ceiling) and misses the ordinary one: lower the allowance, let the workload go idle, and
+residency sits above the ceiling forever with capacity comfortably under it. Trigger on
+the measured quantity.
+
+**3. A pre-check is advisory; only a check under the claim is exact.** `try_mark_cached`
+documents that the caller must first establish "not central-free, not quarantined", and
+`free_with`'s screen does — before the claim, with nothing held in between. The
+interleaving that defeats it is not two simultaneous frees (the claim settles those) but a
+**handoff**: the winner's central insert *releases* the claim as part of the `cached →
+central-free` transition, so a second free that passed the screen earlier and stalled finds
+a clear bit and takes it legitimately, then parks in a per-CPU slot an address the central
+free list already holds. The state a screen reads is only stable once the claim is held, so
+the check belongs after it. Making it exact needed the claim itself to acquire
+(`CachedBits::set` was relaxed): both handoffs publish their replacement marker before
+releasing this one, and only an acquiring claim is guaranteed to see it. **Where a claim can
+be re-taken across a handoff, re-establish its preconditions under the claim, and give the
+claim the ordering that makes the re-check meaningful.**
+
+**4. Not blocking is right for the holder and wrong for everyone else.** The atfork guard
+let *any* thread that found an attempt in flight return immediately. That is mandatory for
+the registering thread — `pthread_atfork` can allocate and re-enter, and waiting there is
+waiting for itself — but for another thread it means proceeding into `GLOBAL.get_or_init`
+with no handlers installed, which is the exact window the eager registration exists to
+close. A thread-local marks the holder; everyone else waits. **"Don't block" derived from a
+re-entrancy argument applies only to the re-entrant caller — identify it rather than
+extending the exemption to all observers.** The wait ends on either terminal state, not on
+success, so a repeatedly failing attempt cannot park a caller forever.
+
 ### Round-15 review: the cost of a mapping the count no longer bounds (0.4.3)
 
 Round 14 made the no-RSEQ fallback slot mapping independent of the published CPU count.
