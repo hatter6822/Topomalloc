@@ -1409,10 +1409,6 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// impossible state that would mean the bit and the slot had diverged — and dropped
     /// rather than double-vended.
     fn alloc_small_cached(&self, sc: SizeClassId) -> *mut u8 {
-        // The core this loop last refilled, if any. Only meaningful while the loop runs:
-        // it is how a thread that migrates *after* a refill can still reach the batch it
-        // just moved out of central. See the `Empty` arm.
-        let mut parked: Option<CoreId> = None;
         for _ in 0..Self::FRONT_END_POP_RETRY {
             // Re-read the running core **every iteration**, and refill the core the pop
             // reports rather than this hint, so a refill and the pop that is meant to
@@ -1451,31 +1447,45 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 }
                 FeOutcome::Empty => {
                     if !self.refill_front_end(served, sc) {
-                        // Central is out of objects. Before concluding that only a new
-                        // span can help, reclaim any batch **this loop itself** parked on
-                        // a core it has since migrated off. A refill moves objects out of
-                        // central, so if that refill took the last batch and the thread
-                        // then migrated, the objects exist but sit on `parked` while this
-                        // iteration polls a different, empty slot — and returning null
-                        // here is a spurious OOM on an exhausted backend. `fe_pop_on_core`
-                        // reaches the specific slot regardless of the running CPU, which
-                        // the RSEQ-mode `fe_pop` cannot do.
-                        if let Some(prev) = parked.filter(|c| *c != served) {
-                            if let FeOutcome::Success(addr) =
-                                self.cpu_cache
-                                    .fe_pop_on_core(prev, ArenaId::DEFAULT, sc, self.meta)
-                            {
-                                let p = self.claim_cached_object(addr, sc);
-                                if !p.is_null() {
-                                    return p;
-                                }
-                            }
-                        }
                         return ptr::null_mut(); // central list is empty: needs a span
                     }
-                    // Remember where the batch went: a migration before the next pop
-                    // makes this the only handle on it.
-                    parked = Some(served);
+                    // **Consume the refill in the iteration that performed it, from the
+                    // slot it went into.** A refill *moves* objects: central loses a
+                    // batch and `served`'s slot gains it. Looping back to
+                    // `fe_pop_tracked` instead would re-read the running CPU, so a thread
+                    // that migrated in between polls a different slot and never sees the
+                    // batch it just created — and if that refill took central's last
+                    // batch, the loop reports OOM with reusable objects parked on a core
+                    // nothing will look at.
+                    //
+                    // Carrying the parked core forward to a recovery probe at the OOM
+                    // point is not enough, which is the bug this replaces: across two
+                    // migrations (A → B → C) only the *most recent* refilled core is
+                    // remembered, so a batch left on A is forgotten the moment B is
+                    // refilled, and a concurrent consumer draining B turns the exhausted
+                    // backend into a spurious OOM with A still holding objects. Making
+                    // every refill self-consuming removes the bookkeeping instead of
+                    // widening it: no iteration can end with a batch this loop created
+                    // sitting in a slot the loop will not revisit, whatever the migration
+                    // pattern. `fe_pop_on_core` is what makes that possible — it honours
+                    // the core argument regardless of the running CPU, which the
+                    // RSEQ-mode `fe_pop` cannot do by design.
+                    //
+                    // A miss here is legitimate and not a stranding: either another
+                    // thread drained the slot first, or the slot was already full when
+                    // the refill ran and `refill_front_end` handed its batch to the
+                    // transfer cache one layer down instead (which is exactly why it
+                    // reports `need_span` rather than `filled > 0`). Either way the
+                    // objects are reachable, so the bounded loop simply retries.
+                    if let FeOutcome::Success(addr) =
+                        self.cpu_cache
+                            .fe_pop_on_core(served, ArenaId::DEFAULT, sc, self.meta)
+                    {
+                        let p = self.claim_cached_object(addr, sc);
+                        if !p.is_null() {
+                            return p;
+                        }
+                    }
                 }
                 // `fe_pop` never yields these (`Full` is a push outcome; the RSEQ path
                 // resolves `Abort` internally or falls back to the locked path). Decline
@@ -1770,10 +1780,20 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     const PER_CPU_OBJECT_BUDGET: usize = 32 * SIZE_CLASSES.len();
 
     /// Publish the host's CPU count to the front end (W6-4/W6-5) and size the §11.5
-    /// global cache budget from it. The count bounds which cores the W6-5 controller and
-    /// the idle-flush sweep visit; it does **not** bound which core an allocation may use
-    /// (a slot is valid for any core id below `MAX_CPUS`), so a stale or absent count
-    /// costs adaptation quality, never correctness.
+    /// global cache budget from it. The count sizes the *global allowance* and nothing
+    /// else; it does **not** bound which core an allocation may use (a slot is valid for
+    /// any core id below `MAX_CPUS`), nor which cores the W6-5 controller and the
+    /// idle-flush sweep visit — both walk the whole array, because a CPU *count* is a
+    /// population and a slot is keyed by a CPU *id*, and Linux does not promise those
+    /// ids are dense (see [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)).
+    ///
+    /// That separation is what makes a stale, absent, or *shrinking* count cost
+    /// adaptation quality and never correctness. It is load-bearing:
+    /// [`CpuCache::current_core`] used to take its no-RSEQ fallback key modulo this
+    /// count, so publishing one re-mapped every thread into `0..cpus` and orphaned
+    /// whatever the pre-publication mapping had cached at higher indices — objects
+    /// already removed from central, hence a spurious OOM on an exhausted backend. The
+    /// mapping is now independent of the count, so this call cannot strand anything.
     pub fn set_front_end_cpus(&self, cpus: u32) {
         self.cpu_cache.set_active_cpus(cpus);
         let n = self.cpu_cache.active_cpus().max(1) as usize;
@@ -7692,6 +7712,87 @@ mod tests {
             .is_null());
         assert_eq!(tfree(&a, p), FreeOutcome::Freed);
         assert!(a.check_invariants());
+    }
+
+    /// A refill must be consumable from the slot it targeted, by a thread running
+    /// anywhere — the primitive `alloc_small_cached` now leans on to consume each refill
+    /// in the iteration that performed it.
+    ///
+    /// A refill *moves* objects: central loses a batch and the target slot gains it. The
+    /// loop previously looped back to the running-CPU pop instead, and carried the last
+    /// refilled core forward to a single recovery probe at the OOM point. Across two
+    /// migrations (A → B → C) that forgets A the moment B is refilled, so a concurrent
+    /// consumer draining B turns an exhausted backend into a spurious OOM with a full
+    /// batch still sitting on A. Consuming each refill immediately removes the
+    /// bookkeeping rather than widening it — no iteration can end with a batch this loop
+    /// created in a slot the loop will not revisit, whatever the migration pattern.
+    ///
+    /// The loop shapes are indistinguishable without a migration (both pop from the slot
+    /// they just filled), so what is pinned here is the mechanism: a core-addressed pop
+    /// reaches its slot regardless of the running CPU, and the running-CPU pop cannot see
+    /// it — which is precisely why the batch used to be lost.
+    #[test]
+    fn a_refill_is_consumable_from_the_core_it_targeted_not_the_running_one() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let req = classify(64, MIN_ALIGN, 0).expect("classify");
+        let sc = match req.kind {
+            RequestKind::Small { sc, .. } => sc,
+            other => panic!("expected small, got {other:?}"),
+        };
+
+        // One allocation creates the span; its remaining objects land in central, which
+        // is what a refill draws from.
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+
+        // A core this thread is certainly not running on.
+        let far = CoreId(crate::cpu_cache::MAX_CPUS as u32 - 1);
+        let running = a.cpu_cache.current_core();
+        assert_ne!(running, far, "test needs a core other than the running one");
+
+        // Mirror the loop's own order: the pop that reports `Empty` is what lazily
+        // initializes the slot, and `push_batch` declines an uninitialized one (its batch
+        // would go to the transfer cache instead). So the refill in the `Empty` arm
+        // always targets a slot that can receive it.
+        assert!(matches!(
+            a.cpu_cache
+                .fe_pop_on_core(far, ArenaId::DEFAULT, sc, a.meta),
+            FeOutcome::Empty
+        ));
+        assert!(
+            a.refill_front_end(far, sc),
+            "central holds this class's objects, so the refill must not report need_span"
+        );
+
+        // The running-CPU pop cannot see the batch. This is the whole failure mode: a
+        // thread that migrated after its refill polls *this* slot, finds it empty, and —
+        // if that refill took central's last batch — reports OOM.
+        assert!(
+            matches!(
+                a.cpu_cache.fe_pop(running, ArenaId::DEFAULT, sc, a.meta),
+                FeOutcome::Empty
+            ),
+            "the refill went to `far`, so the running core's slot must still be empty"
+        );
+
+        // The core-addressed pop does, which is what makes immediate consumption
+        // possible and what the old recovery probe could only do for one core.
+        let addr = match a
+            .cpu_cache
+            .fe_pop_on_core(far, ArenaId::DEFAULT, sc, a.meta)
+        {
+            FeOutcome::Success(addr) => addr,
+            other => panic!("the refilled batch must be reachable through its core: {other:?}"),
+        };
+        let claimed = a.claim_cached_object(addr, sc);
+        assert!(!claimed.is_null(), "a refilled object must claim cleanly");
+
+        tfree(&a, claimed);
+        tfree(&a, p);
+        assert!(a.check_invariants(), "state stays well-formed");
     }
 
     #[test]

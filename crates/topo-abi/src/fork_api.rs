@@ -28,7 +28,7 @@
 //! a child that inherits a half-constructed `OnceLock` (W16-5 / #4).
 
 #[cfg(unix)]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// `pthread_atfork` prepare handler (parent context, pre-fork): quiesce the
 /// allocator so `fork()` happens with no internal lock held (§28.1).
@@ -94,23 +94,102 @@ extern "C" fn atfork_child() {
     }
 }
 
+/// The guard for a **one-shot side effect that can fail transiently**: it records
+/// whether the effect *happened*, separately from whether a thread is attempting it.
+///
+/// Two states cannot express that, and the difference is not academic here. A plain
+/// `registered: bool` has to set the flag *before* calling `pthread_atfork` (claiming the
+/// attempt is what makes re-entry safe — a blocking `Once` would dead-lock when
+/// `pthread_atfork` allocates and re-enters through the global allocator). That same flag
+/// is what every other caller reads as "already installed", so during the window between
+/// the claim and a failing store a concurrent thread reads a registration that never
+/// happened and skips its own attempt. Releasing the flag afterwards does not repair it:
+/// the retry has to come from some *later* caller, and once `GLOBAL` is initialized
+/// `global()` answers from its fast path, so on a two-state flag no later caller exists.
+/// One transient `ENOMEM` — the documented failure when the handler list cannot grow —
+/// then costs the process its fork safety permanently, and every subsequent `fork()`
+/// leaves the child on inherited allocator state with no quiesce handler.
+///
+/// Three states fix both halves: an observer's skip means only "someone else is trying",
+/// and [`registered`](Self::registered) is a predicate the fast-path retry can act on.
 #[cfg(unix)]
-static ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
+struct AtforkGuard(AtomicU8);
+
+#[cfg(unix)]
+impl AtforkGuard {
+    /// No attempt has been made, or the last one failed and released its claim.
+    const IDLE: u8 = 0;
+    /// A thread is inside `pthread_atfork` right now. **Not** the same as registered.
+    const IN_PROGRESS: u8 = 1;
+    /// The handlers are installed. Terminal — `pthread_atfork` cannot be undone.
+    const DONE: u8 = 2;
+
+    const fn new() -> AtforkGuard {
+        AtforkGuard(AtomicU8::new(Self::IDLE))
+    }
+
+    /// Whether the effect has **completed**. One load; `IN_PROGRESS` reads `false`.
+    #[inline]
+    fn registered(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::DONE
+    }
+
+    /// Claim the right to attempt the effect. `false` for both "already done" and
+    /// "someone else is mid-attempt" — the caller returns either way rather than
+    /// blocking, which is what keeps a re-entrant `pthread_atfork` from dead-locking.
+    #[inline]
+    fn try_claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::IDLE,
+                Self::IN_PROGRESS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Publish an attempt's outcome: `DONE` on success, back to `IDLE` on failure so
+    /// the next caller retries.
+    #[inline]
+    fn publish(&self, ok: bool) {
+        self.0
+            .store(if ok { Self::DONE } else { Self::IDLE }, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+static ATFORK: AtforkGuard = AtforkGuard::new();
+
+/// Whether the `pthread_atfork` handlers are **installed** — not merely being
+/// installed. One load; the fast path of [`crate::global`] uses it to retry a
+/// registration that a transient failure lost. Always `true` on non-unix hosts, which
+/// have no `fork` to guard.
+#[inline]
+pub(crate) fn atfork_registered() -> bool {
+    #[cfg(unix)]
+    {
+        ATFORK.registered()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 /// Install the `pthread_atfork` handlers exactly once (W16-5). Idempotent and
-/// **re-entrancy-safe**: the guard flag is claimed *before* `pthread_atfork` is
-/// called, so if that call itself allocates — re-entering this function through the
-/// global allocator during the load-time ctor — the nested call observes the flag
-/// and returns without a second registration. (A blocking `Once` would instead
-/// dead-lock on such re-entry.) Installed eagerly at load by [`REGISTER_ATFORK_CTOR`]
-/// and, as a fallback, on the first `global()` call. A no-op on non-unix hosts (no
-/// `fork`).
+/// **re-entrancy-safe**: the claim is taken *before* `pthread_atfork` is called, so if
+/// that call itself allocates — re-entering this function through the global allocator
+/// during the load-time ctor — the nested call observes the claim and returns without a
+/// second registration. (A blocking `Once` would instead dead-lock on such re-entry, and
+/// so would *waiting* for the in-progress attempt to finish, which is why an observer
+/// returns rather than spins.) Installed eagerly at load by [`REGISTER_ATFORK_CTOR`],
+/// on the first `global()` call as a fallback, and retried from `global()`'s fast path
+/// while [`atfork_registered`] is false — see [`AtforkGuard`] for why a two-state flag
+/// makes one transient failure permanent. A no-op on non-unix hosts (no `fork`).
 pub(crate) fn register_atfork_handlers() {
     #[cfg(unix)]
-    if ATFORK_REGISTERED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
+    if ATFORK.try_claim() {
         // SAFETY: the three handlers are `extern "C"` functions with no captured
         // state that only call the allocation-free `topo_core::fork::*` routines;
         // `pthread_atfork` simply records them.
@@ -121,20 +200,7 @@ pub(crate) fn register_atfork_handlers() {
                 Some(atfork_child),
             )
         };
-        if rc != 0 {
-            // The registration did **not** happen, so the flag must not claim it did.
-            // `pthread_atfork` fails with `ENOMEM` when the handler list cannot grow —
-            // a transient, allocation-pressure condition, not a permanent property of
-            // the process. Leaving the flag set would record a registration that never
-            // occurred: the `global()` fallback path checks this exact flag, so it would
-            // never retry, and every later `fork()` would run without the quiesce
-            // handlers — the child inheriting held allocator locks or a half-built
-            // `OnceLock` and deadlocking on its first allocation. Releasing the flag
-            // makes the next caller (library-load ctor or first `global()`) try again,
-            // which is the difference between a transient failure and a permanent loss
-            // of fork safety.
-            ATFORK_REGISTERED.store(false, Ordering::Release);
-        }
+        ATFORK.publish(rc == 0);
     }
 }
 
@@ -228,8 +294,51 @@ mod tests {
         }
         // By now (the test binary has long since allocated, and the `.init_array`
         // ctor ran at load), the handlers are registered.
-        #[cfg(unix)]
-        assert!(ATFORK_REGISTERED.load(Ordering::Acquire));
+        assert!(atfork_registered());
+    }
+
+    /// A transient `pthread_atfork` failure must stay transient.
+    ///
+    /// Driven over a **private** [`AtforkGuard`], not the process-global one: the
+    /// harness runs tests as parallel threads and every allocating test now consults
+    /// the global guard through `global()`'s fast path, so a test that swapped its
+    /// state would race real registration attempts. The guard is the whole mechanism,
+    /// so exercising an instance of it is exercising the fix.
+    ///
+    /// Each assertion below fails on a two-state `AtomicBool`, which is what this
+    /// replaced: there, claiming the attempt sets the same bit that means "installed",
+    /// so an observer during the window reads `true` and skips — and because
+    /// `global()`'s fast path skips its retry on that same predicate, and no caller
+    /// reaches the slow path once `GLOBAL` is initialized, nothing ever tries again.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_registration_is_retried_and_never_reads_as_installed() {
+        let guard = AtforkGuard::new();
+        assert!(!guard.registered(), "a fresh guard has installed nothing");
+
+        // Thread A claims the attempt and is now inside `pthread_atfork`.
+        assert!(guard.try_claim());
+        // The window a two-state flag gets wrong: an attempt is not an installation.
+        assert!(
+            !guard.registered(),
+            "an in-flight attempt must not advertise itself as installed"
+        );
+        // Thread B (or a re-entrant call from inside `pthread_atfork` itself) must
+        // decline and return — never block, never register a second set of handlers.
+        assert!(!guard.try_claim(), "an observer must not double-register");
+
+        // A's call returns ENOMEM. The claim is released...
+        guard.publish(false);
+        assert!(!guard.registered());
+        // ...and the next caller genuinely retries, which is the property that makes
+        // the failure transient rather than terminal.
+        assert!(guard.try_claim(), "a released claim must be retryable");
+        guard.publish(true);
+        assert!(guard.registered());
+
+        // Terminal: a later caller neither re-registers nor can disturb the state.
+        assert!(!guard.try_claim());
+        assert!(guard.registered());
     }
 
     #[test]

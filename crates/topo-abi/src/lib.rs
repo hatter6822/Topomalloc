@@ -801,6 +801,19 @@ pub(crate) fn global() -> Option<&'static AnyAllocator> {
     // Fast path: already initialized. The steady-state allocation path pays no
     // fork-gate cost here — the per-operation gate lives in the allocator methods.
     if let Some(inner) = GLOBAL.get() {
+        // One relaxed load, then a perfectly-predicted branch that is taken exactly
+        // once per successful registration. It is the *only* place a lost registration
+        // can be recovered: `pthread_atfork` can fail transiently with `ENOMEM`, and
+        // once `GLOBAL` is initialized no caller reaches the slow path below ever
+        // again — so without this retry a single transient failure during bring-up
+        // costs the process its fork safety permanently, and every later `fork()`
+        // leaves the child on inherited allocator state with no quiesce handler.
+        // Cheap because it asks whether registration *completed*, not whether someone
+        // is attempting it; a call that races an in-flight attempt returns at once
+        // rather than blocking (see `fork_api::register_atfork_handlers`).
+        if !crate::fork_api::atfork_registered() {
+            crate::fork_api::register_atfork_handlers();
+        }
         return inner.as_ref();
     }
     // Slow path: the first allocation builds the global allocator. Two #4

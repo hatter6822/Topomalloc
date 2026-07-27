@@ -2716,3 +2716,76 @@ Gating the fork-reset test the same way costs nothing real: `reset_after_fork` i
 atomic store over process-global mode state, with no assembly and no per-arch path, so one
 architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
 are the part that matters on every target, and those are unconditional.
+
+### Round-14 review: four defects, four missing rules (0.4.3)
+
+Each finding this round was a *rule* that had been stated somewhere in the tree and not
+applied somewhere else. The fixes are at that level rather than at the reported site.
+
+**1. A population count is not an index bound.** `CpuCache::current_core`'s no-RSEQ
+fallback keyed its slot as `thread_key % active_cpus`, so publishing the host's CPU count
+— or later publishing a smaller one — re-mapped every thread into `0..cpus`. Everything
+the previous mapping had cached at a higher index became unreachable to ordinary
+allocation, and those objects had been *removed from central* to get there, so on an
+exhausted backend the allocator returns null with reusable objects parked in slots nothing
+will look at. `CacheBudget::adapt` already turns on exactly this distinction, in a comment
+written for the same array: `active_cpus` counts online CPUs while a slot is keyed by the
+CPU *id* `rseq::current_cpu()` reports, and Linux does not promise those are dense.
+
+Draining the excluded slots at the publication point — the obvious local fix, and the one
+the finding suggested first — only narrows the window: a thread that sampled the old
+mapping can push after the drain, and the count can shrink again. Making the mapping
+*independent* of the count closes it, and costs nothing (the `[PerCpu; MAX_CPUS]` array is
+carved whole either way, and residency is bounded by the global budget, which is still
+sized from the count). The mapping is now an associated function with no `&self`, so it
+cannot read allocator state even by accident — the signature is the invariant.
+
+**2. A self-consuming step beats bookkeeping about a step already taken.** A front-end
+refill *moves* objects: central loses a batch, the target slot gains it. The allocation
+loop refilled the core its pop reported and then looped back to a running-CPU pop,
+carrying the last refilled core forward to a single recovery probe at the OOM point.
+Across two migrations (A → B → C) that forgets A the moment B is refilled, so a concurrent
+consumer draining B turns an exhausted backend into a spurious OOM with a full batch still
+on A. Round 12 fixed the one-migration case by *adding* the parked-core probe; the general
+case is not one more probe but the removal of the bookkeeping: consume each refill in the
+iteration that performed it, from the slot it targeted. No iteration can then end with a
+batch this loop created in a slot the loop will not revisit, whatever the migration
+pattern. **A repair that has to remember what an earlier iteration did is a hint that the
+earlier iteration should have finished its own work.**
+
+**3. "Approximate" is a property of the value, not of the word it lives in.** The guard
+sampler and the quarantine evictor drew from an `AtomicU64` with a relaxed
+load-compute-store, justified — correctly, for sampling — by "a lost update merely re-uses
+a value". But `set_seed` writes that same word, and a draw that loaded the old state can
+land its successor *after* a reseed, putting the stream back on the one the reseed just
+moved it off. That is a security property, not a statistical one: it is how disabling
+deterministic mode re-arms §29.4/§29.5 unpredictability and how a fork moves the child off
+the parent's stream. Both draws are now CAS loops, so a draw that races a reseed re-reads
+it. **Tolerance for lost updates belongs to a reader that only samples the word; it does
+not extend to a word an exact publisher also writes.**
+
+**4. A one-shot guard must record that the effect happened, and its retry must have a
+caller.** `pthread_atfork` registration used one `AtomicBool`, claimed *before* the call
+(claiming rather than blocking is what keeps a re-entrant `pthread_atfork` from
+dead-locking on a `Once`). The same bit therefore meant both "an attempt is in flight" and
+"the handlers are installed", so during the window before a failing store a concurrent
+thread read a registration that never happened. Releasing the flag on failure did not
+repair it either: the retry needs a *later* caller, and once `GLOBAL` is initialized
+`global()` answers from its fast path and no later caller exists — so one transient
+`ENOMEM` (the documented failure when the handler list cannot grow) cost the process its
+fork safety permanently. Three states separate the claim from the outcome, and `global()`'s
+fast path retries on the "installed" predicate — one relaxed load, taken once. **Two
+questions, two states; and a released claim is not a retry until something reaches the
+code that retries.**
+
+*On regression tests.* The refill fix is the one case here with no single-threaded
+witness: both loop shapes pop from the slot they just filled when no migration occurs, so
+no deterministic test can separate them. Its test pins the mechanism instead (a
+core-addressed pop reaches its slot regardless of the running CPU; the running-CPU pop
+cannot see it) and says so, rather than dressing a structural change as a behavioural
+regression test. The other three were verified by neutering the fix and re-running: the
+slot-mapping test fails on the pre-fix modulus, the RNG test reports ~58% of 160 000 draws
+lost across repeated runs, and the guard test's assertions each fail on a two-state flag.
+The atfork test drives a *private* guard instance rather than the process-global one —
+every allocating test now consults that global through `global()`'s fast path, so a test
+that swapped its state would race real registration attempts.

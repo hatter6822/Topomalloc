@@ -837,23 +837,48 @@ impl CpuCache {
     /// strictly worse than the per-size-class-binned central path it fronts. This is
     /// the same reasoning (and the same golden-ratio key) as the fork gate's shard
     /// selection; see [`crate::fork`].
+    ///
+    /// **The fallback spreads over the whole array, never over
+    /// [`active_cpus`](Self::active_cpus).** `active_cpus` is a *population count*, not
+    /// an index bound — the same distinction [`CacheBudget::adapt`](crate::budget::CacheBudget::adapt)
+    /// already turns on, since Linux does not promise online CPU ids are dense. Keying
+    /// the fallback to it made this mapping **change under the host's feet**: an
+    /// embedding that allocates before publishing a count (or that later publishes a
+    /// smaller one) spreads over `MAX_CPUS` first, and the publication then re-maps every
+    /// thread into `0..cpus`, leaving whatever those threads had cached at indices
+    /// `>= cpus` unreachable to ordinary allocation. Those objects were *removed from
+    /// central* to get there, so on an exhausted backend the allocator returns null with
+    /// reusable objects sitting in slots nothing will look at — a spurious OOM. Draining
+    /// the excluded slots at the publication point would only narrow the window (a thread
+    /// that sampled the old mapping can push after the drain); making the mapping
+    /// independent of the count closes it, and costs nothing: the `[PerCpu; MAX_CPUS]`
+    /// array is carved whole either way, and total residency is bounded by the §11.5
+    /// *global* budget, which is still sized from the CPU count.
     #[inline]
     pub fn current_core(&self) -> CoreId {
         let cpu = rseq::current_cpu();
         if cpu >= 0 && (cpu as usize) < MAX_CPUS {
             return CoreId(cpu as u32);
         }
-        // No per-CPU id: spread by thread instead. Modulo the active-CPU count when
-        // the host published one (so slot metadata stays proportional to the machine),
-        // else the whole array.
-        let span = match self.active_cpus.load(Ordering::Relaxed) {
-            0 => MAX_CPUS,
-            n => (n as usize).min(MAX_CPUS),
-        };
+        // No per-CPU id: spread by thread instead.
         match crate::fork::shard::thread_key() {
-            Some(k) => CoreId((k % span) as u32),
+            Some(k) => Self::fallback_core(k),
             None => CoreId::DEFAULT,
         }
+    }
+
+    /// The no-RSEQ slot for a thread key.
+    ///
+    /// **Deliberately an associated function with no `&self`**, so it cannot read
+    /// `active_cpus` — or any other mutable allocator state — even by accident. That is
+    /// the invariant, not an implementation detail: a slot mapping that moves under a
+    /// host's feet orphans everything the previous mapping cached (see
+    /// [`current_core`](Self::current_core)), and the type signature is what keeps it
+    /// from coming back.
+    #[inline]
+    #[must_use]
+    pub fn fallback_core(key: usize) -> CoreId {
+        CoreId((key % MAX_CPUS) as u32)
     }
 
     /// The per-CPU entry for a core (bounds-checked).
@@ -2358,6 +2383,69 @@ mod tests {
         // Normal value within range works.
         slot.set_soft_capacity(64);
         assert_eq!(slot.soft_capacity(), 64);
+    }
+
+    /// Publishing (or shrinking) the host's CPU count must not move a single thread's
+    /// slot. It used to: the no-RSEQ fallback took its key modulo `active_cpus`, so an
+    /// embedding that allocated before announcing a count spread over `MAX_CPUS` and the
+    /// announcement then re-mapped every thread into `0..cpus`. Everything the earlier
+    /// mapping had cached at a higher index became unreachable to ordinary allocation —
+    /// and those objects had been *removed from central* to get there, so on an exhausted
+    /// backend the allocator returns null with reusable objects parked in slots nothing
+    /// will look at.
+    ///
+    /// Draining the excluded slots at the publication point would only narrow the window
+    /// (a thread that sampled the old mapping can push after the drain, and a shrink can
+    /// happen again); this pins the mapping's *independence* from the count instead,
+    /// which is what closes it. `active_cpus` is a population, not an index bound — the
+    /// same distinction `CacheBudget::adapt` turns on, since Linux does not promise online CPU
+    /// ids are dense.
+    #[test]
+    fn the_fallback_slot_never_moves_when_the_cpu_count_changes() {
+        let cc = CpuCache::new();
+        // Every count the host could publish, including "none yet" (0), a shrink, and a
+        // value larger than the array.
+        for count in [
+            0u32,
+            1,
+            2,
+            7,
+            64,
+            MAX_CPUS as u32,
+            MAX_CPUS as u32 + 9,
+            3,
+            0,
+        ] {
+            cc.set_active_cpus(count);
+            for key in 0..512usize {
+                assert_eq!(
+                    CpuCache::fallback_core(key),
+                    CoreId((key % MAX_CPUS) as u32),
+                    "thread key {key} moved slots after publishing {count} CPUs"
+                );
+            }
+        }
+
+        // ...and the mapping really does reach the whole array, so a future "clamp to
+        // the active count" cannot pass the invariance check above by collapsing
+        // everything onto core 0.
+        let mut seen = [false; MAX_CPUS];
+        for key in 0..MAX_CPUS {
+            seen[CpuCache::fallback_core(key).index()] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "the fallback must span every slot");
+
+        // The live entry point agrees whenever it takes the fallback branch (it takes
+        // the hardware CPU when RSEQ is active, which is count-independent by
+        // construction).
+        if rseq::current_cpu() < 0 {
+            if let Some(k) = crate::fork::shard::thread_key() {
+                cc.set_active_cpus(1);
+                assert_eq!(cc.current_core(), CpuCache::fallback_core(k));
+                cc.set_active_cpus(0);
+                assert_eq!(cc.current_core(), CpuCache::fallback_core(k));
+            }
+        }
     }
 
     #[test]
