@@ -2383,3 +2383,56 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   quarantine schedules far more predictable than the platform allows (§29.5). Both branches
   now carry the same cfg. The general rule: **when a fix is "this cfg was too narrow", the
   unit of repair is every use of that cfg for that reason**, not the line the report names.
+
+* **Only the thread that did the work may publish that the work is done (0.4.3).** Leaving
+  RSEQ mode is two steps — stop new sequences, then drain the in-flight ones — and the
+  previous round introduced a transitional `MODE_DRAINING` so a concurrent non-owner drain
+  fences instead of skipping. The transition itself was still written as an unconditional
+  `swap` then `store`: a second thread calling `disable_rseq` while the first was inside
+  `fence_rseq` observed the transitional mode, skipped the fence, and stored `MODE_LOCKED`
+  anyway. `MODE_LOCKED` is precisely the claim "no sequence is in flight and none can
+  start" — the licence a drainer relies on to skip `fence_if_non_owner` — so the second
+  caller advertised a drain that had not happened, restoring the race the transitional mode
+  was added to close.
+
+  The transition is now a `compare_exchange` from `MODE_RSEQ`: only the caller that wins it
+  fences, and only that caller publishes the terminal state. A caller that finds a
+  transition already under way returns without touching the mode, which is sound because
+  `MODE_DRAINING` is itself a correct resting state (no new sequences, drains still fence),
+  so every caller's postcondition — "the fast path is off on return" — holds regardless of
+  which one it was. The general rule: **a state that means "an operation completed" may
+  only be published by the thread that completed it**; adding a transitional state fixes
+  nothing if any passer-by can still skip to the end. Pinned by
+  `a_second_disable_caller_cannot_publish_the_terminal_mode_early`.
+
+* **Two claims that decide the same race have to exclude each other (0.4.3).** A freed
+  object is claimed exactly once, and that claim is what makes `free(p); free(p)` report a
+  double free instead of vending one address twice. W6 made the cached bit the claim for a
+  front-end-cacheable object; W18-3 made the quarantined bit the claim for an object the
+  quarantine holds. A free chooses between them at runtime — and the two did not exclude
+  each other.
+
+  The quarantine must claim *before* offering an entry to the ring (a concurrent offer may
+  evict and drain that very entry the instant it is published), so a **declined** offer
+  found itself holding a claim it no longer wanted, and released it. That release left the
+  object owned by nobody until the caller took its next marker. A second free of the same
+  address entering that window took the quarantine claim itself, was sampled *in*, and
+  returned `Freed` while the first free also returned `Freed` from the cache path: one
+  address resident in a per-CPU slot **and** in the quarantine ring, vended to a caller
+  while a later drain freed it underneath them. The mirror gap ran the other way — once a
+  free handed its claim to the cached bit, that bit was the object's only marker, and the
+  quarantine never consulted it, so it would happily claim an object already sitting in a
+  slot.
+
+  The claim now travels from one residency marker to the next without a gap: a declined
+  offer reports `ClaimHeld` and the caller releases it only after setting the cached bit
+  (cached-bit-first, mirroring the existing free-bit-first handoff, which `insert_batch_inner`
+  already performs for the central route), and the quarantine rejects an object that is
+  already cached exactly as it already rejected one that is already central-free. The large
+  path carried the same window and is closed the same way, except that there the immediate
+  free retires the descriptor — and every (re)acquire resets the flag — so the claim needs
+  releasing only when that free fails. The general rule: **when two mechanisms can each
+  settle the same race, the handoff between them is itself a critical section** — an object
+  that is briefly claimed by neither is an object that can be freed twice. Pinned by
+  `the_quarantine_cannot_claim_an_object_the_front_end_already_holds` and
+  `a_declined_quarantine_offer_hands_its_claim_to_the_front_end`.
