@@ -569,15 +569,20 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // `Allocator::want_guarded` enforces — but this is a public entry point, so the
         // bound is checked here rather than assumed. An over-aligned guarded request is
         // simply declined (the caller falls back to the ordinary large path).
-        if usable > object_pages * PAGE_SIZE {
-            return ptr::null_mut();
-        }
+        // Checked: this is a **public** entry point, so `size` is arbitrary and
+        // `object_pages` can be large enough that `object_pages * PAGE_SIZE` overflows —
+        // which would panic in debug instead of returning null as the allocation API
+        // promises (§9.7: any overflow fails safely, never wraps). Deriving both bounds
+        // from one checked computation also keeps them from drifting apart.
         let Some(total_bytes) = object_pages
             .checked_add(2)
             .and_then(|p| p.checked_mul(PAGE_SIZE))
         else {
             return ptr::null_mut();
         };
+        if usable > total_bytes - 2 * PAGE_SIZE {
+            return ptr::null_mut();
+        }
         // Reserve through the extent manager with no region cache (guards need a real
         // extent to protect/restore).
         let (region, backing, _prov) = match self.extents.alloc_large(
@@ -964,22 +969,32 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // is the page-aligned trailing guard, and the leading guard is the first page of
         // the extent — `object_pages = ceil(usable/PAGE)` pages of object + 1 below it.
         // Best-effort: a host fallback with no page protection no-ops.
+        let mut guard_restore_failed = false;
         if guard_armed {
             let object_base = region.base as usize;
             let trailing_guard_start = object_base + region.len;
             let object_pages = region.len.div_ceil(PAGE_SIZE);
             let ext_base = trailing_guard_start.wrapping_sub((object_pages + 1) * PAGE_SIZE);
-            // A failed *restore* would recycle an extent with a `PROT_NONE` page inside
-            // it, so the next allocation carved over it faults on first touch. Count it
-            // so the condition is observable rather than a mystery SIGSEGV. (Restoring is
-            // a protection *merge*, which the kernel satisfies without allocating a VMA,
-            // so unlike the install above this is not expected to fail in practice.)
+            // A failed *restore* leaves a `PROT_NONE` page inside the extent, so an
+            // ordinary allocation later carved over it faults on first touch — on memory
+            // that is entirely valid from the caller's point of view. Counting that and
+            // continuing treats observability as recovery: the counter tells an operator
+            // afterwards *why* a process died, which is not the same as not dying.
+            //
+            // The extent is therefore **withheld from reuse**: `return_backing` is
+            // skipped, so the range stays allocated and well-formed but never re-vends.
+            // That leaks one guarded allocation's backing in a case the kernel has
+            // already told us it cannot serve — the §2.4 trade, a bounded leak over a
+            // latent fault. (Restoring is a protection *merge*, which the kernel
+            // satisfies without allocating a VMA, so unlike the install this is not
+            // expected to fail in practice.)
             let a = self.extents.protect_range(ext_base, PAGE_SIZE, true);
             let b = self
                 .extents
                 .protect_range(trailing_guard_start, PAGE_SIZE, true);
             if a.is_err() || b.is_err() {
                 self.guard_protect_failures.fetch_add(1, Ordering::Relaxed);
+                guard_restore_failed = true;
             }
         }
 
@@ -1024,6 +1039,15 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
         // Return the backing outside the pool lock (the provider call is the slow,
         // §27.2-lowest step). A failed extent free still leaves us well-formed;
         // a failed *revoke* (drain path) is reported so the caller quarantines.
+        //
+        // Unless a guard page could not be restored: this extent still contains an
+        // inaccessible page, so recycling it would hand a later, valid allocation memory
+        // that faults on first touch. Withhold it instead — the range stays allocated and
+        // well-formed, simply never re-vended (see the restore above). The free itself
+        // still succeeded from the caller's point of view.
+        if guard_restore_failed {
+            return (true, false);
+        }
         let reclaimed = self.return_backing(backing, region, hook, revoke, did_fill);
         (true, reclaimed)
     }
@@ -1084,9 +1108,52 @@ impl<'a, P: TopoBackingProvider> LargeAllocator<'a, P> {
                 let pool = unsafe { &mut *self.pool.get() };
                 match pool.index_of(desc_ptr) {
                     Some(idx) => {
+                        // Test-and-set under the pool lock: a `false` here means the large
+                        // was *already* held, which makes this the authoritative
+                        // double-free check as well as the claim. The caller relies on
+                        // that to claim the object **before** publishing it to the ring.
                         // SAFETY: `idx` is a live slot under the lock.
-                        unsafe { (*pool.slot_ptr(idx)).quarantined = 1 };
-                        true
+                        let slot = pool.slot_ptr(idx);
+                        // SAFETY: as above.
+                        if unsafe { (*slot).quarantined } != 0 {
+                            false
+                        } else {
+                            // SAFETY: as above.
+                            unsafe { (*slot).quarantined = 1 };
+                            true
+                        }
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        self.lock.release();
+        r
+    }
+
+    /// W18-3 (§29.4): release a [`mark_quarantined`](Self::mark_quarantined) claim — the
+    /// ring **declined** the offer, so this large is not held after all and takes the
+    /// ordinary immediate-free path. Without it a declined offer would leave the mark set
+    /// and every later free of that pointer would be reported as a quarantine-hit double
+    /// free. Returns whether a mark was cleared.
+    pub fn unmark_quarantined(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        self.lock.acquire();
+        let r = match self.pagemap.lookup(ptr as usize).large_ptr() {
+            Some(desc_ptr) => {
+                // SAFETY: lock held ⇒ exclusive pool access.
+                let pool = unsafe { &mut *self.pool.get() };
+                match pool.index_of(desc_ptr) {
+                    Some(idx) => {
+                        let slot = pool.slot_ptr(idx);
+                        // SAFETY: `idx` is a live slot under the lock.
+                        let was = unsafe { (*slot).quarantined } != 0;
+                        // SAFETY: as above.
+                        unsafe { (*slot).quarantined = 0 };
+                        was
                     }
                     None => false,
                 }
@@ -1546,6 +1613,10 @@ pub trait LargeBacking {
     /// this backend*; returns whether it did. See [`LargeAllocator::mark_quarantined`].
     #[cfg(feature = "quarantine")]
     fn mark_quarantined(&self, ptr: *mut u8) -> bool;
+    /// W18-3 (§29.4): release a `mark_quarantined` claim after a declined offer. See
+    /// [`LargeAllocator::unmark_quarantined`].
+    #[cfg(feature = "quarantine")]
+    fn unmark_quarantined(&self, ptr: *mut u8) -> bool;
     /// W18-3 (§29.4): whether the live large at `ptr` is quarantine-held *in this
     /// backend*. See [`LargeAllocator::is_quarantined`].
     #[cfg(feature = "quarantine")]
@@ -1616,6 +1687,11 @@ impl<P: TopoBackingProvider> LargeBacking for LargeAllocator<'_, P> {
     #[inline]
     fn mark_quarantined(&self, ptr: *mut u8) -> bool {
         LargeAllocator::mark_quarantined(self, ptr)
+    }
+    #[cfg(feature = "quarantine")]
+    #[inline]
+    fn unmark_quarantined(&self, ptr: *mut u8) -> bool {
+        LargeAllocator::unmark_quarantined(self, ptr)
     }
     #[cfg(feature = "quarantine")]
     #[inline]

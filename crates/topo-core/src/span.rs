@@ -1103,9 +1103,27 @@ impl SpanDescriptor {
     /// central bitmap, so `is_central_free` would report it as a live allocation.
     /// Advisory in exactly the same way as its two components (see `is_central_free`) —
     /// exact when the caller owns the object or the span is quiescent.
+    ///
+    /// **The load order is load-bearing, not incidental.** Free-bit-first makes the
+    /// *predicate* `cached || central_free` true at every instant of the `cached →
+    /// central-free` flush — but two separate loads do not evaluate it at an instant. Read
+    /// central first and a reader can straddle the transition: central reads `false`
+    /// (pre-flush), the flush then sets central and clears cached, and cached reads `false`
+    /// (post-flush). Both loads are individually accurate and the conjunction is still
+    /// wrong, so a second free would sail past this check and re-cache an object that is
+    /// already central-free — vending one address to two callers, the exact corruption
+    /// §29.3 detection exists to prevent.
+    ///
+    /// Reading **cached first** closes it. `cached == false` at `t1` implies
+    /// `central_free == true` at `t1` (free-bit-first clears cached only *after* setting
+    /// the free bit), and the free bit is cleared only by `remove_batch` — a legitimate
+    /// re-vend under the span lock. So observing both false means a re-vend happened
+    /// between the loads, i.e. the pointer now belongs to another caller: a stale-pointer
+    /// free, which this method's callers exclude by contract and which the pre-front-end
+    /// `central_insert` test-and-set could not detect either.
     #[inline]
     pub fn is_free_awaiting_reuse(&self, i: usize) -> bool {
-        self.is_central_free(i) || self.is_cached(i)
+        self.is_cached(i) || self.is_central_free(i)
     }
 
     /// Whether object `i` is currently **quarantined** (W18-3, §29.4) — a lock-free

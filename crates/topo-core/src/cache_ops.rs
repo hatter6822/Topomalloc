@@ -30,6 +30,10 @@
 //! central goes through `CentralCache::insert_batch`, which clears it **after** setting
 //! the free bit (free-bit-first, so no instant of the transition has both clear).
 //!
+//! Free-bit-first bounds the *predicate*, not a reader: a lock-free check that loads the
+//! two bits separately must read **cached first** or it can straddle the flush and see
+//! both false. See [`SpanDescriptor::is_free_awaiting_reuse`].
+//!
 //! **Lock ordering (§27.2).** Front end (rank `FRONT_END`) < transfer (`TRANSFER`) <
 //! central (`CENTRAL`) < span (`SPAN`). Each is released before the next is acquired —
 //! the transfer lock in particular is always released BEFORE the central lock is
@@ -193,11 +197,23 @@ pub fn refill(
                         // happens **before** the address is published to a slot: once
                         // pushed, another core can pop it and clear the bit, and a
                         // mark-after-push would then re-mark an object that is already
-                        // live. `remove_batch` cleared the free bit under the span lock,
-                        // so this test-and-set always wins; a `false` would mean the
-                        // central list handed out an already-cached object.
-                        let fresh = span.try_mark_cached(obj);
-                        debug_assert!(fresh, "refill: central vended an already-cached object");
+                        // live.
+                        //
+                        // Losing this test-and-set means a concurrent `free` of the very
+                        // object central just vended claimed it first — a double or stale
+                        // free, since nobody owned it. That free will push the address
+                        // into a slot, so **drop it here**: pushing it too would put one
+                        // address in the front end twice and vend it to two callers, which
+                        // is worse than losing one object out of an already-corrupt
+                        // program's heap (§2.4 — detection must never corrupt, W18-2).
+                        if !span.try_mark_cached(obj) {
+                            debug_assert!(
+                                false,
+                                "refill: central vended an object a concurrent free had \
+                                 already cached (double free)"
+                            );
+                            continue;
+                        }
                         addrs[addr_count] = addr;
                         addr_count += 1;
                     }
@@ -207,11 +223,12 @@ pub fn refill(
             // central list handed out converts to an address — the index→address
             // mapping never drops an object (the indices are in `0..object_count`,
             // so `object_addr` always succeeds and `batch.len() <= batch_size <=
-            // MAX_BATCH_LEN` never trips the cap). A mismatch is a refill leak.
-            debug_assert_eq!(
-                addr_count,
-                batch.len(),
-                "refill lost objects converting central indices to addresses"
+            // MAX_BATCH_LEN` never trips the cap). A mismatch is a refill leak, *except*
+            // for an object a concurrent double free claimed above, which has its own
+            // `debug_assert` and is deliberately dropped.
+            debug_assert!(
+                addr_count <= batch.len(),
+                "refill produced more addresses than central vended"
             );
 
             // Push addresses into the CPU cache slot.

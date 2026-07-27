@@ -2435,35 +2435,48 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             arena,
             bytes: usable as u64,
         };
+        // **Claim the object before it can be published to the ring.** `offer` pushes the
+        // entry and releases the quarantine lock, after which any concurrent `offer` may
+        // evict *this* entry and drain it — really freeing the object. Marking afterwards
+        // would then race that drain: the object could be back in the central list (or,
+        // for a large, its backing unmapped) while this thread is still filling it, so the
+        // fill would scribble over another owner's live allocation. Marking first closes
+        // the window — the drain observes the mark and completes the transition properly.
+        //
+        // `mark_quarantined` is a test-and-set under the span lock, so it is *also* the
+        // authoritative double-free check: losing it means the object is already held.
+        {
+            let sg = span.lock();
+            if !sg.mark_quarantined(idx as usize) {
+                return Some(FreeOutcome::DoubleFree);
+            }
+            // §29.4 + §29.6: destroy the contents and arm the use-after-free canary **at
+            // hold time**, not at drain. The hold *is* the detection window the quarantine
+            // exists to create, so leaving the bytes intact through it would (a) keep freed
+            // secrets readable through a dangling pointer for the whole hold and (b) mean a
+            // write-after-free during it is silently overwritten by the drain's fill and
+            // never reported. Under the span lock, exactly where `insert_batch_scrubbing`
+            // fills: the object is neither central-free nor handable-out (its quarantine
+            // bit is set) and is not yet in the ring, so we are its sole accessor.
+            // SAFETY: `ptr` is this object's `usable`-byte user region, freed and now
+            // exclusively ours.
+            unsafe { crate::harden::fill_on_free(ptr, usable) };
+        }
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
-            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
-            crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
-                // Mark the object quarantined under the span lock — the authoritative
-                // marker. The ring's `AlreadyQuarantined` covered the brief window from
-                // `offer` until now; from here the bit covers it (including after an
-                // eviction removes it from the ring). Then account the app-free and
-                // drain any evicted objects (their bits are cleared by the drain's
-                // `insert_batch`, free-bit-first).
-                {
-                    let sg = span.lock();
-                    sg.mark_quarantined(idx as usize);
-                    // §29.4 + §29.6: destroy the contents and arm the use-after-free
-                    // canary **at hold time**, not at drain. The hold *is* the detection
-                    // window the quarantine exists to create, so leaving the bytes intact
-                    // through it would (a) keep freed secrets readable through a dangling
-                    // pointer for the whole hold and (b) mean a write-after-free during it
-                    // is silently overwritten by the drain's fill and never reported.
-                    // Under the span lock, exactly where `insert_batch_scrubbing` fills:
-                    // the object is neither central-free nor handable-out (its quarantine
-                    // bit is set), so we are its sole accessor.
-                    // SAFETY: `ptr` is this object's `usable`-byte user region, freed and
-                    // now exclusively ours until the drain inserts it.
-                    unsafe { crate::harden::fill_on_free(ptr, usable) };
-                }
+                // Account the app-free and drain any evicted objects (their bits are
+                // cleared by the drain's `insert_batch`, free-bit-first).
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
+            }
+            // The ring declined (or, unreachably, already had it — the mark is exclusive,
+            // so we cannot both hold the claim and be in the ring). Release the claim and
+            // let the caller finish on the ordinary central path; the fill above is
+            // exactly what that path would have written anyway.
+            crate::harden::Offer::Declined | crate::harden::Offer::AlreadyQuarantined => {
+                span.lock().clear_quarantined(idx as usize);
+                None
             }
         }
     }
@@ -2512,29 +2525,39 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             arena,
             bytes: usable as u64,
         };
+        // Claim the descriptor **before** the entry can be published to the ring — see
+        // `maybe_quarantine_small` for why. The stakes are higher here: a racing evict +
+        // drain retires the descriptor and returns (possibly decommits) the backing, so a
+        // scrub sequenced after `offer` could write through an unmapped pointer. The
+        // test-and-set under the pool lock is also the authoritative double-free check.
+        if !owner.mark_quarantined(ptr) {
+            return Some(FreeOutcome::DoubleFree);
+        }
+        // Destroy the contents at hold time, mirroring the non-quarantined large free
+        // (`free_scrubbing`): a §36.12 label downgrade zeroes, otherwise the junk-fill
+        // canary is armed. Without this the hold window — the window the quarantine exists
+        // to create — is exactly the window in which freed bytes stay readable and no
+        // canary is armed. The descriptor is marked held and not yet in the ring, so no
+        // reuse or drain can race us.
+        // SAFETY: `ptr` is the live base of this `usable`-byte allocation, freed and
+        // exclusively ours.
+        if self.scrub_on_release(arena) {
+            unsafe { crate::harden::scrub(ptr, usable) };
+        } else {
+            unsafe { crate::harden::fill_on_free(ptr, usable) };
+        }
         let mut evicted = crate::harden::EvictBatch::new();
         match self.quarantine.offer(entry, &mut evicted) {
-            crate::harden::Offer::AlreadyQuarantined => Some(FreeOutcome::DoubleFree),
-            crate::harden::Offer::Declined => None,
             crate::harden::Offer::Held => {
-                // Mark the descriptor quarantine-held (authoritative). The ring covered
-                // it from `offer` until now; the mark covers it after (incl. eviction).
-                owner.mark_quarantined(ptr);
-                // Destroy the contents at hold time, mirroring the non-quarantined large
-                // free (`free_scrubbing`): a §36.12 label downgrade zeroes, otherwise the
-                // junk-fill canary is armed. Without this the hold window — the window the
-                // quarantine exists to create — is exactly the window in which freed bytes
-                // stay readable and no canary is armed. The descriptor is marked held, so
-                // no reuse can race us.
-                // SAFETY: `ptr` is the live base of this `usable`-byte allocation, freed
-                // and exclusively ours until the drain performs the physical free.
-                if self.scrub_on_release(arena) {
-                    unsafe { crate::harden::scrub(ptr, usable) };
-                } else {
-                    unsafe { crate::harden::fill_on_free(ptr, usable) };
-                }
                 self.account_quarantined_free(arena, usable, evicted.as_slice());
                 Some(FreeOutcome::Freed)
+            }
+            // Declined (or, unreachably, already ringed — the mark is exclusive): release
+            // the claim so the ordinary immediate free proceeds, rather than leaving a
+            // mark that would report every later free of this pointer as a double free.
+            crate::harden::Offer::Declined | crate::harden::Offer::AlreadyQuarantined => {
+                owner.unmark_quarantined(ptr);
+                None
             }
         }
     }

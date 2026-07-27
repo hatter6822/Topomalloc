@@ -564,7 +564,21 @@ impl CpuCache {
     /// Disable any fast path, reverting to the locked baseline (§28.1 child fork
     /// handler / conservative mode). Already-cached objects are unaffected.
     pub fn disable_rseq(&self) {
-        self.mode.store(MODE_LOCKED, Ordering::Release);
+        let was_rseq = self.mode.swap(MODE_LOCKED, Ordering::AcqRel) == MODE_RSEQ;
+        // Drain any sequence that started before the store. Without this, a restartable
+        // section already in flight on some CPU can still commit its `len` while a thread
+        // that observes the new mode takes that CPU's lock and edits the same slot — and
+        // `fence_if_non_owner` will not save it, because that guard is itself gated on
+        // `rseq_mode()`, which is now false. The two would then race, losing an update or
+        // double-vending an object.
+        //
+        // The `pthread_atfork` child caller is already quiesced, but this is a safe public
+        // method that states no such precondition, so it establishes the property itself.
+        // One membarrier on a mode switch that happens at most a handful of times in a
+        // process's life.
+        if was_rseq {
+            let _ = rseq::fence_rseq();
+        }
     }
 
     /// Whether the RSEQ fast path is currently active.

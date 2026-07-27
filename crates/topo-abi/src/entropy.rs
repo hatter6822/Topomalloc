@@ -40,9 +40,17 @@
 /// `getauxval(AT_SECURE)` is authoritative where available; elsewhere the classic
 /// `euid != uid || egid != gid` test is the portable approximation. On a host with
 /// neither, the answer is `false` (no elevation to protect against).
+///
+/// The id comparison is an approximation, not a substitute: `AT_SECURE` is also set for a
+/// binary carrying **file capabilities** or a secure-exec `LSM` decision, where the real
+/// and effective ids are equal and the comparison sees nothing. Restricting the
+/// authoritative check to `target_env = "gnu"` therefore left a supported Linux target
+/// (musl) honouring attacker-controlled `TOPOMALLOC_*` in exactly that case — so the
+/// query runs on every Linux libc that provides it, which `libc` does for gnu and musl
+/// alike.
 #[must_use]
 pub(crate) fn is_secure_execution() -> bool {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
     {
         const AT_SECURE: libc::c_ulong = 23;
         // SAFETY: a pure query of this process's auxiliary vector; absent keys read `0`.
