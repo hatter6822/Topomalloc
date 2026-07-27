@@ -26,9 +26,9 @@ yet.
 Within a stable major series:
 
 * **Public C API names and struct ABI MUST remain stable.** Opaque handles are
-  preferred over exposed structs (`topo_arena_t`/`topo_tcache_t` are opaque
-  integer handles; the only exposed struct is the generated, pinned
-  `topomalloc_size_class_t`).
+  preferred over exposed structs (`topo_arena_t` is an opaque integer handle;
+  the exposed structs are the generated, pinned `topomalloc_size_class_t` and
+  the frozen `topomalloc_stats_t`).
 * **Stats JSON fields are additive** — fields may be *added*, never removed or
   renamed; consumers must ignore unknown fields. The renderer in `topo-stats`
   is written to make additions the only change.

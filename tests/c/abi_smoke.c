@@ -37,7 +37,6 @@ _Static_assert(offsetof(topomalloc_size_class_t, max_local_capacity) == 20,
                "max_local_capacity moved");
 _Static_assert(sizeof(topo_flags_t) == 8, "topo_flags_t must be 64-bit");
 _Static_assert(sizeof(topo_arena_t) == 4, "topo_arena_t must be 32-bit");
-_Static_assert(sizeof(topo_tcache_t) == 4, "topo_tcache_t must be 32-bit");
 
 /* A minimal C extent-hook backing (§23.2, W10): malloc-backed, with op counters
  * so the harness can confirm the arena's allocations were served from it. */

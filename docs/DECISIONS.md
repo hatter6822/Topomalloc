@@ -2191,3 +2191,27 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   needed, and it does not *run* the fuzzers (a campaign, not a gate). The general form:
   **excluding something from the build graph excludes it from the guarantees**, so
   anything deliberately excluded needs its own explicit gate.
+
+* **ABI — a handle type with no API is a frozen guess, not a reserved name (0.4.0).**
+  `typedef uint32_t topo_tcache_t` sat in the public header with no function accepting
+  it, above a comment saying "the encoding is deferred to its subsystem rather than
+  frozen as a guess" — while `uint32_t` *is* a frozen guess at the width, and
+  `tests/c/abi_smoke.c` pinned it with a `_Static_assert`, so CI enforced a guess the
+  header disclaimed. The same sentence cited `TOPO_TCACHE(id)`/`TOPO_NUMA(node)` as the
+  precedent for deferring, and those are deferred by being *absent*: identical deferrals
+  treated two different ways, one paragraph apart.
+
+  §10.3 does not require it. Its block is a **SHOULD** whose "naming is illustrative" and
+  whose conformance requirement is "equivalent **functionality**" — and the tree already
+  reads it that way, since `topo_arena_purge` and `topo_arena_set_decay` from the same
+  block are not exposed either. Nor would the type be forward-compatible: a handle names
+  an *explicit* cache to route through, and a front end keyed by CPU has nothing for a
+  caller-held handle to name, so whatever such a subsystem eventually needed (a registered
+  id, an opaque pointer) is as likely to differ from `uint32_t` as to match it. Removed,
+  with the header stating why the absence is deliberate. `TOPO_TCACHE_NONE` — *declining*
+  the cache, which needs no handle — is supported and honoured.
+
+  The general rule, the same one that retired the thread-cache prototype: **reserving a
+  name you cannot yet design is not forward compatibility, it is a claim with a version
+  number attached.** Adding a type when its API lands costs nothing; carrying one that
+  documents an API that does not exist costs a reader's trust in the rest of the header.

@@ -116,15 +116,19 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * (§22/§36.4): the default arena (id 0) is always present, and explicit
  * arenas are created with the arena API below (plan 06 W9). TOPO_ARENA(id)
  * routes an allocation to arena `id`; naming an arena that does not exist (or
- * is being reset/destroyed) is a deterministic EINVAL. topo_tcache_t names an
- * *explicit* cache to route through; it is declared for the §10.3 surface but
- * has no consumer, because this allocator's front end is keyed by CPU rather
- * than by a caller-held cache handle, so there is nothing for such a handle to
- * name (TOPO_TCACHE_NONE — declining the cache entirely — is honoured). As with
- * TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is deferred to its subsystem
- * rather than frozen as a guess (reserved flag bits hold the space). */
+ * is being reset/destroyed) is a deterministic EINVAL.
+ *
+ * There is deliberately no `topo_tcache_t`. §10.3's sketch lists one (it is a
+ * SHOULD whose naming is "illustrative", and whose conformance requirement is
+ * equivalent *functionality*), but a handle type names an explicit cache to
+ * route an allocation through, and this allocator's front end is keyed by CPU —
+ * there is nothing for a caller-held handle to name. Declaring one anyway would
+ * freeze a guess at its width for a subsystem whose design is undecided, which
+ * is the opposite of deferring it; the same reasoning is why TOPO_TCACHE(id)
+ * and TOPO_NUMA(node) are absent rather than declared (reserved flag bits hold
+ * the space). TOPO_TCACHE_NONE — *declining* the cache, which needs no handle —
+ * is supported and honoured. */
 typedef uint32_t topo_arena_t;
-typedef uint32_t topo_tcache_t;
 typedef uint64_t topo_flags_t;
 
 /* The topo_flags_t layout (validated; reserved bits MUST be zero — §10.4):
