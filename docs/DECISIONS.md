@@ -2116,3 +2116,78 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   the field set rather than about Rust, and is therefore pinned by a test. A failed carve is
   not an error: the accessors read a null array as "no slots", the front end declines, and
   the central path serves (§2.4 — a policy layer may degrade, never fail an allocation).
+
+* **W6 — the §13 thread cache is an *alternative* front end, not a layer; deleting the
+  prototype (0.4.0).**
+  `thread_cache.rs` shipped ~850 lines of unit-tested, publicly re-exported code that no
+  allocation ever reached, and it could not be wired as written: its slots were
+  `Vec<usize>`, so `push` would `realloc` through the global allocator on the allocation
+  fast path and the thread-exit flush would `dealloc` through it during TLS teardown —
+  the Appendix-F recursion anti-pattern at both ends. Worse, `pub unsafe fn
+  set_flush_hook(&mut self, hook, ctx: *const ())` carried a contract ("`ctx` must remain
+  valid until the thread exits") that **no caller can discharge**, because the thread that
+  must outlive `ctx` is not the one calling; `Drop` then invoked that raw pointer. Dead
+  code is a cost; dead *public* code with an undischargeable safety contract is a trap.
+
+  Rewriting the storage is not the job. Per-thread state loses four properties per-CPU
+  state has for free: **bounded metadata** (monotonic metadata is never returned and
+  thread count is unbounded, so a per-thread carve needs a registry and a reuse
+  free-list — with its own lock), a **teardown path** that must never touch
+  destructor-registered TLS (`THREAD_CACHE` is `RefCell<ThreadCache>`; re-entering it
+  during its own destruction panics), a **fork story** (a child inherits the caches of
+  threads that no longer exist, so their objects are unreachable forever — per-CPU slots
+  have no analogue, since every CPU still exists in the child), and a third `CachedBits`
+  transition plus a third residency term in every stats/invariant/drain path.
+
+  The spec settles the value question. §13 is titled "**Optional** thread cache fallback"
+  and §13.1 says thread caches "exist for portability and for policy domains that cannot
+  or should not use per-CPU caches" and "are **not** the preferred default on systems with
+  RSEQ" — i.e. §13 *replaces* §11 on such platforms rather than stacking on it. P-003's
+  fallback is already satisfied ("per-thread cache mode **or lock-sharded arena mode**" —
+  the locked per-CPU baseline is the latter, and the `rseq_equivalence` battery proves the
+  two paths observationally identical). §160 cites [R1] that per-CPU caches reduce cache
+  blowup versus per-thread on high-thread-count systems — the spec prefers per-CPU on the
+  very configuration where a thread cache might win latency. And O-002 asks that the byte
+  class be *reported*, which `Stats::thread_cache_bytes` does, as `0`.
+
+  Measurement agrees. The thing a thread cache exists to remove is the per-CPU spinlock;
+  running the same `malloc(64)+free` loop per mode gave RSEQ (lock-free) 69.9–71.6 ns/op,
+  `MODE_LOCKED` (per-CPU spinlock) 66.0–86.2 ns/op, and the central path 94.5 ns/op. The
+  locked baseline is not measurably slower than lock-free — setting up a restartable
+  critical section costs about what an uncontended test-and-set does — so there is no lock
+  cost left for a third layer to remove.
+
+  If a platform ever appears with neither RSEQ nor a per-core oracle *and* threads ≫ cores
+  with heavy migration, the right response is a per-thread front end **replacing** the
+  per-CPU one (§13.1's framing), built on the metadata-carved slot discipline `CpuSlot`
+  already exemplifies, plus the registry/teardown/fork protocol above. The rule this
+  ratifies: **an unwired implementation is not a head start; it is a claim the tree cannot
+  honour.**
+
+* **W6 — wiring a layer makes every "not yet" comment about it a claim to re-check
+  (0.4.0).**
+  Deleting the thread cache surfaced two things the *absence* of a front end had been
+  quietly excusing. `TOPO_TCACHE_NONE` ("bypass local caches", §10.3) decoded into
+  `RequestFlags::CACHE_BYPASS` and had **zero consumers** — harmless while there was no
+  cache to bypass, a broken ABI promise the moment there was one. It is now honoured on
+  `topo_mallocx` (served from central, not a slot) *and* on `topo_dallocx`/`topo_sdallocx`
+  (returned straight to central), through a shared free body so the flagged and unflagged
+  paths cannot drift in their `errno` handling. And the §31.2 `BY_CPU` stats flag rendered
+  a hard-coded `[]` with the comment "front-end per-CPU caches land at M2" — true until
+  they landed; it now renders the real per-core residency and is empty exactly when the
+  front end is.
+
+  Neither was reachable by any test, because both were *correct no-ops* under the old
+  state of the tree. The rule: when a subsystem goes live, every comment that deferred to
+  it is a claim that has just changed truth value, and grepping for those deferrals is
+  part of landing the subsystem — not cleanup for later.
+
+* **CI — a standalone workspace that nothing builds will break and stay broken (0.4.0).**
+  The `fuzz/` workspace is excluded from the main one (so `cargo test` does not drag in
+  `libfuzzer-sys`), which also meant no `xtask ci` step ever compiled it. A signature
+  change in 0.3.0 (`topo_stats::redact_summary` gaining an `observer_label` parameter)
+  left two fuzz targets uncompilable through a release with every other gate green. `ci`
+  now runs `cargo check --manifest-path fuzz/Cargo.toml --all-targets` — cheap, no nightly
+  needed, and it does not *run* the fuzzers (a campaign, not a gate). The general form:
+  **excluding something from the build graph excludes it from the guarantees**, so
+  anything deliberately excluded needs its own explicit gate.

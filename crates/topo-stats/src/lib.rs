@@ -39,7 +39,15 @@ pub struct Stats {
     pub rss_bytes: u64,
     /// Bytes held in per-CPU caches.
     pub per_cpu_bytes: u64,
-    /// Bytes held in thread caches.
+    /// Bytes held in per-thread caches — the §13 *optional* front end.
+    ///
+    /// Always `0` in this tree, and correctly so: O-002 requires the byte class be
+    /// **reported**, and §13 is an optional *alternative* to the §11 per-CPU front end
+    /// for platforms that cannot use per-CPU caches (§13.1 — "not the preferred default
+    /// on systems with RSEQ"). This tree implements the per-CPU one, so the class is
+    /// empty rather than absent. The field is part of the frozen Appendix-D JSON and of
+    /// `topomalloc_stats_t::cache_bytes`, so it stays; `explain` omits zero contributors,
+    /// so it never appears in the human-readable attribution.
     pub thread_cache_bytes: u64,
     /// Bytes held in transfer caches.
     pub transfer_bytes: u64,
@@ -166,7 +174,8 @@ impl StatsFlags {
     pub const BY_ARENA: StatsFlags = StatsFlags(1 << 0);
     /// Per-size-class breakdown: central-free bytes per class.
     pub const BY_SIZE_CLASS: StatsFlags = StatsFlags(1 << 1);
-    /// Per-CPU cache breakdown (front-end caches, M2 — empty until then).
+    /// Per-CPU front-end cache breakdown: what each core's §11 slots hold. Cores holding
+    /// nothing are omitted, so an idle or drained front end renders an empty array.
     pub const BY_CPU: StatsFlags = StatsFlags(1 << 2);
     /// Per-NUMA-node breakdown (§15): the topology / router counters block.
     pub const BY_NUMA: StatsFlags = StatsFlags(1 << 3);
@@ -415,7 +424,7 @@ impl Stats {
         // §31.5 fragmentation, derived from the byte classes (W17-4). `external` is the free
         // **physically-backed** back-end memory not immediately useful (dirty + muzzy;
         // `released` is unbacked, so excluded); `cache` is the bytes stranded in front-end
-        // caches (per-CPU + thread + transfer, 0 until M2).
+        // caches (per-CPU + transfer; the thread-cache term is always 0, see the field).
         let frag_external = self.dirty_bytes.saturating_add(self.muzzy_bytes);
         let frag_cache = self
             .per_cpu_bytes
@@ -627,9 +636,18 @@ impl Stats {
             });
         }
         if flags.contains(StatsFlags::BY_CPU) {
-            // Front-end per-CPU caches land at M2; the breakdown is an empty array until
-            // then (the flag resolves to a defined, additive shape, never a missing key).
-            out.push_str(",\n  \"by_cpu\": []");
+            out.push_str(",\n  \"by_cpu\": [");
+            for (i, c) in detail.cpus.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "{}\n    {{\"cpu\": {}, \"objects\": {}, \"bytes\": {}}}",
+                    if i > 0 { "," } else { "" },
+                    c.cpu,
+                    c.objects,
+                    c.bytes,
+                );
+            }
+            out.push_str(if detail.cpus.is_empty() { "]" } else { "\n  ]" });
         }
         if flags.contains(StatsFlags::BY_NUMA) {
             // Per-node §19.7 hugepage coverage (empty in the default build / single-node host;
@@ -808,6 +826,23 @@ pub struct SizeClassLine {
     pub free_bytes: u64,
 }
 
+/// One line of the §31.2 `BY_CPU` per-core breakdown (W17-2 / W6): what one core's §11
+/// front-end slots currently hold, across every size class.
+///
+/// Cores holding nothing are omitted, so the array is proportional to the front end's
+/// *live* spread rather than to `MAX_CPUS` — on a machine where a few cores do the
+/// allocating, that is the difference between a handful of lines and 128 zeroes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuCacheLine {
+    /// The core id (the index of the per-CPU slot array, i.e. the CPU the front end keys
+    /// this residency by — not necessarily a CPU any thread is running on now).
+    pub cpu: u32,
+    /// Objects this core's slots hold, summed over size classes.
+    pub objects: u64,
+    /// Bytes those objects occupy (Σ `objects × object_size` per class).
+    pub bytes: u64,
+}
+
 /// One line of the §31.2 `BY_NUMA` per-node breakdown (W17-2): a NUMA node's §19.7 hugepage
 /// coverage. Empty (all backends absent) in the default build; populated under the live NUMA
 /// router (`hugepage-optimized`).
@@ -832,6 +867,8 @@ pub struct StatsDetail<'a> {
     pub arenas: &'a [ArenaLine],
     /// `BY_SIZE_CLASS` lines.
     pub size_classes: &'a [SizeClassLine],
+    /// `BY_CPU` per-core front-end residency lines.
+    pub cpus: &'a [CpuCacheLine],
     /// `BY_NUMA` per-node lines.
     pub numa_nodes: &'a [NumaNodeLine],
 }
@@ -841,6 +878,7 @@ impl StatsDetail<'_> {
     pub const EMPTY: StatsDetail<'static> = StatsDetail {
         arenas: &[],
         size_classes: &[],
+        cpus: &[],
         numa_nodes: &[],
     };
 }
@@ -1296,6 +1334,7 @@ mod tests {
         let detail = StatsDetail {
             arenas: &arenas,
             size_classes: &[],
+            cpus: &[],
             numa_nodes: &[],
         };
         // Without the flag: no by_arena key.
@@ -1384,6 +1423,7 @@ mod tests {
             &StatsDetail {
                 arenas: &redacted,
                 size_classes: &[],
+                cpus: &[],
                 numa_nodes: &[],
             },
         );

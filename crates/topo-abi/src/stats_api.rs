@@ -38,7 +38,9 @@ use std::string::String;
 use std::vec::Vec;
 
 use topo_core::{ArenaId, ArenaState};
-use topo_stats::{ArenaLine, NumaNodeLine, Profile, SizeClassLine, Stats, StatsDetail, StatsFlags};
+use topo_stats::{
+    ArenaLine, CpuCacheLine, NumaNodeLine, Profile, SizeClassLine, Stats, StatsDetail, StatsFlags,
+};
 
 use crate::{global, AnyAllocator};
 
@@ -77,7 +79,13 @@ fn checked_flags(flags: u64) -> Option<StatsFlags> {
 /// **redacted** for that low domain (§36.12, W17-6): the cross-domain summary aggregates are
 /// zeroed and only the visible arenas survive. The single place a snapshot is taken, so the
 /// epoch is bumped exactly once per public stats call.
-type Composed = (Stats, Vec<ArenaLine>, Vec<SizeClassLine>, Vec<NumaNodeLine>);
+type Composed = (
+    Stats,
+    Vec<ArenaLine>,
+    Vec<SizeClassLine>,
+    Vec<CpuCacheLine>,
+    Vec<NumaNodeLine>,
+);
 
 fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> Composed {
     let mut s = Stats {
@@ -148,12 +156,20 @@ fn compose(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> 
         Vec::new()
     };
     // Per-node NUMA coverage (cross-domain infrastructure ⇒ omitted for a redacted observer).
+    // Front-end residency is cross-domain infrastructure (a per-CPU slot serves whichever
+    // threads run on that core), so a redacted low observer gets none — the same rule the
+    // per-size-class and per-node detail follow.
+    let cpus = if flags.contains(StatsFlags::BY_CPU) && !redacting {
+        cpu_cache_lines()
+    } else {
+        Vec::new()
+    };
     let numa_nodes = if flags.contains(StatsFlags::BY_NUMA) && !redacting {
         numa_node_lines()
     } else {
         Vec::new()
     };
-    (summary, arenas, size_classes, numa_nodes)
+    (summary, arenas, size_classes, cpus, numa_nodes)
 }
 
 /// The §31.2 `BY_NUMA` per-node lines — each node's §19.7 hugepage coverage, from the live
@@ -271,16 +287,34 @@ fn size_class_lines() -> Vec<SizeClassLine> {
     v
 }
 
+/// The §31.2 `BY_CPU` per-core lines (W17-2 / W6): what each core's §11 front-end slots
+/// hold. Cores holding nothing are skipped by the engine's visitor, so an idle or drained
+/// front end yields an empty vector.
+fn cpu_cache_lines() -> Vec<CpuCacheLine> {
+    let mut v = Vec::new();
+    if let Some(eng) = global() {
+        eng.for_each_cpu_cache(|cpu, objects, bytes| {
+            v.push(CpuCacheLine {
+                cpu,
+                objects,
+                bytes,
+            });
+        });
+    }
+    v
+}
+
 /// Compose and render the snapshot as JSON honoring `flags`, redacting arena detail for
 /// `observer_label` if given. `delivering` is false for a length-query (`buf == NULL`) sizing
 /// call, so a `RESET_PEAKS` request does not clear the gauge before the caller's data call reads.
 fn render_json(flags: StatsFlags, observer_label: Option<u32>, delivering: bool) -> String {
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, observer_label, delivering);
+    let (s, arenas, size_classes, cpus, numa_nodes) = compose(flags, observer_label, delivering);
     s.to_json_with(
         flags,
         &StatsDetail {
             arenas: &arenas,
             size_classes: &size_classes,
+            cpus: &cpus,
             numa_nodes: &numa_nodes,
         },
     )
@@ -521,12 +555,13 @@ pub unsafe extern "C" fn topomalloc_stats_print(out: *mut libc::FILE, flags: u64
     }
     let _op = topo_core::fork::operation_guard();
     // `out` is non-null here, so this call always delivers (RESET_PEAKS, if set, takes effect).
-    let (s, arenas, size_classes, numa_nodes) = compose(flags, None, true);
+    let (s, arenas, size_classes, cpus, numa_nodes) = compose(flags, None, true);
     let json = s.to_json_with(
         flags,
         &StatsDetail {
             arenas: &arenas,
             size_classes: &size_classes,
+            cpus: &cpus,
             numa_nodes: &numa_nodes,
         },
     );

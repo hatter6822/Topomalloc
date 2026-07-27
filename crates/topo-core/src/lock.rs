@@ -98,7 +98,7 @@ impl LockRank {
     pub const ARENA_REGISTRY: u8 = 1;
     /// Per-arena hook-backend registry (`HookRegistry`).
     pub const ARENA: u8 = 2;
-    /// Front-end per-CPU / thread cache lock — the locked baseline and RSEQ
+    /// Front-end per-CPU cache lock — the locked baseline and RSEQ
     /// fallback (W7-4). The outermost data-path lock (§27.2 "front-end").
     pub const FRONT_END: u8 = 3;
     /// Transfer cache (per-LLC-domain), the innermost middle-end lock.

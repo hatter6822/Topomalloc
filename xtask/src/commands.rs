@@ -575,6 +575,7 @@ pub fn ci(root: &Path, _args: &[String]) -> Outcome {
         ],
     );
     global_alloc_smoke_step(&mut r);
+    fuzz_targets_compile_step(&mut r);
 
     // C ABI compile-link-run (§34.1) + rustdoc intra-doc-link check.
     abi_test_steps(&mut r, root);
@@ -957,6 +958,31 @@ fn msan_steps(r: &mut Runner<'_>) {
         ],
     );
     std::env::remove_var("RUSTFLAGS");
+}
+
+/// Type-check the `cargo-fuzz` targets (W19, `fuzz/`).
+///
+/// The fuzz workspace is **standalone** — its own `Cargo.toml`, excluded from the main
+/// workspace so `cargo test` does not drag in `libfuzzer-sys` — which means nothing else
+/// in `ci` compiles it. That is exactly how a change to a signature the targets call
+/// (`topo_stats::redact_summary` gained an `observer_label` parameter in 0.3.0) left them
+/// broken for a release with every other gate green. A `check` is cheap, needs no nightly,
+/// and turns "the fuzz targets no longer build" into a CI failure instead of a discovery
+/// made the next time someone runs a fuzz campaign.
+///
+/// This does not *run* the fuzzers (that needs nightly + `cargo-fuzz`, and is a campaign,
+/// not a gate); it only proves the targets still compile against the current API.
+fn fuzz_targets_compile_step(r: &mut Runner<'_>) {
+    r.run(
+        "fuzz targets compile (W19)",
+        "cargo",
+        &[
+            "check",
+            "--manifest-path",
+            "fuzz/Cargo.toml",
+            "--all-targets",
+        ],
+    );
 }
 
 /// Run the `#[global_allocator]` bootstrap smoke example (the re-entrancy guard,

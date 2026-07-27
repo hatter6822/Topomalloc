@@ -445,10 +445,14 @@ impl SpanFlags {
 /// The non-central terms of the §16.4 partition (`local_cached`, `transfer_cached`,
 /// `quarantined`) — *logical* quantities the descriptor does not track per-op; a
 /// caller reconstructs them in debug (W5-3c) and passes them to the
-/// conservation/empty checks. All zero before caches exist (M1).
+/// conservation/empty checks. All zero in this tree — see
+/// [`reconstruct_non_central_residency`](SpanDescriptor::reconstruct_non_central_residency)
+/// for why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NonCentralResidency {
-    /// Objects held in per-CPU and thread caches.
+    /// Objects held in a thread- or CPU-local cache — the §16.4 `local_cached` term
+    /// (this tree's front end is the §11 per-CPU one; §13 thread caches are the optional
+    /// alternative it does not implement).
     pub local_cached: u32,
     /// Objects held in transfer caches.
     pub transfer_cached: u32,
@@ -1167,7 +1171,7 @@ impl SpanDescriptor {
     }
 
     /// Conservation law where `live_count` includes all objects removed from
-    /// central (including those held in CPU/transfer/thread caches). Correct
+    /// central (including those held in the per-CPU and transfer caches). Correct
     /// as long as cache layers do not separately track per-span residency.
     #[inline]
     pub fn conservation_holds_central_only(&self) -> bool {
@@ -1182,7 +1186,7 @@ impl SpanDescriptor {
 
     /// Empty predicate where `live_count` includes cached objects. A span is
     /// empty only when all objects have been returned to central (`live_count == 0`
-    /// and `central_free == object_count`). Objects in CPU/transfer/thread caches
+    /// and `central_free == object_count`). Objects in the per-CPU and transfer caches
     /// keep `live_count > 0`, preventing false-positive empty detection.
     #[inline]
     pub fn is_empty_central_only(&self) -> bool {
@@ -1191,10 +1195,9 @@ impl SpanDescriptor {
 
     /// Reconstruct the non-central residency terms for this span.
     ///
-    /// Currently returns `NONE`: `live_count` already includes objects held in
-    /// CPU, transfer, and thread caches (they are counted as "removed from
-    /// central"), so the conservation law holds without explicit non-central
-    /// terms. If a future milestone redefines `live_count` to mean "in
+    /// Currently returns `NONE`: `live_count` already includes objects held in the
+    /// per-CPU and transfer caches (they are counted as "removed from central"), so
+    /// the conservation law holds without explicit non-central terms. If a future milestone redefines `live_count` to mean "in
     /// application code only" (excluding cached objects), this method must
     /// return actual cache/quarantine counts and all call sites using
     /// `NonCentralResidency::NONE` must migrate.

@@ -27,7 +27,7 @@
 //! Each tick produces a budgeted plan over the six §21.3 rungs, in priority order,
 //! each rung gated by the current §21.5 [`PressureMode`]:
 //!
-//! 1. drain idle CPU/thread caches,
+//! 1. drain idle CPU caches,
 //! 2. release completely-empty hugepages **beyond the demand reserve**,
 //! 3. purge dirty spans **not on hot hugepages** (after `dirty_decay_ms`),
 //! 4. convert aged dirty → muzzy where cheap (also gated by `dirty_decay_ms`),

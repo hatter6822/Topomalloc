@@ -42,13 +42,19 @@
 //! ### B.2 Cache ([`check_b2_cache`])
 //! * *per-CPU counts ≤ capacity / bytes ≤ hard budget* —
 //!   [`CpuCache::check_invariants`](crate::CpuCache::check_invariants);
-//! * *thread-cache bytes ≤ hard budget* —
-//!   [`ThreadCache::check_invariants`](crate::ThreadCache::check_invariants);
 //! * *transfer batches contain distinct objects / consistent size class* —
 //!   [`TransferCache::check_invariants`](crate::TransferCache::check_invariants);
+//! * *cached and central-free objects are disjoint* — the W6 residency marker the
+//!   lock-free double-free oracle rests on, checked per span under its lock by
+//!   [`SpanDescriptor::cached_and_central_free_are_disjoint`](crate::SpanDescriptor::cached_and_central_free_are_disjoint)
+//!   and swept by [`Allocator::check_invariants`](crate::Allocator::check_invariants);
 //! * *cache flush/refill preserves object count* — asserted at the
 //!   [`cache_ops`](crate::cache_ops) flush/refill sites (a transition invariant,
 //!   not a state predicate).
+//!
+//! There is no per-thread term: the §13 thread cache is an *optional alternative*
+//! front end for platforms that cannot use per-CPU caches (§13.1), and this tree
+//! implements the per-CPU one. See `docs/DECISIONS.md`.
 //!
 //! ### B.3 Span ([`SpanDescriptor::check_invariants`](crate::SpanDescriptor::check_invariants))
 //! * *object ranges fit within span / are disjoint* — verified against the §16.3
@@ -101,7 +107,6 @@
 //! ([`runtime_checks_enabled`] reports whether the assertions are live).
 
 use crate::cpu_cache::CpuCache;
-use crate::thread_cache::ThreadCache;
 use crate::transfer_cache::TransferCache;
 
 /// Whether the Appendix-B runtime invariant checks are wired into runtime
@@ -152,15 +157,19 @@ impl Group {
     ];
 }
 
-/// Appendix B.2 (cache invariants, W19-1b): the whole front-end cache layer —
-/// per-CPU ([`CpuCache`]), transfer ([`TransferCache`]), and per-thread
-/// ([`ThreadCache`]) — is well-formed. Total + side-effect-free; the single
-/// callable that composes the three cache checkers, so a test or the G-conc gate
-/// validates the layer in one call. The cache structures are not owned by the
-/// engine at M1 (the M1 path is the central free list), so this group lives here
-/// rather than in [`Allocator::check_invariants`](crate::Allocator::check_invariants).
-pub fn check_b2_cache(cpu: &CpuCache, transfer: &TransferCache, thread: &ThreadCache) -> bool {
-    cpu.check_invariants() && transfer.check_invariants() && thread.check_invariants()
+/// Appendix B.2 (cache invariants, W19-1b): the front-end cache layer — per-CPU
+/// ([`CpuCache`]) and transfer ([`TransferCache`]) — is well-formed. Total +
+/// side-effect-free; the single callable that composes both cache checkers, so a
+/// test or the G-conc gate validates the layer in one call.
+///
+/// The engine's own [`check_invariants`](crate::Allocator::check_invariants) runs
+/// these two directly (it owns both structures since W6) *plus* the per-span
+/// cached↔central-free disjointness sweep, which needs the span pool this function
+/// has no access to. This entry point stays for a caller holding the cache
+/// structures without an engine — the `cache_ops` unit tests and the `debug_checks`
+/// fuzz target.
+pub fn check_b2_cache(cpu: &CpuCache, transfer: &TransferCache) -> bool {
+    cpu.check_invariants() && transfer.check_invariants()
 }
 
 #[cfg(test)]
@@ -207,27 +216,20 @@ mod tests {
         let cpu = CpuCache::new();
         cpu.set_active_cpus(2);
         let transfer = TransferCache::new();
-        let mut thread = ThreadCache::with_default_budget();
         let sc = SizeClassId::new(0);
         let batch = size_class::batch(sc) as u32;
 
-        // Exercise all three layers, then assert the composed B.2 checker.
+        // Exercise both layers, then assert the composed B.2 checker.
         cpu.init_slot(CoreId(0), sc, &m, batch);
         for i in 1..=10usize {
             cpu.fe_push(CoreId(0), A, sc, i, &m);
         }
         transfer.try_push_batch(A, sc, &[100, 200, 300, 400], &m);
-        thread.push(sc, 0x1000);
-        thread.push(sc, 0x2000);
 
-        assert!(check_b2_cache(&cpu, &transfer, &thread));
+        assert!(check_b2_cache(&cpu, &transfer));
         // And each layer individually.
         assert!(cpu.check_invariants());
         assert!(transfer.check_invariants());
-        assert!(thread.check_invariants());
-
-        // Drain the thread cache before it drops (its Drop asserts it was flushed).
-        thread.flush_all(|_, _| {});
     }
 
     #[test]
@@ -296,37 +298,34 @@ mod tests {
     }
 
     #[test]
-    fn b2_thread_checker_catches_a_duplicate_entry() {
-        // B.2 (W19-1b) negative test: a duplicate in a thread slot is a
-        // double-freed object; the distinctness check must reject it.
-        let mut thread = ThreadCache::with_default_budget();
-        let sc = SizeClassId::new(0);
-        assert!(thread.push(sc, 0x2000));
-        assert!(thread.push(sc, 0x2000)); // the same object freed twice
-        assert!(
-            !thread.check_invariants(),
-            "a duplicate thread-cache entry must fail the distinctness check"
-        );
-        thread.flush_all(|_, _| {}); // drain before drop
-    }
-
-    #[test]
-    fn b2_thread_checker_catches_a_count_drift() {
-        // A well-formed thread cache reconciles; a forced over-budget does not.
-        let mut thread = ThreadCache::new(4);
-        let sc = SizeClassId::new(0);
-        assert!(thread.check_invariants());
-        // Fill to the budget — still well-formed.
-        for i in 0..4usize {
-            assert!(thread.push(sc, i + 1));
+    fn b2_residency_checker_catches_a_cached_and_central_free_object() {
+        // B.2 (W6, §16.4) negative test: the front-end residency marker and the central
+        // free bitmap must name **disjoint** sets. An object in both is the one state
+        // that breaks the lock-free double-free oracle — a free observes
+        // `is_cached || is_central_free` and reports a double free, while the central
+        // list simultaneously believes the object is re-vendable, so it would be handed
+        // out to a caller who then "double frees" it. The sweep must reject it.
+        let m = meta(4 * 1024 * 1024);
+        let span = fresh_span(64, &m);
+        // Positive: a fresh span (nothing central-free, nothing cached) is disjoint,
+        // and so is one with the two states on *different* objects.
+        assert!(span.cached_and_central_free_are_disjoint());
+        {
+            let g = span.lock();
+            assert!(g.central_insert(0));
         }
-        assert!(thread.check_invariants());
-        // The budget is honoured: a further push is refused (no drift).
-        assert!(!thread.push(sc, 99));
-        assert!(thread.check_invariants());
+        assert!(span.try_mark_cached(1));
+        assert!(
+            span.cached_and_central_free_are_disjoint(),
+            "distinct objects in the two states are not a violation"
+        );
 
-        // Drain before drop (the Drop impl asserts the cache was flushed).
-        thread.flush_all(|_, _| {});
+        // Negative: the *same* object in both sets.
+        assert!(span.try_mark_cached(0));
+        assert!(
+            !span.cached_and_central_free_are_disjoint(),
+            "an object that is both cached and central-free must fail the B.2 sweep"
+        );
     }
 
     // --- B.3 span checker: positive + negative --------------------------------

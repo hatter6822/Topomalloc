@@ -28,11 +28,14 @@
 //! dedicated `align` argument of [`classify`], so it can never be dropped
 //! as an "advisory bit" (§10.4's "MUST NOT be silently ignored").
 //!
-//! Advisory flags accepted today and *acted on* at M1: `TOPO_ALIGN_LG`,
-//! `TOPO_ZERO`, `TOPO_ARENA(0)`. The placement hints (`TOPO_TCACHE_NONE`,
-//! `TOPO_GUARDED`, hugepage policy, lifetime, hotness) validate and thread
-//! through to the classifier ([`Request::flags`]) where plans 04/05/07/08
-//! consume them as their subsystems land — they are accepted because they
+//! Advisory flags accepted today and *acted on*: `TOPO_ALIGN_LG`, `TOPO_ZERO`,
+//! `TOPO_ARENA(0)`, `TOPO_GUARDED`, `TOPO_TCACHE_NONE` (W6/W7 — a bypassing
+//! request is served from, and returned to, the central free list rather than
+//! the running core's per-CPU slot; honoured on `topo_mallocx` *and* on
+//! `topo_dallocx`/`topo_sdallocx`), and the hugepage/lifetime/hotness
+//! placement hints. They validate and thread
+//! through to the classifier ([`Request::flags`]) where their subsystems
+//! consume them — they are accepted because they
 //! are *advisory* (§10.4 allows documented advisory flags to be no-ops, not
 //! mandatory ones).
 //!
@@ -405,8 +408,13 @@ pub unsafe extern "C" fn topo_dallocx(ptr: *mut c_void, flags: u64) {
         decode_flags(flags).is_some(),
         "topo_dallocx: invalid flag word {flags:#x}"
     );
-    // SAFETY: identical contract, forwarded.
-    unsafe { c_api::topomalloc_free(ptr) };
+    // `TOPO_TCACHE_NONE` is honoured here: the object goes straight to the central free
+    // list instead of the running core's front-end slot. Both are correct (the front end
+    // only delays the trip to central), so this is a locality/residency choice — but it
+    // is the one the flag promises, and a decoded-then-discarded flag is a lie.
+    // SAFETY: identical contract, forwarded through the shared `topomalloc_free` body,
+    // so `errno` preservation and the non-`Freed`-outcome policy are the same.
+    unsafe { c_api::free_with_flag(ptr, flags & TOPO_TCACHE_NONE != 0) };
 }
 
 /// `void topo_sdallocx(void* ptr, size_t size, topo_flags_t flags)` (§10.3):
@@ -425,13 +433,14 @@ pub unsafe extern "C" fn topo_sdallocx(ptr: *mut c_void, size: usize, flags: u64
         decoded.is_some(),
         "topo_sdallocx: invalid flag word {flags:#x}"
     );
-    // SAFETY: identical contract, forwarded.
-    unsafe {
-        match decoded {
-            Some((align, _)) if align > 1 => c_api::topomalloc_free_aligned_sized(ptr, align, size),
-            _ => c_api::topomalloc_free_sized(ptr, size),
-        }
-    }
+    let bypass = flags & TOPO_TCACHE_NONE != 0;
+    let align = match decoded {
+        Some((a, _)) if a > 1 => a,
+        _ => 1,
+    };
+    // SAFETY: identical contract, forwarded; `TOPO_TCACHE_NONE` routed as in
+    // [`topo_dallocx`].
+    unsafe { c_api::free_sized_with(ptr, align, size, bypass) }
 }
 
 /// `size_t topo_nallocx(size_t size, topo_flags_t flags)` (§10.3): the usable
@@ -606,11 +615,12 @@ mod tests {
         set_errno(5);
         assert!(trallocx(p, 0, 0).is_null());
         assert_eq!(get_errno(), 5, "freeing via rallocx(p, 0) is not an error");
-        // The object was genuinely freed (not leaked): its slot is vended again. The live
-        // allocator has no front-end thread cache yet (M2), so a freed small object returns
-        // to the *shared* central free list, which a parallel test thread can transiently
-        // touch — so confirm recycling by membership in a bounded batch (held to drain the
-        // list toward the freed slot, then freed), not by asserting the exact next call.
+        // The object was genuinely freed (not leaked): its slot is vended again. Every
+        // front-end layer is *shared* — a per-CPU slot serves whichever threads run on that
+        // core, and the transfer cache is process-wide — so a parallel test thread can
+        // transiently take the freed object. Confirm recycling by membership in a bounded
+        // batch (held to drain toward the freed slot, then freed), not by asserting the
+        // exact next call.
         let mut batch = Vec::with_capacity(64);
         let mut recycled = false;
         for _ in 0..64 {

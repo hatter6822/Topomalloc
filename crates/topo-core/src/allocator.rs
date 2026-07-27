@@ -18,7 +18,7 @@
 //!
 //! **This is the M1 path: no front-end caches.** Every operation goes through
 //! the central list's locks (the "global lock" of the milestone ladder, §5).
-//! Plan 05's per-CPU/thread caches are wired *under* the same API at M2
+//! Plan 05's per-CPU + transfer caches are wired *under* the same API (W6/W7)
 //! (W16-4 owns that transition); nothing here changes when they arrive.
 //!
 //! **Trace spine (§33.7 / principle 6).** The allocator does not emit trace
@@ -1128,9 +1128,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
             }
         } else {
             match req.kind {
-                RequestKind::Small { sc, .. } => {
-                    self.alloc_small(arena, sc, self.small_place_class(&req))
-                }
+                RequestKind::Small { sc, .. } => self.alloc_small(
+                    arena,
+                    sc,
+                    self.small_place_class(&req),
+                    req.flags.hints().cache_bypass,
+                ),
                 RequestKind::Medium { .. } | RequestKind::Large { .. } => {
                     // Route to the arena's own hooked large backing if it has one (W10);
                     // otherwise the shared backend, carrying the request's placement hints
@@ -1736,6 +1739,12 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// short-lived small objects cluster; creating and activating a new (class-tagged)
     /// span when none is available (§A.2's OOM-retry loop).
     ///
+    /// `cache_bypass` is the request's `TOPO_TCACHE_NONE` (§10.3
+    /// [`RequestFlags::CACHE_BYPASS`]): the caller has asked *not* to be served from a
+    /// local cache, so the front end is skipped and the object comes from central. The
+    /// flag is per-call, not per-object — a bypassed allocation's later `free` may still
+    /// be absorbed by the front end unless that free also carries the flag.
+    ///
     /// The front end is a pure *accelerator*: it can decline for any reason (empty slot
     /// with an empty central list, an RSEQ abort, exhausted slot metadata) and the central
     /// path below then serves the request unchanged. So the front end can never turn into
@@ -1751,8 +1760,17 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// span; span creation draws from a finite region/pool, so a thread can
     /// loop only while *other* threads consume the objects it activates —
     /// i.e. only while the system as a whole makes progress.
-    fn alloc_small(&self, arena: ArenaId, sc: SizeClassId, class: u8) -> *mut u8 {
-        if Self::front_end_cacheable(arena, class) && !crate::deterministic::force_slow_path() {
+    fn alloc_small(
+        &self,
+        arena: ArenaId,
+        sc: SizeClassId,
+        class: u8,
+        cache_bypass: bool,
+    ) -> *mut u8 {
+        if !cache_bypass
+            && Self::front_end_cacheable(arena, class)
+            && !crate::deterministic::force_slow_path()
+        {
             let p = self.alloc_small_cached(sc);
             if !p.is_null() {
                 return p;
@@ -2027,7 +2045,27 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// recycled, currently-live allocation (the classic double-free): freeing
     /// it would release another owner's object and invalidate that owner's
     /// outstanding pointer.
+    #[inline]
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // SAFETY: this method's own contract is the one being forwarded.
+        unsafe { self.free_with(ptr, false) }
+    }
+
+    /// [`free`](Self::free), honouring the request's `TOPO_TCACHE_NONE`
+    /// ([`RequestFlags::CACHE_BYPASS`], §10.3): with `cache_bypass` set, the object is
+    /// returned **straight to the central free list** instead of being parked in the
+    /// running core's front-end slot.
+    ///
+    /// This is what `topo_dallocx`/`topo_sdallocx` route the flag to. Both outcomes are
+    /// equally correct — the central list is the authoritative home and the front end only
+    /// ever delays the trip there — so the flag is a locality/residency choice, never a
+    /// safety one. It is per-call: freeing with the flag does not mark the *object* as
+    /// uncacheable, it only declines the cache for this one free.
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free).
+    pub unsafe fn free_with(&self, ptr: *mut u8, cache_bypass: bool) -> FreeOutcome {
         if ptr.is_null() {
             return FreeOutcome::Null;
         }
@@ -2081,7 +2119,8 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 // cacheable. `None` ⇒ the front end declined and the central path below
                 // completes the free (the object stays marked cached until
                 // `insert_batch_inner` clears it free-bit-first).
-                if Self::front_end_cacheable(arena, span.place_class())
+                if !cache_bypass
+                    && Self::front_end_cacheable(arena, span.place_class())
                     && !crate::deterministic::force_slow_path()
                 {
                     if let Some(outcome) = self.free_small_cached(ptr, span, idx, arena, usable) {
@@ -3652,6 +3691,34 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 .bin(SizeClassId::new(i))
                 .map_or(0, |bin| bin.total_central_free() * row.size as u64);
             f(i, row.size, free);
+        }
+    }
+
+    /// Visit each core that currently holds front-end residency — the per-core
+    /// decomposition of `AllocatorStats::per_cpu_bytes` for the §31.2 `BY_CPU` detail view
+    /// (plan 07 W17-2): `f(core_index, objects, bytes)`.
+    ///
+    /// Cores holding **nothing** are skipped, so a visitor sees a list proportional to the
+    /// front end's live spread rather than to `MAX_CPUS`. Lock-free approximate reads,
+    /// exact when quiescent (§31.1) — exactly as [`stats`](Self::stats) sums them.
+    pub fn for_each_cpu_cache<F: FnMut(u32, u64, u64)>(&self, mut f: F) {
+        for c in 0..crate::cpu_cache::MAX_CPUS {
+            let Some(cpu) = self.cpu_cache.per_cpu(CoreId(c as u32)) else {
+                // The array is carved lazily; a null one means no core holds anything.
+                return;
+            };
+            let mut objects = 0u64;
+            let mut bytes = 0u64;
+            for (i, row) in SIZE_CLASSES.iter().enumerate() {
+                if let Some(slot) = cpu.slot(SizeClassId::new(i)) {
+                    let n = slot.len() as u64;
+                    objects += n;
+                    bytes += n * row.size as u64;
+                }
+            }
+            if objects > 0 {
+                f(c as u32, objects, bytes);
+            }
         }
     }
 

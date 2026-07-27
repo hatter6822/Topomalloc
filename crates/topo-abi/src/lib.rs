@@ -197,13 +197,26 @@ impl AnyAllocator {
     /// of this allocator the caller still owns, or memory never returned by
     /// it (rejected harmlessly). A stale pointer aliasing a recycled live
     /// allocation would free another owner's object.
+    #[inline]
     pub unsafe fn free(&self, ptr: *mut u8) -> FreeOutcome {
+        // SAFETY: this method's own contract is the one being forwarded.
+        unsafe { self.free_with(ptr, false) }
+    }
+
+    /// [`free`](Self::free), honouring `TOPO_TCACHE_NONE` (§10.3): with `cache_bypass`
+    /// set, the object goes straight to the central free list instead of the running
+    /// core's front-end slot. The route `topo_dallocx`/`topo_sdallocx` take for the flag.
+    ///
+    /// # Safety
+    ///
+    /// As [`free`](Self::free).
+    pub unsafe fn free_with(&self, ptr: *mut u8, cache_bypass: bool) -> FreeOutcome {
         let _op = topo_core::fork::operation_guard();
         // W17-3: resolve a sampled object's lifetime *before* the free; lock-free
         // (a Bloom reject) for the common non-sampled pointer, and a no-op when off.
         crate::sampling::on_free(ptr);
         // SAFETY: the caller upholds this method's identical contract.
-        dispatch!(self, a => unsafe { a.free(ptr) })
+        dispatch!(self, a => unsafe { a.free_with(ptr, cache_bypass) })
     }
 
     /// Reallocate under the §25.1 contract (failure preserves the original).
@@ -425,6 +438,12 @@ impl AnyAllocator {
     pub fn check_invariants(&self) -> bool {
         let _op = topo_core::fork::operation_guard();
         dispatch!(self, a => a.check_invariants())
+    }
+
+    /// Visit each core holding front-end residency (§31.2 `BY_CPU` detail, W17-2 / W6):
+    /// `f(core, objects, bytes)`. Cores holding nothing are skipped.
+    pub fn for_each_cpu_cache<F: FnMut(u32, u64, u64)>(&self, f: F) {
+        dispatch!(self, a => a.for_each_cpu_cache(f))
     }
 
     /// Visit each size class's central-resident free bytes (§31.2 `BY_SIZE_CLASS`
@@ -1122,11 +1141,12 @@ mod tests {
             ptr::write_bytes(p, 1, 128);
             g.dealloc(p, layout);
         }
-        // The engine genuinely freed it (not leaked): the slot is vended again. No
-        // front-end thread cache yet (M2), so a freed small object returns to the *shared*
-        // central free list, which a parallel test thread can transiently touch — confirm
-        // recycling by membership in a bounded batch (held to drain toward the freed slot,
-        // then freed), not by asserting the exact next call.
+        // The engine genuinely freed it (not leaked): the slot is vended again. Every
+        // front-end layer is *shared* (a per-CPU slot serves whichever threads run on that
+        // core; the transfer cache is process-wide), so a parallel test thread can
+        // transiently take the freed object — confirm recycling by membership in a bounded
+        // batch (held to drain toward the freed slot, then freed), not by asserting the
+        // exact next call.
         let mut batch = Vec::with_capacity(64);
         let mut recycled = false;
         for _ in 0..64 {

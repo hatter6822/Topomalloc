@@ -215,8 +215,9 @@ type CentralGuard<'a> = RankedGuard<'a, { LockRank::CENTRAL }>;
 // ---------------------------------------------------------------------------
 
 /// Per-size-class central structure (W5-4a): a partial-span list, an
-/// empty-span cache, occupancy counters, and a lock (DD-4). At M1 this is the
-/// only allocation path; at M2, caches drain/refill through it.
+/// empty-span cache, occupancy counters, and a lock (DD-4). The authoritative
+/// home for every free small object: the §11 front end refills from and flushes
+/// to it (W6), and a request the front end declines is served here directly.
 pub struct CentralBin {
     /// Spinlock protecting all mutable state below.
     lock: CentralLock,
@@ -1016,12 +1017,13 @@ impl CentralCache {
             sg.central_free_count() == inserted && inserted > 0 && !core::ptr::eq(head, span)
         };
 
-        // W5-3d/3e: empty detection trigger.  This is one of two trigger
-        // points in the W5-3e protocol:
-        //   1. central insert (here) — fires on every batch return.
-        //   2. cache drain (M2, plan 05) — fires on idle-CPU flush, thread
-        //      exit, arena reset.  Not yet implemented; no caches exist at M1.
-        // M2 action: replace NONE with span.reconstruct_non_central_residency().
+        // W5-3d/3e: empty detection. Every path that returns objects to central lands
+        // here — a direct free, a front-end flush or idle-CPU drain (W6, which routes
+        // through `insert_batch`), and an arena-reset drain — so this single trigger
+        // point covers them all. `NONE` is correct because `live_count` already counts
+        // cached objects as "removed from central" (see `reconstruct_non_central_residency`),
+        // so a
+        // span holding cached objects is never reported empty.
         let is_empty = sg.is_empty(NonCentralResidency::NONE);
         drop(sg);
 
@@ -1090,8 +1092,8 @@ impl CentralCache {
             // B.3 (W19-1c): the freshly-activated span is well-formed (full bitmap,
             // `central_free == object_count`, geometry fits). A runtime assertion at
             // this transition, under the held lock. Subsumes the §16.4 conservation
-            // (M2 action: pass `span.reconstruct_non_central_residency()` once caches
-            // track per-span residency).
+            // (`NONE` stays correct while `live_count` subsumes cache residency — see
+            // `SpanDescriptor::reconstruct_non_central_residency`).
             debug_assert!(span.check_invariants_locked(&sg));
         }
 

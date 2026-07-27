@@ -496,6 +496,7 @@ fn explanation_and_full_report_render_for_a_live_snapshot() {
     let detail = StatsDetail {
         arenas: &arenas,
         size_classes: &[],
+        cpus: &[],
         numa_nodes: &[],
     };
     let json = s.to_json_with(StatsFlags::BY_ARENA | StatsFlags::BY_CPU, &detail);
@@ -550,6 +551,7 @@ fn redaction_is_label_noninterference_end_to_end() {
         &StatsDetail {
             arenas: &view_a,
             size_classes: &[],
+            cpus: &[],
             numa_nodes: &[],
         },
     );
@@ -558,6 +560,7 @@ fn redaction_is_label_noninterference_end_to_end() {
         &StatsDetail {
             arenas: &view_b,
             size_classes: &[],
+            cpus: &[],
             numa_nodes: &[],
         },
     );

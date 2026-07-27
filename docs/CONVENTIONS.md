@@ -41,7 +41,7 @@ sweep on the `performance` hot path.
 The Appendix-B checklist (W19-1, DD-2) is **first-class runtime code**: one *total*,
 side-effect-free `check_invariants` method per type, landing with the state it checks
 (`SpanDescriptor`/`CentralCache` for B.3/B.1, `PageMap` for the B.1 pagemap↔descriptor
-agreement, the `CpuCache`/`TransferCache`/`ThreadCache` trio for B.2, `HugePageFiller` for
+agreement, the `CpuCache`/`TransferCache` pair for B.2, `HugePageFiller` for
 B.4, `ArenaTable` for B.5), gathered and documented by invariant group in the `crate::debug`
 module (the B.1–B.5 → code map, the `check_b2_cache` group callable, the `Group` enum). The
 **cheap per-span B.3 check runs as a `debug_assert!` at every central transition** (the

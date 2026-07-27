@@ -33,16 +33,49 @@ one contract; the Lean RSEQ axiom (plan 02 W1-7) is its specification.
 
 | WU | Description | Size | ∥ | Acceptance | Status |
 |---|---|---|---|---|---|
-| W6-1a | Thread cache (§13): per-`(arena,sc,label)` free lists; push/pop/refill/flush. | M | | basic tcache correct under single thread. | **DONE** — `thread_cache.rs` |
-| W6-1b | Thread-cache GC on exit/pressure/budget (§13.3) + arena-reset drain precondition (§13.4). | M | ∥ | thread-exit flush; budget bounded (B.2); reset drains. | **DONE** — `Drop` impl w/ flush hook, `thread_local!` wiring, `drain_arena`, budget tracking |
+| W6-1a | Thread cache (§13): per-`(arena,sc,label)` free lists; push/pop/refill/flush. | M | | basic tcache correct under single thread. | **NOT IMPLEMENTED** — §13 is an optional *alternative* front end (see the note below) |
+| W6-1b | Thread-cache GC on exit/pressure/budget (§13.3) + arena-reset drain precondition (§13.4). | M | ∥ | thread-exit flush; budget bounded (B.2); reset drains. | **NOT IMPLEMENTED** — n/a without W6-1a |
 | W6-2 | Transfer cache `(domain, arena, label, sc)` with `Batch` (§14.2); distinct/correct/free guarantee. | M | ∥ | batch invariants tested. | **DONE** — `transfer_cache.rs`; `ArenaId` param wired (M2-ready); M2 keying documented |
-| W6-3a | Refill (§14.3): transfer batch → central batch (plan 03 W5-4b) → new span; push to cpu/thread cache. **Hand-over-hand:** release the transfer lock before taking the central lock. | M | | never holds two middle-end locks; conservation matches plan 02 W1-6c. | **DONE** — `cache_ops::refill` + `refill_with_retry` OOM-retry helper |
+| W6-3a | Refill (§14.3): transfer batch → central batch (plan 03 W5-4b) → new span; push to the per-CPU cache. **Hand-over-hand:** release the transfer lock before taking the central lock. | M | | never holds two middle-end locks; conservation matches plan 02 W1-6c. | **DONE** — `cache_ops::refill` + `refill_with_retry` OOM-retry helper |
 | W6-3b | Flush (§14.4): pop a batch → transfer cache if capacity else central (W5-4c); same hand-over-hand. | M | ∥ | lock-order checker clean; conservation matches W1-6c. | **DONE** — `cache_ops::flush` with `ArenaId` param |
 | W6-3c | Wire empty-span detection (plan 03 W5-3e) into flush-to-central; debug conservation check (B.2). | S | | a flush that empties a span triggers detection. | **DONE** — `flush_addrs_to_central` wires `span_empty`; uses `span.slab_header()` accessor |
 | W6-4 | Per-CPU cache structure + **locked** per-CPU mode (§11.2–§11.5) as the RSEQ-free correct baseline + RSEQ fallback. | M | | hard-capacity invariant (§11.5) holds; ready as fallback. | **DONE** — `cpu_cache.rs`; `fe_push` respects `soft_capacity`; `ArenaId` in contract |
 | W6-5 | Cache budget controller v1 (§11.5, P-005): adapt to miss/overflow counts; global budget + per-CPU soft/hard. | M | ∥ | budget honored; stats expose miss/overflow. | **DONE** — `budget.rs`; soft_capacity effective in fast path; `should_adapt` periodic trigger |
 | W6-6 | Arena routing (D6, §11.7): bound-arena fast path now; arena-qualified `(cpu,arena,sc)` slots wired for M4. | M | | free always returns to the owning arena's structures; alloc from A returns only A's objects. | **DONE** — `ArenaId` wired through `fe_pop`/`fe_push`/`flush`/transfer APIs; M4 keying documented |
 | W6-7 | Idle-CPU/affinity-change flush (§11.6) + a control to release stranded caches. | S | ∥ | flushing an idle CPU moves objects to transfer/central; control hook present (plan 07). | **DONE** — `cache_ops::flush_idle_cpu` with `ArenaId`; plan 07 hook site documented |
+
+### W6-1 (§13 thread cache): deliberately not implemented
+
+§13 is titled "**Optional** thread cache fallback", and §13.1 says thread caches "exist
+for portability and for policy domains that cannot or should not use per-CPU caches" and
+"are **not** the preferred default on systems with RSEQ". §13 is therefore an
+*alternative* front end to §11, not a layer stacked on top of it — and this tree
+implements the §11 per-CPU one (W6-2 … W6-7, wired live).
+
+The obligations W6-1 would have discharged are met without it:
+
+* **P-003** ("without RSEQ the fallback SHOULD be per-thread cache mode **or lock-sharded
+  arena mode**") — the per-CPU cache's *locked* baseline is a lock-sharded mode. It is
+  shipped, it is the automatic fallback when `rseq::enable()` declines, and the
+  `rseq_equivalence` battery proves it observationally identical to the RSEQ path.
+* **§13.3/§13.4** (thread-exit / pressure / budget GC; the arena-reset drain
+  precondition) — vacuous with no thread cache. The per-CPU equivalents are W6-5
+  (budget), W6-7 + `topomalloc_cache_flush_all` (pressure/idle drain), and the W6
+  cacheability restriction to the default arena, which makes the §13.4 arena-drain
+  precondition unreachable by construction.
+* **O-002** (report bytes in "optional thread caches") — `Stats::thread_cache_bytes` is
+  reported, and is `0` because the class is empty, not because it is unmeasured.
+
+An implementation existed (`crates/topo-core/src/thread_cache.rs`, removed in 0.4.0) but
+could not be wired: its slots were `Vec`-backed, so the fast path would have allocated
+through the allocator and thread-exit teardown would have freed through it — the
+Appendix-F recursion anti-pattern. Rewriting it is more than swapping the storage, because
+per-thread state loses four properties per-CPU state has for free: bounded metadata
+(monotonic metadata never returns, and thread count is unbounded, so it needs a registry
+and a reuse free-list), a teardown path that must not touch destructor-registered TLS, a
+fork story (a child inherits the caches of threads that no longer exist), and a third
+residency term in every stats/invariant/drain path. `docs/DECISIONS.md` records the full
+reasoning and what a future §13 front end would have to look like.
 
 > **▸ Decomposition — W6-3 (refill/flush), the hand-over-hand rule.** Refill and flush are the only places
 > two middle-end locks could be wanted at once; the lock hierarchy (W16-1) forbids holding them together, so

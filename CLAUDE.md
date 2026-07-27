@@ -403,11 +403,22 @@ the double-free oracle is pinned by the fixed-wall tests
 `SpanDescriptor::cached_and_central_free_are_disjoint` (an Appendix-B checker run from
 `Allocator::check_invariants`), and the wiring itself by
 `crates/topo-abi/tests/front_end.rs` (the front end observed through the public C surface,
-so a regression that silently unwires it fails CI). `thread_cache.rs` (§11.2) is
-**deliberately not wired**: its slots are `Vec`-backed, so it would allocate through the
-allocator on the fast path (an Appendix-F anti-pattern) and free through it at TLS teardown;
-and with RSEQ removing the per-CPU lock entirely there is little left for a third residency
-layer to save. Its module docs record both premises and what wiring it would require.
+so a regression that silently unwires it fails CI). The §13 **thread cache is not
+implemented** and its prototype (`thread_cache.rs`) was removed: §13 is an optional
+*alternative* front end for platforms that cannot use per-CPU caches (§13.1 — "not the
+preferred default on systems with RSEQ"), P-003's fallback is met by the *locked* per-CPU
+baseline (a lock-sharded mode, proven observationally identical to the RSEQ path by the
+`rseq_equivalence` battery), and §160 prefers per-CPU over per-thread for RSS on
+high-thread-count systems. `Stats::thread_cache_bytes` stays and reports `0` (O-002).
+See `planning/plans/05` §"W6-1" and `docs/DECISIONS.md`. Removing it surfaced two things
+the absence of a front end had excused: **`TOPO_TCACHE_NONE`** (§10.3) was decoded into
+`RequestFlags::CACHE_BYPASS` and never consumed — it is now honoured on `topo_mallocx`
+*and* on `topo_dallocx`/`topo_sdallocx` (shared free body, so `errno` handling cannot
+drift), pinned by `tcache_none_bypasses_the_front_end_on_both_sides`; and the §31.2
+**`BY_CPU`** flag rendered a hard-coded `[]` — it now renders real per-core residency
+(`Allocator::for_each_cpu_cache` → `CpuCacheLine`). `cargo xtask ci` also gained a
+**`fuzz targets compile`** step: the `fuzz/` workspace is excluded from the main one, so
+nothing built it, and a 0.3.0 signature change had left two targets uncompilable.
 
 Observability: stats, telemetry & profiling (W17) completes plan 07's observability track ahead of its M6
 slot. The pure renderer is `topo-stats` and the live C surface is `crates/topo-abi/src/stats_api.rs`. **W17-1a

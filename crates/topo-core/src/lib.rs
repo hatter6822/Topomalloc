@@ -51,7 +51,6 @@ pub mod size_class;
 pub mod skeleton;
 pub mod slab;
 pub mod span;
-pub mod thread_cache;
 pub mod topology;
 pub mod trace;
 pub mod transfer_cache;
@@ -154,9 +153,6 @@ pub use cache_ops::{flush, flush_idle_cpu, refill, refill_with_retry, FlushResul
 pub use cpu_cache::CpuCache;
 pub use fe::{CoreId, FeOutcome};
 pub use pinned::{CoreProvider, FixedCore};
-#[cfg(any(test, feature = "std"))]
-pub use thread_cache::init_thread_cache;
-pub use thread_cache::{with_thread_cache, FlushHookFn, ThreadCache};
 pub use transfer_cache::TransferCache;
 
 #[cfg(test)]

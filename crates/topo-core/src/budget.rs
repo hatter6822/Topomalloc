@@ -48,10 +48,10 @@ const DEFAULT_ADAPT_INTERVAL: u64 = 4096;
 ///   path increments a per-CPU counter and calls `adapt` when the counter
 ///   crosses [`adapt_interval`](Self::adapt_interval).
 ///
-/// **Thread cache budgets.** The controller currently manages per-CPU cache
-/// soft capacities. Per-thread cache budgets are managed independently by
-/// [`ThreadCache::set_budget`](crate::thread_cache::ThreadCache::set_budget);
-/// a future enhancement may unify them under a single global budget.
+/// **Scope.** The controller manages per-CPU slot soft capacities, which is the whole
+/// §11.5 budget: the transfer cache is fixed-capacity per size class, and this tree
+/// implements no per-thread cache (§13 is an optional *alternative* front end for
+/// platforms that cannot use per-CPU caches — see `docs/DECISIONS.md`).
 pub struct CacheBudget {
     /// Global budget: maximum total soft capacity across all CPUs and SCs
     /// (in objects). When the total exceeds this, slots above the minimum are

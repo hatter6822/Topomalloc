@@ -17,10 +17,13 @@
 
 use std::sync::Mutex;
 
+use std::ffi::CStr;
+
 use topo_abi::{
-    topomalloc_cache_budget_tick, topomalloc_cache_flush_all, topomalloc_cache_rseq_active,
-    topomalloc_debug_check_now, topomalloc_free, topomalloc_malloc, topomalloc_stats_snapshot,
-    topomalloc_stats_t,
+    topo_dallocx, topo_mallocx, topo_sdallocx, topomalloc_cache_budget_tick,
+    topomalloc_cache_flush_all, topomalloc_cache_rseq_active, topomalloc_debug_check_now,
+    topomalloc_free, topomalloc_malloc, topomalloc_malloc_usable_size, topomalloc_stats_json,
+    topomalloc_stats_snapshot, topomalloc_stats_t, TOPO_TCACHE_NONE,
 };
 
 /// Serializes this binary's tests: they assert on process-wide residency counters.
@@ -182,5 +185,155 @@ fn draining_the_front_end_empties_both_layers() {
         "both front-end layers are empty after a drain"
     );
     assert_eq!(d.live_bytes, 0);
+    assert_eq!(topomalloc_debug_check_now(), 1);
+}
+
+/// §10.3 `TOPO_TCACHE_NONE` means what it says on **both** sides: an allocation carrying
+/// it is served from the central free list rather than a per-CPU slot, and a free carrying
+/// it returns the object straight to central rather than parking it in one.
+///
+/// This is the flag's whole observable contract — both routes are equally correct, so
+/// nothing but a test distinguishes "honoured" from "decoded and discarded", which is what
+/// it was before there was a front end to bypass.
+///
+/// Asserted as **deltas**, never absolutes: a `malloc` that misses refills a whole batch
+/// into the slot, so front-end residency after any single operation is a batch-sized
+/// number, not zero. What the flag controls is whether an operation moves one object
+/// across the front-end boundary — exactly what a delta measures.
+#[test]
+fn tcache_none_bypasses_the_front_end_on_both_sides() {
+    let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    quiesce(&g);
+    assert_eq!(stats().cache_bytes, 0);
+
+    // Prime the slot so both directions have somewhere to move an object to or from, and
+    // learn the class's usable size — residency is counted in usable bytes, not requested.
+    let prime = topomalloc_malloc(SIZE);
+    assert!(!prime.is_null());
+    let obj = topomalloc_malloc_usable_size(prime) as u64;
+    assert!(obj >= SIZE as u64);
+
+    // --- free side ----------------------------------------------------------------
+    let before = stats().cache_bytes;
+    assert!(
+        before > 0,
+        "the priming miss refilled a batch into the slot"
+    );
+    // SAFETY: `prime` is live and owned here; the flag word is valid.
+    unsafe { topo_dallocx(prime.cast(), TOPO_TCACHE_NONE) };
+    assert_eq!(
+        stats().cache_bytes,
+        before,
+        "a TOPO_TCACHE_NONE free must go straight to central, adding no residency"
+    );
+
+    // Not vacuous: the *unflagged* free of the same shape does add exactly one object.
+    let p = topomalloc_malloc(SIZE); // pops one from the slot
+    let mid = stats().cache_bytes;
+    // SAFETY: `p` is live and owned here.
+    unsafe { topo_dallocx(p.cast(), 0) };
+    assert_eq!(
+        stats().cache_bytes,
+        mid + obj,
+        "an unflagged free is absorbed by the front end"
+    );
+
+    // --- alloc side ---------------------------------------------------------------
+    let held = stats().cache_bytes;
+    let q = topo_mallocx(SIZE, TOPO_TCACHE_NONE);
+    assert!(!q.is_null());
+    assert_eq!(
+        stats().cache_bytes,
+        held,
+        "a TOPO_TCACHE_NONE allocation must come from central, not from the slot"
+    );
+    // Not vacuous: the *unflagged* allocation right after it does pop one.
+    let r = topomalloc_malloc(SIZE);
+    assert!(!r.is_null());
+    assert_eq!(
+        stats().cache_bytes,
+        held - obj,
+        "an unflagged allocation is served from the front end"
+    );
+
+    // --- sized free carries the flag too (`topo_sdallocx`) ------------------------
+    let before_sized = stats().cache_bytes;
+    // SAFETY: `q` is a live allocation owned here, freed once with a truthful size hint.
+    unsafe { topo_sdallocx(q.cast(), SIZE, TOPO_TCACHE_NONE) };
+    assert_eq!(
+        stats().cache_bytes,
+        before_sized,
+        "a TOPO_TCACHE_NONE sized free must go straight to central"
+    );
+
+    // SAFETY: `r` is a live allocation owned here.
+    unsafe { topomalloc_free(r) };
+    topomalloc_cache_flush_all();
+    assert_eq!(topomalloc_debug_check_now(), 1);
+}
+
+/// §31.2 `BY_CPU` renders the **real** per-core front-end residency. The flag predates the
+/// front end and used to emit a hard-coded empty array, which was honest only while no
+/// cache existed; now the array is empty exactly when the front end is, and otherwise
+/// names the cores holding objects.
+#[test]
+fn by_cpu_detail_reconciles_with_the_front_end_total() {
+    /// `StatsFlags::BY_CPU` (bit 2).
+    const BY_CPU: u64 = 1 << 2;
+
+    let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    quiesce(&g);
+
+    let json = |flags: u64| -> String {
+        let mut buf = vec![0i8; 64 * 1024];
+        // SAFETY: `buf` is a valid writable buffer of `len` bytes; the renderer
+        // NUL-terminates within it.
+        let n = unsafe { topomalloc_stats_json(buf.as_mut_ptr(), buf.len(), flags) };
+        assert!(n > 0, "the renderer must produce output");
+        // SAFETY: the renderer wrote a NUL-terminated string into `buf`.
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // Drained: no core holds anything, so the array is empty — and present, not missing
+    // (the flag's shape is additive, §35.3).
+    let empty = json(BY_CPU);
+    assert!(
+        empty.contains("\"by_cpu\": []"),
+        "a drained front end renders an empty by_cpu array:\n{empty}"
+    );
+
+    // Populated: a burst leaves residency, and the per-core lines must sum to the
+    // `cache_bytes` total minus whatever the transfer cache holds.
+    let mut ptrs = Vec::new();
+    for _ in 0..500 {
+        ptrs.push(topomalloc_malloc(SIZE));
+    }
+    for p in ptrs {
+        // SAFETY: live allocations owned here.
+        unsafe { topomalloc_free(p) };
+    }
+    let live = json(BY_CPU);
+    assert!(
+        live.contains("\"cpu\":") && live.contains("\"objects\":") && live.contains("\"bytes\":"),
+        "a populated front end names the cores holding objects:\n{live}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&live).expect("valid JSON");
+    let lines = v["by_cpu"].as_array().expect("by_cpu is an array");
+    assert!(!lines.is_empty(), "some core holds the burst's residency");
+    let per_cpu_total: u64 = lines.iter().map(|l| l["bytes"].as_u64().unwrap()).sum();
+    assert!(
+        per_cpu_total > 0 && per_cpu_total <= stats().cache_bytes,
+        "the per-core lines are a real decomposition of the front-end total \
+         ({per_cpu_total} vs {})",
+        stats().cache_bytes
+    );
+
+    topomalloc_cache_flush_all();
+    assert!(
+        json(BY_CPU).contains("\"by_cpu\": []"),
+        "the drain empties it again"
+    );
     assert_eq!(topomalloc_debug_check_now(), 1);
 }

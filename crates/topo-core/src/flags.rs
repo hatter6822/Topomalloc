@@ -78,7 +78,11 @@ pub enum HugepagePolicy {
 pub struct Hints {
     /// Zero the returned memory (`TOPO_ZERO`).
     pub zero: bool,
-    /// Bypass the front-end cache for this request (`TOPO_TCACHE_NONE`).
+    /// Bypass the §11 front-end cache for this request (`TOPO_TCACHE_NONE`, W6/W7):
+    /// serve the allocation from the central free list rather than the running core's
+    /// per-CPU slot, and (on `topo_dallocx`/`topo_sdallocx`) return the object straight
+    /// to central rather than parking it in one. Per-call, not per-object: a bypassing
+    /// allocation's later unflagged `free` may still be absorbed by the front end.
     pub cache_bypass: bool,
     /// Sampled or forced guard allocation (`TOPO_GUARDED`).
     pub guarded: bool,

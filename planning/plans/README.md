@@ -111,7 +111,7 @@ lets domains parallelize.
             ├──────────────────────────────────────────────────────────────┤
             │ Request classifier: size class, align, arena, label, hints     │  W2  → plan 03
             ├──────────────────────────────────────────────────────────────┤
-            │ Front-end: per-CPU (RSEQ / pinned-core) or thread cache         │  W6,W7 → plan 05
+            │ Front-end: per-CPU cache (RSEQ / pinned-core / locked)          │  W6,W7 → plan 05
             ├──────────────────────────────────────────────────────────────┤
             │ Middle-end: transfer caches + central free lists (label-part.)  │  W5,W6 → plan 03,05
             ├──────────────────────────────────────────────────────────────┤

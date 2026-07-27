@@ -116,11 +116,13 @@ void topomalloc_free_aligned_sized(void *ptr, size_t alignment, size_t size);
  * (§22/§36.4): the default arena (id 0) is always present, and explicit
  * arenas are created with the arena API below (plan 06 W9). TOPO_ARENA(id)
  * routes an allocation to arena `id`; naming an arena that does not exist (or
- * is being reset/destroyed) is a deterministic EINVAL. topo_tcache_t is
- * declared for the §10.3 surface but has no consumer until explicit-tcache
- * routing lands (plan 05, M2) — as with TOPO_TCACHE(id)/TOPO_NUMA(node), the
- * encoding is deferred to its subsystem rather than frozen as a guess
- * (reserved flag bits hold the space). */
+ * is being reset/destroyed) is a deterministic EINVAL. topo_tcache_t names an
+ * *explicit* cache to route through; it is declared for the §10.3 surface but
+ * has no consumer, because this allocator's front end is keyed by CPU rather
+ * than by a caller-held cache handle, so there is nothing for such a handle to
+ * name (TOPO_TCACHE_NONE — declining the cache entirely — is honoured). As with
+ * TOPO_TCACHE(id)/TOPO_NUMA(node), the encoding is deferred to its subsystem
+ * rather than frozen as a guess (reserved flag bits hold the space). */
 typedef uint32_t topo_arena_t;
 typedef uint32_t topo_tcache_t;
 typedef uint64_t topo_flags_t;
@@ -128,7 +130,7 @@ typedef uint64_t topo_flags_t;
 /* The topo_flags_t layout (validated; reserved bits MUST be zero — §10.4):
  *   bits 0–5   lg(alignment), 0 = natural        TOPO_ALIGN_LG(la)
  *   bit  6     zero returned memory              TOPO_ZERO
- *   bit  7     bypass local caches               TOPO_TCACHE_NONE
+ *   bit  7     bypass the per-CPU cache          TOPO_TCACHE_NONE
  *   bit  8     guard allocation                  TOPO_GUARDED
  *   bit  9     avoid hugepages                   TOPO_NO_HUGEPAGE
  *   bit 10     prefer hugepages                  TOPO_PREFER_HUGEPAGE
@@ -138,6 +140,14 @@ typedef uint64_t topo_flags_t;
  *   bits 53–63 reserved (must be zero)
  * Invalid words fail deterministically (NULL/0 + EINVAL); advisory hints are
  * validated and threaded to the placement subsystems as they land.
+ *
+ * TOPO_TCACHE_NONE: serve this allocation from the central free list instead
+ * of the running core's per-CPU cache. Honoured on topo_mallocx and on
+ * topo_dallocx/topo_sdallocx (where it returns the object straight to central
+ * rather than parking it in a slot). Per-call, not per-object: a bypassing
+ * allocation freed without the flag may still be absorbed by the cache. Both
+ * routes are equally correct — this controls locality and cache residency,
+ * never validity.
  *
  * TOPO_ALIGN_LG(la): an out-of-range `la` (>= 64, including negative values
  * via the unsigned conversion) encodes a reserved-bit word, so the request
