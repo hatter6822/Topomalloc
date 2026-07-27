@@ -167,18 +167,18 @@ dependencies = [
 
 [[package]]
 name = "topo-arch"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "topo-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "topo-arch",
 ]
 
 [[package]]
 name = "topo-stats"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "topo-core",
 ]

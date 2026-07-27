@@ -2215,3 +2215,46 @@ lazy-init/fork race) deferred to a decision because its complete fix is architec
   name you cannot yet design is not forward compatibility, it is a claim with a version
   number attached.** Adding a type when its API lands costs nothing; carrying one that
   documents an API that does not exist costs a reader's trust in the rest of the header.
+
+* **Free path — one authoritative claim per object, not one per route (0.4.1).** The W6
+  front end gave a *cacheable* small object two possible homes and therefore two possible
+  test-and-sets: `SpanDescriptor::try_mark_cached` on the cached route and
+  `central_insert` on the central one. `free_with`'s lock-free
+  `is_free_awaiting_reuse` screen reads both bits, so a *sequential* double free is caught
+  either way — but the screen is advisory (two loads, no claim), and the routes could
+  disagree about *which* atomic settles a concurrent one. `TOPO_TCACHE_NONE` (§10.3) and
+  the deterministic force-slow-path skipped the cached route entirely, so a normal free
+  and a bypassing free of the same live object could both pass the screen, take *different*
+  claims, and both succeed: the address ends up in a per-CPU slot **and** in the central
+  free list, to be vended to two callers.
+
+  The claim is now taken on the object's cacheability alone, before the cache-versus-central
+  decision — so the decision cannot change who wins. The general rule: **when a value can
+  take more than one path to the same terminal state, the exclusion has to live above the
+  branch, not inside each arm.** An oracle chosen per route is not an oracle; the screen
+  that reads every route's bit only papers over it for the non-concurrent case. Pinned by
+  `a_bypassing_free_racing_a_cached_free_cannot_also_succeed`, which reproduces the
+  interleaving exactly (`free_small_screened` is `free_with`'s body *after* the screen, so
+  calling it with the cached bit already set **is** the racing free winning the claim in
+  the window).
+
+* **Hugepage placement — a bounded scan has to count what it skips (0.4.1).** §19.3's
+  approximate-bin cap bounds `HugePageFiller::place` to `SCAN_CAP` hugepages per bin. The
+  scan skipped a *completely full* hugepage without spending budget — reasonable, since it
+  can never fit a run — which quietly made the walk unbounded: §19.4 files a **hot** full
+  hugepage in `HotDense`, the first bin `PACKING_ORDER` scans, not the excluded `Full` one,
+  so a hot workload's full hugepages are all *in* the scanned bin and placement cost grew
+  linearly with the backend's capacity (1024 hugepages by default, more for a custom
+  configuration).
+
+  Counting them fixes the bound but would spend the budget on hugepages with no room, so
+  the fix is both halves: the cap now counts **every** node visited, and `bin_insert` files
+  a full hugepage at the *tail* of its bin (with `refile` moving one between the two ends
+  as its occupancy crosses full, since a hot 7/8-full hugepage filling up does not change
+  bins). Every hugepage that can still fit a run therefore precedes every one that cannot —
+  a B.4 invariant `check_invariants` now asserts, alongside the tail pointer itself.
+  `classify_bin` is untouched: it is the §19.4 observable classification, pinned 1:1 to the
+  Lean `classifyBin` by `hugeBinGate`, and *where in a bin list* a hugepage sits is
+  placement policy that the bin assignment does not speak to. The general rule: **a cap
+  that some inputs are exempt from is not a cap** — the exempt class is exactly what an
+  adversarial (or merely hot) workload will produce.

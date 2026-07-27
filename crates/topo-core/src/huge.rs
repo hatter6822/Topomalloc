@@ -702,6 +702,9 @@ pub struct HugePageFiller {
     /// Per-bin list heads (intrusive, over touched hugepages). Index by `HugeBin as
     /// usize`.
     bins: [u32; HugeBin::COUNT],
+    /// Per-bin list tails, where [`bin_insert`](HugePageFiller::bin_insert) files a
+    /// **full** hugepage. Same indexing as [`bins`](Self::bins).
+    bin_tails: [u32; HugeBin::COUNT],
     /// Cumulative subreleases performed (the §19.6 metric the control plane reads).
     subrelease_events: u64,
 }
@@ -744,6 +747,7 @@ impl HugePageFiller {
             region_base,
             next_untouched: 0,
             bins: [NIL; HugeBin::COUNT],
+            bin_tails: [NIL; HugeBin::COUNT],
             subrelease_events: 0,
         })
     }
@@ -800,21 +804,47 @@ impl HugePageFiller {
 
     // --- bin index (touched hugepages) ---------------------------------------
 
-    /// Insert touched hugepage `i` at the head of `bin`'s list and record the filed
-    /// bin on the slot.
+    /// Insert touched hugepage `i` into `bin`'s list and record the filed bin on the
+    /// slot: a **completely full** hugepage at the *tail*, every other one at the head.
+    ///
+    /// A full hugepage can never fit a run, so filing it behind the ones that still can
+    /// is what lets [`place`](Self::place)'s bounded per-bin scan spend its budget on real
+    /// candidates. Full hugepages are *not* confined to the [`Full`](HugeBin::Full) bin
+    /// `PACKING_ORDER` excludes — §19.4 files a **hot** full one in
+    /// [`HotDense`](HugeBin::HotDense), the first bin scanned — so without this a hot
+    /// workload's full hugepages would crowd the fittable ones past the cap.
     fn bin_insert(&mut self, i: u32, bin: HugeBin) {
-        let head = self.bins[bin as usize];
+        let b = bin as usize;
         let mut s = self.get(i);
+        let at_tail = s.used() >= PAGES_PER_HUGEPAGE;
         s.bin = bin as u8;
-        s.bin_prev = NIL;
-        s.bin_next = head;
-        self.put(i, s);
-        if head != NIL {
-            let mut h = self.get(head);
-            h.bin_prev = i;
-            self.put(head, h);
+        if at_tail {
+            let tail = self.bin_tails[b];
+            s.bin_prev = tail;
+            s.bin_next = NIL;
+            self.put(i, s);
+            if tail != NIL {
+                let mut t = self.get(tail);
+                t.bin_next = i;
+                self.put(tail, t);
+            } else {
+                self.bins[b] = i;
+            }
+            self.bin_tails[b] = i;
+        } else {
+            let head = self.bins[b];
+            s.bin_prev = NIL;
+            s.bin_next = head;
+            self.put(i, s);
+            if head != NIL {
+                let mut h = self.get(head);
+                h.bin_prev = i;
+                self.put(head, h);
+            } else {
+                self.bin_tails[b] = i;
+            }
+            self.bins[b] = i;
         }
-        self.bins[bin as usize] = i;
     }
 
     /// Remove touched hugepage `i` from its current filed bin.
@@ -833,16 +863,36 @@ impl HugePageFiller {
             let mut n = self.get(s.bin_next);
             n.bin_prev = s.bin_prev;
             self.put(s.bin_next, n);
+        } else {
+            debug_assert_eq!(
+                self.bin_tails[bin], i,
+                "hugepage not at the tail of its bin"
+            );
+            self.bin_tails[bin] = s.bin_prev;
         }
     }
 
     /// Re-file touched hugepage `i` into the bin its current occupancy/state implies
-    /// (H-003), if that differs from its filed bin. Called after any change to a
-    /// hugepage's `live`/`released`/`hotness`.
+    /// (H-003) **and the end of that bin its fullness implies**. Called after any change
+    /// to a hugepage's `live`/`released`/`hotness`.
+    ///
+    /// Re-filing on the bin alone is not enough: occupancy also moves a hugepage between
+    /// the fittable group (head) and the full group (tail) *without* changing its bin — a
+    /// hot hugepage at 7/8 filling up stays [`HotDense`](HugeBin::HotDense). Left in
+    /// place it would ossify in front of hugepages that can still fit a run, which is
+    /// exactly what the split in [`bin_insert`](Self::bin_insert) exists to prevent. Since
+    /// every occupancy change re-files, the resulting order is exact: every hugepage that
+    /// can fit a run precedes every one that cannot (asserted by
+    /// [`check_invariants`](Self::check_invariants)).
     fn refile(&mut self, i: u32) {
         let s = self.get(i);
         let target = s.target_bin();
-        if s.bin != target as u8 {
+        let at_right_end = if s.used() >= PAGES_PER_HUGEPAGE {
+            self.bin_tails[target as usize] == i
+        } else {
+            self.bins[target as usize] == i
+        };
+        if s.bin != target as u8 || !at_right_end {
             self.bin_remove(i);
             self.bin_insert(i, target);
         }
@@ -1101,21 +1151,29 @@ impl HugePageFiller {
             // The cap is **per bin**, not cumulative. `HotDense` is the first bin scanned
             // and `classify_bin` files a *completely full* hugepage there whenever it is
             // hot (only the non-hot full case becomes `Full`, which `PACKING_ORDER` omits),
-            // so a hot workload accumulates full hugepages at the head of the very first
-            // bin. With a cumulative cap those alone exhausted the whole placement budget
-            // and aborted the entire descent, so every request opened a fresh hugepage
-            // even though `NearlyFull`/`Medium`/`Sparse` ones had room — until the region
-            // ran out and the backend stopped serving altogether, exactly inverting the
-            // §19.5 packing policy. Per-bin, exhausting one bin's budget only moves on to
-            // the next.
+            // so a hot workload accumulates full hugepages in the very first bin. With a
+            // cumulative cap those alone exhausted the whole placement budget and aborted
+            // the entire descent, so every request opened a fresh hugepage even though
+            // `NearlyFull`/`Medium`/`Sparse` ones had room — until the region ran out and
+            // the backend stopped serving altogether, exactly inverting the §19.5 packing
+            // policy. Per-bin, exhausting one bin's budget only moves on to the next.
             scanned = 0;
             while i != NIL {
                 let s = self.get(i);
-                // A full hugepage can never fit a run; skip it without spending budget or
-                // walking its bitmap. `Full` is excluded from `PACKING_ORDER` for exactly
-                // this reason, but a *hot* full hugepage is filed `HotDense`, which is not.
+                // The cap counts **every** node visited, a full hugepage included, so the
+                // walk is bounded by `SCAN_CAP` regardless of what the bin holds — the
+                // placement cost cannot grow with the backend's capacity. `bin_insert`
+                // files full hugepages at the tail, behind every one that can still fit a
+                // run, so the budget is still spent on real candidates first.
+                scanned += 1;
+                // A full hugepage can never fit a run; skip it without walking its bitmap.
+                // `Full` is excluded from `PACKING_ORDER` for exactly this reason, but a
+                // *hot* full hugepage is filed `HotDense`, which is not.
                 if s.used() >= PAGES_PER_HUGEPAGE {
                     i = s.bin_next;
+                    if scanned >= SCAN_CAP {
+                        break;
+                    }
                     continue;
                 }
                 if let Some(off) = find_run_aligned(&s.live, pages, stride) {
@@ -1132,7 +1190,6 @@ impl HugePageFiller {
                     }
                 }
                 i = s.bin_next;
-                scanned += 1;
                 // Approximate-bin cap (§19.3 "MAY use approximate bins"): never scan
                 // an unbounded number of hugepages within one bin.
                 if scanned >= SCAN_CAP {
@@ -1890,16 +1947,26 @@ impl HugePageFiller {
             }
             i += 1;
         }
-        // 2. Each bin list is well-formed and counts match.
+        // 2. Each bin list is well-formed, ordered fittable-before-full, and counts match.
         for (b, (&head, &expected)) in self.bins.iter().zip(binned.iter()).enumerate() {
             let mut j = head;
             let mut prev = NIL;
             let mut seen = 0usize;
+            let mut seen_full = false;
             while j != NIL {
                 let s = self.get(j);
                 if s.touched != 1 || s.bin as usize != b || s.bin_prev != prev {
                     return false;
                 }
+                // Every hugepage that can still fit a run precedes every one that cannot
+                // (`bin_insert` files full ones at the tail, `refile` keeps them there).
+                // This is what makes `place`'s bounded per-bin scan spend its budget on
+                // real candidates instead of on hugepages with no room.
+                let full = s.used() >= PAGES_PER_HUGEPAGE;
+                if seen_full && !full {
+                    return false;
+                }
+                seen_full |= full;
                 prev = j;
                 j = s.bin_next;
                 seen += 1;
@@ -1909,6 +1976,9 @@ impl HugePageFiller {
             }
             if seen != expected {
                 return false; // a touched hugepage missing from / extra in its bin
+            }
+            if self.bin_tails[b] != prev {
+                return false; // the tail pointer must name the list's last node
             }
         }
         true
@@ -3290,6 +3360,70 @@ mod filler_tests {
             partial_hp,
             "the run landed in the hugepage that had room"
         );
+        assert!(f.check_invariants());
+    }
+
+    /// Regression (bounded placement, §19.3): the per-bin scan counts **every** node it
+    /// walks against `SCAN_CAP`, hugepages it skips for being full included. Skipping them
+    /// for free made the walk unbounded — §19.4 files a *hot* full hugepage in `HotDense`,
+    /// the first bin `PACKING_ORDER` scans, not the excluded `Full` one, so a hot workload
+    /// made every placement traverse its entire backend and allocation latency grew with
+    /// the region's capacity.
+    ///
+    /// Counting alone would trade that for a packing loss (the budget spent on hugepages
+    /// with no room), so `bin_insert` files a full hugepage at the *tail*: every hugepage
+    /// that can still fit a run precedes every one that cannot. That ordering is what this
+    /// test pins — the fittable hugepage stays inside the scan budget no matter how many
+    /// full ones accumulate.
+    #[test]
+    fn a_bin_full_of_full_hugepages_stays_within_the_scan_budget() {
+        let mut f = filler(4 * SCAN_CAP);
+        let hot = PlaceHints {
+            hotness: Hotness::Hot,
+            ..PlaceHints::default()
+        };
+
+        // One hugepage with room to spare, dense and hot enough to be filed `HotDense`.
+        let big = f
+            .place(PAGES_PER_HUGEPAGE - 8, PAGE_SIZE, hot)
+            .expect("big run");
+        f.mark_committed(&big);
+
+        // Then far more than a budget's worth of *completely full* hot hugepages, each
+        // filed in that same bin.
+        for _ in 0..3 * SCAN_CAP {
+            let p = f
+                .place(PAGES_PER_HUGEPAGE, PAGE_SIZE, hot)
+                .expect("full hugepage");
+            f.mark_committed(&p);
+        }
+        assert!(f.check_invariants());
+
+        // The hugepage with room is still within the bin's scan budget of its head — the
+        // full ones are all behind it.
+        let bin = f.bin_of(big.base).expect("filed in a bin");
+        let mut j = f.bins[bin as usize];
+        let mut pos = 0usize;
+        while j != NIL && j != big.hugepage {
+            j = f.get(j).bin_next;
+            pos += 1;
+        }
+        assert_eq!(j, big.hugepage, "the fittable hugepage is in its bin");
+        assert!(
+            pos < SCAN_CAP,
+            "the fittable hugepage sits at position {pos}, past the {SCAN_CAP}-node budget"
+        );
+
+        // So the capped scan finds it: the placement packs instead of opening a fresh one.
+        let touched_before = f.touched();
+        let p = f.place(4, PAGE_SIZE, hot).expect("placement");
+        f.mark_committed(&p);
+        assert_eq!(
+            f.touched(),
+            touched_before,
+            "the placement opened a fresh hugepage instead of packing into the one with room"
+        );
+        assert_eq!(p.hugepage, big.hugepage);
         assert!(f.check_invariants());
     }
 

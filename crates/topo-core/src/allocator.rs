@@ -1478,25 +1478,21 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
     /// is left marked cached, and `insert_batch_inner` clears that bit free-bit-first as
     /// part of the ordinary `cached → central-free` flush transition).
     ///
-    /// [`SpanDescriptor::try_mark_cached`] is the **double-free oracle** for this path,
-    /// exactly as `central_insert`'s test-and-set is for the central one: two concurrent
-    /// frees of the same live object both reach it and exactly one wins. The loser is
-    /// reported, not serviced, so the address is never pushed into a slot twice (which
-    /// would double-vend it). The `live → cached` transition is published in that single
-    /// atomic, and the object's bytes are destroyed *before* the address becomes reachable
-    /// from a slot.
+    /// **Precondition:** the caller has already won this object's
+    /// [`SpanDescriptor::try_mark_cached`] — the **double-free oracle** for every free of
+    /// a cacheable object, exactly as `central_insert`'s test-and-set is for one that
+    /// reaches the central bitmap. It is taken in `free_with` rather than here because a
+    /// *bypassing* free (`TOPO_TCACHE_NONE`, force-slow-path) never calls this function
+    /// yet must still settle the same race; two concurrent frees of one live object then
+    /// both reach that single atomic and exactly one wins, whichever routes each takes.
     fn free_small_cached(
         &self,
         ptr: *mut u8,
         span: &SpanDescriptor,
-        idx: u16,
         arena: ArenaId,
         usable: usize,
     ) -> Option<FreeOutcome> {
-        if !span.try_mark_cached(idx as usize) {
-            return Some(FreeOutcome::DoubleFree);
-        }
-        // Won the test-and-set ⇒ this object is exclusively ours: it is neither
+        // Holding the claim ⇒ this object is exclusively ours: it is neither
         // central-free (nothing can vend it) nor yet in a slot (nothing can pop it).
         // W18-5 (§29.6): arm the use-after-free canary here — the cached counterpart of
         // `insert_batch_scrubbing`'s under-the-span-lock fill — so a cached object carries
@@ -1524,6 +1520,79 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         }
         self.account_small_free(arena, usable);
         Some(FreeOutcome::Freed)
+    }
+
+    /// Complete a small free that has passed [`free_with`](Self::free_with)'s lock-free
+    /// "already awaiting reuse" **screen** — quarantine, then the authoritative claim,
+    /// then the front-end-or-central routing.
+    ///
+    /// Split out from `free_with` because the screen is only *advisory* (two loads, no
+    /// claim): the concurrency question is what happens when a second free of the same
+    /// object passes the screen and *then* the claim is taken. Calling this directly with
+    /// the claim already held is exactly that interleaving, which is how
+    /// `a_bypassing_free_racing_a_cached_free_cannot_also_succeed` pins it as a fixed wall.
+    fn free_small_screened(
+        &self,
+        ptr: *mut u8,
+        span: &SpanDescriptor,
+        idx: u16,
+        arena: ArenaId,
+        usable: usize,
+        cache_bypass: bool,
+    ) -> FreeOutcome {
+        // W18-3 (§29.4): when the quarantine is active it may *hold* this freed object
+        // out of circulation (delaying reuse) or detect a quarantine-hit double free —
+        // returning the final outcome; a true no-op (always `None`) without the
+        // `quarantine` feature.
+        if let Some(outcome) = self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
+            return outcome;
+        }
+        // W6 (§29.3): for a **front-end-cacheable** object the cached marker is the
+        // authoritative free-path claim — its test-and-set is what decides between two
+        // concurrent frees, exactly as `central_insert`'s does for an object that reaches
+        // the bitmap. *Every* route that can free such an object has to take it, including
+        // the two that go straight to central: `TOPO_TCACHE_NONE` (§10.3) and the
+        // deterministic force-slow-path. A route that skipped it would insert into a
+        // bitmap a cached free never touches, so a concurrent normal free and a bypassing
+        // one could each succeed — one address sitting in a per-CPU slot *and* in the
+        // central free list, to be vended to two callers. The claim is taken **before**
+        // the cache-versus-central decision precisely so the decision cannot change who
+        // wins the race.
+        let cacheable = Self::front_end_cacheable(arena, span.place_class());
+        if cacheable && !span.try_mark_cached(idx as usize) {
+            return FreeOutcome::DoubleFree;
+        }
+        // W6/W7: absorb the free into the running core's slot unless this call declined
+        // the cache. `None` ⇒ the front end declined and the central path below completes
+        // the free (the object stays marked cached until `insert_batch_inner` clears it
+        // free-bit-first).
+        if cacheable && !cache_bypass && !crate::deterministic::force_slow_path() {
+            if let Some(outcome) = self.free_small_cached(ptr, span, arena, usable) {
+                return outcome;
+            }
+        }
+        // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the use-after-free
+        // canary under the span lock; a true no-op otherwise.
+        let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
+        if r.inserted == 0 {
+            // Already central-free (double free) or the span raced its teardown; nothing
+            // was mutated (W8 hardening).
+            //
+            // W6 defence in depth: a cacheable object reaching here still carries the
+            // claim taken above — either the front end declined its push or this call
+            // bypassed the cache — and it sits in no slot. Clearing the mark restores
+            // exactly the pre-W6 state; the alternative is an object that is unreachable
+            // *and* reports a double free forever. A no-op for a non-cacheable object,
+            // which is never marked. Either way nothing else can hold this object's mark:
+            // reaching here means we won its `try_mark_cached`.
+            span.unmark_cached(idx as usize);
+            return FreeOutcome::DoubleFree;
+        }
+        self.account_small_free(arena, usable);
+        if r.span_empty {
+            self.retire_span(span);
+        }
+        FreeOutcome::Freed
     }
 
     /// Record a completed small free: the cumulative `freed` counter (§8.6
@@ -2108,47 +2177,7 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                 if span.is_free_awaiting_reuse(idx as usize) {
                     return FreeOutcome::DoubleFree;
                 }
-                // W18-3 (§29.4): when the quarantine is active it may *hold* this
-                // freed object out of circulation (delaying reuse) or detect a
-                // quarantine-hit double free — returning the final outcome; a true
-                // no-op (always `None`) without the `quarantine` feature.
-                if let Some(outcome) = self.maybe_quarantine_small(ptr, span, idx, arena, usable) {
-                    return outcome;
-                }
-                // W6/W7: absorb the free into the running core's slot when the object is
-                // cacheable. `None` ⇒ the front end declined and the central path below
-                // completes the free (the object stays marked cached until
-                // `insert_batch_inner` clears it free-bit-first).
-                if !cache_bypass
-                    && Self::front_end_cacheable(arena, span.place_class())
-                    && !crate::deterministic::force_slow_path()
-                {
-                    if let Some(outcome) = self.free_small_cached(ptr, span, idx, arena, usable) {
-                        return outcome;
-                    }
-                }
-                // Scrubbing insert (§29.6, W18-5): junk-fill builds re-arm the
-                // use-after-free canary under the span lock; a true no-op otherwise.
-                let r = self.central.insert_batch_scrubbing(span, &[idx], 1);
-                if r.inserted == 0 {
-                    // Already central-free (double free) or the span raced
-                    // its teardown; nothing was mutated (W8 hardening).
-                    //
-                    // W6 defence in depth: if we arrived here *from* the cached path (its
-                    // push was declined), the object is marked cached but sits in no
-                    // slot. Clearing the mark restores exactly the pre-W6 state — the
-                    // alternative is an object that is unreachable *and* reports a double
-                    // free forever. A no-op when we never marked it (the non-cacheable
-                    // path), since nothing else can have this object marked: reaching the
-                    // central insert means we won its `try_mark_cached`.
-                    span.unmark_cached(idx as usize);
-                    return FreeOutcome::DoubleFree;
-                }
-                self.account_small_free(arena, usable);
-                if r.span_empty {
-                    self.retire_span(span);
-                }
-                FreeOutcome::Freed
+                self.free_small_screened(ptr, span, idx, arena, usable, cache_bypass)
             }
             Ok(FreeTarget::Large { desc }) => {
                 // SAFETY: `desc` is a live large descriptor — the pagemap classified
@@ -4346,6 +4375,65 @@ mod tests {
             "the object reached central"
         );
         assert_eq!(tfree(&a, p), FreeOutcome::DoubleFree);
+        assert!(a.check_invariants());
+    }
+
+    /// §29.3 / §10.3: a free that **bypasses** the front end (`TOPO_TCACHE_NONE`, or the
+    /// deterministic force-slow-path) must settle the double-free race through the *same*
+    /// atomic claim a cached free does. It goes straight to the central bitmap — which a
+    /// cached object never enters — so if it skipped the claim, a normal free and a
+    /// bypassing free of one live object could each succeed and leave the address in a
+    /// per-CPU slot *and* in the central free list, to be vended twice.
+    ///
+    /// The interleaving is reproduced exactly: `free_small_screened` is `free_with`'s body
+    /// *after* its advisory screen, so calling it with the cached bit already set is the
+    /// racing normal free winning the claim in the window between the bypassing free's
+    /// screen and its own claim.
+    #[test]
+    fn a_bypassing_free_racing_a_cached_free_cannot_also_succeed() {
+        let m = meta(8 * 1024 * 1024);
+        let pm = PageMap::new();
+        let a = small_allocator(&m, &pm);
+
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let Ok(FreeTarget::Small { span, object_index }) =
+            validate_free(a.pagemap, a.meta_region, p as usize)
+        else {
+            panic!("a 64-byte object is a small allocation");
+        };
+        // SAFETY: the pagemap only holds descriptors in never-freed metadata (§27.5).
+        let span = unsafe { &*span };
+        let idx = object_index as u16;
+        assert!(
+            Allocator::<HostProvider>::front_end_cacheable(span.arena(), span.place_class()),
+            "the default arena's unhinted small objects are the cacheable case"
+        );
+
+        // The racing normal free wins the claim; it has not pushed into a slot yet.
+        assert!(span.try_mark_cached(object_index));
+
+        // The bypassing free is already past its screen. It must lose, and — the part
+        // that actually matters — it must not reach the central bitmap. (The span's other
+        // slots are central-free from activation, hence the before/after comparison.)
+        let usable = size_class::usable_size(span.size_class());
+        let before = a.stats();
+        let outcome = a.free_small_screened(p, span, idx, span.arena(), usable, true);
+        assert_eq!(outcome, FreeOutcome::DoubleFree);
+        assert!(
+            !span.is_central_free(object_index),
+            "the bypassing free inserted an object the front end already owns"
+        );
+        let after = a.stats();
+        assert_eq!(
+            after.central_free_bytes, before.central_free_bytes,
+            "the losing free must not publish the object to central"
+        );
+        assert_eq!(
+            after.freed_bytes_total, before.freed_bytes_total,
+            "the losing free must account nothing"
+        );
+        assert!(span.cached_and_central_free_are_disjoint());
         assert!(a.check_invariants());
     }
 
