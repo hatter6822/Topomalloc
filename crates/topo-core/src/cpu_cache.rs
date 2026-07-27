@@ -983,7 +983,7 @@ impl CpuCache {
 
     /// [`fe_pop`](Self::fe_pop), additionally reporting **which core's slot it actually
     /// operated on** — the authoritative answer, resolved inside the pop rather than
-    /// guessed by the caller beforehand.
+    /// guessed by the caller beforehand — or `None` if it touched no slot at all.
     ///
     /// A caller that reacts to `Empty` by refilling needs this. `core` is only a *hint*
     /// in RSEQ mode (§27.4): the sequence ignores it and uses the hardware CPU, so a
@@ -995,6 +995,10 @@ impl CpuCache {
     /// keyed to the same CPU, so a migration costs at most a retry instead of a spurious
     /// failure. (Migrating again after this read is harmless: the objects land in a real
     /// slot either way, and the caller's loop is bounded.)
+    ///
+    /// **`None` means "the front end declined; do not follow up on any core"** — see the
+    /// `MODE_PINNED` arm. A caller must not substitute a hint of its own: the whole point
+    /// of the answer being `None` is that no core is safe to touch.
     #[inline]
     pub fn fe_pop_tracked(
         &self,
@@ -1002,22 +1006,39 @@ impl CpuCache {
         arena: ArenaId,
         sc: SizeClassId,
         meta: &dyn MetadataAlloc,
-    ) -> (FeOutcome<usize>, CoreId) {
+    ) -> (FeOutcome<usize>, Option<CoreId>) {
         match self.mode.load(Ordering::Acquire) {
             MODE_RSEQ => {
-                if let Some(out) = self.fe_pop_rseq(sc) {
-                    return out;
+                if let Some((out, served)) = self.fe_pop_rseq(sc) {
+                    return (out, Some(served));
                 }
                 let eff = self.effective_core(core);
-                (self.fe_pop_locked(eff, arena, sc, meta), eff)
+                (self.fe_pop_locked(eff, arena, sc, meta), Some(eff))
             }
-            MODE_PINNED => {
-                if let Some(out) = self.fe_pop_pinned_dispatch(arena, sc, meta) {
-                    return out;
-                }
-                (self.fe_pop_locked(core, arena, sc, meta), core)
-            }
-            _ => (self.fe_pop_locked(core, arena, sc, meta), core),
+            // **In pinned mode the pinned sequence is the only thing that may touch a
+            // slot, so a declined dispatch declines the front end** (§2.4) rather than
+            // falling back to a locked access keyed on `core`.
+            //
+            // `core` comes from [`current_core`](Self::current_core), which knows nothing
+            // about the pinned oracle: with no RSEQ it is a per-thread spreading key (core
+            // 0 in the `no_std` build), so it names an essentially arbitrary slot — one
+            // that under the §36.10 contract belongs to *another* core's pinned worker.
+            // That worker takes no per-CPU lock and no fence can drain it, so the locked
+            // fallback would read and rewrite its non-atomic slot buffer concurrently:
+            // undefined behaviour, and an object lost or double-vended. The allocator must
+            // itself honour the contract [`enable_pinned_core`](Self::enable_pinned_core)
+            // asks its caller to uphold.
+            //
+            // Nothing is lost by declining. The dispatch only gives up when the oracle
+            // cannot name this thread's core or the thread keeps migrating — exactly the
+            // states in which guessing is unsound — and the lazy slot init lives inside
+            // `fe_pop_pinned` itself, so it is not what the locked path was there for.
+            // The caller serves from central instead.
+            MODE_PINNED => match self.fe_pop_pinned_dispatch(arena, sc, meta) {
+                Some((out, served)) => (out, Some(served)),
+                None => (FeOutcome::Empty, None),
+            },
+            _ => (self.fe_pop_locked(core, arena, sc, meta), Some(core)),
         }
     }
 
@@ -1118,20 +1139,45 @@ impl CpuCache {
         addr: usize,
         meta: &dyn MetadataAlloc,
     ) -> FeOutcome<()> {
+        self.fe_push_tracked(core, arena, sc, addr, meta).0
+    }
+
+    /// [`fe_push`](Self::fe_push), additionally reporting **which core's slot it actually
+    /// operated on**, or `None` if it touched none — the push-side counterpart of
+    /// [`fe_pop_tracked`](Self::fe_pop_tracked), and needed for the same reason.
+    ///
+    /// A caller that reacts to `Full` by flushing needs this. `core` is only a hint on
+    /// both fast paths, and the push resolves the real core itself: in RSEQ mode the
+    /// hardware CPU, in pinned mode the §36.10 oracle. Flushing the hint instead is wrong
+    /// twice over — it drains a slot that is not the full one (so the retry fails and the
+    /// object falls to central for no reason), and in pinned mode it drains a core this
+    /// thread does not own, racing that core's pinned worker on its non-atomic slot
+    /// buffer. The pop side already learned this (see `fe_pop_tracked`); the push side
+    /// went on guessing.
+    #[inline]
+    pub fn fe_push_tracked(
+        &self,
+        core: CoreId,
+        arena: ArenaId,
+        sc: SizeClassId,
+        addr: usize,
+        meta: &dyn MetadataAlloc,
+    ) -> (FeOutcome<()>, Option<CoreId>) {
         match self.mode.load(Ordering::Acquire) {
             MODE_RSEQ => {
-                if let Some(out) = self.fe_push_rseq(sc, addr) {
-                    return out;
+                if let Some((out, served)) = self.fe_push_rseq(sc, addr) {
+                    return (out, Some(served));
                 }
-                self.fe_push_locked(self.effective_core(core), arena, sc, addr, meta)
+                let eff = self.effective_core(core);
+                (self.fe_push_locked(eff, arena, sc, addr, meta), Some(eff))
             }
-            MODE_PINNED => {
-                if let Some(out) = self.fe_push_pinned_dispatch(arena, sc, addr, meta) {
-                    return out;
-                }
-                self.fe_push_locked(core, arena, sc, addr, meta)
-            }
-            _ => self.fe_push_locked(core, arena, sc, addr, meta),
+            // Decline rather than guess a core — see `fe_pop_tracked`'s `MODE_PINNED` arm
+            // for why a locked fallback keyed on `core` is undefined behaviour here.
+            MODE_PINNED => match self.fe_push_pinned_dispatch(arena, sc, addr, meta) {
+                Some((out, served)) => (out, Some(served)),
+                None => (FeOutcome::Full, None),
+            },
+            _ => (self.fe_push_locked(core, arena, sc, addr, meta), Some(core)),
         }
     }
 
@@ -1377,10 +1423,10 @@ impl CpuCache {
         None
     }
 
-    /// Attempt the restartable push on the current CPU's slot for `sc`. See
-    /// [`fe_pop_rseq`](Self::fe_pop_rseq) for the `None` semantics.
+    /// Attempt the restartable push on the current CPU's slot for `sc`, reporting the CPU
+    /// it ran on. See [`fe_pop_rseq`](Self::fe_pop_rseq) for the `None` semantics.
     #[inline]
-    fn fe_push_rseq(&self, sc: SizeClassId, addr: usize) -> Option<FeOutcome<()>> {
+    fn fe_push_rseq(&self, sc: SizeClassId, addr: usize) -> Option<(FeOutcome<()>, CoreId)> {
         if sc.index() >= NUM_SIZE_CLASSES {
             return None;
         }
@@ -1411,10 +1457,16 @@ impl CpuCache {
                     addr,
                 )
             } {
-                rseq::Push::Success => return Some(FeOutcome::Success(())),
+                rseq::Push::Success => {
+                    return Some((FeOutcome::Success(()), Self::area_core(area, cpu)))
+                }
                 rseq::Push::Full => {
+                    // Re-read the area's `cpu_id` rather than reuse the pre-loop `cpu`, as
+                    // the `Empty` pop does: the kernel updates it on migration, and this is
+                    // the CPU whose slot the sequence found full — the one a flush must
+                    // target. `cpu` stays the stat key (approximate by construction).
                     self.bump_overflow(cpu as usize, sc);
-                    return Some(FeOutcome::Full);
+                    return Some((FeOutcome::Full, Self::area_core(area, cpu)));
                 }
                 rseq::Push::Abort => continue,
                 rseq::Push::Fallback => return None,
@@ -1466,7 +1518,9 @@ impl CpuCache {
         None
     }
 
-    /// `MODE_PINNED` dispatch for `fe_push`. See [`fe_pop_pinned_dispatch`].
+    /// `MODE_PINNED` dispatch for `fe_push`, reporting the core it ran on so the caller's
+    /// overflow flush targets the slot that is actually full — and, more to the point, one
+    /// this thread owns. See [`fe_pop_pinned_dispatch`](Self::fe_pop_pinned_dispatch).
     #[inline]
     fn fe_push_pinned_dispatch(
         &self,
@@ -1474,7 +1528,7 @@ impl CpuCache {
         sc: SizeClassId,
         addr: usize,
         meta: &dyn MetadataAlloc,
-    ) -> Option<FeOutcome<()>> {
+    ) -> Option<(FeOutcome<()>, CoreId)> {
         let oracle = self.pinned_oracle()?;
         let provider = FnCoreProvider(oracle);
         for _ in 0..RSEQ_ABORT_RETRY {
@@ -1482,9 +1536,10 @@ impl CpuCache {
             if cpu < 0 || (cpu as usize) >= MAX_CPUS {
                 return None;
             }
-            match self.fe_push_pinned(CoreId(cpu as u32), arena, sc, addr, &provider, meta) {
+            let core = CoreId(cpu as u32);
+            match self.fe_push_pinned(core, arena, sc, addr, &provider, meta) {
                 FeOutcome::Abort => continue,
-                other => return Some(other),
+                other => return Some((other, core)),
             }
         }
         None
@@ -2106,7 +2161,11 @@ mod tests {
         // that is the case a refill reacts to.
         let (out, served) = cc.fe_pop_tracked(core, A, sc, &m);
         assert!(out.is_empty());
-        assert_eq!(served, core, "the locked path serves the requested core");
+        assert_eq!(
+            served,
+            Some(core),
+            "the locked path serves the requested core"
+        );
 
         // And on a hit: push to a *different* core, then confirm each pop is attributed
         // to the slot it actually drained rather than to whichever core was asked last.
@@ -2114,14 +2173,103 @@ mod tests {
         assert!(cc.fe_push(other, A, sc, 0xAB, &m).is_success());
         let (out, served) = cc.fe_pop_tracked(other, A, sc, &m);
         assert_eq!(out.unwrap(), 0xAB);
-        assert_eq!(served, other);
+        assert_eq!(served, Some(other));
         let (out, served) = cc.fe_pop_tracked(core, A, sc, &m);
         assert!(out.is_empty(), "core 3's slot was never filled");
-        assert_eq!(served, core, "an empty pop is attributed to its own core");
+        assert_eq!(
+            served,
+            Some(core),
+            "an empty pop is attributed to its own core"
+        );
 
         // The wrapper is the tracked pop's first component, so the two cannot drift.
         assert!(cc.fe_push(core, A, sc, 0xCD, &m).is_success());
         assert_eq!(cc.fe_pop(core, A, sc, &m).unwrap(), 0xCD);
+    }
+
+    /// §36.10: a pinned push lands on the **oracle's** core and reports it, not the
+    /// caller's hint.
+    ///
+    /// `current_core()` — the hint's source — consults `rseq::current_cpu()` and a
+    /// per-thread spreading key, neither of which knows about the pinned oracle, so in a
+    /// no-RSEQ pinned deployment the hint names an essentially arbitrary slot. The caller
+    /// reacts to `Full` by flushing, and flushing the hint drains a core this thread does
+    /// not own: that core's pinned worker takes no per-CPU lock and no fence can drain it,
+    /// so the flush races its non-atomic slot buffer — an object lost or double-vended.
+    ///
+    /// Both halves are asserted, because only the second is the memory-safety one: the
+    /// object lands in the oracle's slot (not the hint's), and the *reported* core — the
+    /// value the flush is keyed on — is the oracle's too. Fails with the pinned arm
+    /// reporting `core`, which is what the push side did while the pop side had already
+    /// been fixed to report the core it served.
+    #[test]
+    fn a_pinned_push_lands_and_reports_the_oracle_core_not_the_hint() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        // A constant oracle: no real CPU pinning needed, since `fe_push_pinned` only
+        // compares the oracle against itself.
+        const PINNED: u32 = 3;
+        // SAFETY: §36.10 hand-off contract — this cache is local to the test, only this
+        // thread ever touches it, and nothing drains it concurrently.
+        unsafe { cc.enable_pinned_core(|| PINNED as i32) };
+        let hint = CoreId(0); // deliberately not the oracle's core
+
+        let (out, served) = cc.fe_push_tracked(hint, A, sc, 0x1000, &m);
+        assert!(out.is_success());
+        assert_eq!(
+            served,
+            Some(CoreId(PINNED)),
+            "the push reported the hint, so an overflow flush would drain a core this \
+             thread does not own"
+        );
+        // The object really is on the oracle's core, not the hint's.
+        assert!(
+            cc.fe_pop_on_core(hint, A, sc, &m).is_empty(),
+            "nothing may land in the hint's slot"
+        );
+        assert_eq!(
+            cc.fe_pop_on_core(CoreId(PINNED), A, sc, &m).unwrap(),
+            0x1000
+        );
+    }
+
+    /// §36.10 + §2.4: when the oracle cannot name this thread's core, a pinned operation
+    /// **declines** — it must not fall back to a locked access keyed on the caller's hint.
+    ///
+    /// The locked fallback was the hazard hiding behind the hint. Under the pinning
+    /// contract the hint's slot belongs to *another* core's pinned worker, which takes no
+    /// per-CPU lock and cannot be fenced, so a locked read-modify-write of its buffer is
+    /// undefined behaviour. The allocator has to honour the contract `enable_pinned_core`
+    /// asks its caller to uphold; declining costs one trip to the central path.
+    ///
+    /// Fails with the `fe_*_locked(core, ..)` fallback restored: the object lands in the
+    /// hint's slot, and the pop reports that slot as served.
+    #[test]
+    fn a_pinned_operation_with_no_resolvable_core_touches_no_slot() {
+        let m = meta(1024 * 1024);
+        let cc = CpuCache::new();
+        let sc = SizeClassId::new(0);
+        // SAFETY: as above — a test-local cache, single-threaded, never drained.
+        unsafe { cc.enable_pinned_core(|| -1) };
+        let hint = CoreId(0);
+
+        let (out, served) = cc.fe_push_tracked(hint, A, sc, 0x2000, &m);
+        assert!(out.is_full(), "an unresolvable core declines the push");
+        assert_eq!(served, None, "no slot was touched, so none may be reported");
+
+        let (out, served) = cc.fe_pop_tracked(hint, A, sc, &m);
+        assert!(out.is_empty(), "an unresolvable core declines the pop");
+        assert_eq!(served, None);
+
+        // Nothing was written into the hint's slot — nor anywhere else the fallback key
+        // could have reached.
+        for c in 0..8u32 {
+            assert!(
+                cc.fe_pop_on_core(CoreId(c), A, sc, &m).is_empty(),
+                "core {c} received an object from a declined pinned push"
+            );
+        }
     }
 
     /// `fe_pop_on_core` reaches a *named* slot regardless of the running CPU — the

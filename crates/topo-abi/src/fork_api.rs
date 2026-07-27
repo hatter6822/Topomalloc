@@ -76,19 +76,43 @@ extern "C" fn atfork_child() {
         // returns a process with exactly one thread, so no restartable sequence from the
         // parent is in flight to race the mode publish or the latch clear.
         unsafe { eng.reset_front_end_after_fork() };
+        refresh_child_entropy(eng, topo_core::deterministic::is_deterministic());
+    }
+}
+
+/// The child half of §29.5: bank fork-distinct entropy, and apply it to the live samplers
+/// unless deterministic mode says to defer.
+///
+/// `deterministic` is a parameter rather than a query so both branches are testable
+/// without switching the process-global mode, which every parallel test would see.
+#[cfg(unix)]
+fn refresh_child_entropy(eng: &crate::AnyAllocator, deterministic: bool) {
+    {
         // §29.5: the child inherited the parent's guard-page coin and quarantine-evictor
         // PRNG state byte for byte, so without a re-seed the two processes make the *same*
         // hardening choices for the same allocation sequence — and one of them is
         // observable to whoever can run it. Fresh, fork-distinct entropy, then re-derive
         // the sampler streams from it.
         //
-        // **Except in deterministic mode (§30.4)**, whose whole contract is that every
-        // randomized decision derives from the configured global seed so a replay
-        // reproduces exactly. Injecting fork-distinct entropy there would silently break
-        // that guarantee for any workload that forks — the two goals are genuinely
-        // opposed, and determinism is the one the operator asked for explicitly.
-        if !topo_core::deterministic::is_deterministic() {
-            crate::entropy::reseed_after_fork();
+        // **The two halves are gated differently, and conflating them was a leak.** The
+        // *stored process entropy* is refreshed unconditionally: it is not a randomized
+        // stream, it is the per-process secret every later re-seed draws from, and nothing
+        // reads it while deterministic mode is on (`seed_security_samplers` is the only
+        // consumer, and `reseed_live` calls it only on the not-deterministic branch).
+        // Leaving it inherited meant a parent and child that both later *disabled*
+        // deterministic mode re-derived the guard coin, the quarantine evictor and the heap
+        // sampler from the identical value — restoring in that moment exactly the matched,
+        // predictable schedules §29.5 exists to prevent, on the very path that advertises
+        // unpredictability restored.
+        crate::entropy::reseed_after_fork();
+        // *Applying* it to the live samplers is what deterministic mode (§30.4) forbids:
+        // its whole contract is that every randomized decision derives from the configured
+        // global seed so a replay reproduces exactly, and injecting fork-distinct entropy
+        // into a running stream would silently break that for any workload that forks. The
+        // two goals are genuinely opposed here, and determinism is the one the operator
+        // asked for explicitly — so the fresh entropy is banked and takes effect if and
+        // when deterministic mode is turned off.
+        if !deterministic {
             eng.seed_security_samplers();
         }
     }
@@ -207,7 +231,11 @@ thread_local! {
 ///
 /// * **The registering thread, re-entered.** Returning at once is the only option — it
 ///   is waiting for itself, so blocking (a `Once`, or a spin) dead-locks. `REGISTERING`
-///   identifies it.
+///   identifies it. It should no longer *get* here: [`RegisteringWindow`] serves that
+///   thread's allocations from bootstrap storage, so `global()` is not called at all.
+///   The branch stays because returning-at-once is the only safe answer for a claimant
+///   that reaches it by some route the window does not cover, and because a re-entrant
+///   caller that merely returns is not enough on its own — see [`RegisteringWindow`].
 /// * **Another thread.** Returning at once leaves it free to walk straight into
 ///   `GLOBAL.get_or_init` with no handlers installed, which is the exact window this
 ///   call exists to close: a `fork()` in it strands the child on a half-constructed
@@ -223,24 +251,87 @@ thread_local! {
 pub(crate) fn register_atfork_handlers() {
     #[cfg(unix)]
     {
-        if ATFORK.try_claim() {
-            REGISTERING.with(|r| r.set(true));
+        run_attempt(&ATFORK, || {
             // SAFETY: the three handlers are `extern "C"` functions with no captured
             // state that only call the allocation-free `topo_core::fork::*` routines;
             // `pthread_atfork` simply records them.
-            let rc = unsafe {
+            unsafe {
                 libc::pthread_atfork(
                     Some(atfork_prepare),
                     Some(atfork_parent),
                     Some(atfork_child),
                 )
-            };
-            REGISTERING.with(|r| r.set(false));
-            ATFORK.publish(rc == 0);
-        } else {
-            await_attempt(&ATFORK, REGISTERING.with(core::cell::Cell::get));
+            }
+        });
+    }
+}
+
+/// The registering thread's window: it is the one inside `pthread_atfork`, **and** its
+/// allocations are served from bootstrap storage rather than the engine.
+///
+/// The second half is what keeps the first from being a loophole. `pthread_atfork`
+/// allocates (glibc grows its handler list once the static pool is exhausted), and when
+/// `TopoMallocGlobal` is the process `#[global_allocator]` that allocation comes straight
+/// back here. Marking the thread makes the nested `register_atfork_handlers` return
+/// instead of waiting for itself — but *returning* was never the end of it: the nested
+/// `global()` then walked on into `GLOBAL.get_or_init` and built the whole allocator with
+/// no handlers installed. A `fork()` from another thread during that build is exactly the
+/// #4 hazard the eager ctor exists to close, reached whenever that ctor was elided — and
+/// the child inherits a half-constructed `OnceLock` with no quiesce handler.
+///
+/// Opening the bootstrap window removes the re-entry rather than tolerating it: the
+/// allocation is served by the system allocator, `global()` is never called, and no
+/// initialization can happen before `pthread_atfork` returns. The engine's own `free`
+/// already routes such a pointer back (it classifies as `Foreign`, the bootstrap-window
+/// contract), so nothing downstream needs to know.
+///
+/// This is the whole re-entry surface: every C symbol this crate exports is
+/// `topomalloc_`-prefixed, so it interposes no libc allocator and `pthread_atfork` has no
+/// other route back into `global()`.
+///
+/// Restores both flags on the way out, panic included.
+#[cfg(unix)]
+struct RegisteringWindow {
+    _bootstrap: crate::BootstrapGuard,
+}
+
+#[cfg(unix)]
+impl RegisteringWindow {
+    fn enter() -> Self {
+        REGISTERING.with(|r| r.set(true));
+        RegisteringWindow {
+            _bootstrap: crate::BootstrapGuard::enter(),
         }
     }
+}
+
+#[cfg(unix)]
+impl Drop for RegisteringWindow {
+    fn drop(&mut self) {
+        REGISTERING.with(|r| r.set(false));
+    }
+}
+
+/// One registration attempt against `guard`: claim it, run `install` inside the
+/// [`RegisteringWindow`], and publish the outcome. A caller that finds the claim taken
+/// waits it out (or returns at once, if it *is* the claimant — see
+/// [`register_atfork_handlers`]). Returns whether this call installed the handlers.
+///
+/// `install` is a parameter, and the guard is too, so both branches are testable without
+/// touching the process-global `ATFORK` — driving that from a test would race the
+/// registration every other test depends on.
+#[cfg(unix)]
+fn run_attempt(guard: &AtforkGuard, install: impl FnOnce() -> core::ffi::c_int) -> bool {
+    if !guard.try_claim() {
+        await_attempt(guard, REGISTERING.with(core::cell::Cell::get));
+        return false;
+    }
+    let rc = {
+        let _window = RegisteringWindow::enter();
+        install()
+    };
+    guard.publish(rc == 0);
+    rc == 0
 }
 
 /// Wait out an in-flight registration attempt — unless this *is* the thread making it,
@@ -458,6 +549,84 @@ mod tests {
         handle.join().expect("observer thread");
         assert!(observed.load(O::Acquire));
         assert!(!guard.registered(), "a failed attempt installs nothing");
+    }
+
+    /// W16-5 (#4): the installer must run with the **bootstrap window open**, so an
+    /// allocation `pthread_atfork` makes cannot re-enter `global()` and build the whole
+    /// allocator before the handlers are installed. A `fork()` from another thread during
+    /// that build strands the child on a half-constructed `OnceLock` with no quiesce
+    /// handler — the exact hazard the eager `.init_array` ctor exists to close, reached
+    /// whenever that ctor was elided.
+    ///
+    /// Marking the thread as the claimant (the previous fix) stopped it *waiting for
+    /// itself*, but it still returned and walked on into the init. Closing the re-entry
+    /// is what this pins.
+    ///
+    /// Driven over a **private** guard and a stand-in installer, for the reason the
+    /// sibling tests give: the process-global `ATFORK` is consulted by `global()`'s fast
+    /// path on every allocating test.
+    #[cfg(unix)]
+    #[test]
+    fn a_registration_attempt_runs_its_installer_inside_the_bootstrap_window() {
+        let guard = AtforkGuard::new();
+        assert!(
+            !crate::in_bootstrap_window(),
+            "precondition: no window open on this thread"
+        );
+
+        let mut window_was_open = false;
+        let mut was_registering = false;
+        let ok = run_attempt(&guard, || {
+            window_was_open = crate::in_bootstrap_window();
+            was_registering = REGISTERING.with(core::cell::Cell::get);
+            0 // stand in for a successful `pthread_atfork`
+        });
+
+        assert!(ok, "a claimed attempt reporting success installs");
+        assert!(guard.registered());
+        assert!(
+            window_was_open,
+            "the installer ran outside the bootstrap window: an allocation it makes \
+             re-enters global() and initializes GLOBAL with no fork handlers installed"
+        );
+        assert!(
+            was_registering,
+            "the installer must also be marked as the registering thread"
+        );
+        assert!(
+            !crate::in_bootstrap_window(),
+            "the window must close again, or every later allocation on this thread \
+             bypasses the engine"
+        );
+    }
+
+    /// §29.5/§30.4: a fork child must bank fork-distinct entropy **even while deterministic
+    /// mode defers applying it**. Skipping the refresh left parent and child holding the
+    /// same `process_entropy`, so a later *disable* in both — the path that advertises
+    /// unpredictability restored — re-derived the guard coin, the quarantine evictor and
+    /// the heap sampler from one identical value.
+    ///
+    /// `deterministic` is passed rather than set, so this does not disturb the
+    /// process-global mode every parallel test would see. Refreshing the stored entropy is
+    /// itself harmless to siblings: a fresh per-process secret is what the value is for,
+    /// and nothing asserts a particular one.
+    ///
+    /// Fails with the refresh back inside the deterministic guard: the entropy is
+    /// unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_child_banks_fresh_entropy_even_when_deterministic_mode_defers_applying_it() {
+        let Some(eng) = crate::global() else {
+            return; // no engine on this host: nothing to exercise
+        };
+        let before = topo_core::harden::process_entropy();
+        refresh_child_entropy(eng, /* deterministic */ true);
+        let after = topo_core::harden::process_entropy();
+        assert_ne!(
+            before, after,
+            "a deterministic-mode child kept the parent's process entropy, so disabling \
+             deterministic mode in both would hand them identical 'unpredictable' streams"
+        );
     }
 
     #[test]

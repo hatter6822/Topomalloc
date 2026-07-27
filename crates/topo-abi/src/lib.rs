@@ -767,21 +767,37 @@ thread_local! {
     static BOOTSTRAPPING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// RAII marker that sets [`BOOTSTRAPPING`] for the duration of `GLOBAL`
-/// initialization and clears it on the way out — even if the initializer panics.
-struct BootstrapGuard;
+/// RAII marker that sets [`BOOTSTRAPPING`] for the duration of a window in which this
+/// thread's allocations must **not** reach the engine, and restores the previous value on
+/// the way out — even if the body panics.
+///
+/// Two windows use it, for the same underlying reason (an allocation made here would
+/// re-enter `global()`), and they can nest: `GLOBAL` initialization itself, and the
+/// `pthread_atfork` call in [`fork_api::register_atfork_handlers`] — see there for why
+/// letting that one through initializes the allocator with no fork handlers installed.
+///
+/// It **restores** rather than clears, so an inner window cannot end an outer one early.
+/// That is a correctness property, not tidiness: an inner guard that cleared the flag
+/// would drop the rest of the outer window onto the engine, which is precisely what the
+/// outer window exists to prevent.
+pub(crate) struct BootstrapGuard(bool);
 
 impl BootstrapGuard {
-    fn enter() -> Self {
-        BOOTSTRAPPING.with(|b| b.set(true));
-        BootstrapGuard
+    pub(crate) fn enter() -> Self {
+        BootstrapGuard(BOOTSTRAPPING.with(|b| b.replace(true)))
     }
 }
 
 impl Drop for BootstrapGuard {
     fn drop(&mut self) {
-        BOOTSTRAPPING.with(|b| b.set(false));
+        BOOTSTRAPPING.with(|b| b.set(self.0));
     }
+}
+
+/// Whether this thread is inside a [`BootstrapGuard`] window. Test-only.
+#[cfg(test)]
+pub(crate) fn in_bootstrap_window() -> bool {
+    BOOTSTRAPPING.with(Cell::get)
 }
 
 /// The global allocator **only if already initialized**, without triggering the
@@ -1282,6 +1298,66 @@ mod tests {
         // SAFETY: `p` was just returned by `a` and is owned by this test.
         assert_eq!(unsafe { a.free(p) }, FreeOutcome::Freed);
         assert!(new_allocator_named("nope").is_none());
+    }
+
+    /// An allocation made inside a [`BootstrapGuard`] window never reaches the engine —
+    /// the property `fork_api`'s registration window relies on to keep `pthread_atfork`
+    /// from initializing `GLOBAL` before the handlers are installed.
+    ///
+    /// "Not the engine" is asserted the only way that is airtight: the engine itself is
+    /// asked, and must reject the pointer as `Foreign`. That is the same classification
+    /// the adapter's `dealloc` already routes on, so the assertion and the production path
+    /// agree by construction.
+    #[test]
+    fn an_allocation_inside_the_bootstrap_window_never_reaches_the_engine() {
+        let g = TopoMallocGlobal;
+        let layout = Layout::from_size_align(96, 16).unwrap();
+        let p = {
+            let _w = BootstrapGuard::enter();
+            // SAFETY: valid non-zero layout; freed below through the same adapter.
+            unsafe { g.alloc(layout) }
+        };
+        assert!(
+            !p.is_null(),
+            "the bootstrap window must still serve the request"
+        );
+        let eng = global().expect("engine");
+        // SAFETY: `p` is a live pointer this adapter produced; the engine only
+        // classifies it (a pagemap lookup) and declines what it does not own.
+        let verdict = unsafe { eng.free(p) };
+        assert!(
+            matches!(verdict, FreeOutcome::Invalid(InvalidFree::Foreign)),
+            "an allocation made in the bootstrap window came from the engine, so \
+             `pthread_atfork` re-entering there would initialize GLOBAL unregistered"
+        );
+        let _w = BootstrapGuard::enter();
+        // SAFETY: same (ptr, layout), returned inside the window that produced it.
+        unsafe { g.dealloc(p, layout) };
+    }
+
+    /// [`BootstrapGuard`] **restores** the previous flag rather than clearing it, so an
+    /// inner window cannot end an outer one early — which would drop the rest of the outer
+    /// window onto the engine.
+    ///
+    /// Defensive: no path nests the two windows today (registration completes before
+    /// `GLOBAL.get_or_init` begins). It pins the property that makes adding one safe,
+    /// rather than reproducing a defect.
+    #[test]
+    fn a_nested_bootstrap_window_does_not_end_the_outer_one() {
+        assert!(!in_bootstrap_window());
+        let outer = BootstrapGuard::enter();
+        assert!(in_bootstrap_window());
+        {
+            let _inner = BootstrapGuard::enter();
+            assert!(in_bootstrap_window());
+        }
+        assert!(
+            in_bootstrap_window(),
+            "an inner window ended the outer one: the rest of the outer window would \
+             route to the engine"
+        );
+        drop(outer);
+        assert!(!in_bootstrap_window());
     }
 
     /// W16-7 (§35.4): the lazy global initializer drives the init phases all the

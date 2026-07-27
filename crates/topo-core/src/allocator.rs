@@ -1446,6 +1446,13 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
                     // already accounted for there, so simply try the next one.
                 }
                 FeOutcome::Empty => {
+                    // `None` ⇒ the front end declined without touching a slot (pinned mode
+                    // with no resolvable core). Refilling would have to invent a core, and
+                    // the reason the pop declined is that no core is safe to touch — so
+                    // serve from central instead.
+                    let Some(served) = served else {
+                        return ptr::null_mut();
+                    };
                     if !self.refill_front_end(served, sc) {
                         return ptr::null_mut(); // central list is empty: needs a span
                     }
@@ -1639,18 +1646,28 @@ impl<'a, P: TopoBackingProvider> Allocator<'a, P> {
         // exclusively ours until the push below publishes it.
         unsafe { crate::harden::fill_on_free(ptr, usable) };
         let sc = span.size_class();
-        let core = self.cpu_cache.current_core();
-        let mut pushed = self
-            .cpu_cache
-            .fe_push(core, arena, sc, ptr as usize, self.meta)
-            .is_success();
+        let hint = self.cpu_cache.current_core();
+        // `served` is the core the push *actually* used — the hardware CPU in RSEQ mode,
+        // the §36.10 oracle's core in pinned mode — which `hint` need not name, since
+        // `current_core` consults neither. The flush below has to target that core and not
+        // the hint: draining the hint drains a slot that is not the full one, and in pinned
+        // mode drains one this thread does not own, racing its pinned worker's non-atomic
+        // buffer. `None` ⇒ the front end declined without touching any slot, so there is
+        // nothing to flush and no core it would be safe to guess. See
+        // `CpuCache::fe_push_tracked`.
+        let (outcome, served) =
+            self.cpu_cache
+                .fe_push_tracked(hint, arena, sc, ptr as usize, self.meta);
+        let mut pushed = outcome.is_success();
         if !pushed {
-            // At soft capacity (§11.5): push a batch down the hierarchy and retry once.
-            self.flush_front_end(core, sc);
-            pushed = self
-                .cpu_cache
-                .fe_push(core, arena, sc, ptr as usize, self.meta)
-                .is_success();
+            if let Some(served) = served {
+                // At soft capacity (§11.5): push a batch down the hierarchy and retry once.
+                self.flush_front_end(served, sc);
+                pushed = self
+                    .cpu_cache
+                    .fe_push(served, arena, sc, ptr as usize, self.meta)
+                    .is_success();
+            }
         }
         if !pushed {
             return None; // the central path completes the free

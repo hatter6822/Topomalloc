@@ -2717,6 +2717,68 @@ atomic store over process-global mode state, with no assembly and no per-arch pa
 architecture exercises all of it. The bounds-checks on the `current_cpu() as usize` casts
 are the part that matters on every target, and those are unconditional.
 
+### Round-17 review: a hint mistaken for an answer (0.4.3)
+
+Three findings, and the two that matter share a shape: a value that was only ever a *hint*
+was used as though it named reality.
+
+**1. An operation that overrides its caller's hint must report what it actually did.**
+`fe_push`'s `core` argument is a hint on both fast paths — RSEQ uses the hardware CPU,
+pinned mode uses the §36.10 oracle — and `free_small_cached` keyed its overflow flush on
+the hint instead. In a no-RSEQ pinned deployment the hint comes from `current_core()`,
+which consults neither oracle, so a worker pinned to core B whose slot filled up flushed
+core *0*: the wrong slot (so the retry failed and the object fell to central for nothing)
+and, far worse, a core this thread does not own — whose pinned worker takes no per-CPU
+lock and cannot be fenced, so the drain raced its non-atomic slot buffer. The pop side had
+already been fixed to report the core it served, twice (rounds 12 and 15), each time for
+this exact failure mode; nobody looked across at the push. `fe_push_tracked` now reports
+it, as `fe_pop_tracked` does. **A follow-up action keyed to a hint the callee is free to
+ignore is a latent bug; when one operation learns to report its real target, check its
+mirror image the same day.**
+
+**2. Honour the contract you ask your callers to uphold.** `enable_pinned_core` is `unsafe`
+because only a core's own pinned worker may touch its slot. Yet in pinned mode both
+`fe_push` and `fe_pop` fell back to a *locked* access keyed on the caller's spreading key
+whenever the oracle could not name a core — the allocator itself doing the thing it demands
+its embedder never do, and reachable in precisely the states where guessing is least
+defensible (the oracle unable to answer, or the thread migrating). They now decline and the
+caller serves from central (§2.4); the lazy slot init that the locked path might have been
+covering for lives inside the pinned sequences already. Round 16's rule was "when adding a
+call to a safe function, check what the callee's callers were promised". **This is the same
+rule pointed inward: check that you are not the one breaking it.**
+
+**3. Defer applying a secret, never acquiring it.** The fork child skipped
+`reseed_after_fork` entirely under deterministic mode, on the reasoning that injecting
+fork-distinct entropy into a reproducible run would break the replay guarantee. True of the
+live samplers — and false of the *stored* `process_entropy`, which is not a stream but the
+per-process secret later re-seeds draw from, and which nothing reads while deterministic
+mode is on. So parent and child held the same value, and the moment both disabled
+deterministic mode — the path whose entire purpose is restoring §29.4/§29.5
+unpredictability — they re-derived the guard coin, the quarantine evictor and the heap
+sampler from one identical secret. The refresh is now unconditional and only the
+application is gated. **A deferral that also skips acquisition converts a temporary
+suspension into a leak at the moment it is lifted.**
+
+**4. Returning early is not the same as not re-entering.** Round 16 marked the thread
+inside `pthread_atfork` so a re-entrant call would not wait for itself. That fixed the
+deadlock and left the consequence: the nested `global()` returned from the registration and
+then walked on into `GLOBAL.get_or_init`, building the entire allocator with no fork
+handlers installed — the #4 hazard the eager `.init_array` ctor exists to close, reached
+whenever that ctor was elided. The registration now runs inside the existing bootstrap
+window, so the allocation is served by the system allocator and `global()` is not called at
+all. **Where a re-entrant call would take a forbidden action, remove the re-entry rather
+than make it return politely.** (The `REGISTERING` marker stays: returning at once is still
+the only safe answer for a claimant that arrives by a route the window does not cover.)
+
+*On verification.* Each fix was neutered **individually** and its test re-run — separately,
+not as a batch, which is what caught a vacuous test last round. The pinned-report test fails
+when the push reports the hint; the pinned-decline test fails when the locked fallback is
+restored; the entropy test fails with the refresh back inside the deterministic guard; the
+bootstrap-window test fails when the installer runs outside it. `BootstrapGuard` was also
+changed to **restore** rather than clear the flag, so an inner window cannot end an outer
+one early — that one is defensive (nothing nests the two windows today) and its test says
+so rather than claiming a reproduced defect.
+
 ### Round-16 review: a claim, a ceiling, and two contracts (0.4.3)
 
 Two of this round's four findings landed on the round-15 fix itself — the drain added to
